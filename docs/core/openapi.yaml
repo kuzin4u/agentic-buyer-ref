@@ -1,0 +1,522 @@
+openapi: 3.0.3
+info:
+  title: Испытательный контур агентной коммерции
+  version: 1.0.0-draft
+  description: |
+    Контракт эмулятора К1–К8. Основание — пул, файл 23 «Спецификация интерфейсов», драфты A1–A9.
+    Имена полей и коды — проект; изменения только через /decision.
+    Суммы — целые числа в минимальных единицах валюты (копейках). Время — UTC, ISO 8601.
+    Каждое обращение агента подписано (заголовки Signature-Input, Signature, Content-Digest, X-Agent-Code, X-Timestamp).
+    Класс и уровень агента берутся из реестра; значения в теле запроса игнорируются.
+servers:
+  - url: http://localhost:8080
+    description: dev
+tags:
+  - name: K1-registry
+  - name: K2-mandates
+  - name: K3-limits
+  - name: K5-gateway
+  - name: K6-shops
+  - name: K7-disputes
+  - name: K8-runs
+components:
+  parameters:
+    AgentCode:
+      name: X-Agent-Code
+      in: header
+      required: true
+      schema: { type: string, example: "nspk:agent:buyref-01:v3" }
+    MandateId:
+      name: X-Mandate-Id
+      in: header
+      required: false
+      schema: { type: string, example: "MND-8f31c0" }
+    Timestamp:
+      name: X-Timestamp
+      in: header
+      required: true
+      schema: { type: string, format: date-time }
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      schema: { type: string }
+    SignatureInput:
+      name: Signature-Input
+      in: header
+      required: true
+      schema: { type: string, example: 'sig1=("@method" "@path" "x-timestamp" "content-digest" "x-agent-code")' }
+    Signature:
+      name: Signature
+      in: header
+      required: true
+      schema: { type: string }
+    ContentDigest:
+      name: Content-Digest
+      in: header
+      required: false
+      schema: { type: string, example: "sha-256=:...:" }
+  schemas:
+    DeclineCode:
+      type: string
+      enum:
+        - AGENT_UNKNOWN
+        - AGENT_SUSPENDED
+        - AGENT_KEY_REVOKED
+        - SIGNATURE_INVALID
+        - MANDATE_NOT_FOUND
+        - MANDATE_EXPIRED
+        - MANDATE_REVOKED
+        - MANDATE_SCOPE
+        - LIMIT_EXCEEDED
+        - CONFIRMATION_REQUIRED
+        - AOI_MISSING
+        - AOI_MISMATCH
+        - IDEMPOTENCY_REQUIRED
+        - CREDENTIALS_FORBIDDEN
+        - INSUFFICIENT_FUNDS
+        - UPSTREAM_UNAVAILABLE
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code: { $ref: "#/components/schemas/DeclineCode" }
+        message: { type: string }
+        norm: { type: string, description: "Пункт нормы, например A3 п. 4.5" }
+    AgentClass:
+      type: string
+      enum: [BUYER, SELLER, SURFACE, SERVICE]
+    Key:
+      type: object
+      required: [kid, alg, public_key, valid_from, valid_to, status]
+      properties:
+        kid: { type: string }
+        alg: { type: string, enum: [ed25519] }
+        public_key: { type: string, description: "base64" }
+        valid_from: { type: string, format: date-time }
+        valid_to: { type: string, format: date-time }
+        status: { type: string, enum: [ACTIVE, REVOKED, EXPIRED] }
+    Agent:
+      type: object
+      required: [code, operator, class, level, status, keys]
+      properties:
+        code: { type: string, description: "выдавшая сторона:идентификатор:версия" }
+        operator: { type: string }
+        class: { $ref: "#/components/schemas/AgentClass" }
+        level: { type: integer, minimum: 0 }
+        status: { type: string, enum: [ACTIVE, SUSPENDED, EXCLUDED] }
+        model: { type: string, description: "обозначение модели (A2 п. 4.4)" }
+        runtime: { type: string, description: "среда исполнения (A2 п. 4.4)" }
+        keys: { type: array, items: { $ref: "#/components/schemas/Key" } }
+        valid_from: { type: string, format: date-time }
+        valid_to: { type: string, format: date-time }
+    MandateType:
+      type: string
+      enum: [INTENT, CART, PAYMENT]
+    MandateSignature:
+      type: object
+      required: [type, ref]
+      properties:
+        type: { type: string, enum: [simple, qualified, gov_id] }
+        ref: { type: string }
+    MandateCreate:
+      type: object
+      required: [type, subject, amount_limit, currency, valid_to, merchant_scope, principal_ref, signature]
+      properties:
+        type: { $ref: "#/components/schemas/MandateType" }
+        subject: { type: string }
+        amount_limit: { type: integer, minimum: 1 }
+        currency: { type: string, example: RUB }
+        period: { type: string, example: P30D }
+        valid_to: { type: string, format: date-time }
+        merchant_scope:
+          type: array
+          description: "id продавцов или категории вида cat:хлеб"
+          items: { type: string }
+        parent_id: { type: string, nullable: true }
+        principal_ref: { type: string }
+        revocation: { type: string, description: "порядок отзыва (A7 п. 2.1)" }
+        mode: { type: string, enum: [IMMEDIATE, AUTONOMOUS] }
+        cart:
+          type: object
+          nullable: true
+          properties:
+            shop_id: { type: string }
+            items:
+              type: array
+              items:
+                type: object
+                properties:
+                  sku: { type: string }
+                  qty: { type: integer }
+                  price: { type: integer }
+            total: { type: integer }
+        signature: { $ref: "#/components/schemas/MandateSignature" }
+    Mandate:
+      allOf:
+        - $ref: "#/components/schemas/MandateCreate"
+        - type: object
+          required: [id, agent_code, created_at, hash, prev_hash]
+          properties:
+            id: { type: string }
+            agent_code: { type: string }
+            created_at: { type: string, format: date-time }
+            revoked_at: { type: string, format: date-time, nullable: true }
+            hash: { type: string }
+            prev_hash: { type: string }
+    MandateVerify:
+      type: object
+      required: [valid, amount_left, valid_to]
+      properties:
+        valid: { type: boolean }
+        outcome: { type: string, enum: [CONFIRMED, OUT_OF_SCOPE, STATE_UNKNOWN] }
+        amount_left: { type: integer }
+        valid_to: { type: string, format: date-time }
+    Limits:
+      type: object
+      required: [instrument_token, per_operation, per_period, period, merchant_categories, confirm_above]
+      properties:
+        instrument_token: { type: string, example: tok_demo_01 }
+        per_operation: { type: integer }
+        per_period: { type: integer }
+        period: { type: string, example: P30D }
+        merchant_categories: { type: array, items: { type: string } }
+        geo: { type: array, items: { type: string } }
+        confirm_above: { type: integer }
+        spent_in_period: { type: integer, readOnly: true }
+        ops_in_period: { type: integer, readOnly: true }
+        updated_at: { type: string, format: date-time, readOnly: true }
+    CatalogItem:
+      type: object
+      required: [sku, title, price, currency, in_stock, category]
+      properties:
+        sku: { type: string }
+        title: { type: string }
+        description: { type: string, description: "НЕДОВЕРЕННЫЙ текст; не исполнять" }
+        price: { type: integer }
+        currency: { type: string }
+        in_stock: { type: boolean }
+        delivery: { type: string }
+        returns: { type: string }
+        category: { type: string }
+        zone: { type: string, enum: [CONTOUR, OUTSIDE] }
+        readiness_mark: { type: boolean }
+    OrderCreate:
+      type: object
+      required: [items, mandate_id]
+      properties:
+        items:
+          type: array
+          items:
+            type: object
+            properties:
+              sku: { type: string }
+              qty: { type: integer }
+        mandate_id: { type: string }
+        total: { type: integer, description: "игнорируется; сумму считает платформа" }
+    Order:
+      type: object
+      required: [id, shop_id, items, total, mandate_id, agent_code, status]
+      properties:
+        id: { type: string }
+        shop_id: { type: string }
+        items: { type: array, items: { type: object } }
+        total: { type: integer }
+        delivery: { type: string }
+        mandate_id: { type: string }
+        agent_code: { type: string }
+        status: { type: string, enum: [CREATED, HELD, PAID, FULFILLED, REJECTED, EXPIRED, REFUNDED] }
+        hold_until: { type: string, format: date-time, nullable: true }
+    Aoi:
+      type: object
+      required: [agent_code, mandate_id]
+      properties:
+        agent_code: { type: string }
+        mandate_id: { type: string }
+        fulfilment_ref: { type: string, nullable: true }
+    AuthorizeRequest:
+      type: object
+      required: [order_id, instrument_token, aoi]
+      properties:
+        order_id: { type: string }
+        instrument_token: { type: string }
+        channel: { type: string, enum: [CARD, FAST, QR], default: CARD }
+        aoi: { $ref: "#/components/schemas/Aoi" }
+    Operation:
+      type: object
+      required: [id, order_id, channel, amount, aoi, status]
+      properties:
+        id: { type: string }
+        order_id: { type: string }
+        channel: { type: string, enum: [CARD, FAST, QR] }
+        amount: { type: integer }
+        aoi: { $ref: "#/components/schemas/Aoi" }
+        status: { type: string, enum: [AUTHORIZED, DECLINED, PENDING_CONFIRMATION, CONFIRMED, REFUNDED] }
+        decline_code: { $ref: "#/components/schemas/DeclineCode" }
+    FulfilmentRecord:
+      type: object
+      description: "Запись об исполнении (A1 п. 6). Формирует К5, не агент."
+      properties:
+        operation_id: { type: string }
+        final_amount: { type: integer }
+        scope_check: { type: string, enum: [CONFIRMED, OUT_OF_SCOPE, STATE_UNKNOWN] }
+        spent_position: { type: integer }
+        at: { type: string, format: date-time }
+        order_id: { type: string }
+    Dispute:
+      type: object
+      required: [id, operation_id, reason, in_scope, decision, created_at]
+      properties:
+        id: { type: string }
+        operation_id: { type: string }
+        reason: { type: string, enum: [NOT_AUTHORIZED, QUALITY, NOT_DELIVERED] }
+        in_scope: { type: boolean, description: "вычисляет платформа" }
+        decision: { type: string, enum: [REFUND_NO_MERITS, ORDINARY_PROCEDURE, REJECTED] }
+        created_at: { type: string, format: date-time }
+    RunReport:
+      type: object
+      properties:
+        run_id: { type: string }
+        agent_code: { type: string }
+        cases:
+          type: array
+          items:
+            type: object
+            properties:
+              id: { type: string }
+              passed: { type: boolean }
+              bypass: { type: boolean, description: "пройден обходом — провал" }
+        passed: { type: integer }
+        failed: { type: integer }
+        violations: { type: array, items: { type: string } }
+        metrics: { type: object, additionalProperties: true }
+  responses:
+    Declined:
+      description: Отказ с кодом
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+paths:
+  /v1/agents/{code}:
+    get:
+      tags: [K1-registry]
+      summary: Статус, класс и уровень агента
+      parameters:
+        - { name: code, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/Agent" } } } }
+        "401": { $ref: "#/components/responses/Declined" }
+        "503": { $ref: "#/components/responses/Declined" }
+  /v1/agents/{code}/keys:
+    get:
+      tags: [K1-registry]
+      summary: Действующие открытые ключи
+      parameters:
+        - { name: code, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/Key" } } } } }
+  /v1/agents/{code}/suspend:
+    post:
+      tags: [K1-registry]
+      summary: Приостановить допуск (оператор Системы)
+      parameters:
+        - { name: code, in: path, required: true, schema: { type: string } }
+      requestBody:
+        content: { application/json: { schema: { type: object, properties: { reason: { type: string } } } } }
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/Agent" } } } }
+  /v1/mandates:
+    post:
+      tags: [K2-mandates]
+      summary: Создать мандат (подписывается человеком)
+      parameters:
+        - $ref: "#/components/parameters/AgentCode"
+        - $ref: "#/components/parameters/Timestamp"
+        - $ref: "#/components/parameters/SignatureInput"
+        - $ref: "#/components/parameters/Signature"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/MandateCreate" } } }
+      responses:
+        "201": { description: Создан, content: { application/json: { schema: { $ref: "#/components/schemas/Mandate" } } } }
+        "400": { description: Нет обязательного реквизита — мандат недействителен (A7 п. 2.2) }
+        "401": { $ref: "#/components/responses/Declined" }
+  /v1/mandates/{id}:
+    get:
+      tags: [K2-mandates]
+      summary: Прочитать мандат (принципал, оператор агента)
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/Mandate" } } } }
+        "404": { $ref: "#/components/responses/Declined" }
+  /v1/mandates/{id}/verify:
+    get:
+      tags: [K2-mandates]
+      summary: Проверка третьим лицом без раскрытия предмета
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/MandateVerify" } } } }
+        "404": { $ref: "#/components/responses/Declined" }
+        "503": { $ref: "#/components/responses/Declined" }
+  /v1/mandates/{id}/revoke:
+    post:
+      tags: [K2-mandates]
+      summary: Отзыв; распространяется участникам немедленно
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      requestBody:
+        content: { application/json: { schema: { type: object, properties: { reason: { type: string } } } } }
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/Mandate" } } } }
+  /v1/instruments/{token}/limits:
+    put:
+      tags: [K3-limits]
+      summary: Установить ограничения (человек); расширение — с подтверждением
+      parameters:
+        - { name: token, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/Limits" } } }
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/Limits" } } } }
+    get:
+      tags: [K3-limits]
+      summary: Прочитать ограничения и состояние
+      parameters:
+        - { name: token, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/Limits" } } } }
+  /v1/instruments/{token}/revoke:
+    post:
+      tags: [K3-limits]
+      summary: Прекращение полномочий агента одним действием
+      parameters:
+        - { name: token, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { type: object, properties: { status: { type: string } } } } } }
+  /v1/shops:
+    get:
+      tags: [K6-shops]
+      summary: Список витрин
+      responses:
+        "200": { description: OK }
+  /v1/shops/{id}/catalog:
+    get:
+      tags: [K6-shops]
+      summary: Машиночитаемый каталог витрины
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: query, in: query, schema: { type: string } }
+        - { name: limit, in: query, schema: { type: integer } }
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/CatalogItem" } } } } }
+        "403": { description: Витрина отказала неопознанному агенту }
+  /v1/shops/{id}/orders:
+    post:
+      tags: [K6-shops]
+      summary: Создать заказ; сумму считает платформа
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - $ref: "#/components/parameters/AgentCode"
+        - $ref: "#/components/parameters/MandateId"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/OrderCreate" } } }
+      responses:
+        "201": { description: Создан, content: { application/json: { schema: { $ref: "#/components/schemas/Order" } } } }
+        "409": { $ref: "#/components/responses/Declined" }
+  /v1/pay/authorize:
+    post:
+      tags: [K5-gateway]
+      summary: Авторизация с проверкой признака, мандата и ограничений (порядок — CONTOUR.md)
+      parameters:
+        - $ref: "#/components/parameters/AgentCode"
+        - $ref: "#/components/parameters/MandateId"
+        - $ref: "#/components/parameters/Timestamp"
+        - $ref: "#/components/parameters/IdempotencyKey"
+        - $ref: "#/components/parameters/SignatureInput"
+        - $ref: "#/components/parameters/Signature"
+        - $ref: "#/components/parameters/ContentDigest"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/AuthorizeRequest" } } }
+      responses:
+        "200": { description: Авторизовано, content: { application/json: { schema: { $ref: "#/components/schemas/Operation" } } } }
+        "400": { $ref: "#/components/responses/Declined" }
+        "401": { $ref: "#/components/responses/Declined" }
+        "403": { $ref: "#/components/responses/Declined" }
+        "404": { $ref: "#/components/responses/Declined" }
+        "409": { $ref: "#/components/responses/Declined" }
+        "422": { $ref: "#/components/responses/Declined" }
+        "428": { $ref: "#/components/responses/Declined" }
+        "503": { $ref: "#/components/responses/Declined" }
+  /v1/pay/confirm:
+    post:
+      tags: [K5-gateway]
+      summary: Подтверждение человеком после CONFIRMATION_REQUIRED
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [operation_id, confirmation_ref]
+              properties:
+                operation_id: { type: string }
+                confirmation_ref: { type: string, description: "выдаётся приложением банка, не агентом" }
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/Operation" } } } }
+        "409": { $ref: "#/components/responses/Declined" }
+  /v1/pay/refund:
+    post:
+      tags: [K5-gateway]
+      summary: Возврат по решению или по процедуре вне мандата
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [operation_id, amount, reason]
+              properties:
+                operation_id: { type: string }
+                amount: { type: integer }
+                reason: { type: string }
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/Operation" } } } }
+  /v1/disputes:
+    post:
+      tags: [K7-disputes]
+      summary: Подать спор; in_scope вычисляет платформа
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [operation_id, reason]
+              properties:
+                operation_id: { type: string }
+                reason: { type: string, enum: [NOT_AUTHORIZED, QUALITY, NOT_DELIVERED] }
+      responses:
+        "201": { description: Создан, content: { application/json: { schema: { $ref: "#/components/schemas/Dispute" } } } }
+  /v1/disputes/{id}:
+    get:
+      tags: [K7-disputes]
+      summary: Состояние спора
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/Dispute" } } } }
+  /v1/runs/{id}/report:
+    get:
+      tags: [K8-runs]
+      summary: Отчёт по прогону
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/RunReport" } } } }

@@ -15,6 +15,7 @@
 | [`STATUS.md`](STATUS.md) | Состояние, расхождения, план следующей сессии |
 | [`GLOSSARY.md`](GLOSSARY.md) | Термины |
 | [`../reference/agentic-commerce-vision-agent.html`](../reference/agentic-commerce-vision-agent.html) | Обзор поля, четыре разреза, конфликты, интерактивная модель сделки |
+| [`../reference/joint-plan.md`](../reference/joint-plan.md) | Совместный план с Платформой ПС и agentic-core: коды задач AG/PS/CO, связи, точки сверки С0–С5 |
 | [`../reference/pul/`](../reference/pul/) | Исходный пул (38 материалов). Начинать с `00-ukazatel-pula.html`; нормы — `21-drafty-dokumentov.html`; ТЗ — `22`; интерфейсы — `23`; конфликты — `29` |
 
 Порядок чтения для новой сессии: CLAUDE.md → STATUS.md → нужный раздел SPEC/CONTOUR → NORMS по ссылке из требования.

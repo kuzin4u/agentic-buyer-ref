@@ -10,7 +10,7 @@
 | [`NORMS.md`](NORMS.md) | Нормы A1–A9, на которые ссылается код |
 | [`SCENARIOS.md`](SCENARIOS.md) | 30 сценариев приёмки (источник — `tests/scenarios/scenarios.json`) |
 | [`PARAMS.md`](PARAMS.md) | Стендовые параметры и что должен измерить прогон |
-| [`DECISIONS.md`](DECISIONS.md) | Журнал решений Р1–Р13 |
+| [`DECISIONS.md`](DECISIONS.md) | Журнал решений Р1–Р19 |
 | [`ROADMAP.md`](ROADMAP.md) | План продукта по этапам и часам |
 | [`STATUS.md`](STATUS.md) | Состояние, расхождения, план следующей сессии |
 | [`GLOSSARY.md`](GLOSSARY.md) | Термины |

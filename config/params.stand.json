@@ -12,5 +12,7 @@
   "qualified_signature_above_kop": 5000000,
   "qualified_signature_above_days": 30,
   "price_corridor_pct": 0,
-  "revocation_propagation_max_ms": 1000
+  "revocation_propagation_max_ms": 1000,
+  "pao_max_attempts": 3,
+  "pao_request_timeout_ms": 5000
 }

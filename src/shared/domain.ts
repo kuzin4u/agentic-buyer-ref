@@ -200,8 +200,10 @@ export class PlatformFailure extends Error {
     readonly platformCode: string | null,
     readonly httpStatus: number,
     readonly idempotencyKey: string | null,
+    /** только фиксированный текст адаптера; тело ответа и сообщения исключений сюда не попадают (инвариант 1) */
+    detail?: string,
   ) {
-    super(`Отказ платформы: ${code}${platformCode && platformCode !== code ? ` (${platformCode})` : ""}`);
+    super(`Отказ платформы: ${code}, HTTP ${httpStatus}${detail ? `: ${detail}` : ""}`);
     this.name = "PlatformFailure";
   }
 }

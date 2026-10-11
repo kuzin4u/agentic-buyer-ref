@@ -26,6 +26,13 @@ describe("стендовые параметры", () => {
     expect(() => parseParams({ ...stand, order_hold_sec: -1 })).toThrow(ConfigError);
   });
 
+  it("бюджет: attempts × timeout + 30 с (РП24) не больше registry_cache_ttl_sec", () => {
+    expect(() => parseParams({ ...stand, pao_max_attempts: 3, pao_request_timeout_ms: 10001 })).toThrow(/registry_cache_ttl_sec/);
+    expect(() => parseParams({ ...stand, registry_cache_ttl_sec: 44 })).toThrow(ConfigError);
+    expect(() => parseParams({ ...stand, registry_cache_ttl_sec: 45 })).not.toThrow();
+    expect(() => parseParams({ ...stand, pao_max_attempts: 0 })).toThrow(ConfigError);
+  });
+
   it("отказ при отсутствии файла", () => {
     expect(() => loadParams("config/missing.json")).toThrow(ConfigError);
   });

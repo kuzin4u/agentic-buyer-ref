@@ -1,2 +1,2 @@
 // Таблица «код отказа → поведение» (SPEC §7).
-export {};
+export * from "./table.js";

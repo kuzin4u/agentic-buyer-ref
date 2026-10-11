@@ -1,0 +1,213 @@
+import { describe, it, expect, afterEach } from "vitest";
+import { newEd25519Signer } from "@kuzin4u/agentic-core";
+import { PaoStub } from "@kuzin4u/agentic-core/pao";
+import { PaoPlatform, assertPaoVersion } from "../../src/agent/adapters/pao/index.js";
+import { loadParams, type StandParams } from "../../src/shared/config.js";
+import { PlatformFailure, type CredentialDraft } from "../../src/shared/domain.js";
+
+const AGENT = "nspk:agent:buyref-01:v1";
+const params = loadParams();
+const draft: CredentialDraft = {
+  mandateId: "m_1",
+  orderRef: "ord_1",
+  merchantId: "shop_1",
+  amountMax: 250000,
+  currency: "RUB",
+  channel: "CARD",
+};
+const { signer, publicKey } = newEd25519Signer("kid_test");
+
+let stub: PaoStub | undefined;
+afterEach(async () => {
+  await stub?.close();
+  stub = undefined;
+});
+
+async function setup(sleeps: number[] = []) {
+  stub = new PaoStub({
+    agents: [{ agentCode: AGENT, keys: [{ kid: "kid_test", alg: "ed25519", publicKey, status: "ACTIVE" }] }],
+    handlers: {
+      "GET /pao/v1/mandates/{id}/verify": ({ path }) => ({
+        body: { outcome: "CONFIRMED", amount_left: path.id === "m_1" ? 175000 : 0, valid_to: "2026-10-20T00:00:00Z" },
+      }),
+      "POST /pao/v1/credentials": ({ body }) => ({
+        status: 201,
+        body: {
+          credential_ref: "cr_1",
+          kind: body.kind,
+          payload: { token_ref: "tok_ref_1", cryptogram: "CRYPTOGRAM_VALUE" },
+          aoi: { indicator: true, agent_code: AGENT, mandate_id: body.mandate_id },
+          status: "ISSUED",
+        },
+      }),
+    },
+  });
+  const baseUrl = await stub.start();
+  const platform = new PaoPlatform({ baseUrl, agentCode: AGENT, signer, params, sleep: async (ms) => void sleeps.push(ms) });
+  return { platform, stub };
+}
+
+/** Платформа без заглушки: ответ задаёт тест, обращения считаются. */
+function fake(reply: () => Response | Promise<Response>, p: StandParams = params) {
+  const calls: RequestInit[] = [];
+  const platform = new PaoPlatform({
+    baseUrl: "http://pao.test",
+    agentCode: AGENT,
+    signer,
+    params: p,
+    sleep: async () => {},
+    fetch: async (_url, init) => {
+      calls.push(init ?? {});
+      return reply();
+    },
+  });
+  return { platform, calls };
+}
+
+const json = (status: number, body: unknown, headers: Record<string, string> = {}) =>
+  new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json", ...headers } });
+
+describe("адаптер ПАО против заглушки agentic-core", () => {
+  it("заявляет возможности ПАО; подписанные события — только после AG-06", async () => {
+    const { platform } = await setup();
+    expect(platform.capabilities()).toMatchObject({
+      platform: "pao",
+      protocolVersion: "1.2.0",
+      guaranteeContour: true,
+      signedEvents: false,
+      conditionalSettlement: false,
+    });
+  });
+
+  it("verify: остаток — от платформы (инвариант 6)", async () => {
+    const { platform, stub } = await setup();
+    expect((await platform.verifyMandate("m_1")).amountLeft).toBe(175000);
+    expect(stub.violations).toEqual([]);
+  });
+
+  it("реквизит: в ядро приходит только ссылка", async () => {
+    const { platform } = await setup();
+    const c = await platform.issueCredential(draft, { idempotencyKey: "idem_cr_1" });
+    expect(c.credentialRef).toBe("cr_1");
+    expect(JSON.stringify(c)).not.toContain("CRYPTOGRAM_VALUE");
+  });
+
+  it("повтор по RATE_LIMITED: новый nonce, тот же Idempotency-Key (Р21)", async () => {
+    const sleeps: number[] = [];
+    const { platform, stub } = await setup(sleeps);
+    stub.fail("POST /pao/v1/credentials", { code: "RATE_LIMITED", retryAfterSec: 1 }, 1);
+    await platform.issueCredential(draft, { idempotencyKey: "idem_cr_2" });
+    const calls = stub.calls.filter((c) => c.op === "POST /pao/v1/credentials");
+    expect(calls.map((c) => c.status)).toEqual([429, 201]);
+    expect(calls[0]!.idempotencyKey).toBe("idem_cr_2");
+    expect(calls[1]!.idempotencyKey).toBe("idem_cr_2");
+    expect(calls[0]!.nonce).toBeTruthy();
+    expect(calls[1]!.nonce).not.toBe(calls[0]!.nonce);
+    expect(sleeps).toEqual([1000]);
+  });
+
+  it("повторов не больше pao_max_attempts", async () => {
+    const { platform, stub } = await setup();
+    stub.fail("GET /pao/v1/mandates/{id}/verify", { code: "STATE_UNAVAILABLE", retryAfterSec: 0 }, 10);
+    await expect(platform.verifyMandate("m_1")).rejects.toMatchObject({ code: "STATE_UNAVAILABLE" });
+    expect(stub.calls.filter((c) => c.op === "GET /pao/v1/mandates/{id}/verify")).toHaveLength(params.pao_max_attempts);
+  });
+
+  it("Retry-After больше потолка — отказ без ожидания (инвариант 4)", async () => {
+    const sleeps: number[] = [];
+    const { platform, stub } = await setup(sleeps);
+    stub.fail("GET /pao/v1/mandates/{id}/verify", { code: "UPSTREAM_UNAVAILABLE", retryAfterSec: 31 }, 1);
+    const err = await platform.verifyMandate("m_1").catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(PlatformFailure);
+    expect(err).toMatchObject({ code: "UPSTREAM_UNAVAILABLE", retry: "same_key", httpStatus: 503 });
+    expect(sleeps).toEqual([]);
+  });
+
+  it.each([
+    ["MANDATE_REVOKED", 500],
+    ["UPSTREAM_UNAVAILABLE", 500],
+    ["RATE_LIMITED", 400],
+  ] as const)("код %s с чужим статусом %i: одно обращение, UNKNOWN", async (code, status) => {
+    const { platform, stub } = await setup();
+    stub.fail("GET /pao/v1/mandates/{id}/verify", { code, status, retry: "same_key", retryAfterSec: 0 }, 3);
+    await expect(platform.verifyMandate("m_1")).rejects.toMatchObject({ code: "UNKNOWN", retry: "never", platformCode: code });
+    expect(stub.calls.filter((c) => c.op === "GET /pao/v1/mandates/{id}/verify")).toHaveLength(1);
+  });
+
+  it("ожидание копится: 20 + 20 с больше потолка — отказ после первого ожидания", async () => {
+    const sleeps: number[] = [];
+    const { platform, stub } = await setup(sleeps);
+    stub.fail("GET /pao/v1/mandates/{id}/verify", { code: "RATE_LIMITED", retryAfterSec: 20 }, 3);
+    await expect(platform.verifyMandate("m_1")).rejects.toMatchObject({ code: "RATE_LIMITED" });
+    expect(sleeps).toEqual([20000]);
+    expect(stub.calls.filter((c) => c.op === "GET /pao/v1/mandates/{id}/verify")).toHaveLength(2);
+  });
+});
+
+describe("fail-closed без заглушки", () => {
+  it("неизвестный код с retry same_key — ровно одно обращение, UNKNOWN, never", async () => {
+    const { platform, calls } = fake(() => json(409, { code: "NEW_CODE", message: "m", retry: "same_key" }, { "retry-after": "0" }));
+    await expect(platform.verifyMandate("m_1")).rejects.toMatchObject({ code: "UNKNOWN", retry: "never", platformCode: "NEW_CODE" });
+    expect(calls).toHaveLength(1);
+  });
+
+  it.each([
+    ["без заголовка", undefined],
+    ["в виде даты", "Wed, 21 Oct 2026 07:28:00 GMT"],
+  ])("429 с Retry-After %s — без повтора", async (_, after) => {
+    const headers: Record<string, string> = after ? { "retry-after": after } : {};
+    const { platform, calls } = fake(() => json(429, { code: "RATE_LIMITED", message: "m", retry: "same_key" }, headers));
+    await expect(platform.verifyMandate("m_1")).rejects.toMatchObject({ code: "RATE_LIMITED" });
+    expect(calls).toHaveLength(1);
+  });
+
+  it("503 без тела ПАО — одно обращение, UNKNOWN", async () => {
+    const { platform, calls } = fake(() => new Response("bad gateway", { status: 503, headers: { "retry-after": "1" } }));
+    await expect(platform.verifyMandate("m_1")).rejects.toMatchObject({ code: "UNKNOWN" });
+    expect(calls).toHaveLength(1);
+  });
+
+  it("пустое тело 2xx — UNKNOWN, а не TypeError", async () => {
+    const { platform } = fake(() => new Response("", { status: 200 }));
+    const err = await platform.getMandate("m_1").catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(PlatformFailure);
+    expect(err).toMatchObject({ code: "UNKNOWN", retry: "never" });
+  });
+
+  it("битый ответ /credentials — в тексте отказа нет фрагментов тела (инвариант 1)", async () => {
+    const { platform } = fake(() => new Response('{"credential_ref":"cr_1","payload":{"cryptogram": SECRETCRYP', { status: 201 }));
+    const err = (await platform.issueCredential(draft, { idempotencyKey: "idem_cr_3" }).catch((e: unknown) => e)) as PlatformFailure;
+    expect(err).toMatchObject({ code: "UNKNOWN", retry: "never" });
+    expect(err.message).not.toMatch(/SECRETCRYP|cryptogram|payload/);
+  });
+
+  it("тайм-аут обращения — UNKNOWN, без повтора", async () => {
+    const calls: unknown[] = [];
+    const platform = new PaoPlatform({
+      baseUrl: "http://pao.test",
+      agentCode: AGENT,
+      signer,
+      params: { ...params, pao_request_timeout_ms: 30 },
+      fetch: (_url, init) =>
+        new Promise((_, reject) => {
+          calls.push(init);
+          init?.signal?.addEventListener("abort", () => reject(init.signal!.reason));
+        }),
+    });
+    await expect(platform.verifyMandate("m_1")).rejects.toMatchObject({ code: "UNKNOWN", httpStatus: 0 });
+    expect(calls).toHaveLength(1);
+  });
+
+  it.each(["", "   "])("пустой Idempotency-Key (%j) — отказ до отправки", async (key) => {
+    const { platform, calls } = fake(() => json(201, {}));
+    await expect(platform.issueCredential(draft, { idempotencyKey: key })).rejects.toMatchObject({ code: "UNKNOWN" });
+    expect(calls).toHaveLength(0);
+  });
+});
+
+describe("версия ПАО", () => {
+  it("версия в agentic-core должна совпасть с копией (Р20)", () => {
+    expect(() => assertPaoVersion()).not.toThrow();
+    expect(() => assertPaoVersion("1.3.0")).toThrow(/Р20/);
+  });
+});

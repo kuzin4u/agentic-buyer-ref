@@ -84,7 +84,7 @@ src/
   shared/       типы из openapi.yaml, коды отказов, конфиг
 tests/
   scenarios/    30 сценариев приёмки, по одному файлу на сценарий
-  contract/     контрактные тесты по docs/core/protocol/agent-protocol.v1.0.0.yaml
+  contract/     контрактные тесты по docs/core/protocol/agent-protocol.v1.2.0.yaml (Р20)
   unit/
 ```
 

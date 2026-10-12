@@ -5,7 +5,9 @@ import {
   PlatformFailure,
   isKopecks,
   type AgentIndicator,
-  type AgentStatus,
+  type AgentKey,
+  type AgentSelf,
+  type KeyDraft,
   type Cart,
   type Confirmation,
   type ConfirmationDraft,
@@ -176,9 +178,35 @@ export function disputeFromPao(d: Pao.Dispute): Dispute {
   };
 }
 
-export function agentStatusFromPao(a: Pao.AgentSelf): AgentStatus {
-  return { agentCode: need(a.agent_code, "agent.agent_code"), status: need(a.status, "agent.status") };
+function oneOf<T extends string>(v: unknown, allowed: readonly T[], what: string): T {
+  if (!allowed.includes(v as T)) incomplete(`${what} — значение вне перечня ПАО`);
+  return v as T;
 }
+
+const AGENT_STATUSES = ["ACTIVE", "SUSPENDED", "EXCLUDED"] as const;
+const KEY_STATUSES = ["ACTIVE", "REVOKED", "EXPIRED"] as const;
+
+/** Ключ ПАО → ключ ядра. Сроки переносятся как есть: их задаёт платформа (РП23). Статус вне перечня — UNKNOWN. */
+export function keyFromPao(k: Pao.Key): AgentKey {
+  return {
+    kid: need(k.kid, "key.kid"),
+    alg: need(k.alg, "key.alg"),
+    publicKey: need(k.public_key, "key.public_key"),
+    validFrom: k.valid_from ?? null,
+    validTo: k.valid_to ?? null,
+    status: oneOf(k.status, KEY_STATUSES, "key.status"),
+  };
+}
+
+export function agentSelfFromPao(a: Pao.AgentSelf): AgentSelf {
+  return {
+    agentCode: need(a.agent_code, "agent.agent_code"),
+    status: oneOf(a.status, AGENT_STATUSES, "agent.status"),
+    keys: (a.keys ?? []).map(keyFromPao),
+  };
+}
+
+export const keyDraftToPao = (d: KeyDraft): { alg: string; public_key: string } => ({ alg: d.alg, public_key: d.publicKey });
 
 const EVENT_TYPES: ReadonlySet<string> = new Set<PlatformEventType>([
   "mandate.signed",

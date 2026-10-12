@@ -1,12 +1,13 @@
 import { createPrivateKey, generateKeyPairSync } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { inspect } from "node:util";
 import { ed25519Verifier } from "@kuzin4u/agentic-core";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { SignerKeyRejected, generateKey, kidOf, loadKey } from "../../src/agent/signer/index.js";
+import { SignerKeyRejected, generateKey, kidOf, listKeys, loadKey } from "../../src/agent/signer/index.js";
+import { markKey, readMeta, writeMeta } from "../../src/agent/signer/keystore.js";
 
 let dir: string;
 beforeEach(() => {
@@ -139,5 +140,78 @@ describe("хранилище ключей: fail-closed при загрузке (
     // исходная ошибка ФС — в cause, без пути в сообщении
     expect(() => loadKey(dir, real)).toThrow(expect.objectContaining({ cause: expect.objectContaining({ code: "ELOOP" }) }));
     expect(() => loadKey(dir, real)).not.toThrow(new RegExp(dir));
+  });
+});
+
+describe("состояние ключа в хранилище: listKeys и markKey", () => {
+  it("смена состояния: файл переходит под новое имя, права сохраняются; listKeys — по одной записи на kid", () => {
+    const { descriptor } = generateKey(dir, "pending");
+    expect(listKeys(dir)).toEqual([{ kid: descriptor.kid, state: "pending" }]);
+    markKey(dir, descriptor.kid, "pending", "active");
+    expect(readdirSync(dir)).toEqual([`${descriptor.kid}.pem`]);
+    expect(mode(fileOf(descriptor.kid))).toBe(0o600);
+    expect(() => loadKey(dir, descriptor.kid)).not.toThrow();
+  });
+
+  it("целевой файл уже есть — SignerKeyRejected, исходный не тронут", () => {
+    const { descriptor } = generateKey(dir);
+    writeFileSync(join(dir, `${descriptor.kid}.revoked.pem`), "занято", { mode: 0o600 });
+    expect(() => markKey(dir, descriptor.kid, "active", "revoked")).toThrow(SignerKeyRejected);
+    expect(existsSync(fileOf(descriptor.kid))).toBe(true);
+    expect(readFileSync(join(dir, `${descriptor.kid}.revoked.pem`), "utf8")).toBe("занято");
+  });
+
+  it("исходного файла нет, kid вне формы, каталог-ссылка или с широкими правами — SignerKeyRejected", () => {
+    const { descriptor } = generateKey(dir);
+    expect(() => markKey(dir, descriptor.kid, "pending", "active")).toThrow(SignerKeyRejected);
+    expect(() => markKey(dir, "../x", "active", "revoked")).toThrow(SignerKeyRejected);
+    const link = join(dir, "..", `link-${descriptor.kid.slice(0, 8)}`);
+    symlinkSync(dir, link);
+    try {
+      expect(() => markKey(link, descriptor.kid, "active", "revoked")).toThrow(SignerKeyRejected);
+      expect(() => listKeys(link)).toThrow(SignerKeyRejected);
+    } finally {
+      rmSync(link);
+    }
+    chmodSync(dir, 0o755);
+    expect(() => listKeys(dir)).toThrow(SignerKeyRejected);
+    chmodSync(dir, 0o700);
+  });
+
+  it("два файла одного kid — берётся более позднее состояние жизненного цикла, а не порядок каталога", () => {
+    const { descriptor } = generateKey(dir, "pending");
+    copyFileSync(join(dir, `${descriptor.kid}.pending.pem`), fileOf(descriptor.kid)); // сбой между link и unlink
+    expect(listKeys(dir)).toEqual([{ kid: descriptor.kid, state: "active" }]);
+    copyFileSync(fileOf(descriptor.kid), join(dir, `${descriptor.kid}.revoked.pem`));
+    expect(listKeys(dir)).toEqual([{ kid: descriptor.kid, state: "revoked" }]);
+  });
+
+  it("метаданные: запись и чтение; неизвестная схема, не дата, kid вне формы, права шире 0600 — SignerKeyRejected", () => {
+    const kid = "A".repeat(43);
+    expect(readMeta(dir)).toEqual({});
+    const entry = { valid_from: "2026-10-01T00:00:00Z", valid_to: "2026-12-30T00:00:00Z" };
+    writeMeta(dir, { [kid]: entry });
+    expect(readMeta(dir)).toEqual({ [kid]: entry });
+    expect(mode(join(dir, "keys.meta.json"))).toBe(0o600);
+    const bad = (body: unknown) => {
+      writeFileSync(join(dir, "keys.meta.json"), JSON.stringify(body), { mode: 0o600 });
+      expect(() => readMeta(dir)).toThrow(SignerKeyRejected);
+    };
+    bad(null);
+    bad({ version: 2, confirmed: {} });
+    bad({ version: 1 });
+    bad({ version: 1, confirmed: { [kid]: { valid_from: "не дата", valid_to: "2026-12-30T00:00:00Z" } } });
+    bad({ version: 1, confirmed: { [kid]: { valid_from: "2026-10-01T00:00:00Z" } } });
+    bad({ version: 1, confirmed: { [kid]: {} } });
+    bad({ version: 1, confirmed: { "../x": entry } });
+    writeMeta(dir, {});
+    chmodSync(join(dir, "keys.meta.json"), 0o644);
+    expect(() => readMeta(dir)).toThrow(SignerKeyRejected);
+  });
+
+  it("прочие файлы каталога не считаются ключами", () => {
+    writeFileSync(join(dir, "readme.txt"), "");
+    writeFileSync(join(dir, `${"A".repeat(43)}.old.pem`), "");
+    expect(listKeys(dir)).toEqual([]);
   });
 });

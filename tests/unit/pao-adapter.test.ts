@@ -220,3 +220,10 @@ describe("версия ПАО", () => {
     expect(() => assertPaoVersion("1.3.0")).toThrow(/Р20/);
   });
 });
+
+describe("экспорт адаптера ПАО (ревью AG-02 № 19)", () => {
+  it("наружу — только адаптер, версия копии и проверка версии; переводчики ПАО (map) не экспортируются", async () => {
+    const exported = Object.keys(await import("../../src/agent/adapters/pao/index.js")).sort();
+    expect(exported).toEqual(["PAO_COPY_VERSION", "PaoPlatform", "assertPaoVersion"]);
+  });
+});

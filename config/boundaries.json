@@ -1,0 +1,31 @@
+{
+  "_comment": "Границы модулей (Р19, Р24, инвариант 2): общий источник для eslint.config.js и теста графа импортов. Вне src/agent/signer и src/agent/compose.ts из node:crypto — только cryptoAllowedOutsideSigner (список разрешённого, а не запрещённого); cryptoKeyApis — для сообщений и пробников.",
+  "cryptoKeyApis": [
+    "generateKeyPair",
+    "generateKeyPairSync",
+    "generateKey",
+    "generateKeySync",
+    "createPrivateKey",
+    "createSecretKey",
+    "sign",
+    "createSign",
+    "KeyObject",
+    "privateDecrypt",
+    "privateEncrypt",
+    "subtle",
+    "webcrypto",
+    "Sign"
+  ],
+  "coreSigningApis": [
+    "newEd25519Signer",
+    "signRequest"
+  ],
+  "cryptoAllowedOutsideSigner": [
+    "randomUUID",
+    "randomBytes",
+    "randomInt",
+    "getRandomValues",
+    "createHash",
+    "timingSafeEqual"
+  ]
+}

@@ -27,6 +27,7 @@ const msg = {
   compose: "Р19: место сборки не импортируется — оно собирает ядро, а не наоборот.",
   dist: "Р19: внутренние пути agentic-core/dist — обход экспортов пакета.",
   bypass: "Р19 (ревью AG-02 № 10): обход границы — только статический импорт строковым литералом.",
+  stand: "Р24: стенд Платформы — dev-зависимость для тестов (С0), не контракт; в src — только ПАО через adapters/pao.",
 };
 
 const paths = (allowPao, allowKeys) => [
@@ -50,6 +51,7 @@ const groups = {
   // из src — только src: tests/, scripts/ и прочее могут транзитивно вести к signer и compose (ревью 3c, повтор № 3)
   outside: { group: ["**/tests/**", "**/scripts/**", "**/config/**"], message: "Р19: из src импортируется только src (полная проверка — граф)." },
   // псевдонимы subpath imports (#…) из package.json подменяют модуль мимо проверки по спецификатору (ревью 3c, повтор 3 № 2)
+  stand: { group: ["agentic-ps-platform", "agentic-ps-platform/**"], message: msg.stand },
   alias: { regex: "^#", message: "Р19 / инвариант 2: псевдонимы #… в src запрещены — только настоящий спецификатор модуля." },
 };
 
@@ -64,8 +66,7 @@ const syntax = (forbiddenModules, allowKeys) => [
   { selector: "MemberExpression[property.value='getBuiltinModule']", message: msg.bypass },
   ...forbiddenModules.flatMap(({ re, message }) => [
     { selector: `ImportExpression[source.value=${re}]`, message },
-    { selector: `TSImportType[argument.literal.value=${re}]`, message },
-    { selector: `TSImportType > TSLiteralType > Literal[value=${re}]`, message },
+    { selector: `TSImportType[source.value=${re}]`, message },
   ]),
   ...(allowKeys
     ? []
@@ -104,11 +105,13 @@ const mod = {
   signer: { re: "/signer/", message: msg.signer },
   compose: { re: "/compose/", message: msg.compose },
   dist: { re: "/agentic-core\\u002Fdist/", message: msg.dist },
+  // без учёта регистра: на macOS import("Agentic-PS-Platform/stand") загружает стенд (ревью 3d № 3)
+  stand: { re: "/^agentic-ps-platform/i", message: msg.stand },
 };
 
 const boundary = ({ allowPao = false, allowKeys = false, patterns, modules }) => ({
-  "no-restricted-imports": ["error", { paths: paths(allowPao, allowKeys), patterns: [...patterns, groups.compose, groups.dist, groups.outside, groups.alias] }],
-  "no-restricted-syntax": ["error", ...syntax([...modules, mod.compose, mod.dist, ...(allowPao ? [] : [mod.pao])], allowKeys)],
+  "no-restricted-imports": ["error", { paths: paths(allowPao, allowKeys), patterns: [...patterns, groups.compose, groups.dist, groups.stand, groups.outside, groups.alias] }],
+  "no-restricted-syntax": ["error", ...syntax([...modules, mod.compose, mod.dist, mod.stand, ...(allowPao ? [] : [mod.pao])], allowKeys)],
 });
 
 export default tseslint.config(

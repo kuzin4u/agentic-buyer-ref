@@ -18,6 +18,22 @@ describe("зависимость от agentic-core", () => {
     );
   });
 
+  it("стенд Платформы для С0 — dev-зависимость по git+https с тегом v0.1.1 (Р24)", () => {
+    const pkg = JSON.parse(readFileSync("package.json", "utf8"));
+    expect(pkg.devDependencies["agentic-ps-platform"]).toBe(
+      "git+https://github.com/kuzin4u/agentic-ps-platform.git#v0.1.1",
+    );
+    expect(pkg.dependencies["agentic-ps-platform"]).toBeUndefined();
+    const lock = JSON.parse(readFileSync("package-lock.json", "utf8"));
+    const entry = lock.packages["node_modules/agentic-ps-platform"];
+    expect(entry).toMatchObject({ version: "0.1.1", dev: true });
+    // a1b0e8e… — коммит тега v0.1.1. npm install переписывает адрес на git+ssh — в lock только git+https.
+    expect(entry.resolved).toBe(
+      "git+https://github.com/kuzin4u/agentic-ps-platform.git#a1b0e8ed6c15c6a5a980c8140310d1088ec6d409",
+    );
+    expect(readFileSync("package-lock.json", "utf8")).not.toMatch(/git\+ssh:|"github:/);
+  });
+
   it("даёт ПАО 1.2.0 и таблицу ошибок с полем retry", () => {
     expect(PAO_VERSION).toBe("1.2.0");
     const codes = Object.keys(PAO_ERRORS);

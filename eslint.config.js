@@ -64,8 +64,7 @@ const syntax = (forbiddenModules, allowKeys) => [
   { selector: "MemberExpression[property.value='getBuiltinModule']", message: msg.bypass },
   ...forbiddenModules.flatMap(({ re, message }) => [
     { selector: `ImportExpression[source.value=${re}]`, message },
-    { selector: `TSImportType[argument.literal.value=${re}]`, message },
-    { selector: `TSImportType > TSLiteralType > Literal[value=${re}]`, message },
+    { selector: `TSImportType[source.value=${re}]`, message },
   ]),
   ...(allowKeys
     ? []

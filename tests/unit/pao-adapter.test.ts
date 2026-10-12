@@ -4,6 +4,7 @@ import { PaoStub } from "@kuzin4u/agentic-core/pao";
 import { PaoPlatform, assertPaoVersion } from "../../src/agent/adapters/pao/index.js";
 import { loadParams, type StandParams } from "../../src/shared/config.js";
 import { PlatformFailure, type CredentialDraft } from "../../src/shared/domain.js";
+import type { RequestSigning } from "../../src/agent/ports/index.js";
 
 const AGENT = "nspk:agent:buyref-01:v1";
 const params = loadParams();
@@ -16,6 +17,14 @@ const draft: CredentialDraft = {
   channel: "CARD",
 };
 const { signer, publicKey } = newEd25519Signer("kid_test");
+/** Порт подписи с одним ключом: отказы по ключу и допуску здесь не проверяются (см. signer-ring и сценарии П01–П03). */
+const signing: RequestSigning = {
+  current: () => signer,
+  keyRevoked: () => {
+    throw new Error("в этих тестах ключ не отзывается");
+  },
+  stop: () => {},
+};
 
 let stub: PaoStub | undefined;
 afterEach(async () => {
@@ -43,7 +52,7 @@ async function setup(sleeps: number[] = []) {
     },
   });
   const baseUrl = await stub.start();
-  const platform = new PaoPlatform({ baseUrl, agentCode: AGENT, signer, params, sleep: async (ms) => void sleeps.push(ms) });
+  const platform = new PaoPlatform({ baseUrl, agentCode: AGENT, signing, params, sleep: async (ms) => void sleeps.push(ms) });
   return { platform, stub };
 }
 
@@ -53,7 +62,7 @@ function fake(reply: () => Response | Promise<Response>, p: StandParams = params
   const platform = new PaoPlatform({
     baseUrl: "http://pao.test",
     agentCode: AGENT,
-    signer,
+    signing,
     params: p,
     sleep: async () => {},
     fetch: async (_url, init) => {
@@ -186,7 +195,7 @@ describe("fail-closed без заглушки", () => {
     const platform = new PaoPlatform({
       baseUrl: "http://pao.test",
       agentCode: AGENT,
-      signer,
+      signing,
       params: { ...params, pao_request_timeout_ms: 30 },
       fetch: (_url, init) =>
         new Promise((_, reject) => {
@@ -209,5 +218,12 @@ describe("версия ПАО", () => {
   it("версия в agentic-core должна совпасть с копией (Р20)", () => {
     expect(() => assertPaoVersion()).not.toThrow();
     expect(() => assertPaoVersion("1.3.0")).toThrow(/Р20/);
+  });
+});
+
+describe("экспорт адаптера ПАО (ревью AG-02 № 19)", () => {
+  it("наружу — только адаптер, версия копии и проверка версии; переводчики ПАО (map) не экспортируются", async () => {
+    const exported = Object.keys(await import("../../src/agent/adapters/pao/index.js")).sort();
+    expect(exported).toEqual(["PAO_COPY_VERSION", "PaoPlatform", "assertPaoVersion"]);
   });
 });

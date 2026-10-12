@@ -1,12 +1,13 @@
 // Адаптер ПАО к порту «платёжная платформа» (Р19). Единственное место ядра, где видны типы и клиент agentic-core/pao.
 // Повторы клиента agentic-core отключены: клиент берёт retry из тела ответа при неизвестном коде (STATUS, ожидание CO-1).
 // Повторяет адаптер — только по таблице ядра (RETRY_SAME_KEY), с прежним Idempotency-Key и новой подписью (Р21).
+// AGENT_KEY_REVOKED (ROTATE_KEY): другой действующий ключ из порта подписи и один повтор тем же Idempotency-Key.
 import { PAO_VERSION, PaoClient, type PaoCallArgs, type PaoOperationKey, type PaoOperations } from "@kuzin4u/agentic-core/pao";
-import type { Signer } from "@kuzin4u/agentic-core";
 import { PAO_RETRY_AFTER_MAX_SEC, type StandParams } from "../../../shared/config.js";
 import { PlatformFailure } from "../../../shared/domain.js";
 import type { PaymentPlatform, PlatformCapabilities, Mutation } from "../../ports/payment-platform.js";
-import { ruleForFailure } from "../../declines/index.js";
+import type { RequestSigning } from "../../ports/request-signing.js";
+import { AGENT_STOP_CODES, ruleForFailure } from "../../declines/index.js";
 import { toFailure } from "./errors.js";
 import * as map from "./map.js";
 
@@ -22,8 +23,8 @@ export function assertPaoVersion(actual: string = PAO_VERSION): void {
 export interface PaoPlatformOptions {
   baseUrl: string;
   agentCode: string;
-  /** подписант из модуля signer; ключ адаптеру не передаётся (инвариант 2) */
-  signer: Signer;
+  /** подпись из модуля signer через порт; ключ адаптеру не передаётся (инвариант 2) */
+  signing: RequestSigning;
   params: StandParams;
   fetch?: typeof fetch;
   sleep?: (ms: number) => Promise<void>;
@@ -68,13 +69,13 @@ export class PaoPlatform implements PaymentPlatform {
   }
 
   /** Одно обращение без повторов клиента; тайм-аут — pao_request_timeout_ms. Retry-After ответа — в last. */
-  private client(last: { retryAfter?: number }): PaoClient {
+  private client(last: { retryAfter?: number }, signer: ReturnType<RequestSigning["current"]>): PaoClient {
     const timeoutMs = this.o.params.pao_request_timeout_ms;
     const f = this.fetchImpl;
     return new PaoClient({
       baseUrl: this.o.baseUrl,
       agentCode: this.o.agentCode,
-      signer: this.o.signer,
+      signer,
       maxAttempts: 1,
       fetch: async (url, init) => {
         const res = await f(url, { ...init, signal: AbortSignal.timeout(timeoutMs) });
@@ -96,17 +97,33 @@ export class PaoPlatform implements PaymentPlatform {
   ): Promise<R> {
     const key = args.idempotencyKey ?? null;
     let waitedSec = 0;
-    for (let attempt = 1; ; attempt++) {
+    let rotations = 0;
+    for (let attempt = 1; ; ) {
       const last: { retryAfter?: number } = {};
+      const signer = this.o.signing.current(); // остановлен — SignerStopped, обращения нет
       let failure: PlatformFailure;
       try {
-        const r = await this.client(last).call(op, args);
+        const r = await this.client(last, signer).call(op, args);
         return to(r);
       } catch (e) {
         failure = toFailure(e, key);
       }
+      const rule = ruleForFailure(failure.code);
+      // Отказ в допуске — остановка агента целиком (SPEC §7а, П03).
+      if (AGENT_STOP_CODES.has(failure.code)) {
+        this.o.signing.stop(failure.code);
+        throw failure;
+      }
+      // Отозванный ключ: другой действующий (нет — SignerStopped); повтор не больше maxRetries за обращение.
+      if (rule.action === "ROTATE_KEY") {
+        this.o.signing.keyRevoked(signer.kid, failure);
+        if (rotations >= (rule.maxRetries ?? 0)) throw failure;
+        rotations++;
+        continue;
+      }
       // Повтор — только по таблице ядра, в пределах попыток и потолка ожидания (инвариант 4, Р20).
-      if (ruleForFailure(failure.code).action !== "RETRY_SAME_KEY" || attempt >= this.o.params.pao_max_attempts) throw failure;
+      if (rule.action !== "RETRY_SAME_KEY" || attempt >= this.o.params.pao_max_attempts) throw failure;
+      attempt++;
       // Без Retry-After повтор не раньше срока невозможен — не повторяем (ПАО §6, инвариант 9).
       const waitSec = last.retryAfter;
       if (waitSec === undefined || waitedSec + waitSec > PAO_RETRY_AFTER_MAX_SEC) throw failure;
@@ -115,8 +132,15 @@ export class PaoPlatform implements PaymentPlatform {
     }
   }
 
-  agentStatus() {
-    return this.call("GET /pao/v1/agent", {}, map.agentStatusFromPao);
+  /** Агент не ACTIVE по ответу платформы (EXCLUDED — 200 по РП23 п. 6.3) — остановка подписи, кто бы ни спросил. */
+  async agentSelf() {
+    const self = await this.call("GET /pao/v1/agent", {}, map.agentSelfFromPao);
+    if (self.status !== "ACTIVE") this.o.signing.stop(`AGENT_${self.status}`);
+    return self;
+  }
+
+  async registerKey(draft: Parameters<PaymentPlatform["registerKey"]>[0], m: Mutation) {
+    return this.call("POST /pao/v1/agent/keys", { body: map.keyDraftToPao(draft), idempotencyKey: keyOf(m) }, map.keyFromPao);
   }
 
   async requestMandate(draft: Parameters<PaymentPlatform["requestMandate"]>[0], m: Mutation) {

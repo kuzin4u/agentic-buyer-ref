@@ -136,6 +136,28 @@ export interface AgentStatus {
   status: "ACTIVE" | "SUSPENDED" | "EXCLUDED";
 }
 
+/** Ключ агента в реестре платформы. Сроки — только из ответа платформы (РП23): агент их не вычисляет. */
+export interface AgentKey {
+  kid: string;
+  alg: string;
+  /** DER SPKI, base64 */
+  publicKey: string;
+  validFrom: string | null;
+  validTo: string | null;
+  status: "ACTIVE" | "REVOKED" | "EXPIRED";
+}
+
+/** Сведения платформы об агенте: статус и ключи (GET /pao/v1/agent). */
+export interface AgentSelf extends AgentStatus {
+  keys: AgentKey[];
+}
+
+/** Регистрация нового ключа: только открытая часть (инвариант 2). */
+export interface KeyDraft {
+  alg: string;
+  publicKey: string;
+}
+
 /** События платформы в понятиях ядра; исходное тело в ядро не передаётся. */
 export type PlatformEventType =
   | "mandate.signed"

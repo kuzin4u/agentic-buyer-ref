@@ -66,6 +66,9 @@ export const FAILURE_RULES: Readonly<Record<FailureCode, DeclineRule>> = {
   UNKNOWN: rule("STOP", "never", 0, false, true),
 };
 
+/** Отказ в допуске (SPEC §7а: AGENT_UNKNOWN, AGENT_SUSPENDED): останавливается агент целиком, а не одно обращение (П03). */
+export const AGENT_STOP_CODES: ReadonlySet<FailureCode> = new Set<FailureCode>(["AGENT_UNKNOWN", "AGENT_SUSPENDED"]);
+
 export function ruleForFailure(code: FailureCode): DeclineRule {
   return FAILURE_RULES[code] ?? FAILURE_RULES.UNKNOWN;
 }

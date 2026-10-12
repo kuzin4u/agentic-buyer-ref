@@ -1,7 +1,8 @@
 // Порт «платёжная платформа» (Р19). Ядро видит платформу только через него; адаптер (pao и следующие)
 // переводит понятия платформы в доменные типы. Отказ — исключение PlatformFailure.
 import type {
-  AgentStatus,
+  AgentKey,
+  AgentSelf,
   Confirmation,
   ConfirmationDraft,
   Credential,
@@ -9,6 +10,7 @@ import type {
   Dispute,
   DisputeDraft,
   Evidence,
+  KeyDraft,
   Mandate,
   MandateCheck,
   MandateDraft,
@@ -42,7 +44,10 @@ export interface Mutation {
 
 export interface PaymentPlatform {
   capabilities(): PlatformCapabilities;
-  agentStatus(): Promise<AgentStatus>;
+  /** Статус агента и ключи с их сроками — сроки задаёт платформа (РП23). */
+  agentSelf(): Promise<AgentSelf>;
+  /** Регистрация нового ключа до перехода на него (A2 п. 5.3); платформа сокращает сроки прежних ключей сама. */
+  registerKey(draft: KeyDraft, m: Mutation): Promise<AgentKey>;
 
   requestMandate(draft: MandateDraft, m: Mutation): Promise<Mandate>;
   getMandate(id: string): Promise<Mandate>;

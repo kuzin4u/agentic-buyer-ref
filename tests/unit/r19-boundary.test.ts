@@ -110,6 +110,31 @@ describe("границы модулей в ESLint", { timeout: 60_000 }, () => {
     }
   });
 
+  // Стенд Платформы — dev-зависимость для С0 (Р24), не контракт: во всём src, включая место сборки (ревью 3d № 3, 6)
+  const STAND_USES: Record<string, string> = {
+    "статический импорт": 'import { createStand } from "agentic-ps-platform/stand";\nexport const s = createStand;\n',
+    "реэкспорт": 'export * from "agentic-ps-platform/stand";\n',
+    "import()": 'export const s = () => import("agentic-ps-platform/stand");\n',
+    "тип через import()": 'export type S = import("agentic-ps-platform/stand").Stand;\n',
+    "import() в другом регистре": 'export const s = () => import("Agentic-PS-Platform/stand");\n',
+    "тип через import() в другом регистре": 'export type S = import("AGENTIC-PS-PLATFORM/stand").Stand;\n',
+    "статический импорт в другом регистре": 'import { createStand } from "Agentic-Ps-Platform/stand";\nexport const s = createStand;\n',
+  };
+  const STAND_FILES = [
+    "src/agent/compose.ts",
+    "src/agent/policy/probe.ts",
+    "src/agent/journal/probe.ts",
+    "src/agent/signer/probe.ts",
+    "src/agent/adapters/pao/probe.ts",
+    "src/agent/adapters/nsvr/probe.ts",
+    "src/shared/probe.ts",
+  ];
+  it.each(Object.entries(STAND_USES))("стенд Платформы в src — нарушение Р24: %s", async (_name, code) => {
+    for (const file of STAND_FILES) {
+      expect(await violations(file, code), file).toContainEqual(expect.stringContaining("стенд Платформы"));
+    }
+  });
+
   it.each(Object.entries(KEY_USES))("ключевой API вне signer — нарушение: %s", async (_name, code) => {
     for (const file of ["src/agent/policy/probe.ts", "src/agent/journal/probe.ts", "src/shared/probe.ts", "src/agent/adapters/pao/probe.ts"]) {
       expect(await violations(file, code), file).not.toEqual([]);

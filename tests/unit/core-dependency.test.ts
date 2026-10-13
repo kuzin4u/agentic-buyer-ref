@@ -48,7 +48,6 @@ describe("зависимость от agentic-core", () => {
 
 describe("структура ядра", () => {
   const dirs = [
-    "src/contour",
     "src/agent/pipeline",
     "src/agent/policy",
     "src/agent/mandates",

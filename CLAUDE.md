@@ -97,7 +97,7 @@
 
 ## Стек
 
-TypeScript, Node ≥ 20, vitest, zod для схем, `@kuzin4u/agentic-core` (подпись, идемпотентность, события, журнал — Р16). Тестовый контур — `PaoStub` agentic-core и стенд `agentic-ps-platform` (dev-зависимость), сборка — в `tests/support/` (Р26). Решения — Р11, Р16 в `DECISIONS.md`.
+TypeScript, Node ≥ 20.19, vitest, zod для схем, `@kuzin4u/agentic-core` (подпись, идемпотентность, события, журнал — Р16). Тестовый контур — `PaoStub` agentic-core и стенд `agentic-ps-platform` (dev-зависимость), сборка — в `tests/support/` (Р26). Решения — Р11, Р16 в `DECISIONS.md`.
 
 Целевая структура кода (создаётся по ROADMAP, не вся сразу):
 

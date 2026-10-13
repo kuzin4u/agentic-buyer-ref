@@ -28,7 +28,9 @@ describe("П02 — обращение с отозванным ключом", () 
         httpStatus: 401,
       });
     }
-    expect(stand.calls(OP).every((c) => c.status === 401)).toBe(true);
+    // по обращению: отказ, переход «на тот же ключ» и один повтор — снова отказ
+    expect(stand.log()).toEqual([{ op: OP, status: 401 }, { op: OP, status: 401 }, { op: OP, status: 401 }, { op: OP, status: 401 }]);
+    expect(stand.stub.violations).toEqual([]);
   });
 
   it("есть другой действующий ключ: переход и один повтор с тем же Idempotency-Key и новой подписью", async () => {
@@ -40,8 +42,9 @@ describe("П02 — обращение с отозванным ключом", () 
 
     await expect(core.platform.issueCredential(DRAFT, { idempotencyKey: "idem-p02" })).resolves.toMatchObject({ status: "ISSUED" });
 
+    expect(stand.log()).toEqual([{ op: "GET /pao/v1/agent", status: 200 }, { op: OP, status: 401 }, { op: OP, status: 201 }]);
+    expect(stand.stub.violations).toEqual([]);
     const calls = stand.calls(OP);
-    expect(calls.map((c) => c.status)).toEqual([401, 201]);
     expect(calls[0]!.idempotencyKey).toBe("idem-p02");
     expect(calls[1]!.idempotencyKey).toBe("idem-p02");
     expect(calls[1]!.nonce).not.toBe(calls[0]!.nonce);
@@ -62,8 +65,8 @@ describe("П02 — обращение с отозванным ключом", () 
 
     await expect(core.platform.issueCredential(DRAFT, { idempotencyKey: "idem-p02" })).rejects.toThrow(SignerStopped);
     await expect(core.platform.agentSelf()).rejects.toThrow(SignerStopped);
-    expect(stand.calls(OP)).toMatchObject([{ status: 401 }]);
-    expect(stand.calls("GET /pao/v1/agent")).toHaveLength(1); // только допуск
+    expect(stand.log()).toEqual([{ op: "GET /pao/v1/agent", status: 200 }, { op: OP, status: 401 }]); // допуск и один отказ
+    expect(stand.stub.violations).toEqual([]);
     expect(journal.entries.at(-1)).toMatchObject({ kind: "agent.stopped", reason: "NO_ACTIVE_KEY" });
   });
 
@@ -76,7 +79,8 @@ describe("П02 — обращение с отозванным ключом", () 
     const err = await core.platform.issueCredential(DRAFT, { idempotencyKey: "idem-p02" }).catch((e: unknown) => e);
     expect(err).toBeInstanceOf(PlatformFailure);
     expect(err).toMatchObject({ code: "AGENT_KEY_REVOKED" });
-    expect(stand.calls(OP).map((c) => c.status)).toEqual([401, 401]);
+    expect(stand.log()).toEqual([{ op: "GET /pao/v1/agent", status: 200 }, { op: OP, status: 401 }, { op: OP, status: 401 }]);
+    expect(stand.stub.violations).toEqual([]);
     expect(new Set(stand.calls(OP).map((c) => c.idempotencyKey))).toEqual(new Set(["idem-p02"]));
   });
 });

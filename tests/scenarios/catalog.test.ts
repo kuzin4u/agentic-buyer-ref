@@ -18,8 +18,25 @@ function declineReasons(spec: string): string[] {
   const section = spec.split(/^### 7б\./m)[1]?.split(/^#{2,3} /m)[0] ?? "";
   return [...section.matchAll(/^\| ([A-Z][A-Z_]+) \|/gm)].map((m) => m[1]!);
 }
+// Р28: строки SPEC §6 «код — сценарии»; диапазоны П01–П03 раскрываются.
+function requirementRows(spec: string): Map<string, Set<string>> {
+  const section = spec.split(/^## 6\./m)[1]?.split(/^## /m)[0] ?? "";
+  const rows = new Map<string, Set<string>>();
+  for (const [, code, cell] of section.matchAll(/^\| (Т\d+а?) \|.*\| ([^|]*) \|$/gm)) {
+    const ids = new Set<string>();
+    for (const part of cell!.split(/,\s*/)) {
+      const m = /^([ПД])(\d\d)(?:–\1(\d\d))?$/.exec(part.trim());
+      if (!m) continue;
+      for (let i = Number(m[2]); i <= Number(m[3] ?? m[2]); i++) ids.add(`${m[1]}${String(i).padStart(2, "0")}`);
+    }
+    rows.set(code!, ids);
+  }
+  return rows;
+}
 const paoErrors = paoErrorCodes(readFileSync("docs/core/protocol/agent-protocol.v1.2.0.yaml", "utf8"));
-const reasons = declineReasons(readFileSync("docs/core/SPEC.md", "utf8"));
+const spec = readFileSync("docs/core/SPEC.md", "utf8");
+const reasons = declineReasons(spec);
+const requirements = requirementRows(spec);
 
 describe("каталог сценариев приёмки", () => {
   const ids: string[] = catalog.scenarios.map((s: { id: string }) => s.id);
@@ -67,6 +84,25 @@ describe("каталог сценариев приёмки", () => {
       expect(s.contour.expected, `${s.id}.contour.expected`).toBeTruthy();
       expect(Array.isArray(s.contour.codes), `${s.id}.contour.codes`).toBe(true);
       for (const c of s.contour.codes) expect(pao, `${s.id}: ${c}`).toContain(c);
+    }
+  });
+
+  // Р28 (№ 17): requirements сценария и столбец «Сценарии» SPEC §6 — одна связь в двух местах.
+  it("связь «требование — сценарий» совпадает в scenarios.json и SPEC §6 в обе стороны", () => {
+    const linked = (s: { requirements: string }) => s.requirements.split(/,\s*/);
+    const used = new Set<string>(catalog.scenarios.flatMap(linked));
+    // Сломанный разбор дал бы пустую таблицу и пустую проверку.
+    expect(requirements.size).toBeGreaterThanOrEqual(16);
+    for (const t of used) expect(requirements.has(t), `SPEC §6: строки ${t} нет`).toBe(true);
+    for (const s of catalog.scenarios) {
+      for (const t of linked(s)) expect(requirements.get(t)?.has(s.id), `SPEC §6 ${t}: нет ${s.id}`).toBe(true);
+    }
+    for (const [t, sids] of requirements) {
+      for (const id of sids) {
+        const s = catalog.scenarios.find((x: { id: string }) => x.id === id);
+        expect(s, `SPEC §6 ${t}: сценария ${id} нет`).toBeTruthy();
+        expect(linked(s), `${id}.requirements: нет ${t}`).toContain(t);
+      }
     }
   });
 

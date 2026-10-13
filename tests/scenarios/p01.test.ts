@@ -17,7 +17,7 @@ describe("П01 — регистрация и первое подписанное
     expect(self.status).toBe("ACTIVE");
     expect(self.keys.map((k) => k.kid)).toEqual([kidOf(d!.public_key)]);
     expect(platformKid(d!.public_key)).toBe(kidOf(d!.public_key)); // независимое вычисление стенда
-    expect(stand.calls("GET /pao/v1/agent")).toMatchObject([{ status: 200 }]);
+    expect(stand.log()).toEqual([{ op: "GET /pao/v1/agent", status: 200 }]);
     expect(stand.stub.violations).toEqual([]);
     expect(journal.entries).toContainEqual(expect.objectContaining({ kind: "request.signed", kid: d!.kid }));
     // в журнале только идентификаторы — ни открытого, ни закрытого ключа

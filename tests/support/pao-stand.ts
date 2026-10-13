@@ -120,6 +120,11 @@ export class PaoStand {
     return this.stub.calls.filter((c) => c.op === op);
   }
 
+  /** Полный журнал обращений к стенду: метод и статус по порядку — лишнее обращение к другому методу видно. */
+  log() {
+    return this.stub.calls.map(({ op, status }) => ({ op, status }));
+  }
+
   async close(): Promise<void> {
     await this.stub.close();
     rmSync(this.dir, { recursive: true, force: true });

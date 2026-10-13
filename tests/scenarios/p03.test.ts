@@ -21,7 +21,8 @@ describe("П03 — исключённый или отсутствующий в �
     expect(stand.calls("GET /pao/v1/agent")).toMatchObject([{ status: 200 }]);
     expect(journal.entries.at(-1)).toMatchObject({ kind: "agent.stopped", reason: "AGENT_EXCLUDED" });
     await expect(core.platform.issueCredential(DRAFT, { idempotencyKey: "idem-p03" })).rejects.toThrow(SignerStopped);
-    expect(stand.calls(OP)).toHaveLength(0);
+    expect(stand.log()).toEqual([{ op: "GET /pao/v1/agent", status: 200 }]);
+    expect(stand.stub.violations).toEqual([]);
   });
 
   it("исключён после допуска: прочий метод — 403 AGENT_SUSPENDED, retry never; без повтора, остановка", async () => {
@@ -39,7 +40,8 @@ describe("П03 — исключённый или отсутствующий в �
     expect(journal.entries.at(-1)).toMatchObject({ kind: "agent.stopped", reason: "AGENT_SUSPENDED" });
     await expect(core.platform.issueCredential(DRAFT, { idempotencyKey: "idem-p03" })).rejects.toThrow(SignerStopped);
     await expect(core.platform.agentSelf()).rejects.toThrow(SignerStopped);
-    expect(stand.calls(OP)).toHaveLength(1);
+    expect(stand.log()).toEqual([{ op: "GET /pao/v1/agent", status: 200 }, { op: OP, status: 403 }]);
+    expect(stand.stub.violations).toEqual([]);
   });
 
   it("агента нет в реестре: 401 AGENT_UNKNOWN; без повтора, остановка, запись в журнале", async () => {
@@ -52,6 +54,7 @@ describe("П03 — исключённый или отсутствующий в �
     expect(stand.calls("GET /pao/v1/agent")).toHaveLength(1);
     expect(journal.entries.at(-1)).toMatchObject({ kind: "agent.stopped", reason: "AGENT_UNKNOWN" });
     await expect(core.platform.agentSelf()).rejects.toThrow(SignerStopped);
-    expect(stand.calls("GET /pao/v1/agent")).toHaveLength(1);
+    expect(stand.log()).toEqual([{ op: "GET /pao/v1/agent", status: 401 }]);
+    expect(stand.stub.violations).toEqual([]);
   });
 });

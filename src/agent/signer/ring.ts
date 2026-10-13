@@ -9,6 +9,7 @@
 import type { Signer } from "@kuzin4u/agentic-core";
 import { PlatformFailure, type AgentKey, type AgentSelf } from "../../shared/domain.js";
 import type { StandParams } from "../../shared/config.js";
+import { ruleForFailure } from "../declines/index.js";
 import type { Journal, JournalKind } from "../journal/index.js";
 import type { PaymentPlatform } from "../ports/payment-platform.js";
 import type { RequestSigning } from "../ports/request-signing.js";
@@ -125,7 +126,8 @@ export class KeyRing {
    * (ACTIVE, valid_to в будущем) — один на попытку допуска; нет такого — остановка (SPEC §7а: «подписать действующим
    * новым ключом; нет — остановка»).
    * Неподтверждённые ключи не пробуются.
-   * SIGNATURE_INVALID — один повтор тем же ключом с новой подписью, затем остановка (SPEC §7а).
+   * SIGNATURE_INVALID — повтор тем же ключом с новой подписью не больше maxRetries таблицы отказов (SPEC §7а: один), затем
+   * остановка.
    * Прочие сбои (503, тайм-аут) — допуск можно повторить; AGENT_UNKNOWN / AGENT_SUSPENDED — остановка (адаптер);
    * класс в реестре не BUYER — остановка AGENT_CLASS_MISMATCH (Р27, после проверки статуса).
    */
@@ -143,6 +145,7 @@ export class KeyRing {
       if (this.#unlock === null) this.#lock();
       if (this.#held.size === 0) this.#loadAll();
       this.#currentKid = this.#admissionKey();
+      const signatureRetries = ruleForFailure("SIGNATURE_INVALID").maxRetries ?? 0; // null — без повтора (fail-closed)
       for (let attempt = 1; ; attempt++) {
         let self: AgentSelf;
         try {
@@ -152,7 +155,7 @@ export class KeyRing {
           this.#record("admission.failed", this.#currentKid, e.code);
           if (e.code === "AGENT_KEY_REVOKED") this.#halt("AGENT_KEY_REVOKED", e);
           if (e.code === "SIGNATURE_INVALID") {
-            if (attempt >= 2) this.#halt("SIGNATURE_INVALID", e);
+            if (attempt > signatureRetries) this.#halt("SIGNATURE_INVALID", e);
             continue;
           }
           throw e;

@@ -24,6 +24,7 @@ const signing: RequestSigning = {
     throw new Error("в этих тестах ключ не отзывается");
   },
   stop: () => {},
+  suspend: () => {},
 };
 
 let stub: PaoStub | undefined;
@@ -205,6 +206,81 @@ describe("fail-closed без заглушки", () => {
     });
     await expect(platform.verifyMandate("m_1")).rejects.toMatchObject({ code: "UNKNOWN", httpStatus: 0 });
     expect(calls).toHaveLength(1);
+  });
+
+  // Р27: ответ 2xx на GET /pao/v1/agent не по схеме — приостановка подписи; тайм-аут и 503 — нет.
+  describe("GET /pao/v1/agent: ответ не по схеме — приостановка (Р27)", () => {
+    const self = { agent_code: AGENT, status: "ACTIVE", class: "BUYER", keys: [] };
+    const watched = (reply: () => Response | Promise<Response>, p: StandParams = params) => {
+      const suspended: string[] = [];
+      const stopped: string[] = [];
+      const platform = new PaoPlatform({
+        baseUrl: "http://pao.test",
+        agentCode: AGENT,
+        signing: { ...signing, stop: (r: string) => void stopped.push(r), suspend: (r: string) => void suspended.push(r) },
+        params: p,
+        sleep: async () => {},
+        fetch: async () => reply(),
+      });
+      return { platform, suspended, stopped };
+    };
+    const raw = (body: string) => () => new Response(body, { status: 200, headers: { "content-type": "application/json" } });
+
+    it.each([
+      ["тело не JSON", raw("{")],
+      ["тело null", raw("null")],
+      ["пустое тело", raw("")],
+      ["keys — не массив", () => json(200, { ...self, keys: {} })],
+      ["элемент keys — null", () => json(200, { ...self, keys: [null] })],
+      ["нет class", () => json(200, { agent_code: AGENT, status: "ACTIVE", keys: [] })],
+      ["класс вне перечня", () => json(200, { ...self, class: "ADMIN" })],
+      ["статус вне перечня", () => json(200, { ...self, status: "BLOCKED" })],
+    ])("%s — UNKNOWN с HTTP 200, подпись приостановлена", async (_n, reply) => {
+      const { platform, suspended, stopped } = watched(reply);
+      await expect(platform.agentSelf()).rejects.toMatchObject({ code: "UNKNOWN", httpStatus: 200 });
+      expect(suspended).toEqual(["AGENT_SELF_UNKNOWN"]);
+      expect(stopped).toEqual([]);
+    });
+
+    it("обрыв тела после заголовков 200 — тоже приостановка (fail-closed)", async () => {
+      const body = new ReadableStream<Uint8Array>({
+        start(c) {
+          c.enqueue(new TextEncoder().encode('{"agent_code":'));
+          c.error(new Error("соединение оборвано"));
+        },
+      });
+      const { platform, suspended } = watched(() => new Response(body, { status: 200, headers: { "content-type": "application/json" } }));
+      await expect(platform.agentSelf()).rejects.toMatchObject({ code: "UNKNOWN", httpStatus: 200 });
+      expect(suspended).toEqual(["AGENT_SELF_UNKNOWN"]);
+    });
+
+    it("ответ по схеме — без приостановки", async () => {
+      const { platform, suspended } = watched(() => json(200, self));
+      await expect(platform.agentSelf()).resolves.toMatchObject({ agentClass: "BUYER" });
+      expect(suspended).toEqual([]);
+    });
+
+    it("тайм-аут — UNKNOWN без ответа (HTTP 0), не приостановка", async () => {
+      const suspended: string[] = [];
+      const platform = new PaoPlatform({
+        baseUrl: "http://pao.test",
+        agentCode: AGENT,
+        signing: { ...signing, suspend: (r: string) => void suspended.push(r) },
+        params: { ...params, pao_request_timeout_ms: 30 },
+        fetch: (_url, init) => new Promise((_, reject) => init?.signal?.addEventListener("abort", () => reject(init.signal!.reason))),
+      });
+      await expect(platform.agentSelf()).rejects.toMatchObject({ code: "UNKNOWN", httpStatus: 0 });
+      expect(suspended).toEqual([]);
+    });
+
+    it("503 — не приостановка", async () => {
+      const { platform, suspended } = watched(() => json(503, { code: "UPSTREAM_UNAVAILABLE", message: "x", retry: "same_key" }), {
+        ...params,
+        pao_max_attempts: 1,
+      });
+      await expect(platform.agentSelf()).rejects.toMatchObject({ code: "UPSTREAM_UNAVAILABLE" });
+      expect(suspended).toEqual([]);
+    });
   });
 
   it.each(["", "   "])("пустой Idempotency-Key (%j) — отказ до отправки", async (key) => {

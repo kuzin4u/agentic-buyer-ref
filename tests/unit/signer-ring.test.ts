@@ -5,9 +5,9 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { MemoryJournal } from "../../src/agent/journal/index.js";
 import { loadParams } from "../../src/shared/config.js";
-import { KeyRing, SignerKeyRejected, SignerStopped, generateKey, kidOf, listKeys } from "../../src/agent/signer/index.js";
-import { lockDir, readMeta } from "../../src/agent/signer/keystore.js";
-import type { AgentKey, AgentSelf } from "../../src/shared/domain.js";
+import { KeyRing, SignerKeyRejected, SignerStopped, SignerSuspended, generateKey, kidOf, listKeys } from "../../src/agent/signer/index.js";
+import { lockDir, readMeta, writeMeta } from "../../src/agent/signer/keystore.js";
+import { PlatformFailure, type AgentKey, type AgentSelf } from "../../src/shared/domain.js";
 import { coreOn } from "../support/core.js";
 import { AGENT, PaoStand } from "../support/pao-stand.js";
 
@@ -110,7 +110,7 @@ describe("сверка с реестром (fail-closed)", () => {
       status: "ACTIVE",
       ...over,
     });
-    const self = (keys: AgentKey[], status: AgentSelf["status"] = "ACTIVE") => async (): Promise<AgentSelf> => ({ agentCode: AGENT, status, keys });
+    const self = (keys: AgentKey[], status: AgentSelf["status"] = "ACTIVE", agentClass: AgentSelf["agentClass"] = "BUYER") => async (): Promise<AgentSelf> => ({ agentCode: AGENT, status, agentClass, keys });
     return { r, d, key, self, j };
   };
 
@@ -134,6 +134,162 @@ describe("сверка с реестром (fail-closed)", () => {
     expect(k.j.entries.at(-1)).toMatchObject({ kind: "agent.stopped", reason: "AGENT_SUSPENDED" });
   });
 
+  // Р27: класс — после статуса; класс из реестра — в detail записи об остановке.
+  it.each(["SELLER", "SURFACE", "SERVICE"] as const)("класс %s при допуске — остановка AGENT_CLASS_MISMATCH", async (cls) => {
+    const k = ring();
+    await expect(k.r.start(k.self([k.key()], "ACTIVE", cls))).rejects.toMatchObject({ reason: "AGENT_CLASS_MISMATCH" });
+    expect(k.j.entries.at(-1)).toEqual(expect.objectContaining({ kind: "agent.stopped", reason: "AGENT_CLASS_MISMATCH", detail: cls }));
+    expect(() => k.r.port().current()).toThrow(SignerStopped);
+  });
+
+  it("SUSPENDED и SELLER — остановка по статусу, класс не проверяется", async () => {
+    const k = ring();
+    await expect(k.r.start(k.self([k.key()], "SUSPENDED", "SELLER"))).rejects.toMatchObject({ reason: "AGENT_SUSPENDED" });
+    expect(k.j.entries.filter((e) => e.kind === "agent.stopped")).toEqual([expect.objectContaining({ reason: "AGENT_SUSPENDED" })]);
+  });
+
+  it("сверка после ротации: класс в реестре стал SELLER — остановка AGENT_CLASS_MISMATCH", async () => {
+    const k = ring();
+    await k.r.start(k.self([k.key()]));
+    let fresh: AgentKey | undefined;
+    const p = {
+      registerKey: async (draft: { alg: string; publicKey: string }): Promise<AgentKey> =>
+        (fresh = k.key({ kid: kidOf(draft.publicKey), publicKey: draft.publicKey, validFrom: "2026-10-12T09:00:00Z" })),
+      agentSelf: async (): Promise<AgentSelf> => ({ agentCode: AGENT, status: "ACTIVE", agentClass: "SELLER", keys: [k.key(), fresh!] }),
+    };
+    await expect(k.r.rotate(p)).rejects.toMatchObject({ reason: "AGENT_CLASS_MISMATCH" });
+    expect(k.j.entries.at(-1)).toEqual(expect.objectContaining({ kind: "agent.stopped", reason: "AGENT_CLASS_MISMATCH", detail: "SELLER" }));
+    expect(() => k.r.port().current()).toThrow(SignerStopped);
+  });
+
+  // Р27 (уточнение): приостановка рабочей подписи до успешной повторной сверки; порт сверки — только на время recheck.
+  describe("приостановка подписи (AGENT_SELF_UNKNOWN)", () => {
+    const suspendedCount = (j: MemoryJournal) => j.entries.filter((e) => e.kind === "signing.suspended").length;
+
+    it("suspend до допуска — без действия; после допуска — рабочая подпись SignerSuspended", async () => {
+      const k = ring();
+      k.r.port().suspend("AGENT_SELF_UNKNOWN");
+      await k.r.start(k.self([k.key()]));
+      expect(() => k.r.port().current()).not.toThrow();
+      k.r.port().suspend("AGENT_SELF_UNKNOWN");
+      k.r.port().suspend("AGENT_SELF_UNKNOWN");
+      expect(() => k.r.port().current()).toThrow(SignerSuspended);
+      expect(suspendedCount(k.j)).toBe(1); // повторная приостановка не пишется
+    });
+
+    it("suspend после остановки — без действия: остаётся SignerStopped", async () => {
+      const k = ring();
+      await k.r.start(k.self([k.key()]));
+      k.r.port().stop("AGENT_SUSPENDED");
+      k.r.port().suspend("AGENT_SELF_UNKNOWN");
+      expect(() => k.r.port().current()).toThrow(SignerStopped);
+      expect(suspendedCount(k.j)).toBe(0);
+    });
+
+    it("recheck без приостановки — без signing.resumed; при приостановке — снимает её", async () => {
+      const k = ring();
+      await k.r.start(k.self([k.key()]));
+      await k.r.recheck(k.self([k.key()]));
+      expect(k.j.entries.map((e) => e.kind)).not.toContain("signing.resumed");
+      k.r.port().suspend("AGENT_SELF_UNKNOWN");
+      await k.r.recheck(k.self([k.key()]));
+      expect(k.j.entries.at(-1)).toMatchObject({ kind: "signing.resumed" });
+      expect(() => k.r.port().current()).not.toThrow();
+    });
+
+    it("порт сверки подписывает при приостановке только во время recheck; после выхода — SignerSuspended", async () => {
+      const k = ring();
+      await k.r.start(k.self([k.key()]));
+      k.r.port().suspend("AGENT_SELF_UNKNOWN");
+      let kept: Parameters<Parameters<KeyRing["recheck"]>[0]>[0] | undefined;
+      await expect(
+        k.r.recheck(async (signing) => {
+          kept = signing;
+          expect(() => signing.current()).not.toThrow();
+          throw new PlatformFailure("UNKNOWN", "never", null, 200, null, "ответ ПАО не по схеме");
+        }),
+      ).rejects.toMatchObject({ code: "UNKNOWN" });
+      expect(() => kept!.current()).toThrow(SignerSuspended);
+      expect(() => k.r.port().current()).toThrow(SignerSuspended);
+    });
+
+    it("гонка: приостановка во время сверки не снимается её (более ранним) ответом", async () => {
+      const k = ring();
+      await k.r.start(k.self([k.key()]));
+      await k.r.recheck(async () => {
+        k.r.port().suspend("AGENT_SELF_UNKNOWN"); // параллельный рабочий запрос получил ответ не по схеме
+        return { agentCode: AGENT, status: "ACTIVE", agentClass: "BUYER", keys: [k.key()] };
+      });
+      expect(() => k.r.port().current()).toThrow(SignerSuspended);
+      expect(k.j.entries.map((e) => e.kind)).not.toContain("signing.resumed");
+    });
+
+    it("ротация при приостановке: регистрации нет, POST /pao/v1/agent/keys не отправляется", async () => {
+      const k = ring();
+      await k.r.start(k.self([k.key()]));
+      k.r.port().suspend("AGENT_SELF_UNKNOWN");
+      let registered = 0;
+      const p = {
+        registerKey: async (): Promise<AgentKey> => {
+          registered++;
+          return k.key();
+        },
+        agentSelf: k.self([k.key()]),
+      };
+      await expect(k.r.rotate(p)).rejects.toThrow(SignerSuspended);
+      expect(registered).toBe(0);
+    });
+
+    it("приостановка между регистрацией и сверкой ротации — дальше подписи нет", async () => {
+      const k = ring();
+      await k.r.start(k.self([k.key()]));
+      let fresh: AgentKey | undefined;
+      const p = {
+        registerKey: async (draft: { alg: string; publicKey: string }): Promise<AgentKey> =>
+          (fresh = k.key({ kid: kidOf(draft.publicKey), publicKey: draft.publicKey, validFrom: "2026-10-12T09:00:00Z" })),
+        agentSelf: async (): Promise<AgentSelf> => {
+          k.r.port().suspend("AGENT_SELF_UNKNOWN");
+          throw new PlatformFailure("UNKNOWN", "never", null, 200, null, "ответ ПАО не по схеме");
+        },
+      };
+      await expect(k.r.rotate(p)).rejects.toMatchObject({ code: "UNKNOWN" });
+      expect(fresh).toBeDefined();
+      expect(() => k.r.port().current()).toThrow(SignerSuspended);
+    });
+
+    it("AGENT_KEY_REVOKED во время сверки при приостановке — переход на другой ключ, сверка завершается", async () => {
+      dir = mkdtempSync(join(tmpdir(), "buyref-keys-"));
+      const d1 = generateKey(dir).descriptor;
+      const d2 = generateKey(dir).descriptor;
+      const j = new MemoryJournal();
+      const now = new Date("2026-10-12T09:00:00Z");
+      const key = (d: typeof d1, validFrom: string, status: AgentKey["status"] = "ACTIVE"): AgentKey => ({
+        kid: d.kid, alg: "ed25519", publicKey: d.public_key, validFrom, validTo: "2026-12-30T00:00:00Z", status,
+      });
+      writeMeta(dir, {
+        [d1.kid]: { valid_from: "2026-10-01T00:00:00Z", valid_to: "2026-12-30T00:00:00Z" },
+        [d2.kid]: { valid_from: "2026-10-05T00:00:00Z", valid_to: "2026-12-30T00:00:00Z" },
+      });
+      const r = new KeyRing({ dir, params, journal: j, now: () => now });
+      const both = async (): Promise<AgentSelf> => ({
+        agentCode: AGENT, status: "ACTIVE", agentClass: "BUYER",
+        keys: [key(d1, "2026-10-01T00:00:00Z"), key(d2, "2026-10-05T00:00:00Z")],
+      });
+      await r.start(both);
+      expect(r.port().current().kid).toBe(d2.kid);
+      r.port().suspend("AGENT_SELF_UNKNOWN");
+      const revoked = new PlatformFailure("AGENT_KEY_REVOKED", "new_key", "AGENT_KEY_REVOKED", 401, null);
+      await r.recheck(async (signing) => {
+        expect(signing.current().kid).toBe(d2.kid);
+        expect(signing.keyRevoked(d2.kid, revoked).kid).toBe(d1.kid);
+        return { agentCode: AGENT, status: "ACTIVE", agentClass: "BUYER", keys: [key(d1, "2026-10-01T00:00:00Z"), key(d2, "2026-10-05T00:00:00Z", "REVOKED")] };
+      });
+      expect(j.entries.at(-1)).toMatchObject({ kind: "signing.resumed" });
+      expect(r.port().current().kid).toBe(d1.kid);
+      r.close();
+    });
+  });
+
   /** Платформа-подделка для ротации: регистрирует присланный ключ; ответ GET /pao/v1/agent задаёт тест. */
   const rotating = (k: ReturnType<typeof ring>, after: (fresh: AgentKey) => AgentKey[], reply?: (fresh: AgentKey) => AgentKey) => {
     let fresh: AgentKey | undefined;
@@ -142,7 +298,7 @@ describe("сверка с реестром (fail-closed)", () => {
         fresh = k.key({ kid: kidOf(draft.publicKey), publicKey: draft.publicKey, validFrom: "2026-10-12T09:00:00Z" });
         return reply ? reply(fresh) : fresh;
       },
-      agentSelf: async (): Promise<AgentSelf> => ({ agentCode: AGENT, status: "ACTIVE", keys: after(fresh!) }),
+      agentSelf: async (): Promise<AgentSelf> => ({ agentCode: AGENT, status: "ACTIVE", agentClass: "BUYER", keys: after(fresh!) }),
     };
   };
 
@@ -215,7 +371,7 @@ describe("сверка с реестром (fail-closed)", () => {
         first ??= f;
         return f;
       },
-      agentSelf: async (): Promise<AgentSelf> => ({ agentCode: AGENT, status: "ACTIVE", keys: sent.length === 1 ? [k.key(), first!] : [k.key()] }),
+      agentSelf: async (): Promise<AgentSelf> => ({ agentCode: AGENT, status: "ACTIVE", agentClass: "BUYER", keys: sent.length === 1 ? [k.key(), first!] : [k.key()] }),
     };
     await k.r.rotate(p);
     expect(k.r.port().current().kid).toBe(sent[0]);
@@ -260,7 +416,7 @@ describe("сверка с реестром (fail-closed)", () => {
     const p = {
       registerKey: (draft: { alg: string; publicKey: string }) =>
         new Promise<AgentKey>((r) => (release = () => r(k.key({ kid: kidOf(draft.publicKey), publicKey: draft.publicKey })))),
-      agentSelf: async (): Promise<AgentSelf> => ({ agentCode: AGENT, status: "ACTIVE", keys: [k.key()] }),
+      agentSelf: async (): Promise<AgentSelf> => ({ agentCode: AGENT, status: "ACTIVE", agentClass: "BUYER", keys: [k.key()] }),
     };
     const rotation = k.r.rotate(p);
     await new Promise((r) => setTimeout(r, 0));

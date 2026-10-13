@@ -184,6 +184,7 @@ function oneOf<T extends string>(v: unknown, allowed: readonly T[], what: string
 }
 
 const AGENT_STATUSES = ["ACTIVE", "SUSPENDED", "EXCLUDED"] as const;
+const AGENT_CLASSES = ["BUYER", "SELLER", "SURFACE", "SERVICE"] as const;
 const KEY_STATUSES = ["ACTIVE", "REVOKED", "EXPIRED"] as const;
 
 /** Ключ ПАО → ключ ядра. Сроки переносятся как есть: их задаёт платформа (РП23). Статус вне перечня — UNKNOWN. */
@@ -202,6 +203,8 @@ export function agentSelfFromPao(a: Pao.AgentSelf): AgentSelf {
   return {
     agentCode: need(a.agent_code, "agent.agent_code"),
     status: oneOf(a.status, AGENT_STATUSES, "agent.status"),
+    // Р27: класс обязателен для ядра (в ПАО 1.2.0 — нет); нет поля — тоже «вне перечня», UNKNOWN.
+    agentClass: oneOf(a.class, AGENT_CLASSES, "agent.class"),
     keys: (a.keys ?? []).map(keyFromPao),
   };
 }

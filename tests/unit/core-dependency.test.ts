@@ -2,36 +2,40 @@ import { describe, it, expect } from "vitest";
 import { existsSync, readFileSync } from "node:fs";
 import { PAO_ERRORS, PAO_VERSION } from "@kuzin4u/agentic-core/pao";
 
-// Каркас ядра (AG-01): зависимость от agentic-core v0.2.1 и структура src по CLAUDE.md.
+// Каркас ядра (AG-01): зависимость от agentic-core v0.2.2 и структура src по CLAUDE.md.
 describe("зависимость от agentic-core", () => {
-  it("подключена по git+https с тегом v0.2.1", () => {
+  it("подключена по git+https с тегом v0.2.2", () => {
     const pkg = JSON.parse(readFileSync("package.json", "utf8"));
     expect(pkg.dependencies["@kuzin4u/agentic-core"]).toBe(
-      "git+https://github.com/kuzin4u/agentic-core.git#v0.2.1",
+      "git+https://github.com/kuzin4u/agentic-core.git#v0.2.2",
     );
     const lock = JSON.parse(readFileSync("package-lock.json", "utf8"));
     const entry = lock.packages["node_modules/@kuzin4u/agentic-core"];
-    expect(entry.version).toBe("0.2.1");
-    // f869ada… — коммит тега v0.2.1 (не объект аннотированного тега).
+    expect(entry.version).toBe("0.2.2");
+    // 024163a… — коммит тега v0.2.2 (лёгкий тег). Копия ядра одна: зависимость стенда #v0.2.1
+    // npm сводит к ней же — стенд в тестах работает на core v0.2.2.
     expect(entry.resolved).toBe(
-      "git+https://github.com/kuzin4u/agentic-core.git#f869ada14a9123b33808c69eb65a47aee48e9818",
+      "git+https://github.com/kuzin4u/agentic-core.git#024163aee96fdf5befa280343ef520600587aeb4",
     );
   });
 
-  it("стенд Платформы для С0 — dev-зависимость по git+https с тегом v0.1.1 (Р24)", () => {
+  it("стенд Платформы для С0 — dev-зависимость по git+https с тегом v0.2.0 (Р24, PS-12)", () => {
     const pkg = JSON.parse(readFileSync("package.json", "utf8"));
     expect(pkg.devDependencies["agentic-ps-platform"]).toBe(
-      "git+https://github.com/kuzin4u/agentic-ps-platform.git#v0.1.1",
+      "git+https://github.com/kuzin4u/agentic-ps-platform.git#v0.2.0",
     );
     expect(pkg.dependencies["agentic-ps-platform"]).toBeUndefined();
     const lock = JSON.parse(readFileSync("package-lock.json", "utf8"));
     const entry = lock.packages["node_modules/agentic-ps-platform"];
-    expect(entry).toMatchObject({ version: "0.1.1", dev: true });
-    // a1b0e8e… — коммит тега v0.1.1. npm install переписывает адрес на git+ssh — в lock только git+https.
+    expect(entry).toMatchObject({ version: "0.2.0", dev: true });
+    // 0396fad… — коммит тега v0.2.0. npm install переписывает адрес на git+ssh — в lock только git+https.
     expect(entry.resolved).toBe(
-      "git+https://github.com/kuzin4u/agentic-ps-platform.git#a1b0e8ed6c15c6a5a980c8140310d1088ec6d409",
+      "git+https://github.com/kuzin4u/agentic-ps-platform.git#0396fad67ec9e1cc9dd02a8d3773e49c71762044",
     );
     expect(readFileSync("package-lock.json", "utf8")).not.toMatch(/git\+ssh:|"github:/);
+    expect(Object.keys(lock.packages).filter((k) => k.endsWith("node_modules/@kuzin4u/agentic-core"))).toEqual([
+      "node_modules/@kuzin4u/agentic-core",
+    ]);
   });
 
   it("даёт ПАО 1.2.0 и таблицу ошибок с полем retry", () => {
@@ -44,7 +48,6 @@ describe("зависимость от agentic-core", () => {
 
 describe("структура ядра", () => {
   const dirs = [
-    "src/contour",
     "src/agent/pipeline",
     "src/agent/policy",
     "src/agent/mandates",

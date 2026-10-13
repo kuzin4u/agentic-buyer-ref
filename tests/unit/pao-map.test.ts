@@ -62,6 +62,24 @@ describe("перевод ПАО ↔ ядро", () => {
     expect(() => map.operationFromPao({ status: "AUTHORIZED" })).toThrow(PlatformFailure);
   });
 
+  // Р27: класс обязателен для ядра (в ПАО 1.2.0 необязателен) — нет поля или значение вне перечня — UNKNOWN.
+  it("агент: класс переводится; нет class или значение вне перечня — UNKNOWN", () => {
+    const a = { agent_code: "nspk:agent:x:v1", status: "ACTIVE" as const, keys: [] };
+    expect(map.agentSelfFromPao({ ...a, class: "SELLER" })).toMatchObject({ agentClass: "SELLER" });
+    expect(map.agentSelfFromPao({ ...a, class: "BUYER" })).toMatchObject({ agentClass: "BUYER" });
+    for (const bad of [a, { ...a, class: "ADMIN" as "BUYER" }, { ...a, class: "buyer" as "BUYER" }]) {
+      const err = (() => {
+        try {
+          return map.agentSelfFromPao(bad);
+        } catch (e) {
+          return e;
+        }
+      })();
+      expect(err).toBeInstanceOf(PlatformFailure);
+      expect(err).toMatchObject({ code: "UNKNOWN" });
+    }
+  });
+
   it("событие: известное переводится, неизвестное и deal.* игнорируются", () => {
     const e = map.eventFromPao({
       event_id: "ev_1",

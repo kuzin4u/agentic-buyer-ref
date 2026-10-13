@@ -17,9 +17,9 @@ import { AGENT } from "../support/pao-stand.js";
 const OPERATOR = "buyref-operator";
 
 /** Заявление оператора о допуске (РП21 п. 2): только открытый ключ, закрытый остаётся в хранилище агента (инвариант 2). */
-const application = (public_key: string) => ({
+const application = (public_key: string, cls = "BUYER") => ({
   agent_code: AGENT,
-  class: "BUYER",
+  class: cls,
   model: "buyer-agent-ref",
   runtime: "node-20",
   alg: "ed25519",
@@ -99,7 +99,7 @@ describe("С0 — подпись агента принимается Платф�
 
     const self = await core.start();
 
-    expect(self).toMatchObject({ agentCode: AGENT, status: "ACTIVE" });
+    expect(self).toMatchObject({ agentCode: AGENT, status: "ACTIVE", agentClass: "BUYER" });
     expect(self.keys.map((k) => k.kid)).toEqual([kidOf(descriptor.public_key)]);
     expect(descriptor.kid).toBe(kidOf(descriptor.public_key));
     if (!decision.admitted) throw new Error("недостижимо");
@@ -148,6 +148,21 @@ describe("С0 — подпись агента принимается Платф�
 
     await expectSignatureStop(core, journal, log);
     expect(listKeys(dir)).toEqual([{ kid: descriptor.kid, state: "active" }]);
+  });
+
+  // Р27: стенд допускает заявление любого класса из перечня — агент, допущенный как SELLER, останавливается сам.
+  it("Р27: агент допущен как SELLER — 200 от Платформы, остановка AGENT_CLASS_MISMATCH, без повтора", async () => {
+    const { s, calls } = await platform();
+    const dir = keysDir();
+    const { descriptor } = generateKey(dir);
+    expect(s.admit(application(descriptor.public_key, "SELLER"), OPERATOR)).toMatchObject({ admitted: true });
+    const { core, journal } = await coreAt(s, dir);
+
+    await expect(core.start()).rejects.toMatchObject({ reason: "AGENT_CLASS_MISMATCH" });
+    expect(calls()).toEqual([{ route: SELF, status: 200 }]);
+    expect(journal.entries.filter((e) => e.kind === "agent.stopped")).toEqual([
+      expect.objectContaining({ reason: "AGENT_CLASS_MISMATCH", detail: "SELLER" }),
+    ]);
   });
 
   it("агента нет в реестре: 401 AGENT_UNKNOWN; без повтора, остановка (П03 по Р23)", async () => {

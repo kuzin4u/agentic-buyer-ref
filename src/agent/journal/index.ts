@@ -22,6 +22,10 @@ export type JournalKind =
   | "request.signed"
   /** допуск не пройден этим ключом или целиком (код отказа в reason); допуск можно повторить */
   | "admission.failed"
+  /** рабочая подпись приостановлена до успешной повторной сверки с реестром (Р27) */
+  | "signing.suspended"
+  /** повторная сверка прошла (ACTIVE и BUYER) — подпись возобновлена */
+  | "signing.resumed"
   /** агент остановлен */
   | "agent.stopped";
 
@@ -31,6 +35,8 @@ export interface JournalEntry {
   kid?: string;
   /** код отказа или причина остановки */
   reason?: string;
+  /** уточнение причины — только значение перечня ПАО (например, класс из реестра при AGENT_CLASS_MISMATCH, Р27) */
+  detail?: string;
 }
 
 export interface Journal {

@@ -5,6 +5,14 @@ export class SignerKeyRejected extends Error {
   override readonly name: string = "SignerKeyRejected";
 }
 
+/** Подпись приостановлена до успешной повторной сверки с реестром (Р27: ответ реестра не по схеме после допуска). */
+export class SignerSuspended extends Error {
+  override readonly name = "SignerSuspended";
+  constructor(readonly reason: string) {
+    super(`подпись приостановлена: ${reason}`);
+  }
+}
+
 /** Подпись остановлена: нет действующего ключа или агенту отказано в допуске (Т1, SPEC §7а). */
 export class SignerStopped extends Error {
   override readonly name = "SignerStopped";

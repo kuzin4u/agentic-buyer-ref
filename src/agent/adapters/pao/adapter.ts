@@ -4,7 +4,7 @@
 // AGENT_KEY_REVOKED (ROTATE_KEY): другой действующий ключ из порта подписи и один повтор тем же Idempotency-Key.
 import { PAO_VERSION, PaoClient, type PaoCallArgs, type PaoOperationKey, type PaoOperations } from "@kuzin4u/agentic-core/pao";
 import { PAO_RETRY_AFTER_MAX_SEC, type StandParams } from "../../../shared/config.js";
-import { PlatformFailure } from "../../../shared/domain.js";
+import { PlatformFailure, type AgentSelf } from "../../../shared/domain.js";
 import type { PaymentPlatform, PlatformCapabilities, Mutation } from "../../ports/payment-platform.js";
 import type { RequestSigning } from "../../ports/request-signing.js";
 import { AGENT_STOP_CODES, ruleForFailure } from "../../declines/index.js";
@@ -68,8 +68,8 @@ export class PaoPlatform implements PaymentPlatform {
     };
   }
 
-  /** Одно обращение без повторов клиента; тайм-аут — pao_request_timeout_ms. Retry-After ответа — в last. */
-  private client(last: { retryAfter?: number }, signer: ReturnType<RequestSigning["current"]>): PaoClient {
+  /** Одно обращение без повторов клиента; тайм-аут — pao_request_timeout_ms. Retry-After и HTTP-статус ответа — в last. */
+  private client(last: { retryAfter?: number; status?: number }, signer: ReturnType<RequestSigning["current"]>): PaoClient {
     const timeoutMs = this.o.params.pao_request_timeout_ms;
     const f = this.fetchImpl;
     return new PaoClient({
@@ -79,6 +79,7 @@ export class PaoPlatform implements PaymentPlatform {
       maxAttempts: 1,
       fetch: async (url, init) => {
         const res = await f(url, { ...init, signal: AbortSignal.timeout(timeoutMs) });
+        last.status = res.status;
         last.retryAfter = retryAfterSec(res.headers.get("retry-after"));
         return res;
       },
@@ -99,7 +100,7 @@ export class PaoPlatform implements PaymentPlatform {
     let waitedSec = 0;
     let rotations = 0;
     for (let attempt = 1; ; ) {
-      const last: { retryAfter?: number } = {};
+      const last: { retryAfter?: number; status?: number } = {};
       const signer = this.o.signing.current(); // остановлен — SignerStopped, обращения нет
       let failure: PlatformFailure;
       try {
@@ -107,6 +108,12 @@ export class PaoPlatform implements PaymentPlatform {
         return to(r);
       } catch (e) {
         failure = toFailure(e, key);
+        // Заголовки 2xx пришли, но ответ не разобран (не JSON, пустое тело, не по схеме, обрыв или тайм-аут при чтении
+        // тела) — HTTP-статус ответа сохраняется: «ответ не подтверждён» (Р27, fail-closed) отличается от тайм-аута и
+        // обрыва до заголовков (httpStatus 0).
+        if (failure.code === "UNKNOWN" && failure.httpStatus === 0 && last.status !== undefined && last.status >= 200 && last.status < 300) {
+          failure = new PlatformFailure("UNKNOWN", "never", null, last.status, key, "ответ ПАО не по схеме");
+        }
       }
       const rule = ruleForFailure(failure.code);
       // Отказ в допуске — остановка агента целиком (SPEC §7а, П03).
@@ -132,10 +139,22 @@ export class PaoPlatform implements PaymentPlatform {
     }
   }
 
-  /** Агент не ACTIVE по ответу платформы (EXCLUDED — 200 по РП23 п. 6.3) — остановка подписи, кто бы ни спросил. */
+  /** Агент не ACTIVE по ответу платформы (EXCLUDED — 200 по РП23 п. 6.3) или класс не BUYER (Р27; сначала статус) —
+   *  остановка подписи, кто бы ни спросил. */
   async agentSelf() {
-    const self = await this.call("GET /pao/v1/agent", {}, map.agentSelfFromPao);
+    let self: AgentSelf;
+    try {
+      self = await this.call("GET /pao/v1/agent", {}, map.agentSelfFromPao);
+    } catch (e) {
+      // Р27: ответ 2xx получен, но не по схеме — состояние агента в реестре не подтверждено: приостановка подписи
+      // до успешной повторной сверки (не бессрочно: подпись ответов Платформы до AG-06 не проверяется).
+      if (e instanceof PlatformFailure && e.code === "UNKNOWN" && e.httpStatus >= 200 && e.httpStatus < 300) {
+        this.o.signing.suspend("AGENT_SELF_UNKNOWN");
+      }
+      throw e;
+    }
     if (self.status !== "ACTIVE") this.o.signing.stop(`AGENT_${self.status}`);
+    else if (self.agentClass !== "BUYER") this.o.signing.stop("AGENT_CLASS_MISMATCH", self.agentClass);
     return self;
   }
 

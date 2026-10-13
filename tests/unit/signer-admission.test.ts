@@ -2,7 +2,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { chmodSync, copyFileSync, existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { SignerKeyRejected, SignerStopped, generateKey, listKeys } from "../../src/agent/signer/index.js";
+import { SignerKeyRejected, SignerStopped, SignerSuspended, generateKey, listKeys } from "../../src/agent/signer/index.js";
 import { markKey, readMeta, writeMeta } from "../../src/agent/signer/keystore.js";
 import { PlatformFailure } from "../../src/shared/domain.js";
 import { CREDENTIALS, DRAFT, coreOn } from "../support/core.js";
@@ -335,6 +335,120 @@ describe("после допуска", () => {
     stand.status = "EXCLUDED";
     await expect(core.platform.agentSelf()).resolves.toMatchObject({ status: "EXCLUDED" });
     expect(journal.entries.at(-1)).toMatchObject({ kind: "agent.stopped", reason: "AGENT_EXCLUDED" });
+    await expect(core.platform.issueCredential(DRAFT, { idempotencyKey: "i1" })).rejects.toThrow(SignerStopped);
+    expect(stand.calls(OP)).toHaveLength(0);
+  });
+
+  // Р27: стадия 0 подтверждает статус ACTIVE и класс BUYER; AGENT_CLASS_MISMATCH — причина остановки ядра, не код ПАО.
+  it("класс в реестре не BUYER при допуске — остановка AGENT_CLASS_MISMATCH, класс в журнале, без повтора", async () => {
+    stand = new PaoStand({ handlers: CREDENTIALS });
+    stand.agentClass = "SELLER";
+    const { core, journal } = await coreOn(stand);
+    await expect(core.start()).rejects.toMatchObject({ reason: "AGENT_CLASS_MISMATCH" });
+    expect(stand.stub.calls.map((c) => c.op)).toEqual(["GET /pao/v1/agent"]);
+    expect(journal.entries.filter((e) => e.kind === "agent.stopped")).toEqual([
+      expect.objectContaining({ reason: "AGENT_CLASS_MISMATCH", detail: "SELLER" }),
+    ]);
+    await expect(core.platform.issueCredential(DRAFT, { idempotencyKey: "i1" })).rejects.toThrow(SignerStopped);
+    await expect(core.start()).rejects.toThrow(SignerStopped);
+    expect(stand.stub.calls).toHaveLength(1);
+  });
+
+  it("порядок: сначала статус, затем класс — SUSPENDED и SELLER дают AGENT_SUSPENDED", async () => {
+    stand = new PaoStand();
+    stand.status = "SUSPENDED";
+    stand.agentClass = "SELLER";
+    const { core, journal } = await coreOn(stand);
+    await expect(core.start()).rejects.toMatchObject({ reason: "AGENT_SUSPENDED" });
+    // причину в журнал пишет первым адаптер — порядок «статус → класс» проверяется и там
+    expect(journal.entries.filter((e) => e.kind === "agent.stopped")).toEqual([expect.objectContaining({ reason: "AGENT_SUSPENDED" })]);
+  });
+
+  it("порядок в адаптере на прямом запросе после допуска: SUSPENDED и SELLER — AGENT_SUSPENDED", async () => {
+    stand = new PaoStand({ handlers: CREDENTIALS });
+    const { core, journal } = await coreOn(stand);
+    await core.start();
+    stand.status = "SUSPENDED";
+    stand.agentClass = "SELLER";
+    await core.platform.agentSelf();
+    expect(journal.entries.filter((e) => e.kind === "agent.stopped")).toEqual([expect.objectContaining({ reason: "AGENT_SUSPENDED" })]);
+  });
+
+  it("нет class в ответе реестра при допуске — UNKNOWN, допуск не состоялся, подписи нет; повтор допуска возможен", async () => {
+    stand = new PaoStand({ handlers: CREDENTIALS });
+    stand.agentClass = undefined;
+    const { core, journal } = await coreOn(stand);
+    await expect(core.start()).rejects.toMatchObject({ code: "UNKNOWN" });
+    await expect(core.platform.issueCredential(DRAFT, { idempotencyKey: "i1" })).rejects.toThrow(SignerStopped);
+    expect(stand.calls(OP)).toHaveLength(0);
+    expect(journal.entries.map((e) => e.kind)).not.toContain("signing.suspended");
+    stand.agentClass = "BUYER";
+    await expect(core.start()).resolves.toMatchObject({ agentClass: "BUYER" });
+  });
+
+  // Р27 (уточнение): после допуска ответ не по схеме — приостановка до успешной повторной сверки, не бессрочная остановка.
+  it.each([
+    ["нет class", (s: PaoStand) => (s.agentClass = undefined)],
+    ["класс вне перечня", (s: PaoStand) => (s.agentClass = "ADMIN")],
+    ["статус вне перечня", (s: PaoStand) => (s.status = "BLOCKED" as "ACTIVE")],
+  ])("после допуска: %s — подпись приостановлена; корректная сверка — возобновлена", async (_n, garble) => {
+    stand = new PaoStand({ handlers: CREDENTIALS });
+    const { core, journal } = await coreOn(stand);
+    await core.start();
+    garble(stand);
+    await expect(core.platform.agentSelf()).rejects.toMatchObject({ code: "UNKNOWN" });
+    await expect(core.platform.issueCredential(DRAFT, { idempotencyKey: "i1" })).rejects.toThrow(SignerSuspended);
+    expect(stand.calls(OP)).toHaveLength(0);
+    expect(journal.entries.filter((e) => e.kind === "signing.suspended")).toEqual([
+      expect.objectContaining({ reason: "AGENT_SELF_UNKNOWN" }),
+    ]);
+    // повторная сверка, пока ответ не по схеме, — приостановка остаётся
+    await expect(core.recheck()).rejects.toMatchObject({ code: "UNKNOWN" });
+    await expect(core.platform.issueCredential(DRAFT, { idempotencyKey: "i1" })).rejects.toThrow(SignerSuspended);
+    expect(journal.entries.filter((e) => e.kind === "signing.suspended")).toHaveLength(1);
+    // ответ снова по схеме: ACTIVE и BUYER — подпись возобновлена
+    stand.agentClass = "BUYER";
+    stand.status = "ACTIVE";
+    await expect(core.recheck()).resolves.toMatchObject({ status: "ACTIVE", agentClass: "BUYER" });
+    await expect(core.platform.issueCredential(DRAFT, { idempotencyKey: "i1" })).resolves.toMatchObject({ status: "ISSUED" });
+    expect(journal.entries.map((e) => e.kind)).toContain("signing.resumed");
+    expect(journal.entries.map((e) => e.kind)).not.toContain("agent.stopped");
+  });
+
+  it("приостановка, затем сверка показала SELLER — бессрочная остановка AGENT_CLASS_MISMATCH", async () => {
+    stand = new PaoStand({ handlers: CREDENTIALS });
+    const { core, journal } = await coreOn(stand);
+    await core.start();
+    stand.agentClass = undefined;
+    await expect(core.platform.agentSelf()).rejects.toMatchObject({ code: "UNKNOWN" });
+    stand.agentClass = "SELLER";
+    await expect(core.recheck()).rejects.toMatchObject({ reason: "AGENT_CLASS_MISMATCH" });
+    expect(journal.entries.filter((e) => e.kind === "agent.stopped")).toEqual([
+      expect.objectContaining({ reason: "AGENT_CLASS_MISMATCH", detail: "SELLER" }),
+    ]);
+    stand.agentClass = "BUYER";
+    await expect(core.recheck()).rejects.toThrow(SignerStopped);
+    await expect(core.platform.issueCredential(DRAFT, { idempotencyKey: "i1" })).rejects.toThrow(SignerStopped);
+    expect(stand.calls(OP)).toHaveLength(0);
+  });
+
+  it("сбой связи (503) после допуска — не приостановка: подпись продолжается", async () => {
+    stand = new PaoStand({ handlers: CREDENTIALS });
+    const { core, journal } = await coreOn(stand);
+    await core.start();
+    stand.stub.fail("GET /pao/v1/agent", { code: "UPSTREAM_UNAVAILABLE" }, core.params.pao_max_attempts);
+    await expect(core.platform.agentSelf()).rejects.toMatchObject({ code: "UPSTREAM_UNAVAILABLE" });
+    expect(journal.entries.map((e) => e.kind)).not.toContain("signing.suspended");
+    await expect(core.platform.issueCredential(DRAFT, { idempotencyKey: "i1" })).resolves.toMatchObject({ status: "ISSUED" });
+  });
+
+  it("класс сменился после допуска — сверка останавливает подпись", async () => {
+    stand = new PaoStand({ handlers: CREDENTIALS });
+    const { core, journal } = await coreOn(stand);
+    await core.start();
+    stand.agentClass = "SERVICE";
+    await expect(core.platform.agentSelf()).resolves.toMatchObject({ agentClass: "SERVICE" });
+    expect(journal.entries.at(-1)).toEqual(expect.objectContaining({ kind: "agent.stopped", reason: "AGENT_CLASS_MISMATCH", detail: "SERVICE" }));
     await expect(core.platform.issueCredential(DRAFT, { idempotencyKey: "i1" })).rejects.toThrow(SignerStopped);
     expect(stand.calls(OP)).toHaveLength(0);
   });

@@ -147,8 +147,13 @@ export interface AgentKey {
   status: "ACTIVE" | "REVOKED" | "EXPIRED";
 }
 
-/** Сведения платформы об агенте: статус и ключи (GET /pao/v1/agent). */
+/** Класс агента в реестре (ПАО AgentSelf.class); ядро допускается только как BUYER (Р27). */
+export type AgentClass = "BUYER" | "SELLER" | "SURFACE" | "SERVICE";
+
+/** Сведения платформы об агенте: статус, класс и ключи (GET /pao/v1/agent). */
 export interface AgentSelf extends AgentStatus {
+  /** в ПАО 1.2.0 поле необязательно; для ядра обязательно — нет поля или значение вне перечня → UNKNOWN (Р27) */
+  agentClass: AgentClass;
   keys: AgentKey[];
 }
 

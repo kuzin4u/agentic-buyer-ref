@@ -14,9 +14,13 @@ export interface AgentCore {
   capabilities: PlatformCapabilities;
   journal: Journal;
   /** Стадия 0: ключи из хранилища и сверка с реестром платформы; до успеха никакие обращения, кроме допуска, не подписываются.
-   *  Исходы отказа: SignerStopped (EXCLUDED, SUSPENDED по ответу, нет ключа) или PlatformFailure (AGENT_UNKNOWN,
-   *  AGENT_SUSPENDED кодом) — в обоих случаях подпись остановлена; прочие сбои (503, тайм-аут) — допуск можно повторить. */
+   *  Исходы отказа: SignerStopped (EXCLUDED, SUSPENDED по ответу, класс не BUYER — Р27, нет ключа) или PlatformFailure (AGENT_UNKNOWN,
+   *  AGENT_SUSPENDED кодом) — в обоих случаях подпись остановлена; прочие сбои (503, тайм-аут, ответ не по схеме —
+   *  UNKNOWN, Р27) — допуск можно повторить. */
   start(): Promise<AgentSelf>;
+  /** Повторная сверка с реестром (Р27): снимает приостановку подписи при ACTIVE и BUYER; не ACTIVE или не BUYER — остановка;
+   *  ответ снова не по схеме или сбой — приостановка остаётся. Расписание сверок — за вызывающим (AG-12). */
+  recheck(): Promise<AgentSelf>;
   /** плановая ротация ключа, если до valid_to (по данным платформы) осталось не больше key_overlap_days */
   maintainKeys(): Promise<void>;
   /** освободить каталог ключей (один процесс на каталог) */
@@ -45,6 +49,7 @@ export function createAgentCore(o: AgentCoreOptions): AgentCore {
     capabilities: platform.capabilities(),
     journal,
     start: () => ring.start((signing) => new PaoPlatform({ ...o.pao, params, signing }).agentSelf()),
+    recheck: () => ring.recheck((signing) => new PaoPlatform({ ...o.pao, params, signing }).agentSelf()),
     maintainKeys: () => ring.maintain(platform),
     close: () => ring.close(),
   };

@@ -3,7 +3,8 @@
 //  1) статус EXCLUDED (PaoStubAgent.status — только ACTIVE | SUSPENDED): GET /pao/v1/agent — 200, status EXCLUDED;
 //     прочие методы — 403 AGENT_SUSPENDED (РП23 п. 6.3 Платформы);
 //  2) сроки ключей в GET /pao/v1/agent (заглушка не отдаёт valid_from / valid_to);
-//  3) POST /pao/v1/agent/keys по РП23: новый ключ на key_ttl_days, сроки прежних ACTIVE сокращаются до now + key_overlap_days.
+//  3) POST /pao/v1/agent/keys по РП23: новый ключ на key_ttl_days, сроки прежних ACTIVE сокращаются до now + key_overlap_days;
+//  4) класс агента в GET /pao/v1/agent (заглушка не отдаёт class; Р27, просьба в CO-1).
 // Подпись, nonce, окно времени, Idempotency-Key и схемы проверяет сама заглушка.
 import { createHash, createPublicKey } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -39,6 +40,8 @@ export class PaoStand {
   readonly dir = mkdtempSync(join(tmpdir(), "buyref-keys-"));
   readonly descriptors: SignerDescriptor[] = [];
   status: "ACTIVE" | "SUSPENDED" | "EXCLUDED" = "ACTIVE";
+  /** класс в реестре (эмуляция, см. шапку); undefined — поле не отдаётся */
+  agentClass: string | undefined = "BUYER";
   clock = new Date("2026-10-12T09:00:00Z");
   readonly stub: PaoStub;
   private readonly agent: PaoStubAgent = { agentCode: AGENT, status: "ACTIVE", keys: [] };
@@ -69,6 +72,8 @@ export class PaoStand {
           body: {
             agent_code: AGENT,
             status: this.status,
+            // приведение — чтобы тест мог отдать и значение вне перечня ПАО (ожидается UNKNOWN у адаптера)
+            ...(this.agentClass !== undefined && { class: this.agentClass as "BUYER" }),
             keys: this.agent.keys.map((k) => ({ kid: k.kid, alg: k.alg, public_key: k.publicKey, status: k.status, ...this.dates.get(k.kid)! })),
           },
         }),

@@ -3,11 +3,16 @@
 import type { Signer } from "@kuzin4u/agentic-core";
 
 export interface RequestSigning {
-  /** Подписант действующего ключа; агент остановлен или не допущен — SignerStopped. */
+  /** Подписант действующего ключа; агент остановлен или не допущен — SignerStopped; подпись приостановлена (Р27) —
+   *  SignerSuspended. */
   current(): Signer;
   /** Платформа ответила AGENT_KEY_REVOKED на подпись kid: следующий действующий ключ или остановка
    *  (SignerStopped, исходный отказ — в cause). */
   keyRevoked(kid: string, failure?: unknown): Signer;
-  /** Отказ в допуске или нет действующего ключа: остановка агента; дальнейшая подпись — SignerStopped. */
-  stop(reason: string): void;
+  /** Отказ в допуске или нет действующего ключа: остановка агента; дальнейшая подпись — SignerStopped.
+   *  detail — уточнение для журнала, только значение перечня ПАО (класс при AGENT_CLASS_MISMATCH, Р27). */
+  stop(reason: string, detail?: string): void;
+  /** Ответ реестра не по схеме после допуска (Р27): подпись приостановлена до успешной повторной сверки; до допуска —
+   *  без действия (допуск и так не состоялся). */
+  suspend(reason: string): void;
 }

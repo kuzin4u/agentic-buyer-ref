@@ -1,5 +1,5 @@
 // Точка сверки С0 (Р24, вариант А): подпись агента принимается настоящей Платформой — стенд agentic-ps-platform
-// v0.1.1 (РП25: среда dev в процессе теста, контур ключей sandbox; не песочница, без mTLS — РП27, PS-05).
+// v0.2.0 (РП25: среда dev в процессе теста, контур ключей sandbox; не песочница, без mTLS — РП27, PS-05).
 // Только GET /pao/v1/agent: регистрация ключа по HTTP — PS-05, ротация до неё — на PaoStub (tests/unit/signer-*.ts).
 // П01 в профиле contour (Р23) против кода Платформы; Т1, A2 п. 3–5, SPEC §7а.
 import { mkdtempSync, rmSync } from "node:fs";
@@ -88,7 +88,7 @@ async function coreAt(s: Stand, dir: string) {
   return { core, journal };
 }
 
-describe("С0 — подпись агента принимается Платформой (agentic-ps-platform v0.1.1)", () => {
+describe("С0 — подпись агента принимается Платформой (agentic-ps-platform v0.2.0)", () => {
   it("П01: допуск своим public_key; подписанный GET /pao/v1/agent — 200, ACTIVE, kid совпадает с вычисленным агентом", async () => {
     const { s, calls } = await platform();
     const dir = keysDir();

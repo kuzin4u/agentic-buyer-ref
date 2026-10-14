@@ -29,7 +29,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { signRequest } from "@kuzin4u/agentic-core";
-import { AGENT_FIXTURES, agentApplication } from "agentic-ps-platform/fixtures";
+import { AGENT_FIXTURES, MERCHANT_FIXTURES, agentApplication, type MerchantFixture, type ShopBehaviour } from "agentic-ps-platform/fixtures";
 import { createMerchants, createStand, type MerchantsStand, type Stand } from "agentic-ps-platform/stand";
 import { PaoPlatform } from "../../src/agent/adapters/pao/index.js";
 import { MemoryJournal } from "../../src/agent/journal/index.js";
@@ -50,7 +50,7 @@ export interface ContourOptions {
 /** Запись журнала обращений: без тел (инвариант 1). */
 export interface ContourCall {
   target: "pao" | "merchants";
-  /** "GET /v1/shops/SHOP-1042/catalog" — путь без query; для PaoStub — ключ операции */
+  /** "GET /v1/shops/<id>/catalog" — путь без query; для PaoStub — ключ операции */
   route: string;
   status: number;
   /** код отказа из поля code ответа */
@@ -144,6 +144,14 @@ function agent(o: { dir: string; baseUrl: string; agentCode: string; params: Sta
     platform,
     start: () => ring.start((signing) => new PaoPlatform({ ...pao, signing }).agentSelf()),
   };
+}
+
+/** Витрина эмулятора по поведению — только из MERCHANT_FIXTURES (Р26 п. 3, К1.2): тесты не пишут id, merchant_id и sku
+ *  витрин литералами, чтобы смена фикстур в эмуляторе не расходилась с тестами молча. */
+export function shopBy(behaviour: ShopBehaviour): MerchantFixture {
+  const found = MERCHANT_FIXTURES.filter((f) => f.behaviour === behaviour);
+  if (found.length !== 1) throw new Error(`в MERCHANT_FIXTURES витрин с поведением ${behaviour}: ${found.length}, ждали одну`);
+  return found[0]!;
 }
 
 export async function createContour(o: ContourOptions): Promise<Contour> {

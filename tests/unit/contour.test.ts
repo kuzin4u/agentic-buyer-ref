@@ -4,10 +4,9 @@ import { spawnSync } from "node:child_process";
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { MERCHANT_FIXTURES } from "agentic-ps-platform/fixtures";
 import { afterEach, describe, expect, it } from "vitest";
 import { SignerStopped, listKeys } from "../../src/agent/signer/index.js";
-import { createContour, type Contour, type ContourCall } from "../support/contour.js";
+import { createContour, shopBy, type Contour, type ContourCall } from "../support/contour.js";
 
 const open: Contour[] = [];
 const dirs: string[] = [];
@@ -23,11 +22,7 @@ async function contour(pao: "stub" | "stand"): Promise<Contour> {
 }
 
 const SELF = "GET /pao/v1/agent";
-const NORMAL = (() => {
-  const f = MERCHANT_FIXTURES.find((x) => x.behaviour === "NORMAL");
-  if (!f) throw new Error("в MERCHANT_FIXTURES нет витрины NORMAL");
-  return f;
-})();
+const NORMAL = shopBy("NORMAL");
 /** Мандат корзины выдуман: только для проверки обёртки — эмулятор его не сверяет. В сценариях — CART из ПАО (AG-11). */
 const CART = "m_cart_1";
 const FIELDS = new Set<keyof ContourCall>(["target", "route", "status", "code", "kid", "nonce", "idempotencyKey"]);

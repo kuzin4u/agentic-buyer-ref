@@ -49,7 +49,8 @@ function options(root: string, p: Project): ts.CompilerOptions {
 
 function facts(p: Project, file: string, opts: ts.CompilerOptions): FileFacts {
   const text = p.read(file) ?? "";
-  const sf = ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  // .tsx — разбор с JSX: иначе import("…") внутри JSX разобрался бы неверно (ревью К2.1 № 3)
+  const sf = ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true, file.endsWith(".tsx") ? ts.ScriptKind.TSX : ts.ScriptKind.TS);
   const host: ts.ModuleResolutionHost = {
     fileExists: (f) => p.exists(f) || ts.sys.fileExists(f),
     readFile: (f) => p.read(f) ?? ts.sys.readFile(f),

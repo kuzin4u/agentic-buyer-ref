@@ -200,6 +200,20 @@ describe("граф импортов src (Р24)", { timeout: 60_000 }, () => {
     expect(SOURCE_FILE.test("src/agent/pipeline/k.js")).toBe(false);
     expect(SOURCE_FILE.test("src/agent/pipeline/k.d.ts")).toBe(false);
     expect(SOURCE_FILE.test("src/agent/pipeline/k.mts")).toBe(true);
+    for (const ext of [".ts", ".mts", ".cts", ".tsx"]) expect(SOURCE_FILE.test(`src/agent/pipeline/k${ext}`), ext).toBe(true);
+  });
+
+  it("маски: .cts и .tsx проверяются как .ts; compose.mts — не место сборки (ревью 3c № 7, AG-04 К2.1)", () => {
+    const v = importGraphViolations(
+      virtual({
+        "src/agent/journal/k.cts": 'import { generateKeyPairSync } from "node:crypto";\nexport const k = generateKeyPairSync;\n',
+        "src/agent/journal/s.tsx": 'import { createStand } from "agentic-ps-platform/stand";\nexport const s = createStand;\n',
+        "src/agent/compose.mts": 'import { generateKeyPairSync } from "node:crypto";\nexport const k = generateKeyPairSync;\n',
+      }),
+    );
+    expect(v).toContain("src/agent/journal/k.cts:1 ключевой API node:crypto.generateKeyPairSync");
+    expect(v.some((x) => x.startsWith("src/agent/journal/s.tsx: стенд Платформы"))).toBe(true);
+    expect(v).toContain("src/agent/compose.mts:1 ключевой API node:crypto.generateKeyPairSync");
   });
 
   it("нелитеральный import() и require() — нарушение", () => {

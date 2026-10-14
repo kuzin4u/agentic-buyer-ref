@@ -77,11 +77,39 @@ beforeAll(async () => {
 
 describe("границы модулей в ESLint", { timeout: 60_000 }, () => {
   it("весь src/ проходит границы", async () => {
-    const results = await eslint.lintFiles(["src/**/*.ts"]);
+    // все расширения исходников — как маска SRC в eslint.config.js и SOURCE_FILE графа (ревью 3c № 7, AG-04 К2.1)
+    const results = await eslint.lintFiles(["src/**/*.{ts,mts,cts,tsx}"]);
     const bad = results.flatMap((r) =>
       r.messages.filter((m) => BOUNDARY.has(m.ruleId ?? "")).map((m) => `${r.filePath}:${m.line} ${m.message}`),
     );
     expect(bad).toEqual([]);
+  });
+
+  // Маски границ — все расширения исходников TypeScript (ревью 3c № 7, AG-04 К2.1): файл .mts/.cts/.tsx вне маски
+  // получил бы только общие правила typescript-eslint, без границ.
+  const EXTS = [".ts", ".mts", ".cts", ".tsx"];
+  const ZONES: [string, string][] = [
+    ["ядро", "src/agent/policy/probe"],
+    ["shared", "src/shared/probe"],
+    ["signer", "src/agent/signer/probe"],
+    ["адаптер pao", "src/agent/adapters/pao/probe"],
+    ["прочий адаптер", "src/agent/adapters/nsvr/probe"],
+  ];
+  const STAND_IMPORT = 'import { createStand } from "agentic-ps-platform/stand";\nexport const s = createStand;\n';
+  const KEY_API = 'import { generateKeyPairSync } from "node:crypto";\nexport const k = generateKeyPairSync;\n';
+  describe.each(EXTS)("маски границ: %s", (ext) => {
+    it.each(ZONES)("%s — границы действуют", async (zone, base) => {
+      const file = base + ext;
+      const config = (await eslint.calculateConfigForFile(file)) as { rules?: Record<string, unknown> } | undefined;
+      expect(config?.rules?.["no-restricted-imports"], file).toBeDefined();
+      expect(await violations(file, STAND_IMPORT), file).toContainEqual(expect.stringContaining("стенд Платформы"));
+      if (zone !== "signer") expect(await violations(file, KEY_API), file).not.toEqual([]);
+    });
+    it("место сборки — только compose.ts, без двойников по расширению", async () => {
+      if (ext === ".ts") return;
+      // compose.mts и т. п. — обычный модуль ядра: импорт signer запрещён
+      expect(await violations(`src/agent/compose${ext}`, 'import { KeyRing } from "./signer/index.js";\nexport const K = KeyRing;\n')).not.toEqual([]);
+    });
   });
 
   describe.each([...NON_ADAPTER.map((d): [string, string] => [d, `src/agent/${d}/probe.ts`]), ["shared", "src/shared/probe.ts"]])(
@@ -119,6 +147,11 @@ describe("границы модулей в ESLint", { timeout: 60_000 }, () => {
     "import() в другом регистре": 'export const s = () => import("Agentic-PS-Platform/stand");\n',
     "тип через import() в другом регистре": 'export type S = import("AGENTIC-PS-PLATFORM/stand").Stand;\n',
     "статический импорт в другом регистре": 'import { createStand } from "Agentic-Ps-Platform/stand";\nexport const s = createStand;\n',
+    // фикстуры и корень пакета — тоже стенд (AG-04 К1.3, Р26 п. 3)
+    "фикстуры": 'import { MERCHANT_FIXTURES } from "agentic-ps-platform/fixtures";\nexport const f = MERCHANT_FIXTURES;\n',
+    "тип фикстур": 'import type { MerchantFixture } from "agentic-ps-platform/fixtures";\nexport type F = MerchantFixture;\n',
+    "import() фикстур": 'export const f = () => import("agentic-ps-platform/fixtures");\n',
+    "корень пакета": 'export * from "agentic-ps-platform";\n',
   };
   const STAND_FILES = [
     "src/agent/compose.ts",
@@ -132,6 +165,18 @@ describe("границы модулей в ESLint", { timeout: 60_000 }, () => {
   it.each(Object.entries(STAND_USES))("стенд Платформы в src — нарушение Р24: %s", async (_name, code) => {
     for (const file of STAND_FILES) {
       expect(await violations(file, code), file).toContainEqual(expect.stringContaining("стенд Платформы"));
+    }
+  });
+
+  // Тестовый контур (tests/support) — не для src, включая место сборки (AG-04 К1.3)
+  const SUPPORT_USES: Record<string, string> = {
+    "статический импорт контура": 'import { createContour } from "../../../tests/support/contour.js";\nexport const c = createContour;\n',
+    "тип контура": 'import type { Contour } from "../../../tests/support/contour.js";\nexport type C = Contour;\n',
+    "import() контура": 'export const c = () => import("../../../tests/support/contour.js");\n',
+  };
+  it.each(Object.entries(SUPPORT_USES))("тестовый контур в src — нарушение: %s", async (_name, code) => {
+    for (const file of STAND_FILES) {
+      expect(await violations(file, code), file).not.toEqual([]);
     }
   });
 

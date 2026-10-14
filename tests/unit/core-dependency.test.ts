@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { PAO_ERRORS, PAO_VERSION } from "@kuzin4u/agentic-core/pao";
 
 // Каркас ядра (AG-01): зависимость от agentic-core v0.2.2 и структура src по CLAUDE.md.
@@ -64,5 +64,16 @@ describe("структура ядра", () => {
   ];
   it.each(dirs)("%s на месте", (d) => {
     expect(existsSync(`${d}/index.ts`)).toBe(true);
+  });
+
+  // Зона src/contour/ снята (Р26 агента п. 4; ревью 3c № 14, AG-04 К2.2): тестовый контур — только в tests/support/.
+  // Каталог не возвращается ни кодом, ни правилами границ, ни деревом CLAUDE.md, ни указаниями reviewer.
+  it("src/contour/ нет — ни каталога, ни упоминаний в границах, CLAUDE.md и reviewer", () => {
+    // без учёта регистра: на Linux (CI) src/Contour — другой каталог, на macOS — тот же (ревью К2.2 № 5)
+    expect(readdirSync("src").filter((d) => d.toLowerCase() === "contour")).toEqual([]);
+    for (const f of ["eslint.config.js", "config/boundaries.json", "tests/support/import-graph.ts", "CLAUDE.md", ".claude/agents/reviewer.md"]) {
+      const text = readFileSync(f, "utf8");
+      expect(text, f).not.toMatch(/src\/contour|^\s*contour\/\s/m);
+    }
   });
 });

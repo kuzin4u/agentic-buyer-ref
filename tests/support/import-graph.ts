@@ -18,6 +18,7 @@ type Zone = "compose" | "signer" | "pao-adapter" | "adapter" | "rest";
 
 const PAO_TYPES = "@kuzin4u/agentic-core/pao";
 const CORE = "@kuzin4u/agentic-core";
+const STAND = /^agentic-ps-platform(\/|$)/i;
 const KEY_API = new Set(boundaries.cryptoKeyApis);
 /** Из node:crypto вне signer — только эти имена (список разрешённого) */
 const CRYPTO_ALLOWED = new Set(boundaries.cryptoAllowedOutsideSigner);
@@ -48,7 +49,8 @@ function options(root: string, p: Project): ts.CompilerOptions {
 
 function facts(p: Project, file: string, opts: ts.CompilerOptions): FileFacts {
   const text = p.read(file) ?? "";
-  const sf = ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  // .tsx — разбор с JSX: иначе import("…") внутри JSX разобрался бы неверно (ревью К2.1 № 3)
+  const sf = ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true, file.endsWith(".tsx") ? ts.ScriptKind.TSX : ts.ScriptKind.TS);
   const host: ts.ModuleResolutionHost = {
     fileExists: (f) => p.exists(f) || ts.sys.fileExists(f),
     readFile: (f) => p.read(f) ?? ts.sys.readFile(f),
@@ -61,6 +63,9 @@ function facts(p: Project, file: string, opts: ts.CompilerOptions): FileFacts {
   const edge = (spec: string) => {
     const r = ts.resolveModuleName(spec, file, opts, host).resolvedModule;
     const relative = spec.startsWith(".") || spec.startsWith("/");
+    // Стенд и фикстуры Платформы — dev-зависимость тестового контура (tests/support), не для src и не для места сборки
+    // (Р24, Р26 п. 3; AG-04 К1.3). Спецификатор — без учёта регистра: так же, как правило ESLint.
+    if (STAND.test(spec)) out.problems.push(`${file.slice(p.root.length + 1)}: стенд Платформы «${spec}» — только tests/support (Р24, Р26)`);
     if (spec.startsWith("#")) out.problems.push(`${file.slice(p.root.length + 1)}: псевдоним «${spec}» (subpath imports) — обход проверки по спецификатору`);
     // Ребро в объявление .d.ts внутри src: реализация (.js) рядом не проверяется (ревью 3c, повтор 3 № 1)
     if (r && r.resolvedFileName.startsWith(`${p.root}/src/`) && /\.d\.[mc]?ts$/.test(r.resolvedFileName)) {

@@ -119,6 +119,11 @@ describe("границы модулей в ESLint", { timeout: 60_000 }, () => {
     "import() в другом регистре": 'export const s = () => import("Agentic-PS-Platform/stand");\n',
     "тип через import() в другом регистре": 'export type S = import("AGENTIC-PS-PLATFORM/stand").Stand;\n',
     "статический импорт в другом регистре": 'import { createStand } from "Agentic-Ps-Platform/stand";\nexport const s = createStand;\n',
+    // фикстуры и корень пакета — тоже стенд (AG-04 К1.3, Р26 п. 3)
+    "фикстуры": 'import { MERCHANT_FIXTURES } from "agentic-ps-platform/fixtures";\nexport const f = MERCHANT_FIXTURES;\n',
+    "тип фикстур": 'import type { MerchantFixture } from "agentic-ps-platform/fixtures";\nexport type F = MerchantFixture;\n',
+    "import() фикстур": 'export const f = () => import("agentic-ps-platform/fixtures");\n',
+    "корень пакета": 'export * from "agentic-ps-platform";\n',
   };
   const STAND_FILES = [
     "src/agent/compose.ts",
@@ -132,6 +137,18 @@ describe("границы модулей в ESLint", { timeout: 60_000 }, () => {
   it.each(Object.entries(STAND_USES))("стенд Платформы в src — нарушение Р24: %s", async (_name, code) => {
     for (const file of STAND_FILES) {
       expect(await violations(file, code), file).toContainEqual(expect.stringContaining("стенд Платформы"));
+    }
+  });
+
+  // Тестовый контур (tests/support) — не для src, включая место сборки (AG-04 К1.3)
+  const SUPPORT_USES: Record<string, string> = {
+    "статический импорт контура": 'import { createContour } from "../../../tests/support/contour.js";\nexport const c = createContour;\n',
+    "тип контура": 'import type { Contour } from "../../../tests/support/contour.js";\nexport type C = Contour;\n',
+    "import() контура": 'export const c = () => import("../../../tests/support/contour.js");\n',
+  };
+  it.each(Object.entries(SUPPORT_USES))("тестовый контур в src — нарушение: %s", async (_name, code) => {
+    for (const file of STAND_FILES) {
+      expect(await violations(file, code), file).not.toEqual([]);
     }
   });
 

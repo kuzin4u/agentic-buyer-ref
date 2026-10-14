@@ -115,7 +115,7 @@ describe("граф импортов src (Р24)", { timeout: 60_000 }, () => {
         "src/shared/all.ts": 'export * from "crypto";\n',
         "src/shared/core.ts": 'export { newEd25519Signer } from "@kuzin4u/agentic-core";\nexport * from "@kuzin4u/agentic-core";\n',
         "src/agent/journal/a.ts": 'export const g = async () => (await import("node:crypto")).generateKeyPairSync;\n',
-        "src/agent/journal/b.ts": 'export const n = async () => (await import("@kuzin4u/agentic-core")).newEd25519Signer;\n',
+      "src/agent/journal/b.ts": 'export const n = async () => (await import("@kuzin4u/agentic-core")).newEd25519Signer;\n',
         "src/agent/policy/m.ts": 'import m from "node:module";\nexport const r = m.createRequire(import.meta.url);\n',
         "src/agent/signer/ok.ts": 'export { sign } from "node:crypto";\nexport const g = async () => (await import("node:crypto")).generateKeyPairSync;\n',
       }),
@@ -136,7 +136,7 @@ describe("граф импортов src (Р24)", { timeout: 60_000 }, () => {
         "src/shared/a.ts": 'export { default as c } from "node:crypto";\n',
         "src/shared/b.ts": 'import * as crypto from "node:crypto";\nexport { crypto };\n',
         "src/shared/c.ts": 'import crypto from "node:crypto";\nexport default crypto;\n',
-        "src/shared/d.ts": "export const w = crypto;\nexport const s = crypto.subtle;\nexport const g = globalThis.crypto;\n",
+      "src/shared/d.ts": "export const w = crypto;\nexport const s = crypto.subtle;\nexport const g = globalThis.crypto;\n",
         "src/shared/e.ts": 'export { default } from "@kuzin4u/agentic-core";\nimport * as core from "@kuzin4u/agentic-core";\nexport { core };\n',
         "src/agent/policy/f.ts": 'declare const process: { getBuiltinModule(m: string): unknown };\nexport const c = process.getBuiltinModule("node:crypto");\n',
       }),
@@ -161,6 +161,30 @@ describe("граф импортов src (Р24)", { timeout: 60_000 }, () => {
     expect(v.some((x) => x.startsWith("src/agent/journal/b.ts: импорт вне src"))).toBe(true);
     expect(v.some((x) => x.startsWith("src/agent/journal/c.ts: импорт вне src"))).toBe(true);
     expect(v).toContain("src/agent/journal/k.mts:1 ключевой API node:crypto.generateKeyPairSync");
+  });
+
+  it("стенд и фикстуры Платформы, тестовый контур — нарушение во всём src, включая место сборки (AG-04 К1.3)", () => {
+    const base = virtual({
+      "src/agent/compose.ts": 'import { createStand } from "agentic-ps-platform/stand";\nexport const s = createStand;\n',
+      "src/agent/policy/a.ts": 'import { MERCHANT_FIXTURES } from "agentic-ps-platform/fixtures";\nexport const f = MERCHANT_FIXTURES;\n',
+        "src/agent/journal/b.ts": 'export type S = import("Agentic-PS-Platform/stand").Stand;\n',
+      "src/agent/adapters/pao/c.ts": 'export const s = () => import("agentic-ps-platform/fixtures");\n',
+        "src/shared/d.ts": 'export * from "agentic-ps-platform";\n',
+      "src/agent/signer/e.ts": 'import { createContour } from "../../../tests/support/contour.js";\nexport const c = createContour;\n',
+      "src/agent/pipeline/ok.ts": "export const ok = 1;\n",
+    });
+    // контур существует вне src: путь разрешается, нарушение — «вне src», а не «неразрешённый путь»
+    const support = join(base.root, "tests/support/contour.ts");
+    const v = importGraphViolations({
+      ...base,
+      read: (p) => (p === support ? "export const createContour = 1;\n" : base.read(p)),
+      exists: (p) => p === support || base.exists(p),
+    });
+    for (const f of ["src/agent/compose.ts", "src/agent/policy/a.ts", "src/agent/journal/b.ts", "src/agent/adapters/pao/c.ts", "src/shared/d.ts"]) {
+      expect(v.some((x) => x.startsWith(`${f}: стенд Платформы`)), f).toBe(true);
+    }
+    expect(v.some((x) => x.startsWith("src/agent/signer/e.ts: импорт вне src"))).toBe(true);
+    expect(v.some((x) => x.startsWith("src/agent/pipeline/ok.ts"))).toBe(false);
   });
 
   it("JS с соседним .d.ts и псевдоним #core — нарушение (ревью 3c, повтор 3)", () => {

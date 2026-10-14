@@ -107,11 +107,14 @@ const mod = {
   dist: { re: "/agentic-core\\u002Fdist/", message: msg.dist },
   // без учёта регистра: на macOS import("Agentic-PS-Platform/stand") загружает стенд (ревью 3d № 3)
   stand: { re: "/^agentic-ps-platform/i", message: msg.stand },
+  // import() и import("…") в типах вне src — как groups.outside для статических импортов (AG-04 К1.3). С учётом регистра
+  // и только «каталог/» — как groups.outside; вторая линия, без этих ограничений, — граф (import-graph.test.ts).
+  outside: { re: "/(^|\\u002F)(tests|scripts|config)\\u002F/", message: groups.outside.message },
 };
 
 const boundary = ({ allowPao = false, allowKeys = false, patterns, modules }) => ({
   "no-restricted-imports": ["error", { paths: paths(allowPao, allowKeys), patterns: [...patterns, groups.compose, groups.dist, groups.stand, groups.outside, groups.alias] }],
-  "no-restricted-syntax": ["error", ...syntax([...modules, mod.compose, mod.dist, mod.stand, ...(allowPao ? [] : [mod.pao])], allowKeys)],
+  "no-restricted-syntax": ["error", ...syntax([...modules, mod.compose, mod.dist, mod.stand, mod.outside, ...(allowPao ? [] : [mod.pao])], allowKeys)],
 });
 
 export default tseslint.config(

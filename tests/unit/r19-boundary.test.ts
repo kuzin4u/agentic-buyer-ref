@@ -1,5 +1,8 @@
 import { beforeAll, describe, it, expect } from "vitest";
 import { ESLint } from "eslint";
+import { readdirSync, readFileSync } from "node:fs";
+import ts from "typescript";
+import { SOURCE_FILE } from "../support/import-graph.js";
 
 // Границы модулей в ESLint (Р19, инвариант 2, ревью AG-02 № 8, 10, 11, 15; ревью 3a № 6).
 // Транзитивные связи — в import-graph.test.ts (Р24).
@@ -210,5 +213,25 @@ describe("границы модулей в ESLint", { timeout: 60_000 }, () => {
     expect(await violations("src/agent/compose.ts", adapter("."))).toEqual([]);
     expect(await violations("src/agent/compose.ts", signer("."))).toEqual([]);
     expect(await violations("src/agent/compose.ts", PAO_TYPES)).not.toEqual([]);
+  });
+});
+
+// Ревью К2 № 13 (AG-05): клиент мандатов видит из портов только порт мандатов (состав AG-К5), не PaymentPlatform целиком.
+// Импорты — разбором компилятора (preProcessFile: import, export … from, import(), import type).
+describe("mandates → только ports/mandates и ports/mutation", () => {
+  const ALLOWED = [/^\.\/[\w-]+\.js$/, /^\.\.\/ports\/(mandates|mutation)\.js$/, /^\.\.\/\.\.\/shared\/[\w-]+\.js$/];
+  const files = readdirSync("src/agent/mandates").filter((f) => SOURCE_FILE.test(f));
+  it("файлы клиента найдены; подкаталогов нет (иначе проверка их бы не видела)", () => {
+    expect(files.length).toBeGreaterThan(0);
+    expect(readdirSync("src/agent/mandates", { withFileTypes: true }).filter((d) => d.isDirectory())).toEqual([]);
+  });
+  it.each(files)("src/agent/mandates/%s", (f) => {
+    const { importedFiles } = ts.preProcessFile(readFileSync(`src/agent/mandates/${f}`, "utf8"), true, true);
+    const bad = importedFiles.map((i) => i.fileName).filter((n) => !ALLOWED.some((re) => re.test(n)));
+    expect(bad).toEqual([]);
+  });
+  it("поломка: импорт payment-platform ловится", () => {
+    const { importedFiles } = ts.preProcessFile('import type { PaymentPlatform } from "../ports/payment-platform.js";', true, true);
+    expect(importedFiles.map((i) => i.fileName).filter((n) => !ALLOWED.some((re) => re.test(n)))).toEqual(["../ports/payment-platform.js"]);
   });
 });

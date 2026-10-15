@@ -6,12 +6,15 @@ import type { AgentSelf } from "../shared/domain.js";
 import type { PaymentPlatform, PlatformCapabilities } from "./ports/payment-platform.js";
 import { PaoPlatform, type PaoPlatformOptions } from "./adapters/pao/index.js";
 import { MemoryJournal, type Journal } from "./journal/index.js";
+import { MandateClient } from "./mandates/index.js";
 import { KeyRing } from "./signer/index.js";
 
 export interface AgentCore {
   params: StandParams;
   platform: PaymentPlatform;
   capabilities: PlatformCapabilities;
+  /** клиент мандатов на порту мандатов той же платформы */
+  mandates: MandateClient;
   journal: Journal;
   /** Стадия 0: ключи из хранилища и сверка с реестром платформы; до успеха никакие обращения, кроме допуска, не подписываются.
    *  Исходы отказа: SignerStopped (EXCLUDED, SUSPENDED по ответу, класс не BUYER — Р27, нет ключа) или PlatformFailure (AGENT_UNKNOWN,
@@ -47,6 +50,7 @@ export function createAgentCore(o: AgentCoreOptions): AgentCore {
     params,
     platform,
     capabilities: platform.capabilities(),
+    mandates: new MandateClient({ port: platform, params, ...(o.now && { now: o.now }) }),
     journal,
     start: () => ring.start((signing) => new PaoPlatform({ ...o.pao, params, signing }).agentSelf()),
     recheck: () => ring.recheck((signing) => new PaoPlatform({ ...o.pao, params, signing }).agentSelf()),

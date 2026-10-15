@@ -6,11 +6,10 @@ import type { PaoStubOptions } from "@kuzin4u/agentic-core/pao";
 import { AGENT, type PaoStand } from "./pao-stand.js";
 
 export const DRAFT: CredentialDraft = {
-  mandateId: "m_1",
+  mandate: { id: "m_1", currency: "RUB" },
   orderRef: "ord_1",
   merchantId: "shop_1",
-  amountMax: 250000,
-  currency: "RUB",
+  amountMax: { amount: 250000, currency: "RUB" },
   channel: "CARD",
 };
 

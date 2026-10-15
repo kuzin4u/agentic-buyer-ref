@@ -73,7 +73,12 @@
       "expected": "201; карточка ключевых параметров показана до подписи; остаток из verify отображается",
       "codes": [],
       "norms": "A7 п. 1–3; A3 п. 3",
-      "requirements": "Т2, Т3, Т3а"
+      "requirements": "Т2, Т3, Т3а",
+      "contour": {
+        "action": "POST /pao/v1/mandates INTENT с key_terms_shown: true; подпись человека — событие mandate.signed и GET /pao/v1/mandates/{id} со статусом ACTIVE (Р29 п. 5); GET /pao/v1/mandates/{id}/verify",
+        "expected": "201 PENDING_SIGNATURE; карточка ключевых параметров показана до подписи — без неё мандат не запрашивается (Т3а); остаток и срок — из verify с as_of не старше registry_cache_ttl_sec (Т3, Р29 п. 4)",
+        "codes": []
+      }
     },
     {
       "id": "П05",
@@ -85,7 +90,12 @@
       "expected": "Агент отказывается искать от имени человека и объясняет причину; обращений к К6 от имени принципала нет",
       "codes": [],
       "norms": "A7 п. 1",
-      "requirements": "Т2"
+      "requirements": "Т2",
+      "contour": {
+        "action": "Человек просит действие от своего имени без действующего мандата (нет мандата или он не ACTIVE)",
+        "expected": "Агент отказывает и объясняет причину; после допуска — ни одного обращения к ПАО и продавцам от имени принципала",
+        "codes": []
+      }
     },
     {
       "id": "П06",
@@ -97,7 +107,12 @@
       "expected": "400; мандат не создан (недействителен)",
       "codes": [],
       "norms": "A7 п. 2.2",
-      "requirements": "Т2"
+      "requirements": "Т2",
+      "contour": {
+        "action": "Проект мандата без merchant_scope или valid_to (A7 п. 2.2)",
+        "expected": "Агент POST /pao/v1/mandates не отправляет — отказ до обращения, мандат не создан",
+        "codes": []
+      }
     },
     {
       "id": "П07",

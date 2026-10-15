@@ -7,15 +7,17 @@ import type {
   ConfirmationDraft,
   Credential,
   CredentialDraft,
+  CurrencyCode,
   Dispute,
   DisputeDraft,
-  Evidence,
   KeyDraft,
-  Mandate,
-  MandateCheck,
-  MandateDraft,
+  MandateRef,
   Operation,
 } from "../../shared/domain.js";
+import type { MandatePort } from "./mandates.js";
+import type { Mutation } from "./mutation.js";
+
+export type { Mutation };
 
 /** Заявление адаптера о возможностях и гарантиях платформы. По `guaranteeContour` ядро применяет Р3. */
 export interface PlatformCapabilities {
@@ -23,6 +25,8 @@ export interface PlatformCapabilities {
   platform: string;
   /** версия протокола, по которой работает адаптер */
   protocolVersion: string;
+  /** допустимое множество валют (Р29 п. 2); не источник валюты: валюта суммы — из мандата. Вне множества — отказ */
+  currencies: readonly CurrencyCode[];
   /** мандат проверяется платформой (verify) и подписан человеком вне агента */
   verifiableMandate: boolean;
   /** спор о полномочиях разбирается по журналу согласий */
@@ -37,31 +41,22 @@ export interface PlatformCapabilities {
   conditionalSettlement: boolean;
 }
 
-/** Ключ идемпотентности задаёт ядро: повтор — с прежним ключом (инвариант 9). */
-export interface Mutation {
-  idempotencyKey: string;
-}
-
-export interface PaymentPlatform {
+/** Порт платформы целиком; части по составу AG-К5 выделяются по мере задач (мандаты — AG-05, MandatePort). */
+export interface PaymentPlatform extends MandatePort {
   capabilities(): PlatformCapabilities;
   /** Статус агента и ключи с их сроками — сроки задаёт платформа (РП23). */
   agentSelf(): Promise<AgentSelf>;
   /** Регистрация нового ключа до перехода на него (A2 п. 5.3); платформа сокращает сроки прежних ключей сама. */
   registerKey(draft: KeyDraft, m: Mutation): Promise<AgentKey>;
 
-  requestMandate(draft: MandateDraft, m: Mutation): Promise<Mandate>;
-  getMandate(id: string): Promise<Mandate>;
-  verifyMandate(id: string): Promise<MandateCheck>;
-  relinquishMandate(id: string, m: Mutation): Promise<Mandate>;
-  mandateEvidence(id: string): Promise<Evidence>;
-
   issueCredential(draft: CredentialDraft, m: Mutation): Promise<Credential>;
 
   requestConfirmation(draft: ConfirmationDraft, m: Mutation): Promise<Confirmation>;
   getConfirmation(id: string): Promise<Confirmation>;
 
-  listOperations(mandateId: string): Promise<Operation[]>;
-  getOperation(opRef: string): Promise<Operation>;
+  /** Суммы операций — в валюте мандата ссылки; признак операции другого мандата — отказ UNKNOWN (Р29 п. 3). */
+  listOperations(ref: MandateRef): Promise<Operation[]>;
+  getOperation(opRef: string, ref: MandateRef): Promise<Operation>;
 
   openDispute(draft: DisputeDraft, m: Mutation): Promise<Dispute>;
   getDispute(id: string): Promise<Dispute>;

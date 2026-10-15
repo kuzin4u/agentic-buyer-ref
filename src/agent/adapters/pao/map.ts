@@ -1,9 +1,11 @@
 // Перевод ПАО ↔ доменные типы ядра (Р19). Неполный ответ платформы — отказ UNKNOWN (fail-closed, инвариант 4).
 // Payload реквизита (криптограмма, token_ref, привязка) отбрасывается здесь и не хранится (инвариант 1, задел к AG-11).
+// Суммы (Р29): валюта — из мандата; у сумм без поля валюты в ПАО 1.2.0 (verify, операция, подтверждение, корзина) —
+// валюта мандата ссылки. Множество валют платформы — только допустимое: вне его — отказ (исходящие) или UNKNOWN (входящие).
+import { money, type CurrencyCode, type Money } from "@kuzin4u/agentic-core";
 import type * as Pao from "@kuzin4u/agentic-core/pao";
 import {
   PlatformFailure,
-  isKopecks,
   type AgentIndicator,
   type AgentKey,
   type AgentSelf,
@@ -16,10 +18,10 @@ import {
   type Dispute,
   type DisputeDraft,
   type Evidence,
-  type Kopecks,
   type Mandate,
   type MandateCheck,
   type MandateDraft,
+  type MandateRef,
   type Operation,
   type PlatformEvent,
   type PlatformEventType,
@@ -34,18 +36,57 @@ function need<T>(v: T | null | undefined, what: string): T {
   return v;
 }
 
-function kop(v: number | null | undefined, what: string): Kopecks {
-  if (!isKopecks(v)) incomplete(`${what} — не целые копейки`);
-  return v;
+/** Допустимое множество валют платформы (Р29 п. 2): по нему проверяют, но валюту из него не берут. */
+export type Currencies = ReadonlySet<CurrencyCode>;
+
+/** Отказ до обращения: обращение не отправлено (fail-closed). */
+function refuse(detail: string): never {
+  throw new PlatformFailure("UNKNOWN", "never", null, 0, null, `обращение не отправлено: ${detail}`);
 }
 
-export function mandateDraftToPao(d: MandateDraft): Pao.MandateRequest {
+/** Валюта входящего мандата — из множества платформы, иначе UNKNOWN. */
+function allowed(c: unknown, cur: Currencies, what: string): CurrencyCode {
+  if (typeof c !== "string" || !cur.has(c)) incomplete(`${what} — валюта вне возможностей платформы`);
+  return c;
+}
+
+/** Ссылка на мандат перед обращением: валюта из множества платформы, иначе отказ до обращения. */
+export function checkRef(ref: MandateRef, cur: Currencies): MandateRef {
+  if (!cur.has(ref.currency)) refuse(`валюта мандата ${ref.currency} вне возможностей платформы`);
+  return ref;
+}
+
+/** Входящая сумма: целое число минимальных единиц ≥ 0 в валюте мандата; иначе UNKNOWN. */
+function minor(v: number | null | undefined, currency: CurrencyCode, what: string): Money {
+  try {
+    return money(v as number, currency);
+  } catch {
+    return incomplete(`${what} — не целое число минимальных единиц`);
+  }
+}
+
+/** Исходящая сумма: в валюте мандата и в множестве платформы, целое ≥ min; иначе отказ до обращения (Р29 пп. 2–3). */
+function outgoing(m: Money, currency: CurrencyCode, cur: Currencies, what: string, min = 0): number {
+  if (m.currency !== currency) refuse(`${what} — валюта ${m.currency}, у мандата ${currency}`);
+  if (!cur.has(m.currency)) refuse(`${what} — валюта ${m.currency} вне возможностей платформы`);
+  try {
+    const amount = money(m.amount, m.currency).amount;
+    if (amount < min) refuse(`${what} — меньше ${min}`);
+    return amount;
+  } catch (e) {
+    if (e instanceof PlatformFailure) throw e;
+    return refuse(`${what} — не целое число минимальных единиц`);
+  }
+}
+
+export function mandateDraftToPao(d: MandateDraft, cur: Currencies): Pao.MandateRequest {
+  const currency = d.amountLimit.currency;
   return {
     type: d.kind,
     parent_id: d.parentId,
     subject: d.subject,
-    amount_limit: d.amountLimit,
-    currency: d.currency,
+    amount_limit: outgoing(d.amountLimit, currency, cur, "amountLimit", 1), // ПАО: minimum 1
+    currency,
     valid_to: d.validTo,
     merchant_scope: d.merchantScope,
     principal_ref: d.principalRef,
@@ -54,28 +95,32 @@ export function mandateDraftToPao(d: MandateDraft): Pao.MandateRequest {
     cart: d.cart
       ? {
           merchant_id: d.cart.merchantId,
-          items: d.cart.lines.map((l) => ({ sku: l.sku, qty: l.qty, price: l.price })),
-          total: d.cart.total,
+          items: d.cart.lines.map((l, n) => ({ sku: l.sku, qty: l.qty, price: outgoing(l.price, currency, cur, `cart.lines[${n}].price`) })),
+          total: outgoing(d.cart.total, currency, cur, "cart.total"),
         }
       : null,
     settlement_mode: "DIRECT",
   };
 }
 
-function cartFromPao(c: Pao.MandateRequest["cart"]): Cart | null {
+function cartFromPao(c: Pao.MandateRequest["cart"], currency: CurrencyCode): Cart | null {
   if (!c) return null;
   return {
     merchantId: need(c.merchant_id, "cart.merchant_id"),
     lines: (c.items ?? []).map((i, n) => ({
       sku: need(i.sku, `cart.items[${n}].sku`),
       qty: need(i.qty, `cart.items[${n}].qty`),
-      price: kop(i.price, `cart.items[${n}].price`),
+      price: minor(i.price, currency, `cart.items[${n}].price`),
     })),
-    total: kop(c.total, "cart.total"),
+    total: minor(c.total, currency, "cart.total"),
   };
 }
 
-export function mandateFromPao(m: Pao.Mandate): Mandate {
+/** Мандат: валюта — из множества платформы; `agent_code` (в ПАО 1.2.0 необязателен) — если есть, только свой
+ *  (ревью К2 № 3а, «Открыто» № 17); чужой — UNKNOWN. */
+export function mandateFromPao(m: Pao.Mandate, cur: Currencies, agentCode: string): Mandate {
+  if (m.agent_code !== undefined && m.agent_code !== agentCode) incomplete("mandate.agent_code — не этот агент");
+  const currency = allowed(m.currency, cur, "mandate.currency");
   return {
     id: need(m.id, "mandate.id"),
     status: need(m.status, "mandate.status"),
@@ -83,63 +128,82 @@ export function mandateFromPao(m: Pao.Mandate): Mandate {
     kind: m.type,
     parentId: m.parent_id ?? null,
     subject: m.subject,
-    amountLimit: kop(m.amount_limit, "mandate.amount_limit"),
-    currency: m.currency,
+    amountLimit: minor(m.amount_limit, currency, "mandate.amount_limit"),
     validTo: m.valid_to,
     merchantScope: m.merchant_scope,
     principalRef: m.principal_ref,
     confirmationMode: m.mode,
     keyTermsShown: m.key_terms_shown ?? false,
-    cart: cartFromPao(m.cart),
+    cart: cartFromPao(m.cart, currency),
   };
 }
 
-export function mandateCheckFromPao(v: Pao.MandateVerify): MandateCheck {
+/** verify: в ПАО 1.2.0 у `amount_left` нет валюты — валюта мандата ссылки (Р29 п. 3). */
+export function mandateCheckFromPao(v: Pao.MandateVerify, ref: MandateRef): MandateCheck {
   return {
     outcome: v.outcome,
-    amountLeft: kop(v.amount_left, "verify.amount_left"),
+    amountLeft: minor(v.amount_left, ref.currency, "verify.amount_left"),
     validTo: v.valid_to,
     asOf: v.as_of ?? null,
   };
 }
 
-function indicatorFromPao(a: Pao.Aoi): AgentIndicator {
+/** Агентский признак — только свой: `agent_code` этого агента, `mandate_id` — мандат запроса («Открыто» № 17). */
+function indicatorFromPao(a: Pao.Aoi, agentCode: string, mandateId: string): AgentIndicator {
   if (a.indicator !== true) incomplete("aoi.indicator");
+  if (a.agent_code !== agentCode) incomplete("aoi.agent_code — не этот агент");
+  if (a.mandate_id !== mandateId) incomplete("aoi.mandate_id — не мандат запроса");
   return { agentCode: a.agent_code, mandateId: a.mandate_id };
 }
 
-export function evidenceFromPao(e: Pao.Evidence): Evidence {
+/** Выписка: валюта операции — валюта её мандата в цепочке (`aoi.mandate_id`; без признака — запрошенного мандата).
+ *  Мандата операции в цепочке нет — UNKNOWN. */
+export function evidenceFromPao(e: Pao.Evidence, mandateId: string, cur: Currencies, agentCode: string): Evidence {
+  const chain = (e.mandate_chain ?? []).map((m) => mandateFromPao(m, cur, agentCode));
+  const refOf = (o: Pao.Operation): MandateRef => {
+    const id = o.aoi?.mandate_id ?? mandateId;
+    const m = chain.find((x) => x.id === id);
+    if (!m) incomplete("evidence.operations — мандата операции нет в цепочке");
+    return { id, currency: m.amountLimit.currency };
+  };
   return {
-    mandateChain: (e.mandate_chain ?? []).map(mandateFromPao),
-    operations: (e.operations ?? []).map(operationFromPao),
+    mandateChain: chain,
+    operations: (e.operations ?? []).map((o) => operationFromPao(o, refOf(o), "list", agentCode)),
     integrity: need(e.integrity, "evidence.integrity"),
   };
 }
 
-export function credentialDraftToPao(d: CredentialDraft): Pao.CredentialRequest {
+export function credentialDraftToPao(d: CredentialDraft, cur: Currencies): Pao.CredentialRequest {
   return {
-    mandate_id: d.mandateId,
+    mandate_id: d.mandate.id,
     order_ref: d.orderRef,
     merchant_id: d.merchantId,
-    amount_max: d.amountMax,
-    currency: d.currency,
+    amount_max: outgoing(d.amountMax, d.mandate.currency, cur, "amountMax"),
+    currency: d.amountMax.currency,
     kind: d.channel,
   };
 }
 
 /** Реквизит глазами ядра: payload не переносится и не хранится (инвариант 1). */
-export function credentialFromPao(c: Pao.Credential): Credential {
+export function credentialFromPao(c: Pao.Credential, mandateId: string, agentCode: string): Credential {
   return {
     credentialRef: c.credential_ref,
     channel: c.kind,
     status: c.status,
     validTo: c.payload?.valid_to ?? null,
-    indicator: indicatorFromPao(c.aoi),
+    indicator: indicatorFromPao(c.aoi, agentCode, mandateId),
   };
 }
 
-export function confirmationDraftToPao(d: ConfirmationDraft): Pao.ConfirmationRequest {
-  return { mandate_id: d.mandateId, merchant_id: d.merchantId, amount: d.amount, summary: d.summary, channel: d.channel };
+/** Подтверждение: в ПАО 1.2.0 у `amount` нет валюты — сумма обязана быть в валюте мандата (Р29 п. 3). */
+export function confirmationDraftToPao(d: ConfirmationDraft, cur: Currencies): Pao.ConfirmationRequest {
+  return {
+    mandate_id: d.mandate.id,
+    merchant_id: d.merchantId,
+    amount: outgoing(d.amount, d.mandate.currency, cur, "amount"),
+    summary: d.summary,
+    channel: d.channel,
+  };
 }
 
 export function confirmationFromPao(c: Pao.Confirmation): Confirmation {
@@ -152,14 +216,19 @@ export function confirmationFromPao(c: Pao.Confirmation): Confirmation {
   };
 }
 
-export function operationFromPao(o: Pao.Operation): Operation {
+/** Операция: в ПАО 1.2.0 у `amount` нет валюты — валюта мандата ссылки; признак другого мандата — UNKNOWN (Р29 п. 3).
+ *  Операция без признака (причина AOI_MISSING, SPEC §7б): в списке и выписке по мандату (`list` — мандат назвала
+ *  платформа) — в валюте мандата ссылки; по одной операции (`single` — мандат назвал вызывающий) сумма не
+ *  подтверждена — `amount: null`. `indicator` — null. */
+export function operationFromPao(o: Pao.Operation, ref: MandateRef, scope: "list" | "single", agentCode: string): Operation {
+  const known = o.amount !== undefined && (o.aoi !== undefined || scope === "list");
   return {
     opRef: need(o.op_ref, "operation.op_ref"),
     orderRef: o.order_ref ?? null,
     channel: o.channel ?? null,
-    amount: o.amount === undefined ? null : kop(o.amount, "operation.amount"),
+    amount: known ? minor(o.amount, ref.currency, "operation.amount") : null,
     merchantId: o.merchant_id ?? null,
-    indicator: o.aoi ? indicatorFromPao(o.aoi) : null,
+    indicator: o.aoi ? indicatorFromPao(o.aoi, agentCode, ref.id) : null,
     status: need(o.status, "operation.status"),
     declineReason: o.reason ?? null,
   };

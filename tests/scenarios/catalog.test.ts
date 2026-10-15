@@ -78,7 +78,8 @@ describe("каталог сценариев приёмки", () => {
   it("профиль contour: поле описано полностью, коды — из x-pao-errors ПАО", () => {
     const pao = new Set(paoErrors);
     const withContour = catalog.scenarios.filter((s: { contour?: unknown }) => s.contour !== undefined);
-    expect(withContour.map((s: { id: string }) => s.id)).toEqual(["П01", "П02", "П03"]);
+    // П01–П03 — Р23, П04–П06 — Р30
+    expect(withContour.map((s: { id: string }) => s.id)).toEqual(["П01", "П02", "П03", "П04", "П05", "П06"]);
     for (const s of withContour) {
       expect(s.contour.action, `${s.id}.contour.action`).toBeTruthy();
       expect(s.contour.expected, `${s.id}.contour.expected`).toBeTruthy();

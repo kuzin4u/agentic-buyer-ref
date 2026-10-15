@@ -2,7 +2,15 @@
 // Повторы клиента agentic-core отключены: клиент берёт retry из тела ответа при неизвестном коде (STATUS, ожидание CO-1).
 // Повторяет адаптер — только по таблице ядра (RETRY_SAME_KEY), с прежним Idempotency-Key и новой подписью (Р21).
 // AGENT_KEY_REVOKED (ROTATE_KEY): другой действующий ключ из порта подписи и один повтор тем же Idempotency-Key.
-import { PAO_VERSION, PaoClient, type PaoCallArgs, type PaoOperationKey, type PaoOperations } from "@kuzin4u/agentic-core/pao";
+import {
+  PAO_OPERATIONS,
+  PAO_VERSION,
+  PaoClient,
+  validatePao,
+  type PaoCallArgs,
+  type PaoOperationKey,
+  type PaoOperations,
+} from "@kuzin4u/agentic-core/pao";
 import { PAO_RETRY_AFTER_MAX_SEC, type StandParams } from "../../../shared/config.js";
 import { PlatformFailure, type AgentSelf, type MandateRef } from "../../../shared/domain.js";
 import type { PaymentPlatform, PlatformCapabilities, Mutation } from "../../ports/payment-platform.js";
@@ -110,6 +118,17 @@ export class PaoPlatform implements PaymentPlatform {
       let failure: PlatformFailure;
       try {
         const r = await this.client(last, signer).call(op, args);
+        // «Открыто» № 4 (ревью AG-02): ответ 2xx — по схеме ПАО до перевода; значение вне перечня (`status`, `outcome`,
+        // `decision`, `kind`…) или пропущенное обязательное поле — UNKNOWN. Неизвестные поля допускаются (validatePao,
+        // ПАО §7). Текст нарушений (в нём значения из тела) в отказ не переносится (инвариант 1). Ключ со статусом вне
+        // перечня делает UNKNOWN весь ответ GET /agent — осознанный fail-closed (ревью 3b № 10): по ПАО §7 новое
+        // значение перечня — не совместимое изменение версии 1.2.0, реестр с ним не подтверждает и остальное.
+        // Список событий (GET /pao/v1/events, AG-06) так проверять нельзя: неизвестный тип события ПАО §7 велит
+        // игнорировать — STATUS «Открыто», AG-06.
+        const schema = PAO_OPERATIONS[op].response;
+        if (schema !== undefined && validatePao(schema, r).length > 0) {
+          throw new PlatformFailure("UNKNOWN", "never", null, last.status ?? 200, key, "ответ ПАО не по схеме");
+        }
         return to(r);
       } catch (e) {
         failure = toFailure(e, key);
@@ -171,7 +190,7 @@ export class PaoPlatform implements PaymentPlatform {
     return this.call("POST /pao/v1/mandates", { body: map.mandateDraftToPao(draft, this.cur), idempotencyKey: keyOf(m) }, this.mandate);
   }
 
-  private readonly mandate = (r: Parameters<typeof map.mandateFromPao>[0]) => map.mandateFromPao(r, this.cur);
+  private readonly mandate = (r: Parameters<typeof map.mandateFromPao>[0]) => map.mandateFromPao(r, this.cur, this.o.agentCode);
 
   getMandate(id: string) {
     return this.call("GET /pao/v1/mandates/{id}", { path: { id } }, this.mandate);
@@ -187,11 +206,13 @@ export class PaoPlatform implements PaymentPlatform {
   }
 
   mandateEvidence(id: string) {
-    return this.call("GET /pao/v1/mandates/{id}/evidence", { path: { id } }, (r) => map.evidenceFromPao(r, id, this.cur));
+    return this.call("GET /pao/v1/mandates/{id}/evidence", { path: { id } }, (r) => map.evidenceFromPao(r, id, this.cur, this.o.agentCode));
   }
 
   async issueCredential(draft: Parameters<PaymentPlatform["issueCredential"]>[0], m: Mutation) {
-    return this.call("POST /pao/v1/credentials", { body: map.credentialDraftToPao(draft, this.cur), idempotencyKey: keyOf(m) }, map.credentialFromPao);
+    return this.call("POST /pao/v1/credentials", { body: map.credentialDraftToPao(draft, this.cur), idempotencyKey: keyOf(m) }, (r) =>
+      map.credentialFromPao(r, draft.mandate.id, this.o.agentCode),
+    );
   }
 
   async requestConfirmation(draft: Parameters<PaymentPlatform["requestConfirmation"]>[0], m: Mutation) {
@@ -208,12 +229,12 @@ export class PaoPlatform implements PaymentPlatform {
 
   async listOperations(ref: MandateRef) {
     map.checkRef(ref, this.cur);
-    return this.call("GET /pao/v1/operations", { query: { mandate_id: ref.id } }, (r) => need(r).map((o) => map.operationFromPao(o, ref, "list")));
+    return this.call("GET /pao/v1/operations", { query: { mandate_id: ref.id } }, (r) => need(r).map((o) => map.operationFromPao(o, ref, "list", this.o.agentCode)));
   }
 
   async getOperation(opRef: string, ref: MandateRef) {
     map.checkRef(ref, this.cur);
-    return this.call("GET /pao/v1/operations/{op_ref}", { path: { op_ref: opRef } }, (r) => map.operationFromPao(r, ref, "single"));
+    return this.call("GET /pao/v1/operations/{op_ref}", { path: { op_ref: opRef } }, (r) => map.operationFromPao(r, ref, "single", this.o.agentCode));
   }
 
   async openDispute(draft: Parameters<PaymentPlatform["openDispute"]>[0], m: Mutation) {

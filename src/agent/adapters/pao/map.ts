@@ -116,7 +116,10 @@ function cartFromPao(c: Pao.MandateRequest["cart"], currency: CurrencyCode): Car
   };
 }
 
-export function mandateFromPao(m: Pao.Mandate, cur: Currencies): Mandate {
+/** Мандат: валюта — из множества платформы; `agent_code` (в ПАО 1.2.0 необязателен) — если есть, только свой
+ *  (ревью К2 № 3а, «Открыто» № 17); чужой — UNKNOWN. */
+export function mandateFromPao(m: Pao.Mandate, cur: Currencies, agentCode: string): Mandate {
+  if (m.agent_code !== undefined && m.agent_code !== agentCode) incomplete("mandate.agent_code — не этот агент");
   const currency = allowed(m.currency, cur, "mandate.currency");
   return {
     id: need(m.id, "mandate.id"),
@@ -145,15 +148,18 @@ export function mandateCheckFromPao(v: Pao.MandateVerify, ref: MandateRef): Mand
   };
 }
 
-function indicatorFromPao(a: Pao.Aoi): AgentIndicator {
+/** Агентский признак — только свой: `agent_code` этого агента, `mandate_id` — мандат запроса («Открыто» № 17). */
+function indicatorFromPao(a: Pao.Aoi, agentCode: string, mandateId: string): AgentIndicator {
   if (a.indicator !== true) incomplete("aoi.indicator");
+  if (a.agent_code !== agentCode) incomplete("aoi.agent_code — не этот агент");
+  if (a.mandate_id !== mandateId) incomplete("aoi.mandate_id — не мандат запроса");
   return { agentCode: a.agent_code, mandateId: a.mandate_id };
 }
 
 /** Выписка: валюта операции — валюта её мандата в цепочке (`aoi.mandate_id`; без признака — запрошенного мандата).
  *  Мандата операции в цепочке нет — UNKNOWN. */
-export function evidenceFromPao(e: Pao.Evidence, mandateId: string, cur: Currencies): Evidence {
-  const chain = (e.mandate_chain ?? []).map((m) => mandateFromPao(m, cur));
+export function evidenceFromPao(e: Pao.Evidence, mandateId: string, cur: Currencies, agentCode: string): Evidence {
+  const chain = (e.mandate_chain ?? []).map((m) => mandateFromPao(m, cur, agentCode));
   const refOf = (o: Pao.Operation): MandateRef => {
     const id = o.aoi?.mandate_id ?? mandateId;
     const m = chain.find((x) => x.id === id);
@@ -162,7 +168,7 @@ export function evidenceFromPao(e: Pao.Evidence, mandateId: string, cur: Currenc
   };
   return {
     mandateChain: chain,
-    operations: (e.operations ?? []).map((o) => operationFromPao(o, refOf(o), "list")),
+    operations: (e.operations ?? []).map((o) => operationFromPao(o, refOf(o), "list", agentCode)),
     integrity: need(e.integrity, "evidence.integrity"),
   };
 }
@@ -179,13 +185,13 @@ export function credentialDraftToPao(d: CredentialDraft, cur: Currencies): Pao.C
 }
 
 /** Реквизит глазами ядра: payload не переносится и не хранится (инвариант 1). */
-export function credentialFromPao(c: Pao.Credential): Credential {
+export function credentialFromPao(c: Pao.Credential, mandateId: string, agentCode: string): Credential {
   return {
     credentialRef: c.credential_ref,
     channel: c.kind,
     status: c.status,
     validTo: c.payload?.valid_to ?? null,
-    indicator: indicatorFromPao(c.aoi),
+    indicator: indicatorFromPao(c.aoi, agentCode, mandateId),
   };
 }
 
@@ -214,8 +220,7 @@ export function confirmationFromPao(c: Pao.Confirmation): Confirmation {
  *  Операция без признака (причина AOI_MISSING, SPEC §7б): в списке и выписке по мандату (`list` — мандат назвала
  *  платформа) — в валюте мандата ссылки; по одной операции (`single` — мандат назвал вызывающий) сумма не
  *  подтверждена — `amount: null`. `indicator` — null. */
-export function operationFromPao(o: Pao.Operation, ref: MandateRef, scope: "list" | "single"): Operation {
-  if (o.aoi && o.aoi.mandate_id !== ref.id) incomplete("operation.aoi.mandate_id — не мандат запроса");
+export function operationFromPao(o: Pao.Operation, ref: MandateRef, scope: "list" | "single", agentCode: string): Operation {
   const known = o.amount !== undefined && (o.aoi !== undefined || scope === "list");
   return {
     opRef: need(o.op_ref, "operation.op_ref"),
@@ -223,7 +228,7 @@ export function operationFromPao(o: Pao.Operation, ref: MandateRef, scope: "list
     channel: o.channel ?? null,
     amount: known ? minor(o.amount, ref.currency, "operation.amount") : null,
     merchantId: o.merchant_id ?? null,
-    indicator: o.aoi ? indicatorFromPao(o.aoi) : null,
+    indicator: o.aoi ? indicatorFromPao(o.aoi, agentCode, ref.id) : null,
     status: need(o.status, "operation.status"),
     declineReason: o.reason ?? null,
   };

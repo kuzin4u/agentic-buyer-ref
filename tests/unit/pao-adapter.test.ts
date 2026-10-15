@@ -205,6 +205,35 @@ describe("валюта — из мандата, множество платфо�
 });
 
 describe("fail-closed без заглушки", () => {
+  // «Открыто» № 4 (ревью AG-02): ответ 2xx — по схеме ПАО; значение вне перечня — UNKNOWN без фрагментов тела.
+  it.each([
+    ["outcome вне перечня", { outcome: "MAYBE_LATER", amount_left: 1, valid_to: "2026-10-20T00:00:00Z" }],
+    ["нет обязательного amount_left", { outcome: "CONFIRMED", valid_to: "2026-10-20T00:00:00Z" }],
+    ["valid_to не дата-время", { outcome: "CONFIRMED", amount_left: 1, valid_to: "MAYBE_LATER" }],
+  ])("verify: %s — UNKNOWN", async (_, body) => {
+    const { platform, calls } = fake(() => json(200, body));
+    const err = (await platform.verifyMandate(M1).catch((e: unknown) => e)) as PlatformFailure;
+    expect(err).toMatchObject({ code: "UNKNOWN", retry: "never", httpStatus: 200 });
+    expect(err.message).not.toContain("MAYBE_LATER");
+    expect(calls).toHaveLength(1);
+  });
+
+  it("неизвестные поля ответа принимаются (ПАО §7)", async () => {
+    const { platform } = fake(() => json(200, { outcome: "CONFIRMED", amount_left: 7, valid_to: "2026-10-20T00:00:00Z", future_field: { x: 1 } }));
+    expect((await platform.verifyMandate(M1)).amountLeft).toEqual({ amount: 7, currency: "RUB" });
+  });
+
+  it("реквизит с aoi чужого мандата или агента — UNKNOWN («Открыто» № 17)", async () => {
+    const cred = (aoi: object) => ({ credential_ref: "cr_1", kind: "CARD", payload: {}, aoi, status: "ISSUED" });
+    for (const aoi of [
+      { indicator: true, agent_code: AGENT, mandate_id: "m_2" },
+      { indicator: true, agent_code: "nspk:agent:other:v1", mandate_id: "m_1" },
+    ]) {
+      const { platform } = fake(() => json(201, cred(aoi)));
+      await expect(platform.issueCredential(draft, { idempotencyKey: "idem_aoi" })).rejects.toMatchObject({ code: "UNKNOWN" });
+    }
+  });
+
   it("неизвестный код с retry same_key — ровно одно обращение, UNKNOWN, never", async () => {
     const { platform, calls } = fake(() => json(409, { code: "NEW_CODE", message: "m", retry: "same_key" }, { "retry-after": "0" }));
     await expect(platform.verifyMandate(M1)).rejects.toMatchObject({ code: "UNKNOWN", retry: "never", platformCode: "NEW_CODE" });

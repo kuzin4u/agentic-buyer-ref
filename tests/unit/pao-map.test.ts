@@ -20,12 +20,13 @@ const draft: MandateDraft = {
   },
 };
 const CUR: map.Currencies = new Set(["RUB"]);
+const AG = "nspk:agent:x:v1";
 const M1 = { id: "m_1", currency: "RUB" };
 
 describe("перевод ПАО ↔ ядро", () => {
   it("мандат туда и обратно", () => {
     const req = map.mandateDraftToPao(draft, CUR);
-    const back = map.mandateFromPao({ ...req, id: "m_1", status: "PENDING_SIGNATURE", signature_type: "simple" }, CUR);
+    const back = map.mandateFromPao({ ...req, id: "m_1", status: "PENDING_SIGNATURE", signature_type: "simple" }, CUR, AG);
     expect(back).toEqual({ ...draft, id: "m_1", status: "PENDING_SIGNATURE", signatureLevel: "simple" });
   });
 
@@ -37,7 +38,7 @@ describe("перевод ПАО ↔ ядро", () => {
       aoi: { indicator: true, agent_code: "nspk:agent:buyref-01:v1", mandate_id: "m_1" },
       status: "ISSUED",
     };
-    const c = map.credentialFromPao(pao);
+    const c = map.credentialFromPao(pao, "m_1", "nspk:agent:buyref-01:v1");
     expect(c).toEqual({
       credentialRef: "cr_1",
       channel: "CARD",
@@ -62,9 +63,9 @@ describe("перевод ПАО ↔ ядро", () => {
 
   it("неполный ответ или дробная сумма — UNKNOWN (fail-closed)", () => {
     const req = map.mandateDraftToPao(draft, CUR);
-    expect(() => map.mandateFromPao({ ...req, status: "ACTIVE" }, CUR)).toThrow(PlatformFailure);
+    expect(() => map.mandateFromPao({ ...req, status: "ACTIVE" }, CUR, AG)).toThrow(PlatformFailure);
     expect(() => map.mandateCheckFromPao({ outcome: "CONFIRMED", amount_left: 1.5, valid_to: "x" }, M1)).toThrow(/минимальных единиц/);
-    expect(() => map.operationFromPao({ status: "AUTHORIZED" }, M1, "single")).toThrow(PlatformFailure);
+    expect(() => map.operationFromPao({ status: "AUTHORIZED" }, M1, "single", AG)).toThrow(PlatformFailure);
   });
 
   // Р29: валюта суммы — из мандата; множество платформы — допустимое, не источник.
@@ -84,21 +85,21 @@ describe("перевод ПАО ↔ ядро", () => {
   it("платформа с двумя валютами: остаток и операция — в валюте своего мандата", () => {
     const both: map.Currencies = new Set(["RUB", "USD"]);
     const req = { ...map.mandateDraftToPao({ ...draft, amountLimit: { amount: 9, currency: "USD" }, cart: null }, both), id: "m_u", status: "ACTIVE" as const };
-    expect(map.mandateFromPao(req, both).amountLimit).toEqual({ amount: 9, currency: "USD" });
+    expect(map.mandateFromPao(req, both, AG).amountLimit).toEqual({ amount: 9, currency: "USD" });
     const u = { id: "m_u", currency: "USD" };
     expect(map.mandateCheckFromPao({ outcome: "CONFIRMED", amount_left: 7, valid_to: "x" }, u).amountLeft).toEqual({ amount: 7, currency: "USD" });
-    expect(map.operationFromPao({ op_ref: "op_1", amount: 3, status: "AUTHORIZED" }, u, "list").amount).toEqual({ amount: 3, currency: "USD" });
+    expect(map.operationFromPao({ op_ref: "op_1", amount: 3, status: "AUTHORIZED" }, u, "list", AG).amount).toEqual({ amount: 3, currency: "USD" });
   });
 
   it("выписка: валюта операции — её мандата в цепочке; мандата нет — UNKNOWN", () => {
     const intent = { ...map.mandateDraftToPao({ ...draft, kind: "INTENT", parentId: null, cart: null }, CUR), id: "m_i", status: "ACTIVE" as const };
     const aoi = (id: string) => ({ indicator: true as const, agent_code: "nspk:agent:x:v1", mandate_id: id });
-    const ev = map.evidenceFromPao({ mandate_chain: [intent], operations: [{ op_ref: "op_1", amount: 5, status: "AUTHORIZED", aoi: aoi("m_i") }], integrity: "OK" }, "m_i", CUR);
+    const ev = map.evidenceFromPao({ mandate_chain: [intent], operations: [{ op_ref: "op_1", amount: 5, status: "AUTHORIZED", aoi: aoi("m_i") }], integrity: "OK" }, "m_i", CUR, AG);
     expect(ev.operations[0]!.amount).toEqual({ amount: 5, currency: "RUB" });
     expect(() =>
-      map.evidenceFromPao({ mandate_chain: [intent], operations: [{ op_ref: "op_2", amount: 5, status: "AUTHORIZED", aoi: aoi("m_x") }], integrity: "OK" }, "m_i", CUR),
+      map.evidenceFromPao({ mandate_chain: [intent], operations: [{ op_ref: "op_2", amount: 5, status: "AUTHORIZED", aoi: aoi("m_x") }], integrity: "OK" }, "m_i", CUR, AG),
     ).toThrow(PlatformFailure);
-    const bare = map.evidenceFromPao({ mandate_chain: [intent], operations: [{ op_ref: "op_3", amount: 4, status: "DECLINED" }], integrity: "OK" }, "m_i", CUR);
+    const bare = map.evidenceFromPao({ mandate_chain: [intent], operations: [{ op_ref: "op_3", amount: 4, status: "DECLINED" }], integrity: "OK" }, "m_i", CUR, AG);
     expect(bare.operations[0]).toMatchObject({ amount: { amount: 4, currency: "RUB" }, indicator: null });
   });
 
@@ -106,6 +107,20 @@ describe("перевод ПАО ↔ ядро", () => {
     const c = { mandate: M1, merchantId: "shop_1", amount: { amount: 300001, currency: "RUB" }, summary: "s", channel: "UPK" as const };
     expect(map.confirmationDraftToPao(c, CUR)).toMatchObject({ mandate_id: "m_1", amount: 300001 });
     expect(() => map.confirmationDraftToPao({ ...c, amount: { amount: 300001, currency: "USD" } }, CUR)).toThrow(/обращение не отправлено/);
+  });
+
+  // «Открыто» № 17, ревью К2 № 3а: признак и мандат — только свои.
+  it("aoi чужого агента или чужого мандата, мандат чужого агента — UNKNOWN", () => {
+    const cred = (aoi: Pao.Aoi): Pao.Credential => ({ credential_ref: "cr_1", kind: "CARD", payload: {}, aoi, status: "ISSUED" });
+    expect(() => map.credentialFromPao(cred({ indicator: true, agent_code: "nspk:agent:other:v1", mandate_id: "m_1" }), "m_1", AG)).toThrow(/не этот агент/);
+    expect(() => map.credentialFromPao(cred({ indicator: true, agent_code: AG, mandate_id: "m_2" }), "m_1", AG)).toThrow(/не мандат запроса/);
+    expect(map.credentialFromPao(cred({ indicator: true, agent_code: AG, mandate_id: "m_1" }), "m_1", AG).indicator).toEqual({ agentCode: AG, mandateId: "m_1" });
+    const op = { op_ref: "op_1", amount: 1, status: "AUTHORIZED" as const };
+    expect(() => map.operationFromPao({ ...op, aoi: { indicator: true, agent_code: "nspk:agent:other:v1", mandate_id: "m_1" } }, M1, "single", AG)).toThrow(/не этот агент/);
+    expect(() => map.operationFromPao({ ...op, aoi: { indicator: true, agent_code: AG, mandate_id: "m_2" } }, M1, "single", AG)).toThrow(/не мандат запроса/);
+    const req = { ...map.mandateDraftToPao(draft, CUR), id: "m_1", status: "ACTIVE" as const };
+    expect(() => map.mandateFromPao({ ...req, agent_code: "nspk:agent:other:v1" }, CUR, AG)).toThrow(/не этот агент/);
+    expect(map.mandateFromPao({ ...req, agent_code: AG }, CUR, AG).id).toBe("m_1");
   });
 
   // Р27: класс обязателен для ядра (в ПАО 1.2.0 необязателен) — нет поля или значение вне перечня — UNKNOWN.

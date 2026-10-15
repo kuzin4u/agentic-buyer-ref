@@ -126,7 +126,6 @@ describe("клиент мандатов на PaoStub", () => {
   const at = (stand: PaoStand, sec: number) => new Date(stand.clock.getTime() + sec * 1000).toISOString();
   it.each([
     ["нет as_of", () => null],
-    ["as_of не разбирается", () => "вчера"],
     ["as_of старше registry_cache_ttl_sec", (s: PaoStand, p: StandParams) => at(s, -p.registry_cache_ttl_sec - 1)],
     ["as_of из будущего дальше signature_skew_sec", (s: PaoStand, p: StandParams) => at(s, p.signature_skew_sec + 1)],
   ] as const)("%s — STATE_UNKNOWN (Р29 п. 4)", async (_, asOfOf) => {
@@ -137,6 +136,17 @@ describe("клиент мандатов на PaoStub", () => {
     consents.asOf = asOf;
     expect((await core.mandates.check(signed)).outcome).toBe("STATE_UNKNOWN");
     await expect(core.mandates.requireActive(signed)).rejects.toMatchObject({ reason: "OUT_OF_SCOPE" });
+  });
+
+  it("as_of не дата-время — ответ не по схеме ПАО: UNKNOWN в адаптере («Открыто» № 4)", async () => {
+    const { core, consents } = await setup();
+    const m = await core.mandates.request(INTENT, { idempotencyKey: "idem_s" });
+    const signed = await core.mandates.awaitSigned(m, feed(consents.sign(m.id)));
+    consents.asOf = "вчера";
+    const err = (await core.mandates.check(signed).catch((e: unknown) => e)) as Error;
+    expect(err).toMatchObject({ code: "UNKNOWN", retry: "never", httpStatus: 200 });
+    expect(err.message).toMatch(/не по схеме/);
+    expect(err.message).not.toContain("вчера"); // значения из тела в отказ не переносятся (инвариант 1)
   });
 
   it("as_of на границе registry_cache_ttl_sec — CONFIRMED", async () => {

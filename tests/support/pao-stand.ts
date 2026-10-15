@@ -1,4 +1,4 @@
-// Тестовая обёртка над PaoStub agentic-core v0.2.2 для П01–П03 и связки ключей.
+// Тестовая обёртка над PaoStub agentic-core v0.3.0 для П01–П03 и связки ключей.
 // ОБЁРТКА, НЕ ДОРАБОТКА ЗАГЛУШКИ: эмулирует то, чего в PaoStub нет (расхождение № 9 в STATUS, передано в CO-1):
 //  1) статус EXCLUDED (PaoStubAgent.status — только ACTIVE | SUSPENDED): GET /pao/v1/agent — 200, status EXCLUDED;
 //     прочие методы — 403 AGENT_SUSPENDED (РП23 п. 6.3 Платформы);

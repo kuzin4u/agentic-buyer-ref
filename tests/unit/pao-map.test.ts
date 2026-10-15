@@ -7,20 +7,25 @@ const draft: MandateDraft = {
   kind: "CART",
   parentId: "m_intent_1",
   subject: "продукты на неделю",
-  amountLimit: 250000,
-  currency: "RUB",
+  amountLimit: { amount: 250000, currency: "RUB" },
   validTo: "2026-10-20T00:00:00Z",
   merchantScope: ["shop_1"],
   principalRef: "pr_1",
   confirmationMode: "IMMEDIATE",
   keyTermsShown: true,
-  cart: { merchantId: "shop_1", lines: [{ sku: "sku_1", qty: 2, price: 125000 }], total: 250000 },
+  cart: {
+    merchantId: "shop_1",
+    lines: [{ sku: "sku_1", qty: 2, price: { amount: 125000, currency: "RUB" } }],
+    total: { amount: 250000, currency: "RUB" },
+  },
 };
+const CUR: map.Currencies = new Set(["RUB"]);
+const M1 = { id: "m_1", currency: "RUB" };
 
 describe("перевод ПАО ↔ ядро", () => {
   it("мандат туда и обратно", () => {
-    const req = map.mandateDraftToPao(draft);
-    const back = map.mandateFromPao({ ...req, id: "m_1", status: "PENDING_SIGNATURE", signature_type: "simple" });
+    const req = map.mandateDraftToPao(draft, CUR);
+    const back = map.mandateFromPao({ ...req, id: "m_1", status: "PENDING_SIGNATURE", signature_type: "simple" }, CUR);
     expect(back).toEqual({ ...draft, id: "m_1", status: "PENDING_SIGNATURE", signatureLevel: "simple" });
   });
 
@@ -47,19 +52,60 @@ describe("перевод ПАО ↔ ядро", () => {
   });
 
   it("verify: остаток — как прислала платформа", () => {
-    expect(map.mandateCheckFromPao({ outcome: "CONFIRMED", amount_left: 12345, valid_to: "2026-10-20T00:00:00Z" })).toEqual({
+    expect(map.mandateCheckFromPao({ outcome: "CONFIRMED", amount_left: 12345, valid_to: "2026-10-20T00:00:00Z" }, M1)).toEqual({
       outcome: "CONFIRMED",
-      amountLeft: 12345,
+      amountLeft: { amount: 12345, currency: "RUB" },
       validTo: "2026-10-20T00:00:00Z",
       asOf: null,
     });
   });
 
-  it("неполный ответ или дробные копейки — UNKNOWN (fail-closed)", () => {
-    const req = map.mandateDraftToPao(draft);
-    expect(() => map.mandateFromPao({ ...req, status: "ACTIVE" })).toThrow(PlatformFailure);
-    expect(() => map.mandateCheckFromPao({ outcome: "CONFIRMED", amount_left: 1.5, valid_to: "x" })).toThrow(/копейки/);
-    expect(() => map.operationFromPao({ status: "AUTHORIZED" })).toThrow(PlatformFailure);
+  it("неполный ответ или дробная сумма — UNKNOWN (fail-closed)", () => {
+    const req = map.mandateDraftToPao(draft, CUR);
+    expect(() => map.mandateFromPao({ ...req, status: "ACTIVE" }, CUR)).toThrow(PlatformFailure);
+    expect(() => map.mandateCheckFromPao({ outcome: "CONFIRMED", amount_left: 1.5, valid_to: "x" }, M1)).toThrow(/минимальных единиц/);
+    expect(() => map.operationFromPao({ status: "AUTHORIZED" }, M1, "single")).toThrow(PlatformFailure);
+  });
+
+  // Р29: валюта суммы — из мандата; множество платформы — допустимое, не источник.
+  it("корзина в чужой валюте и мандат вне множества — отказ до обращения", () => {
+    const usdLine = { ...draft, cart: { ...draft.cart!, total: { amount: 250000, currency: "USD" } } };
+    expect(() => map.mandateDraftToPao(usdLine, CUR)).toThrow(/обращение не отправлено/);
+    const usd = { ...draft, amountLimit: { amount: 1, currency: "USD" }, cart: null };
+    expect(() => map.mandateDraftToPao(usd, CUR)).toThrow(/вне возможностей платформы/);
+    const usdPrice = { ...draft, cart: { ...draft.cart!, lines: [{ sku: "sku_1", qty: 2, price: { amount: 125000, currency: "USD" } }] } };
+    expect(() => map.mandateDraftToPao(usdPrice, CUR)).toThrow(/cart\.lines\[0\]\.price — валюта USD/);
+    expect(() => map.mandateDraftToPao({ ...draft, amountLimit: { amount: 0, currency: "RUB" } }, CUR)).toThrow(/меньше 1/);
+    // та же корзина при платформе с USD — проходит: тип ядра валюту не ограничивает
+    const both: map.Currencies = new Set(["RUB", "USD"]);
+    expect(map.mandateDraftToPao(usd, both)).toMatchObject({ amount_limit: 1, currency: "USD" });
+  });
+
+  it("платформа с двумя валютами: остаток и операция — в валюте своего мандата", () => {
+    const both: map.Currencies = new Set(["RUB", "USD"]);
+    const req = { ...map.mandateDraftToPao({ ...draft, amountLimit: { amount: 9, currency: "USD" }, cart: null }, both), id: "m_u", status: "ACTIVE" as const };
+    expect(map.mandateFromPao(req, both).amountLimit).toEqual({ amount: 9, currency: "USD" });
+    const u = { id: "m_u", currency: "USD" };
+    expect(map.mandateCheckFromPao({ outcome: "CONFIRMED", amount_left: 7, valid_to: "x" }, u).amountLeft).toEqual({ amount: 7, currency: "USD" });
+    expect(map.operationFromPao({ op_ref: "op_1", amount: 3, status: "AUTHORIZED" }, u, "list").amount).toEqual({ amount: 3, currency: "USD" });
+  });
+
+  it("выписка: валюта операции — её мандата в цепочке; мандата нет — UNKNOWN", () => {
+    const intent = { ...map.mandateDraftToPao({ ...draft, kind: "INTENT", parentId: null, cart: null }, CUR), id: "m_i", status: "ACTIVE" as const };
+    const aoi = (id: string) => ({ indicator: true as const, agent_code: "nspk:agent:x:v1", mandate_id: id });
+    const ev = map.evidenceFromPao({ mandate_chain: [intent], operations: [{ op_ref: "op_1", amount: 5, status: "AUTHORIZED", aoi: aoi("m_i") }], integrity: "OK" }, "m_i", CUR);
+    expect(ev.operations[0]!.amount).toEqual({ amount: 5, currency: "RUB" });
+    expect(() =>
+      map.evidenceFromPao({ mandate_chain: [intent], operations: [{ op_ref: "op_2", amount: 5, status: "AUTHORIZED", aoi: aoi("m_x") }], integrity: "OK" }, "m_i", CUR),
+    ).toThrow(PlatformFailure);
+    const bare = map.evidenceFromPao({ mandate_chain: [intent], operations: [{ op_ref: "op_3", amount: 4, status: "DECLINED" }], integrity: "OK" }, "m_i", CUR);
+    expect(bare.operations[0]).toMatchObject({ amount: { amount: 4, currency: "RUB" }, indicator: null });
+  });
+
+  it("подтверждение: сумма в валюте мандата, иначе отказ до обращения (Р29 п. 3)", () => {
+    const c = { mandate: M1, merchantId: "shop_1", amount: { amount: 300001, currency: "RUB" }, summary: "s", channel: "UPK" as const };
+    expect(map.confirmationDraftToPao(c, CUR)).toMatchObject({ mandate_id: "m_1", amount: 300001 });
+    expect(() => map.confirmationDraftToPao({ ...c, amount: { amount: 300001, currency: "USD" } }, CUR)).toThrow(/обращение не отправлено/);
   });
 
   // Р27: класс обязателен для ядра (в ПАО 1.2.0 необязателен) — нет поля или значение вне перечня — UNKNOWN.

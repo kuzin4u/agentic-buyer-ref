@@ -8,12 +8,12 @@ import type { RequestSigning } from "../../src/agent/ports/index.js";
 
 const AGENT = "nspk:agent:buyref-01:v1";
 const params = loadParams();
+const M1 = { id: "m_1", currency: "RUB" };
 const draft: CredentialDraft = {
-  mandateId: "m_1",
+  mandate: M1,
   orderRef: "ord_1",
   merchantId: "shop_1",
-  amountMax: 250000,
-  currency: "RUB",
+  amountMax: { amount: 250000, currency: "RUB" },
   channel: "CARD",
 };
 const { signer, publicKey } = newEd25519Signer("kid_test");
@@ -83,6 +83,7 @@ describe("адаптер ПАО против заглушки agentic-core", () 
     expect(platform.capabilities()).toMatchObject({
       platform: "pao",
       protocolVersion: "1.2.0",
+      currencies: ["RUB"],
       guaranteeContour: true,
       signedEvents: false,
       conditionalSettlement: false,
@@ -91,7 +92,7 @@ describe("адаптер ПАО против заглушки agentic-core", () 
 
   it("verify: остаток — от платформы (инвариант 6)", async () => {
     const { platform, stub } = await setup();
-    expect((await platform.verifyMandate("m_1")).amountLeft).toBe(175000);
+    expect((await platform.verifyMandate(M1)).amountLeft).toEqual({ amount: 175000, currency: "RUB" });
     expect(stub.violations).toEqual([]);
   });
 
@@ -119,7 +120,7 @@ describe("адаптер ПАО против заглушки agentic-core", () 
   it("повторов не больше pao_max_attempts", async () => {
     const { platform, stub } = await setup();
     stub.fail("GET /pao/v1/mandates/{id}/verify", { code: "STATE_UNAVAILABLE", retryAfterSec: 0 }, 10);
-    await expect(platform.verifyMandate("m_1")).rejects.toMatchObject({ code: "STATE_UNAVAILABLE" });
+    await expect(platform.verifyMandate(M1)).rejects.toMatchObject({ code: "STATE_UNAVAILABLE" });
     expect(stub.calls.filter((c) => c.op === "GET /pao/v1/mandates/{id}/verify")).toHaveLength(params.pao_max_attempts);
   });
 
@@ -127,7 +128,7 @@ describe("адаптер ПАО против заглушки agentic-core", () 
     const sleeps: number[] = [];
     const { platform, stub } = await setup(sleeps);
     stub.fail("GET /pao/v1/mandates/{id}/verify", { code: "UPSTREAM_UNAVAILABLE", retryAfterSec: 31 }, 1);
-    const err = await platform.verifyMandate("m_1").catch((e: unknown) => e);
+    const err = await platform.verifyMandate(M1).catch((e: unknown) => e);
     expect(err).toBeInstanceOf(PlatformFailure);
     expect(err).toMatchObject({ code: "UPSTREAM_UNAVAILABLE", retry: "same_key", httpStatus: 503 });
     expect(sleeps).toEqual([]);
@@ -140,7 +141,7 @@ describe("адаптер ПАО против заглушки agentic-core", () 
   ] as const)("код %s с чужим статусом %i: одно обращение, UNKNOWN", async (code, status) => {
     const { platform, stub } = await setup();
     stub.fail("GET /pao/v1/mandates/{id}/verify", { code, status, retry: "same_key", retryAfterSec: 0 }, 3);
-    await expect(platform.verifyMandate("m_1")).rejects.toMatchObject({ code: "UNKNOWN", retry: "never", platformCode: code });
+    await expect(platform.verifyMandate(M1)).rejects.toMatchObject({ code: "UNKNOWN", retry: "never", platformCode: code });
     expect(stub.calls.filter((c) => c.op === "GET /pao/v1/mandates/{id}/verify")).toHaveLength(1);
   });
 
@@ -148,16 +149,65 @@ describe("адаптер ПАО против заглушки agentic-core", () 
     const sleeps: number[] = [];
     const { platform, stub } = await setup(sleeps);
     stub.fail("GET /pao/v1/mandates/{id}/verify", { code: "RATE_LIMITED", retryAfterSec: 20 }, 3);
-    await expect(platform.verifyMandate("m_1")).rejects.toMatchObject({ code: "RATE_LIMITED" });
+    await expect(platform.verifyMandate(M1)).rejects.toMatchObject({ code: "RATE_LIMITED" });
     expect(sleeps).toEqual([20000]);
     expect(stub.calls.filter((c) => c.op === "GET /pao/v1/mandates/{id}/verify")).toHaveLength(2);
+  });
+});
+
+describe("валюта — из мандата, множество платформы — допустимое (Р29)", () => {
+  it.each([
+    ["реквизит в USD по мандату в USD", { ...draft, mandate: { id: "m_1", currency: "USD" }, amountMax: { amount: 1, currency: "USD" } }],
+    ["реквизит в USD по мандату в RUB", { ...draft, amountMax: { amount: 1, currency: "USD" } }],
+    ["дробная сумма", { ...draft, amountMax: { amount: 1.5, currency: "RUB" } }],
+  ])("%s — отказ до обращения", async (_, bad) => {
+    const { platform, stub } = await setup();
+    await expect(platform.issueCredential(bad, { idempotencyKey: "idem_cur" })).rejects.toMatchObject({ code: "UNKNOWN", httpStatus: 0 });
+    expect(stub.calls).toEqual([]);
+  });
+
+  it("verify и операции по мандату в валюте вне множества — отказ до обращения", async () => {
+    const { platform, stub } = await setup();
+    const usd = { id: "m_1", currency: "USD" };
+    await expect(platform.verifyMandate(usd)).rejects.toMatchObject({ code: "UNKNOWN", httpStatus: 0 });
+    await expect(platform.listOperations(usd)).rejects.toMatchObject({ code: "UNKNOWN", httpStatus: 0 });
+    await expect(platform.getOperation("op_1", usd)).rejects.toMatchObject({ code: "UNKNOWN", httpStatus: 0 });
+    expect(stub.calls).toEqual([]);
+  });
+
+  it("мандат платформы в USD — UNKNOWN (поломка «не RUB принят»)", async () => {
+    const mandate = {
+      id: "m_usd", type: "INTENT", subject: "хлеб", amount_limit: 500000, currency: "USD", valid_to: "2026-11-14T00:00:00Z",
+      merchant_scope: ["shop_1"], principal_ref: "pr_1", mode: "IMMEDIATE", status: "ACTIVE",
+    };
+    const { platform } = fake(() => json(200, mandate));
+    await expect(platform.getMandate("m_usd")).rejects.toMatchObject({ code: "UNKNOWN" });
+    const rub = fake(() => json(200, { ...mandate, currency: "RUB" }));
+    expect((await rub.platform.getMandate("m_usd")).amountLimit).toEqual({ amount: 500000, currency: "RUB" });
+  });
+
+  it("подтверждение в USD по мандату в RUB — отказ до обращения", async () => {
+    const { platform, stub } = await setup();
+    const c = { mandate: M1, merchantId: "shop_1", amount: { amount: 1, currency: "USD" }, summary: "s", channel: "UPK" as const };
+    await expect(platform.requestConfirmation(c, { idempotencyKey: "idem_cf" })).rejects.toMatchObject({ code: "UNKNOWN", httpStatus: 0 });
+    expect(stub.calls).toEqual([]);
+  });
+
+  it("операция чужого мандата — UNKNOWN; без признака: по одной — сумма не подтверждена, в списке — валюта мандата", async () => {
+    const op = { op_ref: "op_1", amount: 1000, status: "DECLINED" };
+    const other = fake(() => json(200, { ...op, aoi: { indicator: true, agent_code: AGENT, mandate_id: "m_2" } }));
+    await expect(other.platform.getOperation("op_1", M1)).rejects.toMatchObject({ code: "UNKNOWN" });
+    const bare = fake(() => json(200, op));
+    expect(await bare.platform.getOperation("op_1", M1)).toMatchObject({ amount: null, indicator: null });
+    const list = fake(() => json(200, [op]));
+    expect(await list.platform.listOperations(M1)).toMatchObject([{ amount: { amount: 1000, currency: "RUB" }, indicator: null }]);
   });
 });
 
 describe("fail-closed без заглушки", () => {
   it("неизвестный код с retry same_key — ровно одно обращение, UNKNOWN, never", async () => {
     const { platform, calls } = fake(() => json(409, { code: "NEW_CODE", message: "m", retry: "same_key" }, { "retry-after": "0" }));
-    await expect(platform.verifyMandate("m_1")).rejects.toMatchObject({ code: "UNKNOWN", retry: "never", platformCode: "NEW_CODE" });
+    await expect(platform.verifyMandate(M1)).rejects.toMatchObject({ code: "UNKNOWN", retry: "never", platformCode: "NEW_CODE" });
     expect(calls).toHaveLength(1);
   });
 
@@ -167,13 +217,13 @@ describe("fail-closed без заглушки", () => {
   ])("429 с Retry-After %s — без повтора", async (_, after) => {
     const headers: Record<string, string> = after ? { "retry-after": after } : {};
     const { platform, calls } = fake(() => json(429, { code: "RATE_LIMITED", message: "m", retry: "same_key" }, headers));
-    await expect(platform.verifyMandate("m_1")).rejects.toMatchObject({ code: "RATE_LIMITED" });
+    await expect(platform.verifyMandate(M1)).rejects.toMatchObject({ code: "RATE_LIMITED" });
     expect(calls).toHaveLength(1);
   });
 
   it("503 без тела ПАО — одно обращение, UNKNOWN", async () => {
     const { platform, calls } = fake(() => new Response("bad gateway", { status: 503, headers: { "retry-after": "1" } }));
-    await expect(platform.verifyMandate("m_1")).rejects.toMatchObject({ code: "UNKNOWN" });
+    await expect(platform.verifyMandate(M1)).rejects.toMatchObject({ code: "UNKNOWN" });
     expect(calls).toHaveLength(1);
   });
 
@@ -204,7 +254,7 @@ describe("fail-closed без заглушки", () => {
           init?.signal?.addEventListener("abort", () => reject(init.signal!.reason));
         }),
     });
-    await expect(platform.verifyMandate("m_1")).rejects.toMatchObject({ code: "UNKNOWN", httpStatus: 0 });
+    await expect(platform.verifyMandate(M1)).rejects.toMatchObject({ code: "UNKNOWN", httpStatus: 0 });
     expect(calls).toHaveLength(1);
   });
 

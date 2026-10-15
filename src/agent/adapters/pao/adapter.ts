@@ -4,7 +4,7 @@
 // AGENT_KEY_REVOKED (ROTATE_KEY): другой действующий ключ из порта подписи и один повтор тем же Idempotency-Key.
 import { PAO_VERSION, PaoClient, type PaoCallArgs, type PaoOperationKey, type PaoOperations } from "@kuzin4u/agentic-core/pao";
 import { PAO_RETRY_AFTER_MAX_SEC, type StandParams } from "../../../shared/config.js";
-import { PlatformFailure, type AgentSelf } from "../../../shared/domain.js";
+import { PlatformFailure, type AgentSelf, type MandateRef } from "../../../shared/domain.js";
 import type { PaymentPlatform, PlatformCapabilities, Mutation } from "../../ports/payment-platform.js";
 import type { RequestSigning } from "../../ports/request-signing.js";
 import { AGENT_STOP_CODES, ruleForFailure } from "../../declines/index.js";
@@ -13,6 +13,9 @@ import * as map from "./map.js";
 
 /** Версия копии ПАО у агента (docs/core/protocol/SOURCE.md, Р20). */
 export const PAO_COPY_VERSION = "1.2.0";
+
+/** Валюты Платформы ПС по ПАО 1.2.0 — допустимое множество, не источник валюты (Р29 п. 2). */
+export const PAO_CURRENCIES = ["RUB"] as const;
 
 export function assertPaoVersion(actual: string = PAO_VERSION): void {
   if (actual !== PAO_COPY_VERSION) {
@@ -47,6 +50,7 @@ function keyOf(m: Mutation): string {
 export class PaoPlatform implements PaymentPlatform {
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly fetchImpl: typeof fetch;
+  private readonly cur: map.Currencies = new Set(PAO_CURRENCIES);
 
   constructor(private readonly o: PaoPlatformOptions) {
     assertPaoVersion();
@@ -58,6 +62,7 @@ export class PaoPlatform implements PaymentPlatform {
     return {
       platform: "pao",
       protocolVersion: PAO_COPY_VERSION,
+      currencies: [...PAO_CURRENCIES],
       verifiableMandate: true,
       disputeResolution: true,
       humanConfirmation: true,
@@ -163,33 +168,36 @@ export class PaoPlatform implements PaymentPlatform {
   }
 
   async requestMandate(draft: Parameters<PaymentPlatform["requestMandate"]>[0], m: Mutation) {
-    return this.call("POST /pao/v1/mandates", { body: map.mandateDraftToPao(draft), idempotencyKey: keyOf(m) }, map.mandateFromPao);
+    return this.call("POST /pao/v1/mandates", { body: map.mandateDraftToPao(draft, this.cur), idempotencyKey: keyOf(m) }, this.mandate);
   }
+
+  private readonly mandate = (r: Parameters<typeof map.mandateFromPao>[0]) => map.mandateFromPao(r, this.cur);
 
   getMandate(id: string) {
-    return this.call("GET /pao/v1/mandates/{id}", { path: { id } }, map.mandateFromPao);
+    return this.call("GET /pao/v1/mandates/{id}", { path: { id } }, this.mandate);
   }
 
-  verifyMandate(id: string) {
-    return this.call("GET /pao/v1/mandates/{id}/verify", { path: { id } }, map.mandateCheckFromPao);
+  async verifyMandate(ref: MandateRef) {
+    map.checkRef(ref, this.cur);
+    return this.call("GET /pao/v1/mandates/{id}/verify", { path: { id: ref.id } }, (r) => map.mandateCheckFromPao(r, ref));
   }
 
   async relinquishMandate(id: string, m: Mutation) {
-    return this.call("POST /pao/v1/mandates/{id}/relinquish", { path: { id }, idempotencyKey: keyOf(m) }, map.mandateFromPao);
+    return this.call("POST /pao/v1/mandates/{id}/relinquish", { path: { id }, idempotencyKey: keyOf(m) }, this.mandate);
   }
 
   mandateEvidence(id: string) {
-    return this.call("GET /pao/v1/mandates/{id}/evidence", { path: { id } }, map.evidenceFromPao);
+    return this.call("GET /pao/v1/mandates/{id}/evidence", { path: { id } }, (r) => map.evidenceFromPao(r, id, this.cur));
   }
 
   async issueCredential(draft: Parameters<PaymentPlatform["issueCredential"]>[0], m: Mutation) {
-    return this.call("POST /pao/v1/credentials", { body: map.credentialDraftToPao(draft), idempotencyKey: keyOf(m) }, map.credentialFromPao);
+    return this.call("POST /pao/v1/credentials", { body: map.credentialDraftToPao(draft, this.cur), idempotencyKey: keyOf(m) }, map.credentialFromPao);
   }
 
   async requestConfirmation(draft: Parameters<PaymentPlatform["requestConfirmation"]>[0], m: Mutation) {
     return this.call(
       "POST /pao/v1/confirmations",
-      { body: map.confirmationDraftToPao(draft), idempotencyKey: keyOf(m) },
+      { body: map.confirmationDraftToPao(draft, this.cur), idempotencyKey: keyOf(m) },
       map.confirmationFromPao,
     );
   }
@@ -198,12 +206,14 @@ export class PaoPlatform implements PaymentPlatform {
     return this.call("GET /pao/v1/confirmations/{id}", { path: { id } }, map.confirmationFromPao);
   }
 
-  listOperations(mandateId: string) {
-    return this.call("GET /pao/v1/operations", { query: { mandate_id: mandateId } }, (r) => need(r).map(map.operationFromPao));
+  async listOperations(ref: MandateRef) {
+    map.checkRef(ref, this.cur);
+    return this.call("GET /pao/v1/operations", { query: { mandate_id: ref.id } }, (r) => need(r).map((o) => map.operationFromPao(o, ref, "list")));
   }
 
-  getOperation(opRef: string) {
-    return this.call("GET /pao/v1/operations/{op_ref}", { path: { op_ref: opRef } }, map.operationFromPao);
+  async getOperation(opRef: string, ref: MandateRef) {
+    map.checkRef(ref, this.cur);
+    return this.call("GET /pao/v1/operations/{op_ref}", { path: { op_ref: opRef } }, (r) => map.operationFromPao(r, ref, "single"));
   }
 
   async openDispute(draft: Parameters<PaymentPlatform["openDispute"]>[0], m: Mutation) {

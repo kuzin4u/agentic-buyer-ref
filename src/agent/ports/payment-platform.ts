@@ -7,6 +7,7 @@ import type {
   ConfirmationDraft,
   Credential,
   CredentialDraft,
+  CurrencyCode,
   Dispute,
   DisputeDraft,
   Evidence,
@@ -14,6 +15,7 @@ import type {
   Mandate,
   MandateCheck,
   MandateDraft,
+  MandateRef,
   Operation,
 } from "../../shared/domain.js";
 
@@ -23,6 +25,8 @@ export interface PlatformCapabilities {
   platform: string;
   /** версия протокола, по которой работает адаптер */
   protocolVersion: string;
+  /** допустимое множество валют (Р29 п. 2); не источник валюты: валюта суммы — из мандата. Вне множества — отказ */
+  currencies: readonly CurrencyCode[];
   /** мандат проверяется платформой (verify) и подписан человеком вне агента */
   verifiableMandate: boolean;
   /** спор о полномочиях разбирается по журналу согласий */
@@ -51,7 +55,8 @@ export interface PaymentPlatform {
 
   requestMandate(draft: MandateDraft, m: Mutation): Promise<Mandate>;
   getMandate(id: string): Promise<Mandate>;
-  verifyMandate(id: string): Promise<MandateCheck>;
+  /** Остаток — в валюте мандата ссылки; нет `as_of` или он старше `registry_cache_ttl_sec` — решает ядро (Р29 п. 4). */
+  verifyMandate(ref: MandateRef): Promise<MandateCheck>;
   relinquishMandate(id: string, m: Mutation): Promise<Mandate>;
   mandateEvidence(id: string): Promise<Evidence>;
 
@@ -60,8 +65,9 @@ export interface PaymentPlatform {
   requestConfirmation(draft: ConfirmationDraft, m: Mutation): Promise<Confirmation>;
   getConfirmation(id: string): Promise<Confirmation>;
 
-  listOperations(mandateId: string): Promise<Operation[]>;
-  getOperation(opRef: string): Promise<Operation>;
+  /** Суммы операций — в валюте мандата ссылки; признак операции другого мандата — отказ UNKNOWN (Р29 п. 3). */
+  listOperations(ref: MandateRef): Promise<Operation[]>;
+  getOperation(opRef: string, ref: MandateRef): Promise<Operation>;
 
   openDispute(draft: DisputeDraft, m: Mutation): Promise<Dispute>;
   getDispute(id: string): Promise<Dispute>;

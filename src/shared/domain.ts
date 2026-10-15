@@ -1,11 +1,15 @@
 // Доменные типы ядра (Р19). Ядро работает только с ними; перевод из понятий платформы — в адаптерах.
-// Деньги — целые копейки. Платёжных реквизитов здесь нет и быть не может (инвариант 1).
+// Сумма — Money agentic-core: целое число минимальных единиц и код валюты (Р29). Ограничения на валюту в типе нет:
+// допустимое множество заявляет адаптер (PlatformCapabilities.currencies). Платёжных реквизитов здесь нет (инвариант 1).
+import type { CurrencyCode, Money } from "@kuzin4u/agentic-core";
 
-/** Сумма в копейках: целое ≥ 0. */
-export type Kopecks = number;
+export type { CurrencyCode, Money };
 
-export function isKopecks(v: unknown): v is Kopecks {
-  return typeof v === "number" && Number.isSafeInteger(v) && v >= 0;
+/** Ссылка на мандат с его валютой (Р29 п. 3): валюта — из мандата платформы, по ней адаптер дополняет суммы,
+ *  у которых в протоколе платформы нет поля валюты. */
+export interface MandateRef {
+  id: string;
+  currency: CurrencyCode;
 }
 
 export type MandateKind = "INTENT" | "CART";
@@ -16,13 +20,13 @@ export type SignatureLevel = "simple" | "qualified" | "gov_id";
 export interface CartLine {
   sku: string;
   qty: number;
-  price: Kopecks;
+  price: Money;
 }
 
 export interface Cart {
   merchantId: string;
   lines: CartLine[];
-  total: Kopecks;
+  total: Money;
 }
 
 /** Что ядро просит у человека: пределы поручения. */
@@ -30,8 +34,7 @@ export interface MandateDraft {
   kind: MandateKind;
   parentId: string | null;
   subject: string;
-  amountLimit: Kopecks;
-  currency: string;
+  amountLimit: Money;
   validTo: string;
   merchantScope: string[];
   principalRef: string;
@@ -50,7 +53,7 @@ export interface Mandate extends MandateDraft {
 /** Результат проверки мандата платформой. Остаток — только отсюда (инвариант 6). */
 export interface MandateCheck {
   outcome: "CONFIRMED" | "OUT_OF_SCOPE" | "STATE_UNKNOWN";
-  amountLeft: Kopecks;
+  amountLeft: Money;
   validTo: string;
   asOf: string | null;
 }
@@ -70,11 +73,10 @@ export interface AgentIndicator {
 export type PaymentChannel = "CARD" | "SBP";
 
 export interface CredentialDraft {
-  mandateId: string;
+  mandate: MandateRef;
   orderRef: string;
   merchantId: string;
-  amountMax: Kopecks;
-  currency: string;
+  amountMax: Money;
   channel: PaymentChannel;
 }
 
@@ -88,9 +90,9 @@ export interface Credential {
 }
 
 export interface ConfirmationDraft {
-  mandateId: string;
+  mandate: MandateRef;
   merchantId: string;
-  amount: Kopecks;
+  amount: Money;
   summary: string;
   channel: "UPK" | "ISSUER_APP";
 }
@@ -110,7 +112,7 @@ export interface Operation {
   opRef: string;
   orderRef: string | null;
   channel: PaymentChannel | null;
-  amount: Kopecks | null;
+  amount: Money | null;
   merchantId: string | null;
   indicator: AgentIndicator | null;
   status: OperationStatus;

@@ -7,7 +7,7 @@ import { MandateRefused } from "../../src/agent/mandates/index.js";
 import type { MandateDraft } from "../../src/shared/domain.js";
 import { Consents, INTENT } from "../support/consents.js";
 import { coreOn } from "../support/core.js";
-import { PaoStand } from "../support/pao-stand.js";
+import { PaoStand, CONFIGURATION } from "../support/pao-stand.js";
 
 let stand: PaoStand | undefined;
 afterEach(async () => {
@@ -31,7 +31,7 @@ describe("П06 — мандат без обязательного реквизи
     expect(err).toBeInstanceOf(MandateRefused);
     expect(err.reason).toBe("DRAFT_INVALID");
     expect(consents.mandates.size).toBe(0);
-    expect(s.log()).toEqual([{ op: "GET /pao/v1/agent", status: 200 }]);
+    expect(s.log()).toEqual([CONFIGURATION, { op: "GET /pao/v1/agent", status: 200 }]);
     expect(s.stub.violations).toEqual([]);
   });
 });

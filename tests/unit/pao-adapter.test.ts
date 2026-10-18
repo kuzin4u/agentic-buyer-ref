@@ -5,6 +5,7 @@ import { PaoPlatform, assertPaoVersion } from "../../src/agent/adapters/pao/inde
 import { loadParams, type StandParams } from "../../src/shared/config.js";
 import { PlatformFailure, type CredentialDraft } from "../../src/shared/domain.js";
 import type { RequestSigning } from "../../src/agent/ports/index.js";
+import { Consents, INTENT } from "../support/consents.js";
 
 const AGENT = "nspk:agent:buyref-01:v1";
 const params = loadParams();
@@ -188,7 +189,7 @@ describe("валюта — из мандата, множество платфо�
 
   it("мандат платформы в USD — UNKNOWN (поломка «не RUB принят»)", async () => {
     const mandate = {
-      id: "m_usd", agent_code: AGENT, type: "INTENT", subject: "хлеб", amount_limit: 500000, currency: "USD", valid_to: "2026-11-14T00:00:00Z",
+      id: "m_usd", agent_code: AGENT, revocation_order: "bank:pr_1:revocation:v1", type: "INTENT", subject: "хлеб", amount_limit: 500000, currency: "USD", valid_to: "2026-11-14T00:00:00Z",
       merchant_scope: ["shop_1"], principal_ref: "pr_1", mode: "IMMEDIATE", status: "ACTIVE",
     };
     const { platform } = fake(() => json(200, mandate));
@@ -377,6 +378,66 @@ describe("fail-closed без заглушки", () => {
     const { platform, calls } = fake(() => json(201, {}));
     await expect(platform.issueCredential(draft, { idempotencyKey: key })).rejects.toMatchObject({ code: "UNKNOWN" });
     expect(calls).toHaveLength(0);
+  });
+});
+
+// РП33 (ПАО 1.4.0): ответы 401, 403, 404, 503 у POST и GET мандата — коды из таблицы §7а, новых строк нет (Р33 п. 7).
+// На PaoStub: статус и retry отказа — из x-pao-errors спецификации, мандаты — журнал согласий-обёртка (ревью К2.2 № 1).
+describe("мандаты: коды отказа РП33 на PaoStub", () => {
+  async function mandateStub() {
+    const consents = new Consents(() => new Date("2026-10-12T09:00:00Z"), AGENT);
+    stub = new PaoStub({
+      agents: [{ agentCode: AGENT, keys: [{ kid: "kid_test", alg: "ed25519", publicKey, status: "ACTIVE" }] }],
+      handlers: consents.handlers(),
+    });
+    const baseUrl = await stub.start();
+    const sleeps: number[] = [];
+    const platform = new PaoPlatform({ baseUrl, agentCode: AGENT, signing, params, sleep: async (ms) => void sleeps.push(ms) });
+    // мандат m_1 для GET — до отказов
+    await platform.requestMandate(INTENT, { idempotencyKey: "idem_m_seed" });
+    return { platform, stub, sleeps };
+  }
+  const ops = {
+    "POST /pao/v1/mandates": (p: PaoPlatform) => p.requestMandate({ ...INTENT, subject: "молоко" }, { idempotencyKey: "idem_m_rp33" }),
+    "GET /pao/v1/mandates/{id}": (p: PaoPlatform) => p.getMandate("m_1"),
+  } as const;
+  type Op = keyof typeof ops;
+  const OPS = Object.keys(ops) as Op[];
+
+  it.each(
+    OPS.flatMap((op) =>
+      ([
+        ["AGENT_UNKNOWN", 401],
+        ["SIGNATURE_INVALID", 401],
+        ["AGENT_SUSPENDED", 403],
+        ["MANDATE_NOT_FOUND", 404],
+      ] as const).map(([code, http]) => [op, code, http] as const),
+    ),
+  )("%s: %s (%i) — код ядра, без повтора", async (op, code, http) => {
+    const { platform, stub } = await mandateStub();
+    stub.fail(op, { code });
+    await expect(ops[op](platform)).rejects.toMatchObject({ code, httpStatus: http });
+    expect(stub.calls.filter((c) => c.op === op && c.code === code)).toHaveLength(1);
+    expect(stub.violations).toEqual([]);
+  });
+
+  it.each(OPS)("%s: 503 STATE_UNAVAILABLE — повтор тем же ключом после Retry-After", async (op) => {
+    const { platform, stub, sleeps } = await mandateStub();
+    stub.fail(op, { code: "STATE_UNAVAILABLE" }, 1);
+    await expect(ops[op](platform)).resolves.toMatchObject({ revocationOrder: "bank:pr_1:revocation:v1" });
+    const calls = stub.calls.filter((c) => c.op === op);
+    const last2 = calls.slice(-2);
+    expect(last2.map((c) => c.status)).toEqual([503, op.startsWith("POST") ? 201 : 200]);
+    expect(last2[1]!.idempotencyKey).toBe(last2[0]!.idempotencyKey);
+    expect(sleeps).toEqual([1000]);
+  });
+
+  it("POST: IDEMPOTENCY_CONFLICT (ключ мандата для другого запроса) — остановка без повтора", async () => {
+    const { platform, stub } = await mandateStub();
+    await expect(platform.requestMandate({ ...INTENT, subject: "сыр" }, { idempotencyKey: "idem_m_seed" })).rejects.toMatchObject({
+      code: "IDEMPOTENCY_CONFLICT",
+    });
+    expect(stub.calls.filter((c) => c.code === "IDEMPOTENCY_CONFLICT")).toHaveLength(1);
   });
 });
 

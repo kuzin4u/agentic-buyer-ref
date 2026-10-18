@@ -6,7 +6,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { MandateRefused } from "../../src/agent/mandates/index.js";
 import { Consents, INTENT, RUB, feed } from "../support/consents.js";
 import { coreOn } from "../support/core.js";
-import { PaoStand } from "../support/pao-stand.js";
+import { PaoStand, CONFIGURATION } from "../support/pao-stand.js";
 
 let stand: PaoStand | undefined;
 afterEach(async () => {
@@ -38,6 +38,7 @@ describe("П04 — мандат намерения: хлеб, до 5 000 ₽, 30
 
     // полный журнал обращений: допуск, запрос мандата, сверка подписи, verify — и ничего больше
     expect(stand.log()).toEqual([
+      CONFIGURATION,
       { op: "GET /pao/v1/agent", status: 200 },
       { op: "POST /pao/v1/mandates", status: 201 },
       { op: "GET /pao/v1/mandates/{id}", status: 200 },
@@ -52,7 +53,7 @@ describe("П04 — мандат намерения: хлеб, до 5 000 ₽, 30
     const { core, stand } = await setup();
     const err = await core.mandates.request({ ...INTENT, keyTermsShown: false }, { idempotencyKey: "idem-p04b" }).catch((e: unknown) => e);
     expect(err).toBeInstanceOf(MandateRefused);
-    expect(stand.log()).toEqual([{ op: "GET /pao/v1/agent", status: 200 }]);
+    expect(stand.log()).toEqual([CONFIGURATION, { op: "GET /pao/v1/agent", status: 200 }]);
     expect(stand.stub.violations).toEqual([]);
   });
 });

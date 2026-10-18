@@ -41,9 +41,19 @@ export interface PlatformCapabilities {
   conditionalSettlement: boolean;
 }
 
+/** Версия протокола Платформы при подключении (Р33 п. 10). Несовместимая версия — не исход, а отказ
+ *  PlatformFailure(PLATFORM_PROTOCOL_UNSUPPORTED) с остановкой агента. */
+export type ProtocolCheck =
+  | { status: "confirmed"; version: string }
+  /** версия не определена: проверка — по первому ответу с мандатом; NO_VERSION — нет значений вида 1.x.y,
+   *  BAD_RESPONSE — ответ не по схеме, NO_RESPONSE — адрес не отвечает или отказ */
+  | { status: "unknown"; detail: "NO_VERSION" | "BAD_RESPONSE" | "NO_RESPONSE" };
+
 /** Порт платформы целиком; части по составу AG-К5 выделяются по мере задач (мандаты — AG-05, MandatePort). */
 export interface PaymentPlatform extends MandatePort {
   capabilities(): PlatformCapabilities;
+  /** Стадия 0, до допуска: версия протокола Платформы (Р33 п. 10); обращение без подписи. */
+  checkProtocol(): Promise<ProtocolCheck>;
   /** Статус агента и ключи с их сроками — сроки задаёт платформа (РП23). */
   agentSelf(): Promise<AgentSelf>;
   /** Регистрация нового ключа до перехода на него (A2 п. 5.3); платформа сокращает сроки прежних ключей сама. */

@@ -10,7 +10,8 @@ export interface RequestSigning {
    *  (SignerStopped, исходный отказ — в cause). */
   keyRevoked(kid: string, failure?: unknown): Signer;
   /** Отказ в допуске или нет действующего ключа: остановка агента; дальнейшая подпись — SignerStopped.
-   *  detail — уточнение для журнала, только значение перечня ПАО (класс при AGENT_CLASS_MISMATCH, Р27). */
+   *  detail — уточнение для журнала: только значение перечня ПАО (класс при AGENT_CLASS_MISMATCH, Р27) или версия вида
+   *  1.x.y, собранная из чисел (PLATFORM_PROTOCOL_UNSUPPORTED, Р33 п. 10). */
   stop(reason: string, detail?: string): void;
   /** Ответ реестра не по схеме после допуска (Р27): подпись приостановлена до успешной повторной сверки; до допуска —
    *  без действия (допуск и так не состоялся). */

@@ -3,14 +3,20 @@
 // Остаток и счётчики агент не вычисляет — только переносит ответ verify (инвариант 6, A3 п. 4.3).
 // По типу мандата нет закрытых перечней со switch/never: условие ставится только там, где тип что-то требует (CART).
 import type { StandParams } from "../../shared/config.js";
-import type { Cart, Mandate, MandateCheck, MandateDraft, MandateRef, PlatformEvent } from "../../shared/domain.js";
+import { PlatformFailure, type Cart, type Mandate, type MandateCheck, type MandateDraft, type MandateRef, type PlatformEvent } from "../../shared/domain.js";
 import type { MandatePort } from "../ports/mandates.js";
 import type { Mutation } from "../ports/mutation.js";
-import { MandateRefused } from "./errors.js";
+import { MandateRefused, REVOCATION_ORDER_MISSING_TEXT } from "./errors.js";
+
+/** Часть журнала, которую видит клиент: только своё событие (граница импортов mandates — ревью К2 № 13; Journal подходит). */
+export interface MandateJournal {
+  record(entry: { at: string; kind: "mandate.revocation_order_missing"; reason: "MANDATE_REVOCATION_ORDER_MISSING" }): void;
+}
 
 export interface MandateClientOptions {
   port: MandatePort;
   params: Pick<StandParams, "registry_cache_ttl_sec" | "signature_skew_sec">;
+  journal: MandateJournal;
   now?: () => Date;
 }
 
@@ -87,13 +93,47 @@ export class MandateClient {
     this.now = o.now ?? (() => new Date());
   }
 
-  /** Запрос мандата. Проект без обязательного реквизита — отказ до обращения (A7 п. 2.2, П06). */
-  async request(draft: MandateDraft, m: Mutation): Promise<Mandate> {
+  /** Запрос мандата. Проект без обязательного реквизита — отказ до обращения (A7 п. 2.2, П06). У CART — родитель, которым
+   *  агент располагает: порядок отзыва CART — как у родителя (Р33 п. 4).
+   *  После 201 — статус (РП35): PENDING_SIGNATURE — ждать подписи; ACTIVE (повтор тем же ключом позже 24 ч) — статус
+   *  только из GET (РП34); прочие — отказ, новый мандат молча не создаётся (новый ключ — после нового поручения человека). */
+  async request(draft: MandateDraft, m: Mutation, parent: Mandate | null = null): Promise<Mandate> {
     const missing = missingTerms(draft, this.now());
+    // родитель — только у CART и только тот, на который ссылается проект (ревью К2.2 № 6)
+    if (draft.kind === "CART" ? parent?.id !== draft.parentId : parent !== null) missing.push("parent");
     if (missing.length > 0) throw new MandateRefused("DRAFT_INVALID", `в проекте мандата нет: ${missing.join(", ")}`);
-    const mandate = await this.o.port.requestMandate(draft, m);
+    let mandate = await this.#mandate(() => this.o.port.requestMandate(draft, m));
+    if (mandate.status === "ACTIVE") mandate = await this.#reread(mandate.id);
+    if (mandate.status !== "PENDING_SIGNATURE" && mandate.status !== "ACTIVE") {
+      throw new MandateRefused("NOT_ACTIVE", `мандат не действует (${mandate.status}): новое поручение — только по вашему решению`);
+    }
     if (!sameTerms(draft, mandate)) throw new MandateRefused("REPLY_MISMATCH", "платформа вернула мандат с другими пределами");
+    if (parent !== null && mandate.revocationOrder !== parent.revocationOrder) {
+      throw new MandateRefused("REPLY_MISMATCH", "порядок отзыва мандата корзины не совпадает с мандатом намерения");
+    }
     return mandate;
+  }
+
+  /** Мандат по GET — тот, что спросили: другой id — пределы не подтверждены (инвариант 4, ревью К2.2 № 6). */
+  async #reread(id: string): Promise<Mandate> {
+    const got = await this.#mandate(() => this.o.port.getMandate(id));
+    if (got.id !== id) throw new MandateRefused("REPLY_MISMATCH", "платформа вернула другой мандат");
+    return got;
+  }
+
+  /** Ответ с мандатом без порядка отзыва: версия ПАО Платформы подтверждена — событие в журнал и отказ с текстом человеку
+   *  (Р33 п. 4); не подтверждена — порт уже записал событие и остановил агента (PLATFORM_PROTOCOL_UNSUPPORTED), отказ
+   *  платформы — дальше как есть (Р33 п. 10). */
+  async #mandate(call: () => Promise<Mandate>): Promise<Mandate> {
+    try {
+      return await call();
+    } catch (e) {
+      if (e instanceof PlatformFailure && e.code === "MANDATE_REVOCATION_ORDER_MISSING") {
+        this.o.journal.record({ at: this.now().toISOString(), kind: "mandate.revocation_order_missing", reason: e.code });
+        throw new MandateRefused("REVOCATION_ORDER_MISSING", REVOCATION_ORDER_MISSING_TEXT);
+      }
+      throw e;
+    }
   }
 
   /** Ожидание подписи человека (SPEC §9, Р29 п. 5). Событие — только сигнал: до AG-06 подпись событий не проверяется.
@@ -104,7 +144,7 @@ export class MandateClient {
       if (signal?.aborted) break;
       if (e.mandateId !== mandate.id) continue;
       if (e.type === "mandate.signed") {
-        const actual = await this.o.port.getMandate(mandate.id);
+        const actual = await this.#reread(mandate.id);
         if (actual.status !== "ACTIVE") {
           throw new MandateRefused("NOT_ACTIVE", `событие mandate.signed, а статус мандата у платформы — ${actual.status}`);
         }

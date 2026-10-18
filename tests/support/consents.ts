@@ -2,7 +2,9 @@
 // (подпись в эмуляторе эмитента, mandate.signed) — STATUS «Ждём от платформы», строки AG-05. После них те же тесты —
 // против createStand платформы. POST /pao/v1/mandates → PENDING_SIGNATURE, подпись человека — sign(id),
 // verify — остаток и as_of задаёт тест. Остаток здесь не вычисляется из операций:
-// его ведёт платформа (инвариант 6), тест лишь назначает значение.
+// его ведёт платформа (инвариант 6), тест лишь назначает значение. Порядок отзыва задаёт «Платформа» (ПАО 1.4.0, РП37):
+// поле запроса не берётся, у CART — как у родителя (если родитель здесь есть). Стенд Платформы этого пока не проверяет:
+// стенд v0.4.0 (ПАО 1.4.0, К2а) мандаты уже отдаёт; переход этих тестов на createStand — STATUS «Открыто».
 import type * as Pao from "@kuzin4u/agentic-core/pao";
 import type { PaoStubOptions } from "@kuzin4u/agentic-core/pao";
 import type { MandateDraft, Money, PlatformEvent, PlatformEventType } from "../../src/shared/domain.js";
@@ -35,17 +37,30 @@ export class Consents {
   /** as_of в ответе verify: "now" — часы стенда, null — поле не отдаётся, строка — как есть */
   asOf: "now" | null | string = "now";
   outcome: Verify["outcome"] = "CONFIRMED";
+  /** порядок отзыва из соглашения участника — его отдаёт Платформа, не агент (РП37) */
+  revocationOrder = "bank:pr_1:revocation:v1";
   /** подмена ответа на создание (проверка сверки ответа с проектом) */
   tamper?: (m: PaoMandate) => PaoMandate;
   private seq = 0;
 
-  constructor(private readonly clock: () => Date) {}
+  constructor(
+    private readonly clock: () => Date,
+    private readonly agentCode: string = AGENT,
+  ) {}
 
   handlers(): Handlers {
     return {
       "POST /pao/v1/mandates": ({ body }) => {
         const id = `m_${++this.seq}`;
-        const m: PaoMandate = { ...body, id, agent_code: AGENT, status: "PENDING_SIGNATURE", created_at: this.clock().toISOString() };
+        const parent = body.parent_id ? this.mandates.get(body.parent_id) : undefined;
+        const m: PaoMandate = {
+          ...body,
+          id,
+          agent_code: this.agentCode,
+          revocation_order: parent?.revocation_order ?? this.revocationOrder,
+          status: "PENDING_SIGNATURE",
+          created_at: this.clock().toISOString(),
+        };
         this.mandates.set(id, m);
         return { status: 201, body: this.tamper ? this.tamper(m) : m };
       },

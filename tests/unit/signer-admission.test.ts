@@ -345,13 +345,13 @@ describe("после допуска", () => {
     stand.agentClass = "SELLER";
     const { core, journal } = await coreOn(stand);
     await expect(core.start()).rejects.toMatchObject({ reason: "AGENT_CLASS_MISMATCH" });
-    expect(stand.stub.calls.map((c) => c.op)).toEqual(["GET /pao/v1/agent"]);
+    expect(stand.stub.calls.map((c) => c.op)).toEqual(["GET /.well-known/pao-configuration", "GET /pao/v1/agent"]);
     expect(journal.entries.filter((e) => e.kind === "agent.stopped")).toEqual([
       expect.objectContaining({ reason: "AGENT_CLASS_MISMATCH", detail: "SELLER" }),
     ]);
     await expect(core.platform.issueCredential(DRAFT, { idempotencyKey: "i1" })).rejects.toThrow(SignerStopped);
     await expect(core.start()).rejects.toThrow(SignerStopped);
-    expect(stand.stub.calls).toHaveLength(1);
+    expect(stand.stub.calls).toHaveLength(2);
   });
 
   it("порядок: сначала статус, затем класс — SUSPENDED и SELLER дают AGENT_SUSPENDED", async () => {

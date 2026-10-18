@@ -4,11 +4,18 @@ import { PAO_ERRORS } from "@kuzin4u/agentic-core/pao";
 import { FAILURE_RULES, ruleForDeclineReason, ruleForFailure } from "../../src/agent/declines/index.js";
 
 const spec = readFileSync("docs/core/SPEC.md", "utf8");
+/** коды агента вне ПАО — своя часть §7а (Р33) */
+const AGENT_CODES = ["MANDATE_REVOCATION_ORDER_MISSING", "PLATFORM_PROTOCOL_UNSUPPORTED"];
 const specRows = [...spec.matchAll(/^\| ([A-Z_]+) \| (\d{3}) \| (\w+) \|/gm)].map((m) => ({ code: m[1]!, http: Number(m[2]), retry: m[3]! }));
 
 describe("таблица отказов", () => {
-  it("коды ядра = коды ПАО 1.4.0 + UNKNOWN", () => {
-    expect(Object.keys(FAILURE_RULES).sort()).toEqual([...Object.keys(PAO_ERRORS), "UNKNOWN"].sort());
+  it("коды ядра = коды ПАО 1.4.0 + коды агента вне ПАО (Р33) + UNKNOWN", () => {
+    expect(Object.keys(FAILURE_RULES).sort()).toEqual([...Object.keys(PAO_ERRORS), ...AGENT_CODES, "UNKNOWN"].sort());
+  });
+
+  it("Р33 п. 4: MANDATE_REVOCATION_ORDER_MISSING — стоп без повтора, событие в журнал; строка в SPEC §7а", () => {
+    expect(ruleForFailure("MANDATE_REVOCATION_ORDER_MISSING")).toMatchObject({ action: "STOP", retry: "never", maxRetries: 0, defect: false, journal: true });
+    for (const c of AGENT_CODES) expect(spec).toMatch(new RegExp(`^\\| ${c} \\| — \\| never \\|`, "m"));
   });
 
   it.each(Object.entries(PAO_ERRORS))("%s: retry совпадает с ПАО", (code, row) => {

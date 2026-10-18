@@ -5,6 +5,7 @@
 import {
   PAO_OPERATIONS,
   PAO_VERSION,
+  PaoCallError,
   PaoClient,
   validatePao,
   type PaoCallArgs,
@@ -13,7 +14,7 @@ import {
 } from "@kuzin4u/agentic-core/pao";
 import { PAO_RETRY_AFTER_MAX_SEC, type StandParams } from "../../../shared/config.js";
 import { PlatformFailure, type AgentSelf, type MandateRef } from "../../../shared/domain.js";
-import type { PaymentPlatform, PlatformCapabilities, Mutation } from "../../ports/payment-platform.js";
+import type { PaymentPlatform, PlatformCapabilities, ProtocolCheck, Mutation } from "../../ports/payment-platform.js";
 import type { RequestSigning } from "../../ports/request-signing.js";
 import { AGENT_STOP_CODES, ruleForFailure } from "../../declines/index.js";
 import { toFailure } from "./errors.js";
@@ -21,6 +22,47 @@ import * as map from "./map.js";
 
 /** Версия копии ПАО у агента (docs/core/protocol/SOURCE.md, Р20). */
 export const PAO_COPY_VERSION = "1.4.0";
+
+/** Нижняя граница версии ПАО Платформы (Р33 п. 10): ниже — в мандатах нет порядка отзыва (A7 п. 2.2). Свойство
+ *  контракта, а не стендовый параметр. */
+export const PAO_MIN_PLATFORM_VERSION = "1.4.0";
+
+/** Описание PLATFORM_PROTOCOL_UNSUPPORTED для оператора (Р33 п. 10); version — только значение вида 1.x.y или null. */
+export function protocolUnsupportedText(version: string | null): string {
+  const v = version === null ? "версия не определена; ответ мандата без порядка отзыва" : `Платформа работает по ПАО ${version}`;
+  return `${v}, агенту нужна не ниже ${PAO_MIN_PLATFORM_VERSION}: в мандатах нет порядка отзыва (A7 п. 2.2). Обновите Платформу или подключите совместимую`;
+}
+
+const SEMVER_1 = /^1\.(\d{1,4})\.(\d{1,6})$/;
+
+/** Наибольшее значение вида 1.x.y в Configuration.versions; прочие значения (например, `v1` — версия пути) не учитываются. */
+export function highestPaoVersion(versions: readonly string[]): string | null {
+  let best: [number, number] | null = null;
+  for (const v of versions) {
+    const m = typeof v === "string" ? SEMVER_1.exec(v) : null;
+    if (m === null) continue;
+    const cur: [number, number] = [Number(m[1]), Number(m[2])];
+    if (best === null || cur[0] > best[0] || (cur[0] === best[0] && cur[1] > best[1])) best = cur;
+  }
+  return best === null ? null : `1.${best[0]}.${best[1]}`;
+}
+
+const isStringArray = (v: unknown): v is string[] => Array.isArray(v) && v.every((x) => typeof x === "string");
+
+function belowMin(version: string): boolean {
+  const [, a = 0, b = 0] = version.split(".").map(Number);
+  const [, x = 0, y = 0] = PAO_MIN_PLATFORM_VERSION.split(".").map(Number);
+  return a < x || (a === x && b < y);
+}
+
+/** Подписант для обращений без подписи (конфигурация): подпись ими не вызывается; вызов — дефект, а не обход. */
+const UNSIGNED = Object.freeze({
+  kid: "unsigned",
+  alg: "none",
+  sign(): Buffer {
+    throw new Error("обращение без подписи не подписывается");
+  },
+});
 
 /** Валюты Платформы ПС по ПАО 1.4.0 — допустимое множество, не источник валюты (Р29 п. 2). */
 export const PAO_CURRENCIES = ["RUB"] as const;
@@ -31,12 +73,46 @@ export function assertPaoVersion(actual: string = PAO_VERSION): void {
   }
 }
 
+/** Часть журнала агента, которую видит адаптер: только события версии ПАО Платформы (Р33 п. 10; Journal подходит). */
+export interface ProtocolJournal {
+  record(
+    entry:
+      | { at: string; kind: "platform.version_unknown"; reason: "PLATFORM_VERSION_UNKNOWN"; detail: "NO_VERSION" | "BAD_RESPONSE" | "NO_RESPONSE" }
+      | { at: string; kind: "platform.protocol_unsupported"; reason: "PLATFORM_PROTOCOL_UNSUPPORTED"; detail: "CONFIGURATION" | "MANDATE" },
+  ): void;
+}
+
+/** Операции, ответ которых — мандат или выписка с цепочкой мандатов (Р33 п. 10, шаг 2). */
+const MANDATE_OPS: ReadonlySet<PaoOperationKey> = new Set<PaoOperationKey>([
+  "POST /pao/v1/mandates",
+  "GET /pao/v1/mandates/{id}",
+  "POST /pao/v1/mandates/{id}/relinquish",
+]);
+
+/** Объект с `id` мандата без непустого `revocation_order`; пустое тело, не объект — не мандат (тогда UNKNOWN). */
+const noOrder = (m: unknown): boolean => {
+  if (typeof m !== "object" || m === null) return false;
+  const { id, revocation_order: ro } = m as { id?: unknown; revocation_order?: unknown };
+  return typeof id === "string" && id !== "" && !(typeof ro === "string" && ro.trim() !== "");
+};
+
+/** В ответе есть мандат без порядка отзыва — признак Платформы старше 1.4.0, даже если ответ не по схеме 1.4.0
+ *  (в 1.3.0 `agent_code` мандата был необязателен — ревью К2.3 № 2). */
+function mandateWithoutOrder(op: PaoOperationKey, r: unknown): boolean {
+  if (MANDATE_OPS.has(op)) return noOrder(r);
+  if (op !== "GET /pao/v1/mandates/{id}/evidence") return false;
+  const chain = typeof r === "object" && r !== null ? (r as { mandate_chain?: unknown }).mandate_chain : undefined;
+  return Array.isArray(chain) && chain.some(noOrder);
+}
+
 export interface PaoPlatformOptions {
   baseUrl: string;
   agentCode: string;
   /** подпись из модуля signer через порт; ключ адаптеру не передаётся (инвариант 2) */
   signing: RequestSigning;
   params: StandParams;
+  /** события версии ПАО Платформы (Р33 п. 10); у адаптера допуска не нужен — мандатов он не запрашивает */
+  journal?: ProtocolJournal;
   fetch?: typeof fetch;
   sleep?: (ms: number) => Promise<void>;
   now?: () => Date;
@@ -59,6 +135,10 @@ export class PaoPlatform implements PaymentPlatform {
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly fetchImpl: typeof fetch;
   private readonly cur: map.Currencies = new Set(PAO_CURRENCIES);
+  /** версия ПАО Платформы подтверждена — конфигурацией или первым ответом с мандатом; до перезапуска (Р33 п. 10) */
+  private protocolConfirmed = false;
+  /** Платформа признана несовместимой — флаг подтверждения больше не ставится (ревью К2.3 № 5) */
+  private protocolUnsupported = false;
 
   constructor(private readonly o: PaoPlatformOptions) {
     assertPaoVersion();
@@ -79,6 +159,57 @@ export class PaoPlatform implements PaymentPlatform {
       guaranteeContour: true,
       conditionalSettlement: false,
     };
+  }
+
+  /**
+   * Р33 п. 10, шаг 1: GET /.well-known/pao-configuration без подписи, один раз, без повторов. Наибольшее 1.x.y ниже
+   * PAO_MIN_PLATFORM_VERSION — остановка агента и отказ PLATFORM_PROTOCOL_UNSUPPORTED; не ниже — версия подтверждена;
+   * значений 1.x.y нет, `versions` не массив строк, ответ не объект или отказ — версия не определена, проверка по первому
+   * мандату (шаг 2).
+   */
+  async checkProtocol(): Promise<ProtocolCheck> {
+    let versions: string[] | undefined;
+    try {
+      const r: unknown = await this.client({}, UNSIGNED).call("GET /.well-known/pao-configuration", {});
+      // По схеме — только `versions` (string[]); прочие поля конфигурации агенту не нужны и игнорируются (ПАО §7):
+      // алгоритм или ключ Платформы вне перечня не прячет явную версию ниже 1.4.0 (ревью К2.3 № 9).
+      if (typeof r !== "object" || r === null || Array.isArray(r)) return this.unknownVersion("BAD_RESPONSE");
+      const v = (r as { versions?: unknown }).versions;
+      if (v !== undefined && !isStringArray(v)) return this.unknownVersion("BAD_RESPONSE");
+      versions = v;
+    } catch (e) {
+      // Тело и сообщение исключения не переносятся (инвариант 1). Наружу — всё, что не ответ и не разбор: дефект агента
+      // (например, вызов подписи) не маскируется под «адрес не отвечает» (ревью К2.3 № 4).
+      if (e instanceof SyntaxError) return this.unknownVersion("BAD_RESPONSE");
+      if (e instanceof PaoCallError) return this.unknownVersion("NO_RESPONSE");
+      throw e;
+    }
+    const version = versions === undefined ? null : highestPaoVersion(versions);
+    if (version === null) return this.unknownVersion("NO_VERSION");
+    if (belowMin(version)) {
+      const failure = this.unsupported("CONFIGURATION", version, 200, null);
+      this.o.signing.stop("PLATFORM_PROTOCOL_UNSUPPORTED", version);
+      throw failure;
+    }
+    this.protocolConfirmed = true;
+    return { status: "confirmed", version };
+  }
+
+  private unknownVersion(detail: "NO_VERSION" | "BAD_RESPONSE" | "NO_RESPONSE"): ProtocolCheck {
+    this.o.journal?.record({ at: this.at(), kind: "platform.version_unknown", reason: "PLATFORM_VERSION_UNKNOWN", detail });
+    return { status: "unknown", detail };
+  }
+
+  /** Несовместимая Платформа: событие в журнал (одна точка для обоих шагов и всех путей с мандатом — ревью К2.3 № 1).
+   *  Остановку агента делает вызывающий: шаг 1 — checkProtocol, шаг 2 — call по AGENT_STOP_CODES. */
+  private unsupported(step: "CONFIGURATION" | "MANDATE", version: string | null, httpStatus: number, key: string | null): PlatformFailure {
+    this.protocolUnsupported = true;
+    this.o.journal?.record({ at: this.at(), kind: "platform.protocol_unsupported", reason: "PLATFORM_PROTOCOL_UNSUPPORTED", detail: step });
+    return new PlatformFailure("PLATFORM_PROTOCOL_UNSUPPORTED", "never", null, httpStatus, key, protocolUnsupportedText(version));
+  }
+
+  private at(): string {
+    return (this.o.now ?? (() => new Date()))().toISOString();
   }
 
   /** Одно обращение без повторов клиента; тайм-аут — pao_request_timeout_ms. Retry-After и HTTP-статус ответа — в last. */
@@ -127,6 +258,7 @@ export class PaoPlatform implements PaymentPlatform {
         // игнорировать — STATUS «Открыто», AG-06.
         const schema = PAO_OPERATIONS[op].response;
         if (schema !== undefined && validatePao(schema, r).length > 0) {
+          if (!this.protocolConfirmed && mandateWithoutOrder(op, r)) throw this.unsupported("MANDATE", null, last.status ?? 200, key);
           throw new PlatformFailure("UNKNOWN", "never", null, last.status ?? 200, key, "ответ ПАО не по схеме");
         }
         return to(r);
@@ -190,7 +322,25 @@ export class PaoPlatform implements PaymentPlatform {
     return this.call("POST /pao/v1/mandates", { body: map.mandateDraftToPao(draft, this.cur), idempotencyKey: keyOf(m) }, this.mandate);
   }
 
-  private readonly mandate = (r: Parameters<typeof map.mandateFromPao>[0]) => map.mandateFromPao(r, this.cur, this.o.agentCode);
+  private readonly mandate = (r: Parameters<typeof map.mandateFromPao>[0]) => this.confirming(() => map.mandateFromPao(r, this.cur, this.o.agentCode));
+
+  /** Р33 п. 10, шаг 2: каждый разбор ответа с мандатом (POST, GET, relinquish, evidence). Версия не подтверждена и порядка
+   *  отзыва нет — PLATFORM_PROTOCOL_UNSUPPORTED (call останавливает агента по AGENT_STOP_CODES); разобран — версия
+   *  подтверждена, если в ответе был хоть один мандат (выписка с пустой цепочкой версию не подтверждает). После
+   *  подтверждения — MANDATE_REVOCATION_ORDER_MISSING как есть (Р33 п. 4). */
+  private confirming<R>(parse: () => R, mandates: (r: R) => number = () => 1): R {
+    let r: R;
+    try {
+      r = parse();
+    } catch (e) {
+      if (!this.protocolConfirmed && e instanceof PlatformFailure && e.code === "MANDATE_REVOCATION_ORDER_MISSING") {
+        throw this.unsupported("MANDATE", null, e.httpStatus, e.idempotencyKey);
+      }
+      throw e;
+    }
+    if (mandates(r) > 0 && !this.protocolUnsupported) this.protocolConfirmed = true;
+    return r;
+  }
 
   getMandate(id: string) {
     return this.call("GET /pao/v1/mandates/{id}", { path: { id } }, this.mandate);
@@ -206,7 +356,12 @@ export class PaoPlatform implements PaymentPlatform {
   }
 
   mandateEvidence(id: string) {
-    return this.call("GET /pao/v1/mandates/{id}/evidence", { path: { id } }, (r) => map.evidenceFromPao(r, id, this.cur, this.o.agentCode));
+    return this.call("GET /pao/v1/mandates/{id}/evidence", { path: { id } }, (r) =>
+      this.confirming(
+        () => map.evidenceFromPao(r, id, this.cur, this.o.agentCode),
+        (e) => e.mandateChain.length,
+      ),
+    );
   }
 
   async issueCredential(draft: Parameters<PaymentPlatform["issueCredential"]>[0], m: Mutation) {

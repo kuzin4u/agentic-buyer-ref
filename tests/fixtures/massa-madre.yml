@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE yml_catalog SYSTEM "shops.dtd">
+<yml_catalog date="2026-10-17 07:00">
+  <shop>
+    <name>Масса Мадре</name>
+    <company>Пекарня (тестовый фид)</company>
+    <url>https://example.invalid/</url>
+    <currencies>
+      <currency id="RUR" rate="1"/>
+    </currencies>
+    <categories>
+      <category id="1">Хлеб</category>
+      <category id="2" parentId="1">На закваске</category>
+      <category id="3" parentId="1">Заварной</category>
+    </categories>
+    <delivery-options>
+      <option cost="300" days="1" order-before="18"/>
+    </delivery-options>
+    <pickup-options>
+      <option cost="0" days="0"/>
+    </pickup-options>
+    <offers>
+      <offer id="tartine" available="true">
+        <name>Тартин</name>
+        <url>https://example.invalid/tartine</url>
+        <price>450</price>
+        <currencyId>RUR</currencyId>
+        <categoryId>2</categoryId>
+        <picture>https://example.invalid/tartine.jpg</picture>
+        <delivery>true</delivery>
+        <pickup>true</pickup>
+        <description><![CDATA[<p>Пшеничный хлеб на закваске, 24 часа брожения. Цена 450 ₽.</p>]]></description>
+        <param name="вес" unit="г">750</param>
+        <count>12</count>
+      </offer>
+      <offer id="zavarnoy" available="true">
+        <name>Заварной</name>
+        <price>390.00</price>
+        <currencyId>RUR</currencyId>
+        <categoryId>3</categoryId>
+        <description>Ржано-пшеничный заварной хлеб с солодом и кориандром</description>
+        <param name="вес" unit="г">600</param>
+      </offer>
+      <offer id="tartine-cheese" available="false">
+        <name>Тартин сырный</name>
+        <price>520,50</price>
+        <currencyId>RUR</currencyId>
+        <categoryId>2</categoryId>
+        <delivery>false</delivery>
+        <description>Тартин с сыром &amp; тмином</description>
+        <param name="вес" unit="г">700</param>
+      </offer>
+      <offer id="borodinsky" available="true">
+        <name>Бородинский</name>
+        <price>290</price>
+        <currencyId>RUR</currencyId>
+        <categoryId>3</categoryId>
+        <delivery-options>
+          <option cost="0" days="1-2"/>
+        </delivery-options>
+        <param name="вес" unit="г">500</param>
+      </offer>
+    </offers>
+  </shop>
+</yml_catalog>

@@ -19,6 +19,9 @@ type Zone = "compose" | "signer" | "pao-adapter" | "adapter" | "rest";
 const PAO_TYPES = "@kuzin4u/agentic-core/pao";
 const CORE = "@kuzin4u/agentic-core";
 const STAND = /^agentic-ps-platform(\/|$)/i;
+/** Каталог ядра — подпуть `/catalog` и любой путь к нему внутри пакета (dist) — только в src/agent/catalog (Р32 п. 6). */
+const CORE_CATALOG = /^@kuzin4u\/agentic-core\/(.*\/)?catalog(\/|\.|$)/i;
+const CATALOG_DIR = "src/agent/catalog/";
 const KEY_API = new Set(boundaries.cryptoKeyApis);
 /** Из node:crypto вне signer — только эти имена (список разрешённого) */
 const CRYPTO_ALLOWED = new Set(boundaries.cryptoAllowedOutsideSigner);
@@ -209,6 +212,10 @@ export function importGraphViolations(p: Project): string[] {
       // ключевые API и подпись agentic-core — только в signer и compose; обходы — нигде
       const keyUse = / ключевой API[ :]| подпись agentic-core| WebCrypto/.test(problem);
       if (!keyUse || (zone !== "signer" && zone !== "compose")) out.push(problem);
+    }
+    // Прямой вход в каталог ядра: факты каталога остальным — только через src/agent/catalog (Р32 п. 6)
+    if (!rel(file).startsWith(CATALOG_DIR)) {
+      for (const spec of factsOf(file).external) if (CORE_CATALOG.test(spec)) out.push(`${rel(file)}: «${spec}» — только в ${CATALOG_DIR} (Р32)`);
     }
     if (zone === "compose") continue;
     const reach = closure(file);

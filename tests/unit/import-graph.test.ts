@@ -108,6 +108,28 @@ describe("граф импортов src (Р24)", { timeout: 60_000 }, () => {
     expect(v.filter((x) => x.includes("signer/ok.ts"))).toEqual([]);
   });
 
+  it("каталог ядра (/catalog) — только в src/agent/catalog: импорт, тип, import(), путь dist (Р32 п. 6)", () => {
+    const v = importGraphViolations(
+      virtual({
+        "src/agent/catalog/index.ts": 'export { parseYml } from "@kuzin4u/agentic-core/catalog";\nexport type { LiveCheckCode } from "@kuzin4u/agentic-core/catalog";\n',
+        "src/agent/policy/a.ts": 'import { checkLiveOffer } from "@kuzin4u/agentic-core/catalog";\nexport const c = checkLiveOffer;\n',
+        "src/agent/policy/b.ts": 'export type T = import("@kuzin4u/agentic-core/catalog").CatalogShop;\n',
+        "src/agent/pipeline/c.ts": 'export const p = async () => (await import("@kuzin4u/agentic-core/catalog")).parseYml;\n',
+        "src/shared/d.ts": 'export * from "@kuzin4u/agentic-core/dist/src/catalog/index.js";\n',
+        "src/agent/compose.ts": 'import type { CatalogShop } from "@kuzin4u/agentic-core/catalog";\nexport type S = CatalogShop;\n',
+        "src/agent/policy/ok.ts": 'import type { LiveCheckCode } from "../catalog/index.js";\nexport type L = LiveCheckCode;\n',
+      }),
+    );
+    const cat = v.filter((x) => x.includes("(Р32)"));
+    expect(cat).toEqual([
+      "src/agent/compose.ts: «@kuzin4u/agentic-core/catalog» — только в src/agent/catalog/ (Р32)",
+      "src/agent/pipeline/c.ts: «@kuzin4u/agentic-core/catalog» — только в src/agent/catalog/ (Р32)",
+      "src/agent/policy/a.ts: «@kuzin4u/agentic-core/catalog» — только в src/agent/catalog/ (Р32)",
+      "src/agent/policy/b.ts: «@kuzin4u/agentic-core/catalog» — только в src/agent/catalog/ (Р32)",
+      "src/shared/d.ts: «@kuzin4u/agentic-core/dist/src/catalog/index.js» — только в src/agent/catalog/ (Р32)",
+    ]);
+  });
+
   it("реэкспорт ключевых API, import() модулей с ключами, default-импорт node:module — нарушение (ревью 3c № 1–3)", () => {
     const v = importGraphViolations(
       virtual({

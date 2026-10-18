@@ -69,6 +69,10 @@ export class KeyRing {
   #admissionSwitched = false;
   /** брошенные временные ключи прошлых запусков (не загружаются) */
   readonly #abandoned = new Set<string>();
+  /** KEY_INVALID подряд при регистрации (Р31); успешная регистрация сбрасывает. Счёт — в процессе: перезапуск — решение человека */
+  #keyInvalidStreak = 0;
+  /** ротация остановлена по пределу KEY_INVALID (Р31); подпись прежним подтверждённым ключом продолжается */
+  #rotationStopped = false;
 
   constructor(o: KeyRingOptions) {
     this.#o = o;
@@ -184,6 +188,8 @@ export class KeyRing {
    * Плановая ротация (A2 п. 5.3): новый ключ регистрируется, подписываясь прежним; переход — только после
    * подтверждения платформы и сверки с GET /pao/v1/agent. Повторный вызов во время ротации ждёт ту же ротацию;
    * после сбоя связи регистрируется тот же ожидающий ключ с тем же Idempotency-Key (инвариант 9).
+   * KEY_INVALID (Р31) — ключ отклонён, следующая ротация — новый ключ; подряд сверх maxRetries таблицы отказов — ротация
+   * остановлена (инцидент в журнал, нужен человек), подпись прежним ключом — пока он действителен.
    */
   rotate(platform: Registrar): Promise<void> {
     this.#rotating ??= this.#doRotate(platform).finally(() => (this.#rotating = null));
@@ -196,6 +202,7 @@ export class KeyRing {
 
   async #doRotate(platform: Registrar): Promise<void> {
     this.#current(false); // остановленный или не допущенный агент не ротирует
+    if (this.#rotationStopped) throw new SignerKeyRejected("ротация остановлена после KEY_INVALID подряд: нужен человек (Р31)");
     // В этом процессе: ожидающий регистрации или зарегистрированный без подтверждённого перехода — тот же ключ
     // и тот же Idempotency-Key (инвариант 9). Временные файлы прошлых запусков не используются (#loadAll).
     const pendingKid = [...this.#held.entries()].find(([, h]) => h.state !== "revoked" && (h.state === "pending" || h.awaiting))?.[0];
@@ -208,13 +215,20 @@ export class KeyRing {
       this.#record("key.created", fresh.descriptor.kid);
     }
     const { kid, alg, public_key } = fresh.descriptor;
-    const reg = await platform.registerKey({ alg, publicKey: public_key }, { idempotencyKey: `agent-key-${kid}` });
+    let reg: AgentKey;
+    try {
+      reg = await platform.registerKey({ alg, publicKey: public_key }, { idempotencyKey: `agent-key-${kid}` });
+    } catch (e) {
+      if (e instanceof PlatformFailure && e.code === "KEY_INVALID") this.#keyInvalid(kid);
+      throw e; // прочие отказы: итог регистрации неизвестен — тот же ключ с тем же Idempotency-Key (инвариант 9)
+    }
     if (reg.kid !== kid || reg.publicKey !== public_key) this.#halt("KEY_MISMATCH");
     if (reg.status !== "ACTIVE") {
       this.#mark(kid, "revoked", "KEY_NOT_ACTIVE"); // отклонённый ключ не повторяется: следующая ротация — новый ключ
       throw new SignerKeyRejected("платформа не подтвердила новый ключ как действующий");
     }
     this.#record("key.registered", kid);
+    this.#keyInvalidStreak = 0;
     // Регистрация подтверждена платформой — постоянное имя <kid>.pem. Ключом допуска он станет, только когда сверка
     // запишет его valid_from в метаданные.
     const h = this.#held.get(kid)!;
@@ -224,6 +238,16 @@ export class KeyRing {
     this.#write(kid, "active");
     this.#reconcile(await platform.agentSelf());
     if (this.#currentKid !== kid) throw new SignerKeyRejected("после регистрации платформа не показала новый ключ действующим");
+  }
+
+  /** KEY_INVALID: ключ не принят — отклонён (повторно не регистрируется, инвариант 9); предел подряд — из таблицы отказов. */
+  #keyInvalid(kid: string): void {
+    this.#mark(kid, "revoked", "KEY_INVALID");
+    this.#keyInvalidStreak++;
+    if (this.#keyInvalidStreak > (ruleForFailure("KEY_INVALID").maxRetries ?? 0)) {
+      this.#rotationStopped = true;
+      this.#record("key.rotation_stopped", undefined, "KEY_INVALID");
+    }
   }
 
   #current(admitting: boolean, rechecking = false): Signer {

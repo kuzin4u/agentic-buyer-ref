@@ -5,6 +5,10 @@ import { z } from "zod";
 
 const count = z.number().int().nonnegative();
 const positive = z.number().int().positive();
+/** Предел таймера Node: больше 2^31 − 1 мс таймер срабатывает через 1 мс (agentic-core `checkLiveOffer`). */
+const TIMER_MAX_MS = 2_147_483_647;
+/** Секунды, которые переводятся в мс для ядра: после × 1000 значение остаётся safe integer — отказ при запуске, а не при проверке. */
+const secToMs = count.max(Math.floor(Number.MAX_SAFE_INTEGER / 1000));
 
 /** Потолок суммарного ожидания по Retry-After (429 и 503) у адаптера ПАО. Норма Платформы, не стендовое значение:
  *  РП24 платформы — Retry-After у 503 в границах 0…30 с; см. STATUS, «Передача для AG-03». */
@@ -28,6 +32,10 @@ export const StandParamsSchema = z
   revocation_propagation_max_ms: count,
   pao_max_attempts: positive,
   pao_request_timeout_ms: positive,
+  // Живая проверка перед заказом (Р32 п. 7): в checkLiveOffer ядра передаются в мс.
+  live_check_timeout_ms: positive.max(TIMER_MAX_MS),
+  live_check_max_age_sec: secToMs,
+  live_check_clock_skew_sec: secToMs,
 })
   // Обращения и ожидание повторов укладываются в registry_cache_ttl_sec (инвариант 4, Р20).
   .refine(

@@ -33,7 +33,7 @@ function requirementRows(spec: string): Map<string, Set<string>> {
   }
   return rows;
 }
-const paoErrors = paoErrorCodes(readFileSync("docs/core/protocol/agent-protocol.v1.2.0.yaml", "utf8"));
+const paoErrors = paoErrorCodes(readFileSync("docs/core/protocol/agent-protocol.v1.4.0.yaml", "utf8"));
 const spec = readFileSync("docs/core/SPEC.md", "utf8");
 const reasons = declineReasons(spec);
 const requirements = requirementRows(spec);
@@ -61,8 +61,8 @@ describe("каталог сценариев приёмки", () => {
   });
 
   // Сломанный разбор дал бы пустой перечень и пустую проверку ниже (ревью Р26 № 1).
-  it("перечни кодов разобраны полностью: ПАО — 18 кодов, SPEC §7б — три причины", () => {
-    expect(paoErrors).toHaveLength(18);
+  it("перечни кодов разобраны полностью: ПАО — 20 кодов (Р31), SPEC §7б — три причины", () => {
+    expect(paoErrors).toHaveLength(20);
     // Независимый источник: таблица ошибок agentic-core по той же версии ПАО.
     expect([...paoErrors].sort()).toEqual(Object.keys(PAO_ERRORS).sort());
     expect(reasons).toEqual(["AOI_MISSING", "AOI_MISMATCH", "INSUFFICIENT_FUNDS"]);

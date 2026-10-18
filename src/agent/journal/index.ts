@@ -27,7 +27,9 @@ export type JournalKind =
   /** повторная сверка прошла (ACTIVE и BUYER) — подпись возобновлена */
   | "signing.resumed"
   /** агент остановлен */
-  | "agent.stopped";
+  | "agent.stopped"
+  /** ротация остановлена: KEY_INVALID подряд сверх предела таблицы отказов (Р31); инцидент, нужен человек */
+  | "key.rotation_stopped";
 
 export interface JournalEntry {
   at: string;

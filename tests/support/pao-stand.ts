@@ -1,10 +1,14 @@
-// Тестовая обёртка над PaoStub agentic-core v0.3.0 для П01–П03 и связки ключей.
-// ОБЁРТКА, НЕ ДОРАБОТКА ЗАГЛУШКИ: эмулирует то, чего в PaoStub нет (расхождение № 9 в STATUS, передано в CO-1):
-//  1) статус EXCLUDED (PaoStubAgent.status — только ACTIVE | SUSPENDED): GET /pao/v1/agent — 200, status EXCLUDED;
-//     прочие методы — 403 AGENT_SUSPENDED (РП23 п. 6.3 Платформы);
-//  2) сроки ключей в GET /pao/v1/agent (заглушка не отдаёт valid_from / valid_to);
+// Тестовая обёртка над PaoStub agentic-core для П01–П03 и связки ключей; написана под v0.3.0; с ядром v0.6.0 (Р31) её поведение не менялось.
+// ОБЁРТКА, НЕ ДОРАБОТКА ЗАГЛУШКИ: эмулирует то, чего не было в PaoStub v0.3.0 (расхождение № 9 в STATUS):
+//  1) статус EXCLUDED: GET /pao/v1/agent — 200, status EXCLUDED; прочие методы — 403 AGENT_SUSPENDED (РП23 п. 6.3 Платформы);
+//  2) сроки ключей в GET /pao/v1/agent;
 //  3) POST /pao/v1/agent/keys по РП23: новый ключ на key_ttl_days, сроки прежних ACTIVE сокращаются до now + key_overlap_days;
-//  4) класс агента в GET /pao/v1/agent (заглушка не отдаёт class; Р27, просьба в CO-1).
+//  4) класс агента в GET /pao/v1/agent (Р27);
+//  5) НЕ эмулируется: KEY_INVALID и REQUEST_INVALID при регистрации (РП31 п. 2 — свой отозванный, чужой ключ, alg, тело
+//     не по схеме) — обёртка отвечает 201; где нужен отказ, тест ставит stub.fail (он главнее обработчика). STATUS «Открыто», Р31.
+// С v0.5.0 (К13 ядра) заглушка умеет 1–4 сама, но свои обработчики GET /pao/v1/agent и POST /pao/v1/agent/keys по-прежнему
+// имеют приоритет — тесты идут через обёртку. Упрощение обёртки до заглушки ядра — STATUS «Открыто» (Р31).
+// Ключ заглушки: status необязателен с v0.5.0 (PaoStubKey), по умолчанию ACTIVE.
 // Подпись, nonce, окно времени, Idempotency-Key и схемы проверяет сама заглушка.
 import { createHash, createPublicKey } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -74,7 +78,7 @@ export class PaoStand {
             status: this.status,
             // приведение — чтобы тест мог отдать и значение вне перечня ПАО (ожидается UNKNOWN у адаптера)
             ...(this.agentClass !== undefined && { class: this.agentClass as "BUYER" }),
-            keys: this.agent.keys.map((k) => ({ kid: k.kid, alg: k.alg, public_key: k.publicKey, status: k.status, ...this.dates.get(k.kid)! })),
+            keys: this.agent.keys.map((k) => ({ kid: k.kid, alg: k.alg, public_key: k.publicKey, status: k.status ?? "ACTIVE", ...this.dates.get(k.kid)! })),
           },
         }),
         "POST /pao/v1/agent/keys": ({ body }) => {

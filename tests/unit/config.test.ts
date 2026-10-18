@@ -33,6 +33,23 @@ describe("стендовые параметры", () => {
     expect(() => parseParams({ ...stand, pao_max_attempts: 0 })).toThrow(ConfigError);
   });
 
+  it("живая проверка (Р32 п. 7): три параметра обязательны, таймаут — целое 1…2^31 − 1 мс", () => {
+    for (const k of ["live_check_timeout_ms", "live_check_max_age_sec", "live_check_clock_skew_sec"]) {
+      const rest = { ...stand };
+      delete rest[k];
+      expect(() => parseParams(rest), k).toThrow(ConfigError);
+    }
+    expect(() => parseParams({ ...stand, live_check_timeout_ms: 0 })).toThrow(ConfigError);
+    expect(() => parseParams({ ...stand, live_check_timeout_ms: 2_147_483_648 })).toThrow(ConfigError);
+    expect(() => parseParams({ ...stand, live_check_timeout_ms: 2_147_483_647 })).not.toThrow();
+    expect(() => parseParams({ ...stand, live_check_max_age_sec: -1 })).toThrow(ConfigError);
+    expect(() => parseParams({ ...stand, live_check_clock_skew_sec: 0.5 })).toThrow(ConfigError);
+    expect(() => parseParams({ ...stand, live_check_max_age_sec: 0, live_check_clock_skew_sec: 0 })).not.toThrow();
+    const maxSec = Math.floor(Number.MAX_SAFE_INTEGER / 1000);
+    expect(() => parseParams({ ...stand, live_check_max_age_sec: maxSec })).not.toThrow();
+    expect(() => parseParams({ ...stand, live_check_clock_skew_sec: maxSec + 1 })).toThrow(ConfigError);
+  });
+
   it("отказ при отсутствии файла", () => {
     expect(() => loadParams("config/missing.json")).toThrow(ConfigError);
   });

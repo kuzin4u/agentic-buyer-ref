@@ -8,6 +8,7 @@ import { loadParams } from "../../src/shared/config.js";
 import { KeyRing, SignerKeyRejected, SignerStopped, SignerSuspended, generateKey, kidOf, listKeys } from "../../src/agent/signer/index.js";
 import { lockDir, readMeta, writeMeta } from "../../src/agent/signer/keystore.js";
 import { PlatformFailure, type AgentKey, type AgentSelf } from "../../src/shared/domain.js";
+import { ruleForFailure } from "../../src/agent/declines/index.js";
 import { coreOn } from "../support/core.js";
 import { AGENT, PaoStand } from "../support/pao-stand.js";
 
@@ -48,6 +49,25 @@ describe("плановая ротация против стенда ПАО", () 
     await core.platform.agentSelf();
     expect(signedKids(journal).at(-1)).toBe(fresh);
     expect(stand.stub.violations).toEqual([]);
+  });
+
+  it("KEY_INVALID от заглушки (422) насквозь: каждый раз новый ключ, после предела ротация остановлена, подпись прежним (Р31)", async () => {
+    stand = new PaoStand();
+    const { core, journal } = await coreOn(stand);
+    await core.start();
+    const old = stand.descriptors[0]!.kid;
+    const limit = (ruleForFailure("KEY_INVALID").maxRetries ?? 0) + 1;
+    stand.stub.fail("POST /pao/v1/agent/keys", { code: "KEY_INVALID" }, limit + 1); // fail заглушки — раньше обработчика обёртки
+    stand.clock = new Date(Date.parse(stand.validTo(old)) - OVERLAP);
+    for (let i = 0; i < limit; i++) await expect(core.maintainKeys()).rejects.toMatchObject({ code: "KEY_INVALID", httpStatus: 422 });
+    const posts = stand.calls("POST /pao/v1/agent/keys");
+    expect(posts.map((c) => c.status)).toEqual(Array(limit).fill(422));
+    expect(new Set(posts.map((c) => c.idempotencyKey)).size).toBe(limit); // каждый раз новый ключ
+    expect(journal.entries.filter((e) => e.kind === "key.rotation_stopped")).toMatchObject([{ reason: "KEY_INVALID" }]);
+    await expect(core.maintainKeys()).rejects.toThrow(SignerKeyRejected);
+    expect(stand.calls("POST /pao/v1/agent/keys")).toHaveLength(limit);
+    await core.platform.agentSelf();
+    expect(signedKids(journal).at(-1)).toBe(old);
   });
 
   it("сроки — из ответа платформы, а не из key_ttl_days: ключ на key_ttl_days / 3 ротируется за key_overlap_days до своего valid_to", async () => {
@@ -322,6 +342,75 @@ describe("сверка с реестром (fail-closed)", () => {
     await expect(k.r.rotate(p)).rejects.toThrow(SignerKeyRejected);
     expect(new Set(sent).size).toBe(2);
     expect(listKeys(dir!).filter((x) => x.state === "revoked")).toHaveLength(2);
+  });
+
+  describe("KEY_INVALID при регистрации (Р31)", () => {
+    const keyInvalid = () => new PlatformFailure("KEY_INVALID", "after_fix", "KEY_INVALID", 422, null);
+    /** Платформа: ответ на регистрацию задаёт очередь (true — принять, иначе — бросить отказ); ключи регистраций — в sent. */
+    const scripted = (k: ReturnType<typeof ring>, replies: (boolean | (() => PlatformFailure))[]) => {
+      const sent: { kid: string; idem: string }[] = [];
+      let fresh: AgentKey | undefined;
+      return {
+        sent,
+        registerKey: async (draft: { alg: string; publicKey: string }, o: { idempotencyKey: string }): Promise<AgentKey> => {
+          sent.push({ kid: kidOf(draft.publicKey), idem: o.idempotencyKey });
+          const r = replies.shift() ?? keyInvalid;
+          if (r !== true) throw (r as () => PlatformFailure)();
+          return (fresh = k.key({ kid: kidOf(draft.publicKey), publicKey: draft.publicKey, validFrom: "2026-10-12T09:00:00Z" }));
+        },
+        agentSelf: async (): Promise<AgentSelf> => ({ agentCode: AGENT, status: "ACTIVE", agentClass: "BUYER", keys: [k.key(), fresh!] }),
+      };
+    };
+    const stopped = (j: MemoryJournal) => j.entries.filter((e) => e.kind === "key.rotation_stopped");
+
+    it("ключ отклонён и тем же ключом не повторяется; следующая ротация — новый ключ; подпись на прежнем", async () => {
+      const k = ring();
+      await k.r.start(k.self([k.key()]));
+      const p = scripted(k, []);
+      await expect(k.r.rotate(p)).rejects.toMatchObject({ code: "KEY_INVALID" });
+      expect(k.r.port().current().kid).toBe(k.d.kid);
+      await expect(k.r.rotate(p)).rejects.toMatchObject({ code: "KEY_INVALID" });
+      expect(new Set(p.sent.map((s) => s.kid)).size).toBe(2);
+      expect(listKeys(dir!).filter((x) => x.state === "revoked").map((x) => x.kid).sort()).toEqual(p.sent.map((s) => s.kid).sort());
+      expect(k.j.entries.filter((e) => e.kind === "key.revoked")).toMatchObject([{ reason: "KEY_INVALID" }, { reason: "KEY_INVALID" }]);
+      expect(stopped(k.j)).toEqual([]);
+    });
+
+    it("после 3 отказов подряд ротация остановлена: инцидент в журнал, к платформе не обращается; подпись прежним ключом", async () => {
+      const k = ring();
+      await k.r.start(k.self([k.key()]));
+      const p = scripted(k, []);
+      const limit = (ruleForFailure("KEY_INVALID").maxRetries ?? 0) + 1; // 3 по SPEC §7а — сверяет declines.test
+      for (let i = 0; i < limit; i++) await expect(k.r.rotate(p)).rejects.toMatchObject({ code: "KEY_INVALID" });
+      expect(stopped(k.j)).toMatchObject([{ reason: "KEY_INVALID" }]);
+      const files = listKeys(dir!).length;
+      await expect(k.r.rotate(p)).rejects.toThrow(SignerKeyRejected);
+      expect(p.sent).toHaveLength(limit);
+      expect(listKeys(dir!)).toHaveLength(files); // новый ключ не создаётся
+      expect(stopped(k.j)).toHaveLength(1);
+      expect(k.r.port().current().kid).toBe(k.d.kid);
+    });
+
+    it("успешная регистрация сбрасывает счёт подряд", async () => {
+      const k = ring();
+      await k.r.start(k.self([k.key()]));
+      const p = scripted(k, [keyInvalid, keyInvalid, true, keyInvalid, keyInvalid]);
+      for (let i = 0; i < 2; i++) await expect(k.r.rotate(p)).rejects.toMatchObject({ code: "KEY_INVALID" });
+      await k.r.rotate(p);
+      for (let i = 0; i < 2; i++) await expect(k.r.rotate(p)).rejects.toMatchObject({ code: "KEY_INVALID" });
+      expect(stopped(k.j)).toEqual([]);
+    });
+
+    it("прочий отказ (итог неизвестен) — тот же ключ и тот же Idempotency-Key, в счёт предела не идёт", async () => {
+      const k = ring();
+      await k.r.start(k.self([k.key()]));
+      const unknown = () => new PlatformFailure("UNKNOWN", "never", null, 0, null, "нет ответа");
+      const p = scripted(k, [unknown, unknown, unknown, keyInvalid]);
+      for (let i = 0; i < 3; i++) await expect(k.r.rotate(p)).rejects.toMatchObject({ code: "UNKNOWN" });
+      await expect(k.r.rotate(p)).rejects.toMatchObject({ code: "KEY_INVALID" });
+      expect(new Set(p.sent.map((s) => `${s.kid}/${s.idem}`)).size).toBe(1);
+      expect(stopped(k.j)).toEqual([]);
+    });
   });
 
   it("после регистрации платформа не показала новый ключ действующим — SignerKeyRejected, подпись на прежнем", async () => {

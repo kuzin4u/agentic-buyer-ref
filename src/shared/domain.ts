@@ -154,7 +154,7 @@ export type AgentClass = "BUYER" | "SELLER" | "SURFACE" | "SERVICE";
 
 /** Сведения платформы об агенте: статус, класс и ключи (GET /pao/v1/agent). */
 export interface AgentSelf extends AgentStatus {
-  /** в ПАО 1.2.0 поле необязательно; для ядра обязательно — нет поля или значение вне перечня → UNKNOWN (Р27) */
+  /** в ПАО 1.4.0 поле необязательно; для ядра обязательно — нет поля или значение вне перечня → UNKNOWN (Р27) */
   agentClass: AgentClass;
   keys: AgentKey[];
 }
@@ -217,6 +217,8 @@ export type FailureCode =
   | "IDEMPOTENCY_CONFLICT"
   | "RATE_LIMITED"
   | "UPSTREAM_UNAVAILABLE"
+  | "REQUEST_INVALID"
+  | "KEY_INVALID"
   /** код не опознан или ответа нет — fail-closed (инвариант 4) */
   | "UNKNOWN";
 

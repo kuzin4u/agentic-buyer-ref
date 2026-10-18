@@ -8,7 +8,7 @@ const COPY = `docs/core/protocol/agent-protocol.v${PAO_VERSION}.yaml`;
 
 describe("копия ПАО", () => {
   it("есть для версии agentic-core", () => {
-    expect(PAO_VERSION).toBe("1.2.0");
+    expect(PAO_VERSION).toBe("1.4.0");
     expect(() => readFileSync(COPY)).not.toThrow();
   });
 

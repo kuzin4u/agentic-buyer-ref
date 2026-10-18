@@ -4,22 +4,22 @@ import { createRequire } from "node:module";
 import { dirname } from "node:path";
 import { PAO_ERRORS, PAO_VERSION } from "@kuzin4u/agentic-core/pao";
 
-// Каркас ядра (AG-01): зависимость от agentic-core v0.3.0 (AG-05 К1.1) и структура src по CLAUDE.md.
+// Каркас ядра (AG-01): зависимость от agentic-core v0.7.0 (Р33; прежде v0.6.0 — Р31, v0.3.0 — AG-05 К1.1) и структура src по CLAUDE.md.
 describe("зависимость от agentic-core", () => {
-  it("подключена по git+https с тегом v0.3.0", () => {
+  it("подключена по git+https с тегом v0.7.0", () => {
     const pkg = JSON.parse(readFileSync("package.json", "utf8"));
     expect(pkg.dependencies["@kuzin4u/agentic-core"]).toBe(
-      "git+https://github.com/kuzin4u/agentic-core.git#v0.3.0",
+      "git+https://github.com/kuzin4u/agentic-core.git#v0.7.0",
     );
     const lock = JSON.parse(readFileSync("package-lock.json", "utf8"));
     const entry = lock.packages["node_modules/@kuzin4u/agentic-core"];
-    expect(entry.version).toBe("0.3.0");
+    expect(entry.version).toBe("0.7.0");
     expect(lock.packages[""].dependencies["@kuzin4u/agentic-core"]).toBe(pkg.dependencies["@kuzin4u/agentic-core"]);
-    // 545b949… — коммит тега v0.3.0 (лёгкий тег). Копия ядра одна: зависимость стенда #v0.2.1
-    // npm сводит к ней же — стенд в тестах работает на core v0.3.0 (стенд берёт из ядра только /pao,
-    // ed25519Verifier и verifyRequest — в v0.3.0 без изменений, CHANGELOG ядра «Переход с 0.2.x»).
+    // 60fc4ce… — коммит тега v0.7.0 (лёгкий тег). Копия ядра одна: зависимость стенда #v0.2.1
+    // npm сводит к ней же — стенд в тестах работает на core v0.7.0 (стенд берёт из ядра /pao, ed25519Verifier и
+    // verifyRequest; поведение PaoStub изменено в v0.5.0 — стенд его не использует, тесты С0 на v0.7.0 зелёные, Р33).
     expect(entry.resolved).toBe(
-      "git+https://github.com/kuzin4u/agentic-core.git#545b949ea6ae51b21fb3ba15ed0e6d4bfb1c6706",
+      "git+https://github.com/kuzin4u/agentic-core.git#60fc4ce255bbe4ec39953a4da2bd685de7ae39ba",
     );
   });
 
@@ -53,11 +53,11 @@ describe("зависимость от agentic-core", () => {
       expect(dirname(dir), "package.json ядра не найден").not.toBe(dir);
       dir = dirname(dir);
     }
-    expect(JSON.parse(readFileSync(`${dir}/package.json`, "utf8")).version).toBe("0.3.0");
+    expect(JSON.parse(readFileSync(`${dir}/package.json`, "utf8")).version).toBe("0.7.0");
   });
 
-  it("даёт ПАО 1.2.0 и таблицу ошибок с полем retry", () => {
-    expect(PAO_VERSION).toBe("1.2.0");
+  it("даёт ПАО 1.4.0 и таблицу ошибок с полем retry", () => {
+    expect(PAO_VERSION).toBe("1.4.0");
     const codes = Object.keys(PAO_ERRORS);
     expect(codes.length).toBeGreaterThan(0);
     for (const code of codes) expect(PAO_ERRORS[code as keyof typeof PAO_ERRORS]).toHaveProperty("retry");

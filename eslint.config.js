@@ -10,6 +10,8 @@ const COMPOSE = "src/agent/compose.ts";
 const SIGNER = "src/agent/signer/**";
 const PAO_ADAPTER = "src/agent/adapters/pao/**";
 const ADAPTERS = "src/agent/adapters/**";
+const CATALOG = "src/agent/catalog/**";
+const CORE_CATALOG = "@kuzin4u/agentic-core/catalog";
 
 /** Вне signer и compose из node:crypto — только список разрешённого (randomUUID для Idempotency-Key, Р21, и прочее
  *  неключевое); создание подписанта и подпись обращения в agentic-core — только в signer. Списки — config/boundaries.json. */
@@ -27,11 +29,13 @@ const msg = {
   compose: "Р19: место сборки не импортируется — оно собирает ядро, а не наоборот.",
   dist: "Р19: внутренние пути agentic-core/dist — обход экспортов пакета.",
   bypass: "Р19 (ревью AG-02 № 10): обход границы — только статический импорт строковым литералом.",
+  catalog: "Р32: каталог ядра (/catalog) — только в src/agent/catalog; остальным — его факты.",
   stand: "Р24: стенд Платформы — dev-зависимость для тестов (С0), не контракт; в src — только ПАО через adapters/pao.",
 };
 
-const paths = (allowPao, allowKeys) => [
+const paths = (allowPao, allowKeys, allowCatalog) => [
   ...(allowPao ? [] : [{ name: PAO_TYPES, message: msg.pao }]),
+  ...(allowCatalog ? [] : [{ name: CORE_CATALOG, message: msg.catalog }]),
   ...(allowKeys
     ? []
     : [
@@ -107,14 +111,15 @@ const mod = {
   dist: { re: "/agentic-core\\u002Fdist/", message: msg.dist },
   // без учёта регистра: на macOS import("Agentic-PS-Platform/stand") загружает стенд (ревью 3d № 3)
   stand: { re: "/^agentic-ps-platform/i", message: msg.stand },
+  catalog: { re: "/agentic-core\\u002Fcatalog/", message: msg.catalog },
   // import() и import("…") в типах вне src — как groups.outside для статических импортов (AG-04 К1.3). С учётом регистра
   // и только «каталог/» — как groups.outside; вторая линия, без этих ограничений, — граф (import-graph.test.ts).
   outside: { re: "/(^|\\u002F)(tests|scripts|config)\\u002F/", message: groups.outside.message },
 };
 
-const boundary = ({ allowPao = false, allowKeys = false, patterns, modules }) => ({
-  "no-restricted-imports": ["error", { paths: paths(allowPao, allowKeys), patterns: [...patterns, groups.compose, groups.dist, groups.stand, groups.outside, groups.alias] }],
-  "no-restricted-syntax": ["error", ...syntax([...modules, mod.compose, mod.dist, mod.stand, mod.outside, ...(allowPao ? [] : [mod.pao])], allowKeys)],
+const boundary = ({ allowPao = false, allowKeys = false, allowCatalog = false, patterns, modules }) => ({
+  "no-restricted-imports": ["error", { paths: paths(allowPao, allowKeys, allowCatalog), patterns: [...patterns, groups.compose, groups.dist, groups.stand, groups.outside, groups.alias] }],
+  "no-restricted-syntax": ["error", ...syntax([...modules, mod.compose, mod.dist, mod.stand, mod.outside, ...(allowPao ? [] : [mod.pao]), ...(allowCatalog ? [] : [mod.catalog])], allowKeys)],
 });
 
 export default tseslint.config(
@@ -122,11 +127,16 @@ export default tseslint.config(
   js.configs.recommended,
   ...tseslint.configs.recommended,
   // Ядро и все модули без адаптеров (pipeline, policy, mandates, declines, ports, shared, journal, events,
-  // payment-package, shell): ни адаптеров, ни типов ПАО, ни signer, ни ключевых API.
+  // payment-package, shell): ни адаптеров, ни типов ПАО, ни signer, ни ключевых API, ни каталога ядра.
   {
     files: [SRC],
-    ignores: [ADAPTERS, SIGNER, COMPOSE],
+    ignores: [ADAPTERS, SIGNER, COMPOSE, CATALOG],
     rules: boundary({ patterns: [groups.adapters, groups.signer], modules: [mod.adapters, mod.signer] }),
+  },
+  // catalog: каталог ядра можно (Р32 п. 6); остальное — как у ядра.
+  {
+    files: [CATALOG],
+    rules: boundary({ allowCatalog: true, patterns: [groups.adapters, groups.signer], modules: [mod.adapters, mod.signer] }),
   },
   // signer: ключевые API можно; адаптеров, типов ПАО и места сборки — нет.
   {

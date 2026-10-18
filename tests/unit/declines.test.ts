@@ -7,7 +7,7 @@ const spec = readFileSync("docs/core/SPEC.md", "utf8");
 const specRows = [...spec.matchAll(/^\| ([A-Z_]+) \| (\d{3}) \| (\w+) \|/gm)].map((m) => ({ code: m[1]!, http: Number(m[2]), retry: m[3]! }));
 
 describe("таблица отказов", () => {
-  it("коды ядра = коды ПАО 1.2.0 + UNKNOWN", () => {
+  it("коды ядра = коды ПАО 1.4.0 + UNKNOWN", () => {
     expect(Object.keys(FAILURE_RULES).sort()).toEqual([...Object.keys(PAO_ERRORS), "UNKNOWN"].sort());
   });
 
@@ -18,6 +18,13 @@ describe("таблица отказов", () => {
   it("SPEC §7а совпадает с ПАО по коду, HTTP и retry", () => {
     expect(specRows.length).toBe(Object.keys(PAO_ERRORS).length);
     for (const r of specRows) expect(PAO_ERRORS[r.code as keyof typeof PAO_ERRORS], r.code).toMatchObject({ http: r.http, retry: r.retry });
+  });
+
+  it("Р31: REQUEST_INVALID — остановка, дефект; KEY_INVALID — новый ключ, предел 3 отказа подряд, дефект", () => {
+    expect(ruleForFailure("REQUEST_INVALID")).toMatchObject({ action: "STOP", maxRetries: 0, defect: true, journal: true });
+    expect(ruleForFailure("KEY_INVALID")).toMatchObject({ action: "NEW_KEY", maxRetries: 2, defect: true, journal: true });
+    // SPEC §7а: «после 3 отказов подряд» = первый отказ + maxRetries
+    expect(spec).toMatch(/\| KEY_INVALID \| 422 \| after_fix \|[^\n]*после 3 отказов подряд/);
   });
 
   it("UNKNOWN — остановка без повтора", () => {

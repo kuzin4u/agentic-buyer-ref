@@ -29,7 +29,9 @@ export type JournalKind =
   /** агент остановлен */
   | "agent.stopped"
   /** ротация остановлена: KEY_INVALID подряд сверх предела таблицы отказов (Р31); инцидент, нужен человек */
-  | "key.rotation_stopped";
+  | "key.rotation_stopped"
+  /** ответ Платформы с мандатом без порядка отзыва — мандат не подтверждён, покупки нет (Р33 п. 4) */
+  | "mandate.revocation_order_missing";
 
 export interface JournalEntry {
   at: string;

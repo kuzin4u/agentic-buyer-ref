@@ -50,7 +50,7 @@ export function createAgentCore(o: AgentCoreOptions): AgentCore {
     params,
     platform,
     capabilities: platform.capabilities(),
-    mandates: new MandateClient({ port: platform, params, ...(o.now && { now: o.now }) }),
+    mandates: new MandateClient({ port: platform, params, journal, ...(o.now && { now: o.now }) }),
     journal,
     start: () => ring.start((signing) => new PaoPlatform({ ...o.pao, params, signing }).agentSelf()),
     recheck: () => ring.recheck((signing) => new PaoPlatform({ ...o.pao, params, signing }).agentSelf()),

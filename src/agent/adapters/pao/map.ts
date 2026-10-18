@@ -116,10 +116,20 @@ function cartFromPao(c: Pao.MandateRequest["cart"], currency: CurrencyCode): Car
   };
 }
 
-/** Мандат: валюта — из множества платформы; `agent_code` (в ПАО 1.3.0 необязателен) — если есть, только свой
- *  (ревью К2 № 3а, «Открыто» № 17); чужой — UNKNOWN. */
+/** Мандат: валюта — из множества платформы; `agent_code` обязателен и только свой (ПАО 1.4.0, Р33 п. 3; «Открыто» № 17) —
+ *  нет или чужой — UNKNOWN. Порядок отзыва обязателен (A7 п. 2.2): нет — свой код агента, не UNKNOWN (Р33 п. 4). */
 export function mandateFromPao(m: Pao.Mandate, cur: Currencies, agentCode: string): Mandate {
-  if (m.agent_code !== undefined && m.agent_code !== agentCode) incomplete("mandate.agent_code — не этот агент");
+  if (need(m.agent_code, "mandate.agent_code") !== agentCode) incomplete("mandate.agent_code — не этот агент");
+  if (typeof m.revocation_order !== "string" || m.revocation_order.trim() === "") {
+    throw new PlatformFailure(
+      "MANDATE_REVOCATION_ORDER_MISSING",
+      "never",
+      null,
+      200,
+      null,
+      "ответ Платформы с мандатом без revocation_order: Платформа старше ПАО 1.4.0 или дефект Платформы",
+    );
+  }
   const currency = allowed(m.currency, cur, "mandate.currency");
   return {
     id: need(m.id, "mandate.id"),
@@ -135,6 +145,7 @@ export function mandateFromPao(m: Pao.Mandate, cur: Currencies, agentCode: strin
     confirmationMode: m.mode,
     keyTermsShown: m.key_terms_shown ?? false,
     cart: cartFromPao(m.cart, currency),
+    revocationOrder: m.revocation_order,
   };
 }
 

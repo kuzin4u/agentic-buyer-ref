@@ -1,6 +1,7 @@
 // Клиент мандатов на PaoStub через адаптер pao (AG-05 К2): Т2, Т3, Т3а; Р29 пп. 4–5.
 import { afterEach, describe, expect, it } from "vitest";
-import { MandateRefused, missingTerms } from "../../src/agent/mandates/index.js";
+import { MandateRefused, REVOCATION_ORDER_MISSING_TEXT, missingTerms } from "../../src/agent/mandates/index.js";
+import type { MemoryJournal } from "../../src/agent/journal/index.js";
 import type { MandateDraft } from "../../src/shared/domain.js";
 import { Consents, INTENT, RUB, event, feed } from "../support/consents.js";
 import { coreOn } from "../support/core.js";
@@ -63,16 +64,31 @@ describe("клиент мандатов на PaoStub", () => {
     expect(post[0]!.idempotencyKey).toBe("idem_m1");
   });
 
-  it("CART со ссылкой на INTENT — корзина в валюте мандата", async () => {
+  it("CART со ссылкой на INTENT — корзина в валюте мандата, порядок отзыва — как у родителя (Р33 п. 4)", async () => {
     const { core } = await setup();
+    const intent = await core.mandates.request(INTENT, { idempotencyKey: "idem_i1" });
     const cart: MandateDraft = {
       ...INTENT,
       kind: "CART",
-      parentId: "m_intent",
+      parentId: intent.id,
       cart: { merchantId: "shop_1", lines: [{ sku: "sku_1", qty: 2, price: RUB(1000) }], total: RUB(2000) },
     };
-    const m = await core.mandates.request(cart, { idempotencyKey: "idem_c1" });
-    expect(m).toMatchObject({ kind: "CART", parentId: "m_intent", cart: { total: RUB(2000) } });
+    const m = await core.mandates.request(cart, { idempotencyKey: "idem_c1" }, intent);
+    expect(m).toMatchObject({ kind: "CART", parentId: intent.id, cart: { total: RUB(2000) }, revocationOrder: intent.revocationOrder });
+  });
+
+  it("CART без родителя или с чужим родителем — отказ до обращения", async () => {
+    const { core, stand } = await setup();
+    const intent = await core.mandates.request(INTENT, { idempotencyKey: "idem_i2" });
+    const cart: MandateDraft = {
+      ...INTENT,
+      kind: "CART",
+      parentId: "m_other",
+      cart: { merchantId: "shop_1", lines: [{ sku: "sku_1", qty: 1, price: RUB(1000) }], total: RUB(1000) },
+    };
+    await expect(core.mandates.request(cart, { idempotencyKey: "idem_c4" })).rejects.toMatchObject({ reason: "DRAFT_INVALID" });
+    await expect(core.mandates.request(cart, { idempotencyKey: "idem_c5" }, intent)).rejects.toMatchObject({ reason: "DRAFT_INVALID" });
+    expect(stand.calls("POST /pao/v1/mandates")).toHaveLength(1);
   });
 
   it("проект без реквизита — отказ до обращения (П06)", async () => {
@@ -91,17 +107,99 @@ describe("клиент мандатов на PaoStub", () => {
 
   it("корзина: другой состав в ответе — REPLY_MISMATCH; получатели в другом порядке — тот же мандат", async () => {
     const { core, consents } = await setup();
+    const intent = await core.mandates.request({ ...INTENT, merchantScope: ["shop_1", "shop_2"] }, { idempotencyKey: "idem_i3" });
     const cart: MandateDraft = {
       ...INTENT,
       kind: "CART",
-      parentId: "m_intent",
+      parentId: intent.id,
       merchantScope: ["shop_1", "shop_2"],
       cart: { merchantId: "shop_1", lines: [{ sku: "sku_1", qty: 2, price: RUB(1000) }], total: RUB(2000) },
     };
     consents.tamper = (m) => ({ ...m, merchant_scope: ["shop_2", "shop_1"] });
-    await expect(core.mandates.request(cart, { idempotencyKey: "idem_c2" })).resolves.toMatchObject({ kind: "CART" });
+    await expect(core.mandates.request(cart, { idempotencyKey: "idem_c2" }, intent)).resolves.toMatchObject({ kind: "CART" });
     consents.tamper = (m) => ({ ...m, cart: { ...m.cart!, items: [{ sku: "sku_1", qty: 3, price: 1000 }], total: 3000 } });
-    await expect(core.mandates.request(cart, { idempotencyKey: "idem_c3" })).rejects.toMatchObject({ reason: "REPLY_MISMATCH" });
+    await expect(core.mandates.request(cart, { idempotencyKey: "idem_c3" }, intent)).rejects.toMatchObject({ reason: "REPLY_MISMATCH" });
+    // Р33 п. 4: порядок отзыва CART не как у родителя — REPLY_MISMATCH
+    consents.tamper = (m) => ({ ...m, revocation_order: "bank:pr_1:revocation:v2" });
+    await expect(core.mandates.request(cart, { idempotencyKey: "idem_c6" }, intent)).rejects.toMatchObject({ reason: "REPLY_MISMATCH" });
+  });
+
+  // Р33 п. 4: ответ с мандатом без порядка отзыва — свой код, журнал, текст человеку; покупки по мандату нет.
+  it("мандат без revocation_order — REVOCATION_ORDER_MISSING, событие в журнал, текст человеку", async () => {
+    const { core, consents, stand } = await setup();
+    consents.tamper = (m) => {
+      const r = { ...m };
+      delete r.revocation_order;
+      return r;
+    };
+    const err = (await core.mandates.request(INTENT, { idempotencyKey: "idem_ro" }).catch((e: unknown) => e)) as MandateRefused;
+    expect(err).toBeInstanceOf(MandateRefused);
+    expect(err.reason).toBe("REVOCATION_ORDER_MISSING");
+    expect(err.message).toContain(REVOCATION_ORDER_MISSING_TEXT);
+    expect((core.journal as MemoryJournal).entries.filter((e) => e.kind === "mandate.revocation_order_missing")).toEqual([
+      expect.objectContaining({ reason: "MANDATE_REVOCATION_ORDER_MISSING" }),
+    ]);
+    // ответ без поля схеме 1.4.0 не противоречит (поле необязательно) — отказ ядра, а не схемы
+    expect(stand.stub.violations).toEqual([]);
+  });
+
+  it("GET после mandate.signed без revocation_order — тот же отказ, мандат не действует", async () => {
+    const { core, consents } = await setup();
+    const m = await core.mandates.request(INTENT, { idempotencyKey: "idem_ro2" });
+    const ev = consents.sign(m.id);
+    delete consents.mandates.get(m.id)!.revocation_order;
+    await expect(core.mandates.awaitSigned(m, feed(ev))).rejects.toMatchObject({ reason: "REVOCATION_ORDER_MISSING" });
+    expect((core.journal as MemoryJournal).entries.filter((e) => e.kind === "mandate.revocation_order_missing")).toHaveLength(1);
+  });
+
+  // РП35: после 201 — статус; CART под отозванным или истёкшим INTENT приходит 201 со статусом REVOKED или EXPIRED.
+  it.each(["REVOKED", "EXPIRED", "REJECTED"] as const)("201 со статусом %s — NOT_ACTIVE, нового мандата нет", async (status) => {
+    const { core, consents, stand } = await setup();
+    consents.tamper = (m) => ({ ...m, status });
+    await expect(core.mandates.request(INTENT, { idempotencyKey: `idem_s_${status}` })).rejects.toMatchObject({ reason: "NOT_ACTIVE" });
+    expect(stand.calls("POST /pao/v1/mandates")).toHaveLength(1);
+    expect(stand.calls("GET /pao/v1/mandates/{id}")).toEqual([]);
+  });
+
+  // РП34: статус — только из GET. ACTIVE в 201 (повтор позже 24 ч) — сверка по GET; у платформы отозван — NOT_ACTIVE.
+  it("201 со статусом ACTIVE — статус из GET; GET отдал REVOKED — NOT_ACTIVE", async () => {
+    const { core, consents, stand } = await setup();
+    consents.tamper = (m) => {
+      consents.mandates.set(m.id!, { ...m, status: "REVOKED" });
+      return { ...m, status: "ACTIVE" };
+    };
+    await expect(core.mandates.request(INTENT, { idempotencyKey: "idem_a1" })).rejects.toMatchObject({ reason: "NOT_ACTIVE" });
+    expect(stand.calls("GET /pao/v1/mandates/{id}")).toHaveLength(1);
+    consents.tamper = (m) => {
+      consents.mandates.set(m.id!, { ...m, status: "ACTIVE" });
+      return { ...m, status: "ACTIVE" };
+    };
+    await expect(core.mandates.request(INTENT, { idempotencyKey: "idem_a2" })).resolves.toMatchObject({ status: "ACTIVE" });
+    expect(stand.calls("GET /pao/v1/mandates/{id}")).toHaveLength(2);
+    // ACTIVE в 201, а GET отдал мандат без порядка отзыва — отказ с текстом человеку (ревью К2.2 № 9)
+    consents.tamper = (m) => {
+      const r = { ...m, status: "ACTIVE" as const };
+      delete r.revocation_order;
+      consents.mandates.set(m.id!, { ...r });
+      return { ...m, status: "ACTIVE" };
+    };
+    await expect(core.mandates.request(INTENT, { idempotencyKey: "idem_a3" })).rejects.toMatchObject({ reason: "REVOCATION_ORDER_MISSING" });
+  });
+
+  it("GET вернул другой мандат — REPLY_MISMATCH (ревью К2.2 № 6)", async () => {
+    const { core, consents } = await setup();
+    consents.tamper = (m) => {
+      consents.mandates.set(m.id!, { ...m, id: "m_other", status: "ACTIVE" });
+      return { ...m, status: "ACTIVE" };
+    };
+    await expect(core.mandates.request(INTENT, { idempotencyKey: "idem_g1" })).rejects.toMatchObject({ reason: "REPLY_MISMATCH" });
+  });
+
+  it("INTENT с родителем — отказ до обращения (ревью К2.2 № 6)", async () => {
+    const { core, stand } = await setup();
+    const intent = await core.mandates.request(INTENT, { idempotencyKey: "idem_i4" });
+    await expect(core.mandates.request(INTENT, { idempotencyKey: "idem_i5" }, intent)).rejects.toMatchObject({ reason: "DRAFT_INVALID" });
+    expect(stand.calls("POST /pao/v1/mandates")).toHaveLength(1);
   });
 
   // Поправка 3 ревью плана: событие до AG-06 не подписано — истина у платформы.

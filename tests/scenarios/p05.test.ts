@@ -21,7 +21,7 @@ describe("П05 — действие без действующего мандат
   it("контур со стендом и витринами: мандата нет — отказ; к витринам (К6) ни одного обращения", async () => {
     contour = await createContour({ pao: "stand" });
     await contour.start();
-    const mandates = new MandateClient({ port: contour.platform, params: contour.params });
+    const mandates = new MandateClient({ port: contour.platform, params: contour.params, journal: contour.journal });
     await expect(mandates.requireActive(null)).rejects.toMatchObject({ reason: "NO_MANDATE" });
     expect(contour.calls().filter((c) => c.target === "merchants")).toEqual([]);
     expect(contour.calls().map((c) => c.route)).toEqual(["GET /pao/v1/agent"]);

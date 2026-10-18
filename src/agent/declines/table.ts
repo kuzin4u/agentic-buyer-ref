@@ -70,6 +70,8 @@ export const FAILURE_RULES: Readonly<Record<FailureCode, DeclineRule>> = {
   // Р31: ключ не принят при регистрации — ключ отклонён, тем же ключом не повторяется; новые ключи — не больше maxRetries
   // раз подряд после первого отказа, затем ротация остановлена до решения человека (подпись — прежним ключом).
   KEY_INVALID: rule("NEW_KEY", "after_fix", 2, true),
+  // Р33 п. 4: код агента вне ПАО — мандат без порядка отзыва не подтверждён (A7 п. 2.2); не дефект агента.
+  MANDATE_REVOCATION_ORDER_MISSING: rule("STOP", "never", 0, false, true),
   // Неопознанный ответ платформы — не дефект агента, но остановка и событие в журнал (SPEC §7а).
   UNKNOWN: rule("STOP", "never", 0, false, true),
 };

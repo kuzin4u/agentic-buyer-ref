@@ -48,6 +48,8 @@ export interface Mandate extends MandateDraft {
   id: string;
   status: MandateStatus;
   signatureLevel: SignatureLevel | null;
+  /** порядок отзыва — ссылка на соглашение банка с клиентом; задаёт Платформа, агент только показывает (A7 п. 2.2, Р33 п. 4) */
+  revocationOrder: string;
 }
 
 /** Результат проверки мандата платформой. Остаток — только отсюда (инвариант 6). */
@@ -219,6 +221,9 @@ export type FailureCode =
   | "UPSTREAM_UNAVAILABLE"
   | "REQUEST_INVALID"
   | "KEY_INVALID"
+  /** код агента вне ПАО (Р33 п. 4): ответ с мандатом без порядка отзыва — мандат не подтверждён (A7 п. 2.2); стоп без
+   *  повтора, событие в журнал. До К2.3 — всегда; после — только при подтверждённой версии ПАО Платформы (Р33 п. 10) */
+  | "MANDATE_REVOCATION_ORDER_MISSING"
   /** код не опознан или ответа нет — fail-closed (инвариант 4) */
   | "UNKNOWN";
 

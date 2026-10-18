@@ -22,12 +22,13 @@ const draft: MandateDraft = {
 const CUR: map.Currencies = new Set(["RUB"]);
 const AG = "nspk:agent:x:v1";
 const M1 = { id: "m_1", currency: "RUB" };
+const RO = "bank:pr_1:revocation:v1";
 
 describe("перевод ПАО ↔ ядро", () => {
   it("мандат туда и обратно", () => {
     const req = map.mandateDraftToPao(draft, CUR);
-    const back = map.mandateFromPao({ ...req, agent_code: AG, id: "m_1", status: "PENDING_SIGNATURE", signature_type: "simple" }, CUR, AG);
-    expect(back).toEqual({ ...draft, id: "m_1", status: "PENDING_SIGNATURE", signatureLevel: "simple" });
+    const back = map.mandateFromPao({ ...req, agent_code: AG, revocation_order: RO, id: "m_1", status: "PENDING_SIGNATURE", signature_type: "simple" }, CUR, AG);
+    expect(back).toEqual({ ...draft, id: "m_1", status: "PENDING_SIGNATURE", signatureLevel: "simple", revocationOrder: RO });
   });
 
   it("реквизит: payload не переносится (инвариант 1)", () => {
@@ -84,7 +85,7 @@ describe("перевод ПАО ↔ ядро", () => {
 
   it("платформа с двумя валютами: остаток и операция — в валюте своего мандата", () => {
     const both: map.Currencies = new Set(["RUB", "USD"]);
-    const req = { ...map.mandateDraftToPao({ ...draft, amountLimit: { amount: 9, currency: "USD" }, cart: null }, both), agent_code: AG, id: "m_u", status: "ACTIVE" as const };
+    const req = { ...map.mandateDraftToPao({ ...draft, amountLimit: { amount: 9, currency: "USD" }, cart: null }, both), agent_code: AG, revocation_order: RO, id: "m_u", status: "ACTIVE" as const };
     expect(map.mandateFromPao(req, both, AG).amountLimit).toEqual({ amount: 9, currency: "USD" });
     const u = { id: "m_u", currency: "USD" };
     expect(map.mandateCheckFromPao({ outcome: "CONFIRMED", amount_left: 7, valid_to: "x" }, u).amountLeft).toEqual({ amount: 7, currency: "USD" });
@@ -92,7 +93,7 @@ describe("перевод ПАО ↔ ядро", () => {
   });
 
   it("выписка: валюта операции — её мандата в цепочке; мандата нет — UNKNOWN", () => {
-    const intent = { ...map.mandateDraftToPao({ ...draft, kind: "INTENT", parentId: null, cart: null }, CUR), agent_code: AG, id: "m_i", status: "ACTIVE" as const };
+    const intent = { ...map.mandateDraftToPao({ ...draft, kind: "INTENT", parentId: null, cart: null }, CUR), agent_code: AG, revocation_order: RO, id: "m_i", status: "ACTIVE" as const };
     const aoi = (id: string) => ({ indicator: true as const, agent_code: "nspk:agent:x:v1", mandate_id: id });
     const ev = map.evidenceFromPao({ mandate_chain: [intent], operations: [{ op_ref: "op_1", amount: 5, status: "AUTHORIZED", aoi: aoi("m_i") }], integrity: "OK" }, "m_i", CUR, AG);
     expect(ev.operations[0]!.amount).toEqual({ amount: 5, currency: "RUB" });
@@ -118,9 +119,31 @@ describe("перевод ПАО ↔ ядро", () => {
     const op = { op_ref: "op_1", amount: 1, status: "AUTHORIZED" as const };
     expect(() => map.operationFromPao({ ...op, aoi: { indicator: true, agent_code: "nspk:agent:other:v1", mandate_id: "m_1" } }, M1, "single", AG)).toThrow(/не этот агент/);
     expect(() => map.operationFromPao({ ...op, aoi: { indicator: true, agent_code: AG, mandate_id: "m_2" } }, M1, "single", AG)).toThrow(/не мандат запроса/);
-    const req = { ...map.mandateDraftToPao(draft, CUR), id: "m_1", status: "ACTIVE" as const };
+    const req = { ...map.mandateDraftToPao(draft, CUR), id: "m_1", status: "ACTIVE" as const, revocation_order: RO };
     expect(() => map.mandateFromPao({ ...req, agent_code: "nspk:agent:other:v1" }, CUR, AG)).toThrow(/не этот агент/);
     expect(map.mandateFromPao({ ...req, agent_code: AG }, CUR, AG).id).toBe("m_1");
+    // Р33 п. 3: agent_code обязателен — нет поля (ответ в обход схемы) — UNKNOWN
+    const noCode: Partial<Pao.Mandate> = { ...req, agent_code: AG };
+    delete noCode.agent_code;
+    expect(() => map.mandateFromPao(noCode as Pao.Mandate, CUR, AG)).toThrow(expect.objectContaining({ code: "UNKNOWN" }));
+  });
+
+  // Р33 п. 4: порядок отзыва — реквизит мандата (A7 п. 2.2); нет — свой код агента, не UNKNOWN.
+  it.each([
+    ["нет поля", undefined],
+    ["пустая строка", " "],
+  ])("мандат без revocation_order (%s) — MANDATE_REVOCATION_ORDER_MISSING", (_, ro) => {
+    const req = { ...map.mandateDraftToPao(draft, CUR), agent_code: AG, id: "m_1", status: "ACTIVE" as const, ...(ro !== undefined && { revocation_order: ro }) };
+    const err = (() => {
+      try {
+        map.mandateFromPao(req, CUR, AG);
+      } catch (e) {
+        return e;
+      }
+    })();
+    expect(err).toBeInstanceOf(PlatformFailure);
+    expect(err).toMatchObject({ code: "MANDATE_REVOCATION_ORDER_MISSING", retry: "never" });
+    expect((err as Error).message).toMatch(/старше ПАО 1\.4\.0 или дефект/);
   });
 
   // Р27: класс обязателен для ядра (в ПАО 1.4.0 необязателен) — нет поля или значение вне перечня — UNKNOWN.

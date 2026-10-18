@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { SignerStopped } from "../../src/agent/signer/index.js";
 import { PlatformFailure } from "../../src/shared/domain.js";
 import { CREDENTIALS, DRAFT, coreOn } from "../support/core.js";
-import { PaoStand } from "../support/pao-stand.js";
+import { PaoStand, CONFIGURATION } from "../support/pao-stand.js";
 
 let stand: PaoStand;
 afterEach(() => stand?.close());
@@ -22,7 +22,7 @@ describe("П03 — исключённый или отсутствующий в �
     expect(stand.calls("GET /pao/v1/agent")).toMatchObject([{ status: 200 }]);
     expect(journal.entries.at(-1)).toMatchObject({ kind: "agent.stopped", reason: "AGENT_EXCLUDED" });
     await expect(core.platform.issueCredential(DRAFT, { idempotencyKey: "idem-p03" })).rejects.toThrow(SignerStopped);
-    expect(stand.log()).toEqual([{ op: "GET /pao/v1/agent", status: 200 }]);
+    expect(stand.log()).toEqual([CONFIGURATION, { op: "GET /pao/v1/agent", status: 200 }]);
     expect(stand.stub.violations).toEqual([]);
   });
 
@@ -41,7 +41,7 @@ describe("П03 — исключённый или отсутствующий в �
     expect(journal.entries.at(-1)).toMatchObject({ kind: "agent.stopped", reason: "AGENT_SUSPENDED" });
     await expect(core.platform.issueCredential(DRAFT, { idempotencyKey: "idem-p03" })).rejects.toThrow(SignerStopped);
     await expect(core.platform.agentSelf()).rejects.toThrow(SignerStopped);
-    expect(stand.log()).toEqual([{ op: "GET /pao/v1/agent", status: 200 }, { op: OP, status: 403 }]);
+    expect(stand.log()).toEqual([CONFIGURATION, { op: "GET /pao/v1/agent", status: 200 }, { op: OP, status: 403 }]);
     expect(stand.stub.violations).toEqual([]);
   });
 
@@ -55,7 +55,7 @@ describe("П03 — исключённый или отсутствующий в �
     expect(stand.calls("GET /pao/v1/agent")).toHaveLength(1);
     expect(journal.entries.at(-1)).toMatchObject({ kind: "agent.stopped", reason: "AGENT_UNKNOWN" });
     await expect(core.platform.agentSelf()).rejects.toThrow(SignerStopped);
-    expect(stand.log()).toEqual([{ op: "GET /pao/v1/agent", status: 401 }]);
+    expect(stand.log()).toEqual([CONFIGURATION, { op: "GET /pao/v1/agent", status: 401 }]);
     expect(stand.stub.violations).toEqual([]);
   });
 });

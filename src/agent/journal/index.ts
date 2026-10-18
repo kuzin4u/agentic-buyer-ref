@@ -31,7 +31,12 @@ export type JournalKind =
   /** ротация остановлена: KEY_INVALID подряд сверх предела таблицы отказов (Р31); инцидент, нужен человек */
   | "key.rotation_stopped"
   /** ответ Платформы с мандатом без порядка отзыва — мандат не подтверждён, покупки нет (Р33 п. 4) */
-  | "mandate.revocation_order_missing";
+  | "mandate.revocation_order_missing"
+  /** версия ПАО Платформы при подключении не определена — проверка отложена до первого ответа с мандатом (Р33 п. 10);
+   *  предупреждение, работа продолжается; detail — NO_VERSION, BAD_RESPONSE или NO_RESPONSE */
+  | "platform.version_unknown"
+  /** Платформа ниже ПАО 1.4.0 — агент остановлен (Р33 п. 10); detail — CONFIGURATION или MANDATE (на каком шаге) */
+  | "platform.protocol_unsupported";
 
 export interface JournalEntry {
   at: string;

@@ -5,7 +5,7 @@ import type { MemoryJournal } from "../../src/agent/journal/index.js";
 import type { MandateDraft } from "../../src/shared/domain.js";
 import { Consents, INTENT, RUB, event, feed } from "../support/consents.js";
 import { coreOn } from "../support/core.js";
-import { PaoStand } from "../support/pao-stand.js";
+import { PaoStand, type StandOptions } from "../support/pao-stand.js";
 import type { StandParams } from "../../src/shared/config.js";
 
 let stand: PaoStand | undefined;
@@ -14,9 +14,9 @@ afterEach(async () => {
   stand = undefined;
 });
 
-async function setup() {
+async function setup(configuration?: StandOptions["configuration"]) {
   const consents: Consents = new Consents(() => s.clock);
-  const s = new PaoStand({ handlers: consents.handlers() });
+  const s = new PaoStand({ handlers: consents.handlers(), ...(configuration && { configuration }) });
   stand = s;
   const { core } = await coreOn(s);
   await core.start();
@@ -124,9 +124,10 @@ describe("клиент мандатов на PaoStub", () => {
     await expect(core.mandates.request(cart, { idempotencyKey: "idem_c6" }, intent)).rejects.toMatchObject({ reason: "REPLY_MISMATCH" });
   });
 
-  // Р33 п. 4: ответ с мандатом без порядка отзыва — свой код, журнал, текст человеку; покупки по мандату нет.
+  // Р33 п. 4: ответ с мандатом без порядка отзыва — свой код, журнал, текст человеку; покупки по мандату нет. Версия ПАО
+  // Платформы подтверждена конфигурацией (Р33 п. 10); без подтверждения — PLATFORM_PROTOCOL_UNSUPPORTED (protocol-version).
   it("мандат без revocation_order — REVOCATION_ORDER_MISSING, событие в журнал, текст человеку", async () => {
-    const { core, consents, stand } = await setup();
+    const { core, consents, stand } = await setup({ versions: ["1.4.0"] });
     consents.tamper = (m) => {
       const r = { ...m };
       delete r.revocation_order;

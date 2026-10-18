@@ -5,7 +5,7 @@ import { FAILURE_RULES, ruleForDeclineReason, ruleForFailure } from "../../src/a
 
 const spec = readFileSync("docs/core/SPEC.md", "utf8");
 /** коды агента вне ПАО — своя часть §7а (Р33) */
-const AGENT_CODES = ["MANDATE_REVOCATION_ORDER_MISSING"];
+const AGENT_CODES = ["MANDATE_REVOCATION_ORDER_MISSING", "PLATFORM_PROTOCOL_UNSUPPORTED"];
 const specRows = [...spec.matchAll(/^\| ([A-Z_]+) \| (\d{3}) \| (\w+) \|/gm)].map((m) => ({ code: m[1]!, http: Number(m[2]), retry: m[3]! }));
 
 describe("таблица отказов", () => {

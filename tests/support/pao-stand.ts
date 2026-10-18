@@ -38,7 +38,12 @@ export interface StandOptions {
   overlapDays?: number;
   /** обработчики прочих операций — как у PaoStub */
   handlers?: PaoStubOptions["handlers"];
+  /** ответ GET /.well-known/pao-configuration (Р33 п. 10); по умолчанию PaoStub отдаёт versions ["v1"] */
+  configuration?: PaoStubOptions["configuration"];
 }
+
+/** Р33 п. 10: чтение конфигурации на стадии 0 — первое обращение каждого допуска (PaoStub отдаёт versions ["v1"]). */
+export const CONFIGURATION = { op: "GET /.well-known/pao-configuration", status: 200 } as const;
 
 export class PaoStand {
   readonly dir = mkdtempSync(join(tmpdir(), "buyref-keys-"));
@@ -69,6 +74,7 @@ export class PaoStand {
       writeMeta(this.dir, Object.fromEntries(this.descriptors.map((d) => [d.kid, { ...this.dates.get(d.kid)! }])));
     }
     this.stub = new PaoStub({
+      ...(o.configuration && { configuration: o.configuration }),
       agents: o.unregistered ? [] : [this.agent],
       handlers: {
         ...o.handlers,

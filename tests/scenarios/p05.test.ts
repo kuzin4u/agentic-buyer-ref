@@ -6,7 +6,7 @@ import { MandateClient, MandateRefused } from "../../src/agent/mandates/index.js
 import { Consents, INTENT } from "../support/consents.js";
 import { createContour, type Contour } from "../support/contour.js";
 import { coreOn } from "../support/core.js";
-import { PaoStand } from "../support/pao-stand.js";
+import { PaoStand, CONFIGURATION } from "../support/pao-stand.js";
 
 let stand: PaoStand | undefined;
 let contour: Contour | undefined;
@@ -39,7 +39,7 @@ describe("П05 — действие без действующего мандат
     expect(err).toBeInstanceOf(MandateRefused);
     expect(err.reason).toBe("NO_MANDATE");
     expect(err.message).toMatch(/не действует от вашего имени/);
-    expect(s.log()).toEqual([{ op: "GET /pao/v1/agent", status: 200 }]);
+    expect(s.log()).toEqual([CONFIGURATION, { op: "GET /pao/v1/agent", status: 200 }]);
     expect(s.stub.violations).toEqual([]);
   });
 
@@ -52,6 +52,7 @@ describe("П05 — действие без действующего мандат
     const m = await core.mandates.request(INTENT, { idempotencyKey: "idem-p05" });
     await expect(core.mandates.requireActive(m)).rejects.toMatchObject({ reason: "NO_MANDATE" });
     expect(s.log()).toEqual([
+      CONFIGURATION,
       { op: "GET /pao/v1/agent", status: 200 },
       { op: "POST /pao/v1/mandates", status: 201 },
     ]);

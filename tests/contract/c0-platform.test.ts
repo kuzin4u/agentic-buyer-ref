@@ -61,6 +61,8 @@ async function platform() {
 }
 
 const SELF = "GET /pao/v1/agent";
+/** Р33 п. 10: конфигурация читается на стадии 0; стенд её не отдаёт до PS-05 — 404, версия не определена. */
+const CONF = { route: "GET /.well-known/pao-configuration", status: 404 };
 
 /** Отказ подписи на допуске (SPEC §7а): один повтор с новой подписью (новый x-nonce, Р21), затем остановка. */
 async function expectSignatureStop(core: Awaited<ReturnType<typeof coreAt>>["core"], journal: MemoryJournal, log: Call[]) {
@@ -68,17 +70,14 @@ async function expectSignatureStop(core: Awaited<ReturnType<typeof coreAt>>["cor
   expect(err).toBeInstanceOf(SignerStopped);
   expect(err.reason).toBe("SIGNATURE_INVALID");
   expect(err.cause).toMatchObject({ code: "SIGNATURE_INVALID", httpStatus: 401 });
-  expect(log.map(({ route, status }) => ({ route, status }))).toEqual([
-    { route: SELF, status: 401 },
-    { route: SELF, status: 401 },
-  ]);
-  expect(log[0]!.nonce).toBeTruthy();
-  expect(log[1]!.nonce).not.toBe(log[0]!.nonce);
+  expect(log.map(({ route, status }) => ({ route, status }))).toEqual([CONF, { route: SELF, status: 401 }, { route: SELF, status: 401 }]);
+  expect(log[1]!.nonce).toBeTruthy();
+  expect(log[2]!.nonce).not.toBe(log[1]!.nonce);
   expect(journal.entries.at(-1)).toMatchObject({ kind: "agent.stopped", reason: "SIGNATURE_INVALID" });
   // остановка, а не «ещё не допущен»: повторный допуск — та же причина и ни одного обращения
   await expect(core.start()).rejects.toMatchObject({ reason: "SIGNATURE_INVALID" });
   await expect(core.platform.agentSelf()).rejects.toThrow(SignerStopped);
-  expect(log).toHaveLength(2);
+  expect(log).toHaveLength(3);
 }
 
 async function coreAt(s: Stand, dir: string) {
@@ -104,7 +103,7 @@ describe("С0 — подпись агента принимается Платф�
     expect(descriptor.kid).toBe(kidOf(descriptor.public_key));
     if (!decision.admitted) throw new Error("недостижимо");
     expect(decision.key.kid).toBe(descriptor.kid); // kid присвоен Платформой независимо от агента (RFC 7638)
-    expect(calls()).toEqual([{ route: SELF, status: 200 }]);
+    expect(calls()).toEqual([CONF, { route: SELF, status: 200 }]);
     expect(journal.entries).toContainEqual(expect.objectContaining({ kind: "request.signed", kid: descriptor.kid }));
     expect(JSON.stringify(journal.entries)).not.toContain(descriptor.public_key);
   });
@@ -122,7 +121,7 @@ describe("С0 — подпись агента принимается Платф�
     expect(typeof key!.validTo).toBe("string");
     expect(Date.parse(key!.validTo!)).toBeGreaterThan(Date.parse(key!.validFrom!));
     expect(readMeta(dir)[descriptor.kid]).toEqual({ valid_from: key!.validFrom, valid_to: key!.validTo });
-    expect(calls()).toEqual([{ route: SELF, status: 200 }]);
+    expect(calls()).toEqual([CONF, { route: SELF, status: 200 }]);
   });
 
   it("чужой ключ: в реестре ключ B, у агента ключ A — SIGNATURE_INVALID, один повтор, остановка; ключ A не отозван", async () => {
@@ -159,7 +158,7 @@ describe("С0 — подпись агента принимается Платф�
     const { core, journal } = await coreAt(s, dir);
 
     await expect(core.start()).rejects.toMatchObject({ reason: "AGENT_CLASS_MISMATCH" });
-    expect(calls()).toEqual([{ route: SELF, status: 200 }]);
+    expect(calls()).toEqual([CONF, { route: SELF, status: 200 }]);
     expect(journal.entries.filter((e) => e.kind === "agent.stopped")).toEqual([
       expect.objectContaining({ reason: "AGENT_CLASS_MISMATCH", detail: "SELLER" }),
     ]);
@@ -174,7 +173,7 @@ describe("С0 — подпись агента принимается Платф�
     const err = await core.start().catch((e: unknown) => e);
     expect(err).toBeInstanceOf(PlatformFailure);
     expect(err).toMatchObject({ code: "AGENT_UNKNOWN", retry: "never", httpStatus: 401 });
-    expect(calls()).toEqual([{ route: SELF, status: 401 }]);
+    expect(calls()).toEqual([CONF, { route: SELF, status: 401 }]);
     expect(journal.entries.at(-1)).toMatchObject({ kind: "agent.stopped", reason: "AGENT_UNKNOWN" });
   });
 });

@@ -72,12 +72,19 @@ export const FAILURE_RULES: Readonly<Record<FailureCode, DeclineRule>> = {
   KEY_INVALID: rule("NEW_KEY", "after_fix", 2, true),
   // Р33 п. 4: код агента вне ПАО — мандат без порядка отзыва не подтверждён (A7 п. 2.2); не дефект агента.
   MANDATE_REVOCATION_ORDER_MISSING: rule("STOP", "never", 0, false, true),
+  // Р33 п. 10: Платформа ниже ПАО 1.4.0 — останавливается агент целиком (AGENT_STOP_CODES); не дефект агента.
+  PLATFORM_PROTOCOL_UNSUPPORTED: rule("STOP", "never", 0, false, true),
   // Неопознанный ответ платформы — не дефект агента, но остановка и событие в журнал (SPEC §7а).
   UNKNOWN: rule("STOP", "never", 0, false, true),
 };
 
-/** Отказ в допуске (SPEC §7а: AGENT_UNKNOWN, AGENT_SUSPENDED): останавливается агент целиком, а не одно обращение (П03). */
-export const AGENT_STOP_CODES: ReadonlySet<FailureCode> = new Set<FailureCode>(["AGENT_UNKNOWN", "AGENT_SUSPENDED"]);
+/** Отказ в допуске (SPEC §7а: AGENT_UNKNOWN, AGENT_SUSPENDED) и несовместимая Платформа (PLATFORM_PROTOCOL_UNSUPPORTED,
+ *  Р33 п. 10): останавливается агент целиком, а не одно обращение (П03). */
+export const AGENT_STOP_CODES: ReadonlySet<FailureCode> = new Set<FailureCode>([
+  "AGENT_UNKNOWN",
+  "AGENT_SUSPENDED",
+  "PLATFORM_PROTOCOL_UNSUPPORTED",
+]);
 
 export function ruleForFailure(code: FailureCode): DeclineRule {
   return FAILURE_RULES[code] ?? FAILURE_RULES.UNKNOWN;

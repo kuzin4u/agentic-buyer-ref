@@ -1,5 +1,6 @@
 // П03 (профиль contour, Р23): агент исключён из реестра или в нём отсутствует. Т1, A2 п. 7, SPEC §7а.
-// EXCLUDED эмулирует обёртка стенда: в PaoStub agentic-core v0.3.0 такого статуса нет (STATUS, расхождение № 9, CO-1).
+// EXCLUDED эмулирует обёртка стенда (шапка pao-stand.ts): в PaoStub ядра статус есть с v0.5.0, но обработчик обёртки главнее;
+// упрощение обёртки — STATUS «Открыто», Р31.
 import { afterEach, describe, expect, it } from "vitest";
 import { SignerStopped } from "../../src/agent/signer/index.js";
 import { PlatformFailure } from "../../src/shared/domain.js";

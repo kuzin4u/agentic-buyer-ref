@@ -123,7 +123,7 @@ describe("перевод ПАО ↔ ядро", () => {
     expect(map.mandateFromPao({ ...req, agent_code: AG }, CUR, AG).id).toBe("m_1");
   });
 
-  // Р27: класс обязателен для ядра (в ПАО 1.2.0 необязателен) — нет поля или значение вне перечня — UNKNOWN.
+  // Р27: класс обязателен для ядра (в ПАО 1.3.0 необязателен) — нет поля или значение вне перечня — UNKNOWN.
   it("агент: класс переводится; нет class или значение вне перечня — UNKNOWN", () => {
     const a = { agent_code: "nspk:agent:x:v1", status: "ACTIVE" as const, keys: [] };
     expect(map.agentSelfFromPao({ ...a, class: "SELLER" })).toMatchObject({ agentClass: "SELLER" });

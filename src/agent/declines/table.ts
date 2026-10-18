@@ -8,6 +8,9 @@ export type DeclineAction =
   | "STOP_ALL"
   /** подписать действующим новым ключом; нет ключа — остановка */
   | "ROTATE_KEY"
+  /** регистрируемый ключ не принят: не использовать и не повторять им; следующая ротация — новый ключ, подряд не больше
+   *  maxRetries раз после первого отказа, затем ротация остановлена; подпись — прежним подтверждённым ключом (Р31) */
+  | "NEW_KEY"
   /** исправить причину и повторить не больше maxRetries раз, иначе остановка */
   | "FIX_AND_RETRY"
   /** запросить у человека новый мандат */
@@ -24,7 +27,7 @@ export type DeclineAction =
 
 export interface DeclineRule {
   action: DeclineAction;
-  /** класс повтора по SPEC §7а (совпадает с retry ПАО 1.2.0) */
+  /** класс повтора по SPEC §7а (совпадает с retry ПАО 1.3.0) */
   retry: RetryClass;
   /** null — повторы ограничены временем (registry_cache_ttl_sec), а не числом */
   maxRetries: number | null;
@@ -62,6 +65,11 @@ export const FAILURE_RULES: Readonly<Record<FailureCode, DeclineRule>> = {
   IDEMPOTENCY_CONFLICT: rule("STOP", "after_fix", 0, true),
   RATE_LIMITED: rule("RETRY_SAME_KEY", "same_key", null),
   UPSTREAM_UNAVAILABLE: rule("RETRY_SAME_KEY", "same_key", null),
+  // Р31: тело не по схеме метода — дефект агента, без повтора.
+  REQUEST_INVALID: rule("STOP", "after_fix", 0, true),
+  // Р31: ключ не принят при регистрации — ключ отклонён, тем же ключом не повторяется; новые ключи — не больше maxRetries
+  // раз подряд после первого отказа, затем ротация остановлена до решения человека (подпись — прежним ключом).
+  KEY_INVALID: rule("NEW_KEY", "after_fix", 2, true),
   // Неопознанный ответ платформы — не дефект агента, но остановка и событие в журнал (SPEC §7а).
   UNKNOWN: rule("STOP", "never", 0, false, true),
 };

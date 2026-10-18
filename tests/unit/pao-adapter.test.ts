@@ -82,7 +82,7 @@ describe("адаптер ПАО против заглушки agentic-core", () 
     const { platform } = await setup();
     expect(platform.capabilities()).toMatchObject({
       platform: "pao",
-      protocolVersion: "1.2.0",
+      protocolVersion: "1.3.0",
       currencies: ["RUB"],
       guaranteeContour: true,
       signedEvents: false,
@@ -143,6 +143,17 @@ describe("адаптер ПАО против заглушки agentic-core", () 
     stub.fail("GET /pao/v1/mandates/{id}/verify", { code, status, retry: "same_key", retryAfterSec: 0 }, 3);
     await expect(platform.verifyMandate(M1)).rejects.toMatchObject({ code: "UNKNOWN", retry: "never", platformCode: code });
     expect(stub.calls.filter((c) => c.op === "GET /pao/v1/mandates/{id}/verify")).toHaveLength(1);
+  });
+
+  // Р31: оба кода — after_fix; адаптер не повторяет и не переключает ключ (keyRevoked в этих тестах бросает).
+  // Retry-After: 0 — иначе адаптер не повторил бы и по RETRY_SAME_KEY, и тест был бы пустым (ревью К0.1а № 1).
+  it.each([
+    ["KEY_INVALID", 422, (p: PaoPlatform) => p.registerKey({ alg: "ed25519", publicKey }, { idempotencyKey: "agent-key-k" })],
+    ["REQUEST_INVALID", 400, (p: PaoPlatform) => p.verifyMandate(M1)],
+  ] as const)("код %s (%i): одно обращение, отказ ядра, без перехода на другой ключ", async (code, status, call) => {
+    const { platform, calls } = fake(() => json(status, { code, message: "m", retry: "after_fix" }, { "retry-after": "0" }));
+    await expect(call(platform)).rejects.toMatchObject({ code, retry: "after_fix", platformCode: code });
+    expect(calls).toHaveLength(1);
   });
 
   it("ожидание копится: 20 + 20 с больше потолка — отказ после первого ожидания", async () => {
@@ -372,7 +383,7 @@ describe("fail-closed без заглушки", () => {
 describe("версия ПАО", () => {
   it("версия в agentic-core должна совпасть с копией (Р20)", () => {
     expect(() => assertPaoVersion()).not.toThrow();
-    expect(() => assertPaoVersion("1.3.0")).toThrow(/Р20/);
+    expect(() => assertPaoVersion("1.4.0")).toThrow(/Р20/);
   });
 });
 

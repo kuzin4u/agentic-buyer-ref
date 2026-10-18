@@ -2,6 +2,9 @@
 // мандатом. Ниже 1.4.0 — PLATFORM_PROTOCOL_UNSUPPORTED и остановка агента целиком; не определена — предупреждение
 // PLATFORM_VERSION_UNKNOWN в журнал и работа дальше; после подтверждения ответ без порядка отзыва —
 // MANDATE_REVOCATION_ORDER_MISSING на этом мандате.
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { PAO_MIN_PLATFORM_VERSION, highestPaoVersion, protocolUnsupportedText } from "../../src/agent/adapters/pao/adapter.js";
 import { mandateDraftToPao } from "../../src/agent/adapters/pao/map.js";
@@ -15,6 +18,16 @@ import { AGENT, PaoStand, type StandOptions } from "../support/pao-stand.js";
 
 const CONFIG = "GET /.well-known/pao-configuration";
 const EVIDENCE = "GET /pao/v1/mandates/{id}/evidence";
+/** Тайм-аут обращения в тесте тайм-аута конфигурации: действует на весь прогон, в т. ч. на допуск к заглушке — с запасом
+ *  для загруженного CI (ревью К2.3а № 4); не стендовое значение. */
+const SHORT_TIMEOUT_MS = 300;
+
+/** Нарушения схемы у заглушки — только в испорченном тестом ответе конфигурации (по записи на ошибку); запросы агента —
+ *  без нарушений. */
+function expectOnlyConfigViolation(s: PaoStand) {
+  expect(s.stub.violations.length).toBeGreaterThan(0);
+  for (const v of s.stub.violations) expect(v).toContain(CONFIG);
+}
 
 let stand: PaoStand | undefined;
 afterEach(async () => {
@@ -108,6 +121,69 @@ describe("шаг 1 — при подключении (стадия 0, до GET /
     expect(conf).toHaveLength(1);
     expect(conf[0]!.kid).toBeUndefined();
     expect(conf[0]!.idempotencyKey).toBeUndefined();
+  });
+
+  // Ревью К2.3 № 9: по схеме — только versions; прочие поля конфигурации игнорируются (ПАО §7).
+  it("versions 1.3.0 при поле вне перечня 1.4.0 — всё равно PLATFORM_PROTOCOL_UNSUPPORTED", async () => {
+    const { core, ops, stand: s } = await setup({
+      handlers: { [CONFIG]: () => ({ body: { versions: ["1.3.0"], algorithms: ["rsa-pss"], endpoints: 1 } as never }) },
+    });
+    await expect(core.start()).rejects.toMatchObject({ code: "PLATFORM_PROTOCOL_UNSUPPORTED" });
+    expect(ops()).toEqual([CONFIG]);
+    expectOnlyConfigViolation(s);
+  });
+
+  it.each([
+    ["versions — не строки", { versions: [1, 4, 0] }],
+    ["тело — массив", ["1.4.0"]],
+  ])("%s — BAD_RESPONSE", async (_, body) => {
+    const { core, kinds, ops, stand: s } = await setup({ handlers: { [CONFIG]: () => ({ body: body as never }) } });
+    await core.start();
+    expect(kinds("platform.version_unknown")).toEqual([expect.objectContaining({ detail: "BAD_RESPONSE" })]);
+    expect(ops()).toEqual([CONFIG, "GET /pao/v1/agent"]);
+    expectOnlyConfigViolation(s);
+  });
+
+  // Рекомендация ревью из чата к К2.3: ответы, которых PaoStub не отдаёт, — подменой транспорта адаптера.
+  it("битый JSON на конфигурации — BAD_RESPONSE, допуск идёт", async () => {
+    const consents: Consents = new Consents(() => s.clock);
+    const s: PaoStand = (stand = new PaoStand({ handlers: consents.handlers() }));
+    let served = 0;
+    const fetchImpl: typeof fetch = (url, init) => {
+      if (!String(url).endsWith(CONFIG.slice(4))) return fetch(url, init);
+      served++;
+      return Promise.resolve(new Response('{"versions": ["1.3.0"', { status: 200 }));
+    };
+    const { core, journal } = await coreOn(s, { fetch: fetchImpl });
+    await core.start();
+    expect(served).toBe(1); // без повтора: повтор пошёл бы мимо заглушки
+    expect(journal.entries.filter((e) => e.kind === "platform.version_unknown")).toEqual([expect.objectContaining({ detail: "BAD_RESPONSE" })]);
+    expect(s.stub.calls.map((c) => c.op)).toEqual(["GET /pao/v1/agent"]);
+    expect(s.stub.violations).toEqual([]);
+  });
+
+  it("тайм-аут на конфигурации (pao_request_timeout_ms) — NO_RESPONSE, без повтора, допуск идёт", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "buyref-params-"));
+    try {
+      const paramsPath = join(dir, "params.json");
+      writeFileSync(paramsPath, JSON.stringify({ ...loadParams(), pao_request_timeout_ms: SHORT_TIMEOUT_MS }));
+      const consents: Consents = new Consents(() => s.clock);
+      const s: PaoStand = (stand = new PaoStand({ handlers: consents.handlers() }));
+      let hung = 0;
+      const fetchImpl: typeof fetch = (url, init) => {
+        if (!String(url).endsWith(CONFIG.slice(4))) return fetch(url, init);
+        hung++;
+        return new Promise((_, reject) => init?.signal?.addEventListener("abort", () => reject(init.signal!.reason)));
+      };
+      const { core, journal } = await coreOn(s, { fetch: fetchImpl, paramsPath });
+      await core.start();
+      expect(hung).toBe(1);
+      expect(journal.entries.filter((e) => e.kind === "platform.version_unknown")).toEqual([expect.objectContaining({ detail: "NO_RESPONSE" })]);
+      expect(s.stub.calls.map((c) => [c.op, c.status])).toEqual([["GET /pao/v1/agent", 200]]);
+      expect(s.stub.violations).toEqual([]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   // Ревью К2.3 № 6: повтор допуска после сбоя читает конфигурацию снова — новое предупреждение на каждый start.

@@ -47,6 +47,8 @@ export function highestPaoVersion(versions: readonly string[]): string | null {
   return best === null ? null : `1.${best[0]}.${best[1]}`;
 }
 
+const isStringArray = (v: unknown): v is string[] => Array.isArray(v) && v.every((x) => typeof x === "string");
+
 function belowMin(version: string): boolean {
   const [, a = 0, b = 0] = version.split(".").map(Number);
   const [, x = 0, y = 0] = PAO_MIN_PLATFORM_VERSION.split(".").map(Number);
@@ -162,15 +164,19 @@ export class PaoPlatform implements PaymentPlatform {
   /**
    * Р33 п. 10, шаг 1: GET /.well-known/pao-configuration без подписи, один раз, без повторов. Наибольшее 1.x.y ниже
    * PAO_MIN_PLATFORM_VERSION — остановка агента и отказ PLATFORM_PROTOCOL_UNSUPPORTED; не ниже — версия подтверждена;
-   * значений 1.x.y нет, ответ не по схеме или отказ — версия не определена, проверка по первому мандату (шаг 2).
+   * значений 1.x.y нет, `versions` не массив строк, ответ не объект или отказ — версия не определена, проверка по первому
+   * мандату (шаг 2).
    */
   async checkProtocol(): Promise<ProtocolCheck> {
-    let versions: unknown;
+    let versions: string[] | undefined;
     try {
-      const r = await this.client({}, UNSIGNED).call("GET /.well-known/pao-configuration", {});
-      const schema = PAO_OPERATIONS["GET /.well-known/pao-configuration"].response;
-      if (schema !== undefined && validatePao(schema, r).length > 0) return this.unknownVersion("BAD_RESPONSE");
-      versions = r.versions;
+      const r: unknown = await this.client({}, UNSIGNED).call("GET /.well-known/pao-configuration", {});
+      // По схеме — только `versions` (string[]); прочие поля конфигурации агенту не нужны и игнорируются (ПАО §7):
+      // алгоритм или ключ Платформы вне перечня не прячет явную версию ниже 1.4.0 (ревью К2.3 № 9).
+      if (typeof r !== "object" || r === null || Array.isArray(r)) return this.unknownVersion("BAD_RESPONSE");
+      const v = (r as { versions?: unknown }).versions;
+      if (v !== undefined && !isStringArray(v)) return this.unknownVersion("BAD_RESPONSE");
+      versions = v;
     } catch (e) {
       // Тело и сообщение исключения не переносятся (инвариант 1). Наружу — всё, что не ответ и не разбор: дефект агента
       // (например, вызов подписи) не маскируется под «адрес не отвечает» (ревью К2.3 № 4).
@@ -178,7 +184,7 @@ export class PaoPlatform implements PaymentPlatform {
       if (e instanceof PaoCallError) return this.unknownVersion("NO_RESPONSE");
       throw e;
     }
-    const version = Array.isArray(versions) ? highestPaoVersion(versions as string[]) : null;
+    const version = versions === undefined ? null : highestPaoVersion(versions);
     if (version === null) return this.unknownVersion("NO_VERSION");
     if (belowMin(version)) {
       const failure = this.unsupported("CONFIGURATION", version, 200, null);

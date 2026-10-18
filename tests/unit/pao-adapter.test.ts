@@ -82,7 +82,7 @@ describe("адаптер ПАО против заглушки agentic-core", () 
     const { platform } = await setup();
     expect(platform.capabilities()).toMatchObject({
       platform: "pao",
-      protocolVersion: "1.3.0",
+      protocolVersion: "1.4.0",
       currencies: ["RUB"],
       guaranteeContour: true,
       signedEvents: false,
@@ -188,7 +188,7 @@ describe("валюта — из мандата, множество платфо�
 
   it("мандат платформы в USD — UNKNOWN (поломка «не RUB принят»)", async () => {
     const mandate = {
-      id: "m_usd", type: "INTENT", subject: "хлеб", amount_limit: 500000, currency: "USD", valid_to: "2026-11-14T00:00:00Z",
+      id: "m_usd", agent_code: AGENT, type: "INTENT", subject: "хлеб", amount_limit: 500000, currency: "USD", valid_to: "2026-11-14T00:00:00Z",
       merchant_scope: ["shop_1"], principal_ref: "pr_1", mode: "IMMEDIATE", status: "ACTIVE",
     };
     const { platform } = fake(() => json(200, mandate));
@@ -383,7 +383,7 @@ describe("fail-closed без заглушки", () => {
 describe("версия ПАО", () => {
   it("версия в agentic-core должна совпасть с копией (Р20)", () => {
     expect(() => assertPaoVersion()).not.toThrow();
-    expect(() => assertPaoVersion("1.4.0")).toThrow(/Р20/);
+    expect(() => assertPaoVersion("1.3.0")).toThrow(/Р20/);
   });
 });
 

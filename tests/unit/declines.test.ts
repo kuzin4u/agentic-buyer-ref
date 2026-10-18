@@ -7,7 +7,7 @@ const spec = readFileSync("docs/core/SPEC.md", "utf8");
 const specRows = [...spec.matchAll(/^\| ([A-Z_]+) \| (\d{3}) \| (\w+) \|/gm)].map((m) => ({ code: m[1]!, http: Number(m[2]), retry: m[3]! }));
 
 describe("таблица отказов", () => {
-  it("коды ядра = коды ПАО 1.3.0 + UNKNOWN", () => {
+  it("коды ядра = коды ПАО 1.4.0 + UNKNOWN", () => {
     expect(Object.keys(FAILURE_RULES).sort()).toEqual([...Object.keys(PAO_ERRORS), "UNKNOWN"].sort());
   });
 

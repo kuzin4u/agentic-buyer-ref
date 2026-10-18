@@ -27,7 +27,7 @@ export type DeclineAction =
 
 export interface DeclineRule {
   action: DeclineAction;
-  /** класс повтора по SPEC §7а (совпадает с retry ПАО 1.3.0) */
+  /** класс повтора по SPEC §7а (совпадает с retry ПАО 1.4.0) */
   retry: RetryClass;
   /** null — повторы ограничены временем (registry_cache_ttl_sec), а не числом */
   maxRetries: number | null;

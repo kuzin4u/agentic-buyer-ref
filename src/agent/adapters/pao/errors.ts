@@ -4,7 +4,7 @@ import { PAO_ERRORS, PaoCallError, type ErrorCode } from "@kuzin4u/agentic-core/
 import { PlatformFailure, type FailureCode } from "../../../shared/domain.js";
 import { FAILURE_RULES } from "../../declines/index.js";
 
-/** Полный перевод кодов ПАО 1.3.0; новый код в agentic-core без строки здесь не соберётся. */
+/** Полный перевод кодов ПАО 1.4.0; новый код в agentic-core без строки здесь не соберётся. */
 const CODES: Record<ErrorCode, FailureCode> = {
   AGENT_UNKNOWN: "AGENT_UNKNOWN",
   AGENT_SUSPENDED: "AGENT_SUSPENDED",
@@ -38,7 +38,7 @@ export function toFailure(e: unknown, idempotencyKey: string | null = null): Pla
     const code = raw !== null && Object.hasOwn(CODES, raw) ? CODES[raw as ErrorCode] : undefined;
     const key = e.idempotencyKey ?? idempotencyKey;
     if (code === undefined) {
-      const detail = e.status === 0 ? "нет ответа" : e.body ? "код не из ПАО 1.3.0" : "ответ без тела ПАО";
+      const detail = e.status === 0 ? "нет ответа" : e.body ? "код не из ПАО 1.4.0" : "ответ без тела ПАО";
       return new PlatformFailure("UNKNOWN", "never", raw, e.status, key, detail);
     }
     // Пара «код, HTTP» должна совпасть с x-pao-errors; иначе ответ не подтверждён контрактом (инвариант 4).

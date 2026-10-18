@@ -154,7 +154,7 @@ export type AgentClass = "BUYER" | "SELLER" | "SURFACE" | "SERVICE";
 
 /** Сведения платформы об агенте: статус, класс и ключи (GET /pao/v1/agent). */
 export interface AgentSelf extends AgentStatus {
-  /** в ПАО 1.3.0 поле необязательно; для ядра обязательно — нет поля или значение вне перечня → UNKNOWN (Р27) */
+  /** в ПАО 1.4.0 поле необязательно; для ядра обязательно — нет поля или значение вне перечня → UNKNOWN (Р27) */
   agentClass: AgentClass;
   keys: AgentKey[];
 }

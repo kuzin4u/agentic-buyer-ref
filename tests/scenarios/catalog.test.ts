@@ -33,7 +33,7 @@ function requirementRows(spec: string): Map<string, Set<string>> {
   }
   return rows;
 }
-const paoErrors = paoErrorCodes(readFileSync("docs/core/protocol/agent-protocol.v1.3.0.yaml", "utf8"));
+const paoErrors = paoErrorCodes(readFileSync("docs/core/protocol/agent-protocol.v1.4.0.yaml", "utf8"));
 const spec = readFileSync("docs/core/SPEC.md", "utf8");
 const reasons = declineReasons(spec);
 const requirements = requirementRows(spec);

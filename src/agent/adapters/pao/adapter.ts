@@ -20,9 +20,9 @@ import { toFailure } from "./errors.js";
 import * as map from "./map.js";
 
 /** Версия копии ПАО у агента (docs/core/protocol/SOURCE.md, Р20). */
-export const PAO_COPY_VERSION = "1.3.0";
+export const PAO_COPY_VERSION = "1.4.0";
 
-/** Валюты Платформы ПС по ПАО 1.3.0 — допустимое множество, не источник валюты (Р29 п. 2). */
+/** Валюты Платформы ПС по ПАО 1.4.0 — допустимое множество, не источник валюты (Р29 п. 2). */
 export const PAO_CURRENCIES = ["RUB"] as const;
 
 export function assertPaoVersion(actual: string = PAO_VERSION): void {
@@ -122,7 +122,7 @@ export class PaoPlatform implements PaymentPlatform {
         // `decision`, `kind`…) или пропущенное обязательное поле — UNKNOWN. Неизвестные поля допускаются (validatePao,
         // ПАО §7). Текст нарушений (в нём значения из тела) в отказ не переносится (инвариант 1). Ключ со статусом вне
         // перечня делает UNKNOWN весь ответ GET /agent — осознанный fail-closed (ревью 3b № 10): по ПАО §7 новое
-        // значение перечня — не совместимое изменение версии 1.3.0, реестр с ним не подтверждает и остальное.
+        // значение перечня — не совместимое изменение версии 1.4.0, реестр с ним не подтверждает и остальное.
         // Список событий (GET /pao/v1/events, AG-06) так проверять нельзя: неизвестный тип события ПАО §7 велит
         // игнорировать — STATUS «Открыто», AG-06.
         const schema = PAO_OPERATIONS[op].response;

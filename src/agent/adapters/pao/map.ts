@@ -1,6 +1,6 @@
 // Перевод ПАО ↔ доменные типы ядра (Р19). Неполный ответ платформы — отказ UNKNOWN (fail-closed, инвариант 4).
 // Payload реквизита (криптограмма, token_ref, привязка) отбрасывается здесь и не хранится (инвариант 1, задел к AG-11).
-// Суммы (Р29): валюта — из мандата; у сумм без поля валюты в ПАО 1.3.0 (verify, операция, подтверждение, корзина) —
+// Суммы (Р29): валюта — из мандата; у сумм без поля валюты в ПАО 1.4.0 (verify, операция, подтверждение, корзина) —
 // валюта мандата ссылки. Множество валют платформы — только допустимое: вне его — отказ (исходящие) или UNKNOWN (входящие).
 import { money, type CurrencyCode, type Money } from "@kuzin4u/agentic-core";
 import type * as Pao from "@kuzin4u/agentic-core/pao";
@@ -138,7 +138,7 @@ export function mandateFromPao(m: Pao.Mandate, cur: Currencies, agentCode: strin
   };
 }
 
-/** verify: в ПАО 1.3.0 у `amount_left` нет валюты — валюта мандата ссылки (Р29 п. 3). */
+/** verify: в ПАО 1.4.0 у `amount_left` нет валюты — валюта мандата ссылки (Р29 п. 3). */
 export function mandateCheckFromPao(v: Pao.MandateVerify, ref: MandateRef): MandateCheck {
   return {
     outcome: v.outcome,
@@ -195,7 +195,7 @@ export function credentialFromPao(c: Pao.Credential, mandateId: string, agentCod
   };
 }
 
-/** Подтверждение: в ПАО 1.3.0 у `amount` нет валюты — сумма обязана быть в валюте мандата (Р29 п. 3). */
+/** Подтверждение: в ПАО 1.4.0 у `amount` нет валюты — сумма обязана быть в валюте мандата (Р29 п. 3). */
 export function confirmationDraftToPao(d: ConfirmationDraft, cur: Currencies): Pao.ConfirmationRequest {
   return {
     mandate_id: d.mandate.id,
@@ -216,7 +216,7 @@ export function confirmationFromPao(c: Pao.Confirmation): Confirmation {
   };
 }
 
-/** Операция: в ПАО 1.3.0 у `amount` нет валюты — валюта мандата ссылки; признак другого мандата — UNKNOWN (Р29 п. 3).
+/** Операция: в ПАО 1.4.0 у `amount` нет валюты — валюта мандата ссылки; признак другого мандата — UNKNOWN (Р29 п. 3).
  *  Операция без признака (причина AOI_MISSING, SPEC §7б): в списке и выписке по мандату (`list` — мандат назвала
  *  платформа) — в валюте мандата ссылки; по одной операции (`single` — мандат назвал вызывающий) сумма не
  *  подтверждена — `amount: null`. `indicator` — null. */
@@ -272,7 +272,7 @@ export function agentSelfFromPao(a: Pao.AgentSelf): AgentSelf {
   return {
     agentCode: need(a.agent_code, "agent.agent_code"),
     status: oneOf(a.status, AGENT_STATUSES, "agent.status"),
-    // Р27: класс обязателен для ядра (в ПАО 1.3.0 — нет); нет поля — тоже «вне перечня», UNKNOWN.
+    // Р27: класс обязателен для ядра (в ПАО 1.4.0 — нет); нет поля — тоже «вне перечня», UNKNOWN.
     agentClass: oneOf(a.class, AGENT_CLASSES, "agent.class"),
     keys: (a.keys ?? []).map(keyFromPao),
   };

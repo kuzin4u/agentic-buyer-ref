@@ -9,11 +9,12 @@
 import type { Signer } from "@kuzin4u/agentic-core";
 import { PlatformFailure, type AgentKey, type AgentSelf } from "../../shared/domain.js";
 import type { StandParams } from "../../shared/config.js";
+import type { DiagCode } from "../../shared/diag-codes.js";
 import { ruleForFailure } from "../declines/index.js";
 import type { Journal, JournalKind } from "../journal/index.js";
 import type { PaymentPlatform } from "../ports/payment-platform.js";
 import type { RequestSigning } from "../ports/request-signing.js";
-import { SignerKeyRejected, SignerStopped, SignerSuspended } from "./errors.js";
+import { SignerKeyRejected, SignerStopped, SignerSuspended, type SignerStopReason } from "./errors.js";
 import { KeystoreLocked, generateKey, listKeys, loadKey, lockDir, markKey, pruneKey, readMeta, writeMeta, type KeyMeta, type KeyState, type LoadedKey } from "./keystore.js";
 import { kidOf } from "./kid.js";
 
@@ -50,9 +51,9 @@ export class KeyRing {
   readonly #now: () => Date;
   readonly #held = new Map<string, Held>();
   #currentKid: string | null = null;
-  #stopped: string | null = null;
+  #stopped: SignerStopReason | null = null;
   /** приостановка рабочей подписи до успешной повторной сверки (Р27); остановка сильнее приостановки */
-  #suspended: string | null = null;
+  #suspended: DiagCode | null = null;
   /** счётчик приостановок: сверка снимает только ту, что поставлена до её начала (не позднее, из параллельного ответа) */
   #suspensions = 0;
   /** метка идущей сверки: порт сверки обходит приостановку только пока жива его метка (снимается в finally) */
@@ -85,8 +86,8 @@ export class KeyRing {
     return Object.freeze({
       current: () => this.#current(false),
       keyRevoked: (kid: string, failure?: unknown) => this.#keyRevoked(kid, failure, false),
-      stop: (reason: string, detail?: string) => this.#stop(reason, detail),
-      suspend: (reason: string) => this.#suspend(reason),
+      stop: (reason: DiagCode, detail?: string) => this.#stop(reason, detail),
+      suspend: (reason: DiagCode) => this.#suspend(reason),
     });
   }
 
@@ -104,8 +105,8 @@ export class KeyRing {
     const signing: RequestSigning = Object.freeze({
       current: () => this.#current(false, live()),
       keyRevoked: (kid: string, failure?: unknown) => this.#keyRevoked(kid, failure, false, live()),
-      stop: (reason: string, detail?: string) => this.#stop(reason, detail),
-      suspend: (reason: string) => this.#suspend(reason),
+      stop: (reason: DiagCode, detail?: string) => this.#stop(reason, detail),
+      suspend: (reason: DiagCode) => this.#suspend(reason),
     });
     const before = this.#suspensions;
     this.#recheckToken = token;
@@ -141,8 +142,8 @@ export class KeyRing {
     const signing: RequestSigning = Object.freeze({
       current: () => this.#current(true),
       keyRevoked: (kid: string, failure?: unknown) => this.#keyRevoked(kid, failure, true),
-      stop: (reason: string, detail?: string) => this.#stop(reason, detail),
-      suspend: (reason: string) => this.#suspend(reason),
+      stop: (reason: DiagCode, detail?: string) => this.#stop(reason, detail),
+      suspend: (reason: DiagCode) => this.#suspend(reason),
     });
     this.#admission = "admitting";
     try {
@@ -286,14 +287,14 @@ export class KeyRing {
     return this.#current(admitting, rechecking);
   }
 
-  #suspend(reason: string): void {
+  #suspend(reason: DiagCode): void {
     if (this.#stopped !== null || this.#admission !== "admitted" || this.#suspended !== null) return;
     this.#suspended = reason;
     this.#suspensions++;
     this.#record("signing.suspended", undefined, reason);
   }
 
-  #stop(reason: string, detail?: string): void {
+  #stop(reason: SignerStopReason, detail?: string): void {
     if (this.#stopped !== null) return;
     this.#stopped = reason;
     this.#record("agent.stopped", undefined, reason, detail);
@@ -456,7 +457,7 @@ export class KeyRing {
   }
 
   /** Состояние ключа: сначала в памяти, затем в хранилище; переход в revoked пишется в журнал с причиной. */
-  #mark(kid: string, to: KeyState, reason?: string): void {
+  #mark(kid: string, to: KeyState, reason?: DiagCode): void {
     const h = this.#held.get(kid)!;
     if (h.state === to) return;
     h.state = to;
@@ -480,12 +481,12 @@ export class KeyRing {
     h.disk = to;
   }
 
-  #halt(reason: string, cause?: unknown, detail?: string): never {
+  #halt(reason: DiagCode, cause?: unknown, detail?: string): never {
     this.#stop(reason, detail);
     throw new SignerStopped(reason, cause === undefined ? undefined : { cause });
   }
 
-  #record(kind: JournalKind, kid?: string, reason?: string, detail?: string): void {
+  #record(kind: JournalKind, kid?: string, reason?: SignerStopReason, detail?: string): void {
     this.#o.journal.record({ at: this.#now().toISOString(), kind, ...(kid && { kid }), ...(reason && { reason }), ...(detail && { detail }) });
   }
 }

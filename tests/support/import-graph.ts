@@ -22,6 +22,9 @@ const STAND = /^agentic-ps-platform(\/|$)/i;
 /** Каталог ядра — подпуть `/catalog` и любой путь к нему внутри пакета (dist) — только в src/agent/catalog (Р32 п. 6). */
 const CORE_CATALOG = /^@kuzin4u\/agentic-core\/(.*\/)?catalog(\/|\.|$)/i;
 const CATALOG_DIR = "src/agent/catalog/";
+/** Формат реестра кодов ядра — подпуть `/diag` и путь к нему в dist — только в src/agent/declines (Р36 п. 1). */
+const CORE_DIAG = /^@kuzin4u\/agentic-core\/(.*\/)?diag(\/|\.|$)/i;
+const DIAG_DIR = "src/agent/declines/";
 const KEY_API = new Set(boundaries.cryptoKeyApis);
 /** Из node:crypto вне signer — только эти имена (список разрешённого) */
 const CRYPTO_ALLOWED = new Set(boundaries.cryptoAllowedOutsideSigner);
@@ -216,6 +219,10 @@ export function importGraphViolations(p: Project): string[] {
     // Прямой вход в каталог ядра: факты каталога остальным — только через src/agent/catalog (Р32 п. 6)
     if (!rel(file).startsWith(CATALOG_DIR)) {
       for (const spec of factsOf(file).external) if (CORE_CATALOG.test(spec)) out.push(`${rel(file)}: «${spec}» — только в ${CATALOG_DIR} (Р32)`);
+    }
+    // Формат реестра кодов ядра: остальным — только через src/agent/declines (Р36 п. 1)
+    if (!rel(file).startsWith(DIAG_DIR)) {
+      for (const spec of factsOf(file).external) if (CORE_DIAG.test(spec)) out.push(`${rel(file)}: «${spec}» — только в ${DIAG_DIR} (Р36)`);
     }
     if (zone === "compose") continue;
     const reach = closure(file);

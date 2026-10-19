@@ -22,7 +22,7 @@ describe("П05 — действие без действующего мандат
     contour = await createContour({ pao: "stand" });
     await contour.start();
     const mandates = new MandateClient({ port: contour.platform, params: contour.params, journal: contour.journal });
-    await expect(mandates.requireActive(null)).rejects.toMatchObject({ reason: "NO_MANDATE" });
+    await expect(mandates.requireActive(null)).rejects.toMatchObject({ reason: "MANDATE_NONE" });
     expect(contour.calls().filter((c) => c.target === "merchants")).toEqual([]);
     expect(contour.calls().map((c) => c.route)).toEqual(["GET /pao/v1/agent"]);
     expect(contour.violations()).toEqual([]);
@@ -37,7 +37,7 @@ describe("П05 — действие без действующего мандат
 
     const err = (await core.mandates.requireActive(null).catch((e: unknown) => e)) as MandateRefused;
     expect(err).toBeInstanceOf(MandateRefused);
-    expect(err.reason).toBe("NO_MANDATE");
+    expect(err.reason).toBe("MANDATE_NONE");
     expect(err.message).toMatch(/не действует от вашего имени/);
     expect(s.log()).toEqual([CONFIGURATION, { op: "GET /pao/v1/agent", status: 200 }]);
     expect(s.stub.violations).toEqual([]);
@@ -50,7 +50,7 @@ describe("П05 — действие без действующего мандат
     const { core } = await coreOn(s);
     await core.start();
     const m = await core.mandates.request(INTENT, { idempotencyKey: "idem-p05" });
-    await expect(core.mandates.requireActive(m)).rejects.toMatchObject({ reason: "NO_MANDATE" });
+    await expect(core.mandates.requireActive(m)).rejects.toMatchObject({ reason: "MANDATE_NONE" });
     expect(s.log()).toEqual([
       CONFIGURATION,
       { op: "GET /pao/v1/agent", status: 200 },

@@ -102,15 +102,15 @@ export class MandateClient {
     const missing = missingTerms(draft, this.now());
     // родитель — только у CART и только тот, на который ссылается проект (ревью К2.2 № 6)
     if (draft.kind === "CART" ? parent?.id !== draft.parentId : parent !== null) missing.push("parent");
-    if (missing.length > 0) throw new MandateRefused("DRAFT_INVALID", `в проекте мандата нет: ${missing.join(", ")}`);
+    if (missing.length > 0) throw new MandateRefused("MANDATE_DRAFT_INVALID", `в проекте мандата нет: ${missing.join(", ")}`);
     let mandate = await this.#mandate(() => this.o.port.requestMandate(draft, m));
     if (mandate.status === "ACTIVE") mandate = await this.#reread(mandate.id);
     if (mandate.status !== "PENDING_SIGNATURE" && mandate.status !== "ACTIVE") {
-      throw new MandateRefused("NOT_ACTIVE", `мандат не действует (${mandate.status}): новое поручение — только по вашему решению`);
+      throw new MandateRefused("MANDATE_NOT_ACTIVE", `мандат не действует (${mandate.status}): новое поручение — только по вашему решению`);
     }
-    if (!sameTerms(draft, mandate)) throw new MandateRefused("REPLY_MISMATCH", "платформа вернула мандат с другими пределами");
+    if (!sameTerms(draft, mandate)) throw new MandateRefused("MANDATE_REPLY_MISMATCH", "платформа вернула мандат с другими пределами");
     if (parent !== null && mandate.revocationOrder !== parent.revocationOrder) {
-      throw new MandateRefused("REPLY_MISMATCH", "порядок отзыва мандата корзины не совпадает с мандатом намерения");
+      throw new MandateRefused("MANDATE_REPLY_MISMATCH", "порядок отзыва мандата корзины не совпадает с мандатом намерения");
     }
     return mandate;
   }
@@ -118,7 +118,7 @@ export class MandateClient {
   /** Мандат по GET — тот, что спросили: другой id — пределы не подтверждены (инвариант 4, ревью К2.2 № 6). */
   async #reread(id: string): Promise<Mandate> {
     const got = await this.#mandate(() => this.o.port.getMandate(id));
-    if (got.id !== id) throw new MandateRefused("REPLY_MISMATCH", "платформа вернула другой мандат");
+    if (got.id !== id) throw new MandateRefused("MANDATE_REPLY_MISMATCH", "платформа вернула другой мандат");
     return got;
   }
 
@@ -131,7 +131,7 @@ export class MandateClient {
     } catch (e) {
       if (e instanceof PlatformFailure && e.code === "MANDATE_REVOCATION_ORDER_MISSING") {
         this.o.journal.record({ at: this.now().toISOString(), kind: "mandate.revocation_order_missing", reason: e.code });
-        throw new MandateRefused("REVOCATION_ORDER_MISSING", REVOCATION_ORDER_MISSING_TEXT);
+        throw new MandateRefused("MANDATE_REVOCATION_ORDER_MISSING", REVOCATION_ORDER_MISSING_TEXT);
       }
       throw e;
     }
@@ -147,18 +147,18 @@ export class MandateClient {
    *    и иной статус у платформы — неподтверждённое состояние (SPEC §9, инвариант 4);
    *  - пропуск INVALID_DATA мандатного типа (mandate_id не читается — ответ (б) владельца) — GET ожидаемого мандата, как
    *    до ожидания: ACTIVE — действует, PENDING_SIGNATURE — ждать, иной — остановка.
-   * Лента кончилась или ожидание прервано без подписи — SIGNATURE_PENDING (SPEC §7а: ждать человека).
+   * Лента кончилась или ожидание прервано без подписи — MANDATE_SIGNATURE_PENDING (SPEC §7а: ждать человека).
    */
   async awaitSigned(mandate: Mandate, events: AsyncIterable<FeedItem>, signal?: AbortSignal): Promise<Mandate> {
     /** mode: "wait" — PENDING_SIGNATURE допустим; "signed" — нужен ACTIVE; "changed" — остановка при любом статусе */
     const settle = async (mode: "wait" | "signed" | "changed"): Promise<Mandate | null> => {
       const actual = await this.#reread(mandate.id);
       if (actual.status === "ACTIVE" && mode !== "changed") {
-        if (!sameTerms(mandate, actual)) throw new MandateRefused("REPLY_MISMATCH", "подписан мандат с другими пределами");
+        if (!sameTerms(mandate, actual)) throw new MandateRefused("MANDATE_REPLY_MISMATCH", "подписан мандат с другими пределами");
         return actual;
       }
       if (actual.status === "PENDING_SIGNATURE" && mode === "wait") return null;
-      throw new MandateRefused("NOT_ACTIVE", `событие о мандате и статус у платформы — ${actual.status}`);
+      throw new MandateRefused("MANDATE_NOT_ACTIVE", `событие о мандате и статус у платформы — ${actual.status}`);
     };
     const it = events[Symbol.asyncIterator]();
     let next = it.next(); // запуск итератора: слушатель ленты — до GET
@@ -183,7 +183,7 @@ export class MandateClient {
       void it.return?.()?.catch(() => undefined);
     }
     // Подписи нет — агент не продолжает (SPEC §7а PRINCIPAL_SIGNATURE_PENDING: ждать человека).
-    throw new MandateRefused("SIGNATURE_PENDING", "мандат ещё не подписан человеком");
+    throw new MandateRefused("MANDATE_SIGNATURE_PENDING", "мандат ещё не подписан человеком");
   }
 
   /** Остаток и срок — из verify (Т3, инвариант 6). Нет `as_of`, он не разбирается, старше `registry_cache_ttl_sec`
@@ -202,12 +202,12 @@ export class MandateClient {
   /** Действие от имени человека — только по действующему мандату, подтверждённому verify (Т2, П05).
    *  Мандата нет или он не ACTIVE — отказ без обращений к платформе; объяснение — для человека. */
   async requireActive(mandate: Mandate | null): Promise<MandateCheck> {
-    if (!mandate) throw new MandateRefused("NO_MANDATE", "нет мандата: агент не действует от вашего имени без вашего поручения");
+    if (!mandate) throw new MandateRefused("MANDATE_NONE", "нет мандата: агент не действует от вашего имени без вашего поручения");
     if (mandate.status !== "ACTIVE") {
-      throw new MandateRefused("NO_MANDATE", `мандат не действует (${mandate.status}): агент не действует от вашего имени`);
+      throw new MandateRefused("MANDATE_NONE", `мандат не действует (${mandate.status}): агент не действует от вашего имени`);
     }
     const c = await this.check(mandate);
-    if (c.outcome !== "CONFIRMED") throw new MandateRefused("OUT_OF_SCOPE", `платформа не подтвердила мандат: ${c.outcome}`);
+    if (c.outcome !== "CONFIRMED") throw new MandateRefused("MANDATE_OUT_OF_SCOPE", `платформа не подтвердила мандат: ${c.outcome}`);
     return c;
   }
 }

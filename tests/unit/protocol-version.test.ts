@@ -293,7 +293,7 @@ describe("шаг 2 — версия не определена: по первом
     await core.start();
     await core.mandates.request(INTENT, { idempotencyKey: "idem_c1" });
     withoutOrder(consents);
-    await expect(core.mandates.request(INTENT, { idempotencyKey: "idem_c2" })).rejects.toMatchObject({ reason: "REVOCATION_ORDER_MISSING" });
+    await expect(core.mandates.request(INTENT, { idempotencyKey: "idem_c2" })).rejects.toMatchObject({ reason: "MANDATE_REVOCATION_ORDER_MISSING" });
     expect(kinds("agent.stopped")).toEqual([]);
     consents.tamper = undefined;
     await expect(core.mandates.request(INTENT, { idempotencyKey: "idem_c3" })).resolves.toMatchObject({ status: "PENDING_SIGNATURE" });
@@ -305,7 +305,7 @@ describe("шаг 2 — версия не определена: по первом
     withoutOrder(consents);
     const err = await core.mandates.request(INTENT, { idempotencyKey: "idem_k1" }).catch((e: unknown) => e);
     expect(err).toBeInstanceOf(MandateRefused);
-    expect(err).toMatchObject({ reason: "REVOCATION_ORDER_MISSING" });
+    expect(err).toMatchObject({ reason: "MANDATE_REVOCATION_ORDER_MISSING" });
     expect(kinds("platform.protocol_unsupported")).toEqual([]);
     expect(kinds("agent.stopped")).toEqual([]);
   });

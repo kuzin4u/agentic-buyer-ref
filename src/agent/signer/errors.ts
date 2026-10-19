@@ -1,4 +1,8 @@
 // Ошибки модуля signer. Это не коды ПАО: KEY_INVALID — основание отказа в допуске на стороне Платформы (РП23).
+// Причины остановки и приостановки — коды реестра (Р36); CLOSED — штатное закрытие, в реестр не входит (Р36, вопрос (в)).
+import type { DiagCode } from "../../shared/diag-codes.js";
+
+export type SignerStopReason = DiagCode | "CLOSED";
 
 /** Ключ не принят подписантом: слабый, неканонический, повреждённый, с широкими правами или чужим kid (инвариант 4). */
 export class SignerKeyRejected extends Error {
@@ -8,7 +12,7 @@ export class SignerKeyRejected extends Error {
 /** Подпись приостановлена до успешной повторной сверки с реестром (Р27: ответ реестра не по схеме после допуска). */
 export class SignerSuspended extends Error {
   override readonly name = "SignerSuspended";
-  constructor(readonly reason: string) {
+  constructor(readonly reason: DiagCode) {
     super(`подпись приостановлена: ${reason}`);
   }
 }
@@ -17,7 +21,7 @@ export class SignerSuspended extends Error {
 export class SignerStopped extends Error {
   override readonly name = "SignerStopped";
   constructor(
-    readonly reason: string,
+    readonly reason: SignerStopReason,
     options?: ErrorOptions,
   ) {
     super(`подпись остановлена: ${reason}`, options);

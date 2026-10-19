@@ -1,5 +1,6 @@
 // Таблица «код отказа → поведение» (SPEC §7, Р20). Ключи — словарь ядра; адаптер переводит коды платформы в него.
 import type { FailureCode, RetryClass } from "../../shared/domain.js";
+import type { AgentDiagCode } from "../../shared/diag-codes.js";
 
 export type DeclineAction =
   /** остановка; без повтора */
@@ -94,6 +95,8 @@ export function ruleForFailure(code: FailureCode): DeclineRule {
 export type ReasonAction = "FIX_AGENT" | "STOP" | "NOTIFY_HUMAN" | "STOP_AND_NOTIFY";
 
 export interface ReasonRule {
+  /** код реестра (Р36): причина из перечня §7б или DECLINE_REASON_UNKNOWN */
+  code: Extract<AgentDiagCode, "AOI_MISSING" | "AOI_MISMATCH" | "INSUFFICIENT_FUNDS" | "DECLINE_REASON_UNKNOWN">;
   action: ReasonAction;
   defect: boolean;
   /** отдельное событие в журнал (SPEC §7б) */
@@ -104,13 +107,13 @@ export interface ReasonRule {
 
 /** SPEC §7б: причины отклонения операции (operation.declined). Повтора операции нет ни у одной. */
 export const DECLINE_REASONS: Readonly<Record<string, ReasonRule>> = {
-  AOI_MISSING: { action: "FIX_AGENT", defect: true, journal: true, unknown: false },
-  AOI_MISMATCH: { action: "STOP", defect: true, journal: true, unknown: false },
-  INSUFFICIENT_FUNDS: { action: "NOTIFY_HUMAN", defect: false, journal: false, unknown: false },
+  AOI_MISSING: { code: "AOI_MISSING", action: "FIX_AGENT", defect: true, journal: true, unknown: false },
+  AOI_MISMATCH: { code: "AOI_MISMATCH", action: "STOP", defect: true, journal: true, unknown: false },
+  INSUFFICIENT_FUNDS: { code: "INSUFFICIENT_FUNDS", action: "NOTIFY_HUMAN", defect: false, journal: false, unknown: false },
 };
 
 export function ruleForDeclineReason(reason: string | null): ReasonRule {
   if (reason !== null && Object.hasOwn(DECLINE_REASONS, reason)) return DECLINE_REASONS[reason]!;
   // Р20 (уточнение 11.10.2026): неизвестная причина — остановка по операции, уведомить человека, без повтора.
-  return { action: "STOP_AND_NOTIFY", defect: false, journal: true, unknown: true };
+  return { code: "DECLINE_REASON_UNKNOWN", action: "STOP_AND_NOTIFY", defect: false, journal: true, unknown: true };
 }

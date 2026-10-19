@@ -15,9 +15,12 @@ import {
   type LiveCheckCode,
 } from "@kuzin4u/agentic-core/catalog";
 import type { StandParams } from "../../shared/config.js";
+import type { AgentDiagCode } from "../../shared/diag-codes.js";
 import type { LiveOffer, LiveOfferRequest, LiveOfferSource } from "../ports/index.js";
 
 export type { A5SignalCode, CatalogIssueCode, CatalogProduct, CatalogShop, LiveCheckCode };
+/** Реестр кодов каталога ядра (К17): полный реестр агента собирает место сборки (Р36 п. 1). */
+export { CATALOG_DIAG } from "@kuzin4u/agentic-core/catalog";
 
 /** Товар после проверок: ошибки модели (`issues`) и сигналы A5 товара и магазина (`signals`) — только коды. */
 export interface ProductFacts {
@@ -68,7 +71,7 @@ export function readFeed(input: string | Uint8Array, profile: CatalogShop, opts:
 export type LiveCheckParams = Pick<StandParams, "live_check_timeout_ms" | "live_check_max_age_sec" | "live_check_clock_skew_sec">;
 
 /** Ошибка вызова проверки (не тот `sku`, неверное количество) — код агента: заказа нет так же, как при `LIVE_*`. */
-export type LiveFactCode = LiveCheckCode | "LIVE_CALL_ERROR";
+export type LiveFactCode = LiveCheckCode | Extract<AgentDiagCode, "LIVE_CALL_ERROR">;
 
 export type LiveFact = { ok: true; offer: LiveOffer } | { ok: false; codes: LiveFactCode[]; offer: LiveOffer | null };
 

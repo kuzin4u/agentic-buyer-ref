@@ -6,12 +6,16 @@ import { relative, resolve } from "node:path";
 import { ConfigError, loadParams, type StandParams } from "../shared/config.js";
 import { PLATFORM_EVENT_TYPES, PlatformFailure, type AgentSelf } from "../shared/domain.js";
 import type { PaymentPlatform, PlatformCapabilities } from "./ports/payment-platform.js";
-import { PaoPlatform, type PaoPlatformOptions } from "./adapters/pao/index.js";
+import { PAO_DIAG, PaoPlatform, type PaoPlatformOptions } from "./adapters/pao/index.js";
+import { CATALOG_DIAG } from "./catalog/index.js";
 import { MemoryJournal, type Journal, type JournalEntry } from "./journal/index.js";
 import { MandateClient } from "./mandates/index.js";
 import { EventFeed, FileCursorStore, acceptPush, type PushReply } from "./events/index.js";
 import { KeyRing } from "./signer/index.js";
-import { AGENT_STOP_CODES } from "./declines/index.js";
+import { AGENT_DIAG, AGENT_STOP_CODES, mergeDiag, type DiagRegistry } from "./declines/index.js";
+
+/** Полный реестр кодов агента (Р36 п. 1): ПАО и каталог — записи ядра, свои — AGENT_DIAG; код в двух — ошибка сборки. */
+export const DIAG: DiagRegistry = mergeDiag(PAO_DIAG, CATALOG_DIAG, AGENT_DIAG);
 
 export interface AgentCore {
   params: StandParams;
@@ -20,6 +24,8 @@ export interface AgentCore {
   /** клиент мандатов на порту мандатов той же платформы */
   mandates: MandateClient;
   journal: Journal;
+  /** Полный реестр кодов (Р36): кто ошибся, действие, тексты для человека и оператора. */
+  diag: DiagRegistry;
   /** Лента событий Платформы (Р34): курсор — в каталоге состояния; опрос и ожидание — `signal()`, `items()`. */
   events: EventFeed;
   /** Приём push (Р34 п. 2): только форма и сигнал ленте; HTTP-сервер — у оболочки. Заголовки — в нижнем регистре. */
@@ -127,6 +133,7 @@ export function createAgentCore(o: AgentCoreOptions): AgentCore {
     capabilities: platform.capabilities(),
     mandates: new MandateClient({ port: platform, params, journal, ...(o.now && { now: o.now }) }),
     journal,
+    diag: DIAG,
     events,
     acceptPush: (body, headers) => acceptPush({ wake: () => events.signal(), journal, now }, body, headers),
     // Конфигурация читается после загрузки ключей (сбой хранилища — до обращения к Платформе) и перед GET /pao/v1/agent;

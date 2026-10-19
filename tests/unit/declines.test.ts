@@ -48,7 +48,7 @@ describe("таблица отказов", () => {
     expect(ruleForDeclineReason("AOI_MISMATCH").action).toBe("STOP");
     expect(ruleForDeclineReason("INSUFFICIENT_FUNDS").action).toBe("NOTIFY_HUMAN");
     expect(ruleForDeclineReason("AOI_MISSING").action).toBe("FIX_AGENT");
-    expect(ruleForDeclineReason("SOMETHING_NEW")).toEqual({ action: "STOP_AND_NOTIFY", defect: false, journal: true, unknown: true });
+    expect(ruleForDeclineReason("SOMETHING_NEW")).toEqual({ code: "DECLINE_REASON_UNKNOWN", action: "STOP_AND_NOTIFY", defect: false, journal: true, unknown: true });
     expect(ruleForDeclineReason(null).unknown).toBe(true);
   });
 });

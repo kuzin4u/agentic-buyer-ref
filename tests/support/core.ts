@@ -34,6 +34,8 @@ export async function coreOn(stand: PaoStand, o: { fetch?: typeof fetch; paramsP
   const journal = new MemoryJournal();
   const core = createAgentCore({
     keysDir: stand.dir,
+    // каталог состояния создаётся только при первой записи курсора (события в этих тестах не читаются)
+    stateDir: `${stand.dir}-state`,
     journal,
     now: () => stand.clock,
     ...(o.paramsPath && { paramsPath: o.paramsPath }),

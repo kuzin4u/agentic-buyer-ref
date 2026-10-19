@@ -84,7 +84,7 @@ async function expectSignatureStop(core: Awaited<ReturnType<typeof coreAt>>["cor
 async function coreAt(s: Stand, dir: string) {
   const baseUrl = await s.listen();
   const journal = new MemoryJournal();
-  const core = createAgentCore({ keysDir: dir, journal, now: () => new Date(), pao: { baseUrl, agentCode: AGENT, sleep: async () => {} } });
+  const core = createAgentCore({ keysDir: dir, stateDir: `${dir}-state`, journal, now: () => new Date(), pao: { baseUrl, agentCode: AGENT, sleep: async () => {} } });
   return { core, journal };
 }
 

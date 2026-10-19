@@ -46,7 +46,9 @@ export type JournalKind =
   /** курсора ленты нет — первый запуск или сброс оператором: лента с начала (Р34 п. 4) */
   | "events.cursor_initial"
   /** Платформа отвергла адрес подписки (400) — push нет, работа по ленте (Р34 п. 8) */
-  | "events.subscription_rejected";
+  | "events.subscription_rejected"
+  /** подписка не удалась иначе (503 сверх попыток, UNKNOWN) — работа по ленте, повтор при следующем старте (дополнение Р34 п. 1) */
+  | "events.subscription_failed";
 
 export interface JournalEntry {
   at: string;

@@ -7,6 +7,9 @@ import { PLATFORM_EVENT_TYPES, PlatformFailure } from "../../src/shared/domain.j
 import { INTENT } from "../support/consents.js";
 import { createContour, type Contour } from "../support/contour.js";
 
+
+/** Стенд в процессе теста под параллельной нагрузкой прогона бывает медленнее 5 с по умолчанию (нюанс К2.3). */
+const STAND_TIMEOUT_MS = 20_000;
 let c: Contour | undefined;
 afterEach(async () => {
   await c?.close();
@@ -23,7 +26,7 @@ async function started() {
 
 const key = (k: string) => ({ idempotencyKey: `idem-${k}` });
 
-describe("лента событий на стенде v0.5.0 (Р34 п. 1, РП39 п. 7)", () => {
+describe("лента событий на стенде v0.5.0 (Р34 п. 1, РП39 п. 7)", { timeout: STAND_TIMEOUT_MS }, () => {
   it("без курсора — с начала; подпись человека даёт mandate.signed; после курсора — пусто", async () => {
     const { c, stand } = await started();
     expect(await c.platform.listEvents(null)).toEqual([]);
@@ -59,7 +62,7 @@ describe("лента событий на стенде v0.5.0 (Р34 п. 1, РП39
   });
 });
 
-describe("подписка на стенде v0.5.0 (Р34 п. 8, РП40)", () => {
+describe("подписка на стенде v0.5.0 (Р34 п. 8, РП40)", { timeout: STAND_TIMEOUT_MS }, () => {
   it("адрес из списка стенда принят; push доставлен эмулятору получателя с x-event-id", async () => {
     const { c, stand } = await started();
     const host = stand.params.event_subscription_allow_hosts[0];

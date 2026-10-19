@@ -123,6 +123,25 @@ describe("шаг 1 — при подключении (стадия 0, до GET /
     expect(conf[0]!.idempotencyKey).toBeUndefined();
   });
 
+  // CO-1 ядра v0.8.0 (AG-ДГ К1): у операции без подписи нет заголовков агента; подписанный допуск их несёт.
+  it("конфигурация — без x-agent-code, x-timestamp, x-nonce и signature; GET /pao/v1/agent — с ними", async () => {
+    const consents: Consents = new Consents(() => s.clock);
+    const s: PaoStand = (stand = new PaoStand({ configuration: { versions: ["1.4.0"] }, handlers: consents.handlers() }));
+    const sent: [string, Headers][] = [];
+    const fetchImpl: typeof fetch = (url, init) => {
+      sent.push([new URL(String(url)).pathname, new Headers(init?.headers)]);
+      return fetch(url, init);
+    };
+    const { core } = await coreOn(s, { fetch: fetchImpl });
+    await core.start();
+    const AGENT_HEADERS = ["x-agent-code", "x-timestamp", "x-nonce", "signature", "signature-input"];
+    const present = (h: Headers) => AGENT_HEADERS.filter((n) => h.has(n));
+    expect(sent.map(([p, h]) => [p, present(h)])).toEqual([
+      [CONFIG.slice(4), []],
+      ["/pao/v1/agent", AGENT_HEADERS],
+    ]);
+  });
+
   // Ревью К2.3 № 9: по схеме — только versions; прочие поля конфигурации игнорируются (ПАО §7).
   it("versions 1.3.0 при поле вне перечня 1.4.0 — всё равно PLATFORM_PROTOCOL_UNSUPPORTED", async () => {
     const { core, ops, stand: s } = await setup({

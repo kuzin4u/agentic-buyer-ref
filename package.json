@@ -25,7 +25,7 @@
     "vitest": "^5.0.3"
   },
   "dependencies": {
-    "@kuzin4u/agentic-core": "git+https://github.com/kuzin4u/agentic-core.git#v0.7.0",
+    "@kuzin4u/agentic-core": "git+https://github.com/kuzin4u/agentic-core.git#v0.8.0",
     "zod": "^4.6.6"
   }
 }

@@ -307,6 +307,75 @@ describe("ядро и события на стенде v0.5.0 (Р34)", { timeout
     expect(a.c.selfCheck()!.checks.at(-1)).toEqual({ check: "events.subscription", status: "ok" });
   });
 
+  // Р37 п. 4, Р34 ответ (б): держимый мандат — перечитывание по событию ленты, а не по слову события.
+  it("держимый мандат отозван в банке — mandate.revoked по ленте → GET REVOKED → mandate.revoked, не держится (Т15)", async () => {
+    const { s, core, calls } = await setup();
+    const a = core();
+    await a.c.start();
+    const m = await a.c.mandates.request(INTENT, { idempotencyKey: "idem-held-1" });
+    const abort = new AbortController();
+    const waiting = a.c.mandates.awaitSigned(m, a.c.events.items(abort.signal), abort.signal);
+    for (let i = 0; i < 200 && !calls.some((c) => c.route === "GET /pao/v1/events"); i++) await new Promise((r) => setTimeout(r, 5));
+    expect((await s.issuer.sign(m.id)).statusCode).toBe(200);
+    await a.c.events.signal();
+    await expect(waiting).resolves.toMatchObject({ id: m.id, status: "ACTIVE" });
+    abort.abort();
+    expect(a.c.mandates.held().map((x) => x.id)).toEqual([m.id]);
+
+    const getsBefore = calls.filter((c) => c.route === `GET /pao/v1/mandates/${m.id}`).length;
+    expect((await s.issuer.revoke(m.id)).statusCode).toBe(200);
+    await a.c.events.signal();
+    expect(a.c.mandates.held()).toEqual([]);
+    // статус — по GET после события отзыва: ровно одно новое чтение мандата (ревью К2.3 № 10)
+    expect(calls.filter((c) => c.route === `GET /pao/v1/mandates/${m.id}`)).toHaveLength(getsBefore + 1);
+    expect(a.journal.entries.filter((e) => e.kind === "mandate.revoked")).toEqual([
+      expect.objectContaining({ agent: AGENT, kind: "mandate.revoked", mandate: m.id }),
+    ]);
+    expect(a.journal.entries).toContainEqual(expect.objectContaining({ kind: "event.handled", detail: "mandate.revoked" }));
+  });
+
+  it("сбой GET держимого мандата на mandate.revoked — курсор на месте; после восстановления — одна обработка и одна запись (Р34 п. 3, ревью К2.3 № 7)", async () => {
+    const { s, core, replace } = await setup();
+    const a = core();
+    await a.c.start();
+    const m = await a.c.mandates.request(INTENT, { idempotencyKey: "idem-held-3" });
+    expect((await s.issuer.sign(m.id)).statusCode).toBe(200);
+    const abort = new AbortController();
+    await expect(a.c.mandates.awaitSigned(m, a.c.events.items(abort.signal), abort.signal)).resolves.toMatchObject({ status: "ACTIVE" });
+    abort.abort();
+    await a.c.events.signal();
+    const cursor = a.c.events.cursor();
+    expect((await s.issuer.revoke(m.id)).statusCode).toBe(200);
+    replace.set(`GET /pao/v1/mandates/${m.id}`, () => Response.json({ code: "STATE_UNAVAILABLE", message: "m", retry: "same_key" }, { status: 503 }));
+    await expect(a.c.events.signal()).rejects.toMatchObject({ code: "STATE_UNAVAILABLE" });
+    expect(a.c.events.cursor()).toBe(cursor);
+    expect(a.journal.entries.filter((e) => e.kind === "event.handled" && e.detail === "mandate.revoked")).toEqual([]);
+    expect(a.c.mandates.held().map((x) => x.id)).toEqual([m.id]);
+    replace.delete(`GET /pao/v1/mandates/${m.id}`);
+    await a.c.events.signal();
+    expect(a.journal.entries.filter((e) => e.kind === "event.handled" && e.detail === "mandate.revoked")).toHaveLength(1);
+    expect(a.journal.entries.filter((e) => e.kind === "mandate.revoked")).toHaveLength(1);
+    expect(a.c.mandates.held()).toEqual([]);
+  });
+
+  it("пропуск INVALID_DATA мандатного типа вне ожидания подписи — GET всех держимых, ACTIVE держится (Р34 ответ (б))", async () => {
+    const { s, core, calls, replace } = await setup();
+    const a = core();
+    await a.c.start();
+    const m = await a.c.mandates.request(INTENT, { idempotencyKey: "idem-held-2" });
+    expect((await s.issuer.sign(m.id)).statusCode).toBe(200);
+    const abort = new AbortController();
+    await expect(a.c.mandates.awaitSigned(m, a.c.events.items(abort.signal), abort.signal)).resolves.toMatchObject({ status: "ACTIVE" });
+    abort.abort();
+    await a.c.events.signal(); // mandate.signed из ленты — курсор на нём
+    const before = calls.filter((c) => c.route === `GET /pao/v1/mandates/${m.id}`).length;
+    feedPages(replace, [[{ event_id: "evt_bad_m", type: "mandate.revoked", at: "2026-10-19T09:00:00Z", data: {} }], []]);
+    await a.c.events.signal();
+    expect(a.journal.entries).toContainEqual(expect.objectContaining({ kind: "event.ignored", ref: "evt_bad_m", detail: "INVALID_DATA" }));
+    expect(calls.filter((c) => c.route === `GET /pao/v1/mandates/${m.id}`)).toHaveLength(before + 1);
+    expect(a.c.mandates.held().map((x) => x.id)).toEqual([m.id]);
+  });
+
   it("каталог состояния совпадает с каталогом ключей или вложен (в обе стороны) — отказ сборки", async () => {
     const d = tmp("ev-same-");
     const pao = { baseUrl: "http://127.0.0.1:1", agentCode: AGENT };

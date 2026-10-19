@@ -3,16 +3,38 @@
 // Остаток и счётчики агент не вычисляет — только переносит ответ verify (инвариант 6, A3 п. 4.3).
 // По типу мандата нет закрытых перечней со switch/never: условие ставится только там, где тип что-то требует (CART).
 import type { StandParams } from "../../shared/config.js";
-import { PlatformFailure, type Cart, type Mandate, type MandateCheck, type MandateDraft, type MandateRef } from "../../shared/domain.js";
+import {
+  PlatformFailure,
+  type Cart,
+  type FailureCode,
+  type Mandate,
+  type MandateCheck,
+  type MandateDraft,
+  type MandateRef,
+  type MandateStatus,
+} from "../../shared/domain.js";
 import type { FeedItem } from "../ports/events.js";
 import type { MandatePort } from "../ports/mandates.js";
 import type { Mutation } from "../ports/mutation.js";
-import { MandateRefused, REVOCATION_ORDER_MISSING_TEXT } from "./errors.js";
+import { MandateRefused, REVOCATION_ORDER_MISSING_TEXT, type MandateRefusal } from "./errors.js";
 
-/** Часть журнала, которую видит клиент: только своё событие (граница импортов mandates — ревью К2 № 13; Journal подходит). */
+/** Часть журнала, которую видит клиент: только свои события (граница импортов mandates — ревью К2 № 13; Journal подходит). */
 export interface MandateJournal {
-  record(entry: { at: string; kind: "mandate.revocation_order_missing"; reason: "MANDATE_REVOCATION_ORDER_MISSING" }): void;
+  record(
+    entry:
+      | { at: string; kind: "mandate.revocation_order_missing"; reason: "MANDATE_REVOCATION_ORDER_MISSING" }
+      /** держимый мандат отозван (Т15) или больше не ACTIVE — не держится (Р37 п. 4); detail — статус, reason — код отказа GET */
+      | { at: string; kind: "mandate.revoked"; mandate: string }
+      | { at: string; kind: "mandate.status_changed"; mandate: string; detail?: MandateStatus; reason?: FailureCode }
+      /** отказ агента действовать (Т15, Р37 п. 5): код клиента мандатов */
+      | { at: string; kind: "agent.refused"; reason: MandateRefusal; mandate?: string },
+  ): void;
 }
+
+/** Отказ GET держимого мандата, после которого мандат не действует: Платформа ответила 404 — мандата нет (Р37 п. 4,
+ *  нюанс; вопрос владельцу в PR #35). По копии ПАО у GET мандата других кодов «мандата нет» нет: прочие отказы (503,
+ *  UNKNOWN и др.) — сбой: слушатель падает, курсор ленты не двигается (Р34 п. 3). */
+const GONE: ReadonlySet<FailureCode> = new Set<FailureCode>(["MANDATE_NOT_FOUND"]);
 
 export interface MandateClientOptions {
   port: MandatePort;
@@ -89,6 +111,12 @@ export const refOf = (m: Mandate): MandateRef => ({ id: m.id, currency: m.amount
 
 export class MandateClient {
   private readonly now: () => Date;
+  /** Мандаты, которые агент держит (Р37 п. 4): ACTIVE по GET с пределами запроса; только в памяти — после перезапуска их
+   *  снова приносит конвейер. Выходят при любом другом статусе по GET. */
+  readonly #held = new Map<string, Mandate>();
+  /** Мандаты, которые сейчас читаются по GET перед удержанием: true — во время GET пришло событие о мандате, ответ мог
+   *  устареть — перечитать (гонка «revoked во время GET», ревью К2.3 № 1). */
+  readonly #reading = new Map<string, boolean>();
 
   constructor(private readonly o: MandateClientOptions) {
     this.now = o.now ?? (() => new Date());
@@ -104,7 +132,7 @@ export class MandateClient {
     if (draft.kind === "CART" ? parent?.id !== draft.parentId : parent !== null) missing.push("parent");
     if (missing.length > 0) throw new MandateRefused("MANDATE_DRAFT_INVALID", `в проекте мандата нет: ${missing.join(", ")}`);
     let mandate = await this.#mandate(() => this.o.port.requestMandate(draft, m));
-    if (mandate.status === "ACTIVE") mandate = await this.#reread(mandate.id);
+    if (mandate.status === "ACTIVE") mandate = await this.#fresh(mandate.id);
     if (mandate.status !== "PENDING_SIGNATURE" && mandate.status !== "ACTIVE") {
       throw new MandateRefused("MANDATE_NOT_ACTIVE", `мандат не действует (${mandate.status}): новое поручение — только по вашему решению`);
     }
@@ -112,7 +140,86 @@ export class MandateClient {
     if (parent !== null && mandate.revocationOrder !== parent.revocationOrder) {
       throw new MandateRefused("MANDATE_REPLY_MISMATCH", "порядок отзыва мандата корзины не совпадает с мандатом намерения");
     }
-    return mandate;
+    return this.#hold(mandate);
+  }
+
+  /** Держимые мандаты — для конвейера и проверок (Р37 п. 4). Для решения о списании — не источник: только verify
+   *  (check, requireActive; инвариант 6). */
+  held(): readonly Mandate[] {
+    return [...this.#held.values()];
+  }
+
+  #hold(m: Mandate): Mandate {
+    if (m.status === "ACTIVE") this.#held.set(m.id, m);
+    return m;
+  }
+
+  /**
+   * Событие ленты о держимом мандате (Р34 ответ (б), Р37 п. 4) — сигнал перечитать по GET, статус — только по GET:
+   *  - mandate.* с mandate_id держимого мандата — GET этого мандата; чужой или ожидающий подписи — не здесь (awaitSigned);
+   *  - пропуск INVALID_DATA мандатного типа (mandate_id не читается) — GET всех держимых по очереди;
+   *  - ACTIVE с прежними пределами — держится; иначе выходит: REVOKED — mandate.revoked (Т15), прочий статус или отказ
+   *    GET «мандата нет» — mandate.status_changed, другой мандат или пределы — agent.refused;
+   *  - сбой GET (503, UNKNOWN и др.) — наружу: слушатель падает, курсор не двигается, событие прочитается снова (Р34 п. 3).
+   */
+  async refreshHeld(item: FeedItem): Promise<void> {
+    let ids: string[];
+    if (item.kind === "event") {
+      const id = item.event.mandateId;
+      if (!item.event.type.startsWith("mandate.") || id === null) return;
+      if (this.#reading.has(id)) this.#reading.set(id, true);
+      // отзыв INTENT отзывает и его CART (РП35, РП38): держимые дети перечитываются вместе с ним (ревью К2.3 № 5)
+      ids = [...this.#held.values()].filter((m) => m.id === id || m.parentId === id).map((m) => m.id);
+    } else if (item.detail === "INVALID_DATA" && item.type.startsWith("mandate.")) {
+      for (const id of this.#reading.keys()) this.#reading.set(id, true);
+      ids = [...this.#held.keys()];
+    } else return;
+    for (const id of ids) await this.#recheckHeld(id);
+  }
+
+  /** GET перед удержанием: событие о мандате во время GET — перечитать, пока ответ не окажется свежее событий. */
+  async #fresh(id: string): Promise<Mandate> {
+    this.#reading.set(id, false);
+    try {
+      for (;;) {
+        const m = await this.#reread(id);
+        if (this.#reading.get(id) !== true) return m;
+        this.#reading.set(id, false);
+      }
+    } finally {
+      this.#reading.delete(id);
+    }
+  }
+
+  async #recheckHeld(id: string): Promise<void> {
+    const held = this.#held.get(id);
+    if (held === undefined) return;
+    const at = () => this.now().toISOString();
+    let actual: Mandate;
+    try {
+      actual = await this.#reread(id);
+    } catch (e) {
+      if (e instanceof MandateRefused) {
+        this.#held.delete(id);
+        this.o.journal.record({ at: at(), kind: "agent.refused", reason: e.reason, mandate: id });
+        return;
+      }
+      if (e instanceof PlatformFailure && GONE.has(e.code)) {
+        this.#held.delete(id);
+        this.o.journal.record({ at: at(), kind: "mandate.status_changed", mandate: id, reason: e.code });
+        return;
+      }
+      throw e;
+    }
+    // порядок отзыва — тоже предел мандата (Р33 п. 4, ревью К2.3 № 4)
+    if (actual.status === "ACTIVE" && sameTerms(held, actual) && actual.revocationOrder === held.revocationOrder) {
+      this.#held.set(id, actual);
+      return;
+    }
+    this.#held.delete(id);
+    if (actual.status === "REVOKED") this.o.journal.record({ at: at(), kind: "mandate.revoked", mandate: id });
+    else if (actual.status === "ACTIVE") this.o.journal.record({ at: at(), kind: "agent.refused", reason: "MANDATE_REPLY_MISMATCH", mandate: id });
+    else this.o.journal.record({ at: at(), kind: "mandate.status_changed", mandate: id, detail: actual.status });
   }
 
   /** Мандат по GET — тот, что спросили: другой id — пределы не подтверждены (инвариант 4, ревью К2.2 № 6). */
@@ -152,10 +259,10 @@ export class MandateClient {
   async awaitSigned(mandate: Mandate, events: AsyncIterable<FeedItem>, signal?: AbortSignal): Promise<Mandate> {
     /** mode: "wait" — PENDING_SIGNATURE допустим; "signed" — нужен ACTIVE; "changed" — остановка при любом статусе */
     const settle = async (mode: "wait" | "signed" | "changed"): Promise<Mandate | null> => {
-      const actual = await this.#reread(mandate.id);
+      const actual = await this.#fresh(mandate.id);
       if (actual.status === "ACTIVE" && mode !== "changed") {
         if (!sameTerms(mandate, actual)) throw new MandateRefused("MANDATE_REPLY_MISMATCH", "подписан мандат с другими пределами");
-        return actual;
+        return this.#hold(actual);
       }
       if (actual.status === "PENDING_SIGNATURE" && mode === "wait") return null;
       throw new MandateRefused("MANDATE_NOT_ACTIVE", `событие о мандате и статус у платформы — ${actual.status}`);

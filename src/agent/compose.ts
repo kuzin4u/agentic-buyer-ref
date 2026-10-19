@@ -185,11 +185,16 @@ export function createAgentCore(o: AgentCoreOptions): AgentCore {
     while (rechecking) await rechecking.catch(() => undefined);
     await recheck();
   });
+  const mandates = new MandateClient({ port: platform, params, journal, ...(o.now && { now: o.now }) });
+  // mandate.* о держимом мандате и пропуск INVALID_DATA мандатного типа — перечитать по GET (Р34 ответ (б), Р37 п. 4);
+  // сбой GET — слушатель падает, курсор на месте (Р34 п. 3): лента стоит для всех, и ожидание подписи другого мандата
+  // (awaitSigned) получает тот же отказ — fail-closed, нюанс Р37 (ревью К2.3 № 6). awaitSigned читает ленту само.
+  events.listen((item) => mandates.refreshHeld(item));
   return {
     params,
     platform,
     capabilities: platform.capabilities(),
-    mandates: new MandateClient({ port: platform, params, journal, ...(o.now && { now: o.now }) }),
+    mandates,
     journal,
     diag: DIAG,
     events,

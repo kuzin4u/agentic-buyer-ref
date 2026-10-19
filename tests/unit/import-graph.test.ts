@@ -108,6 +108,23 @@ describe("граф импортов src (Р24)", { timeout: 60_000 }, () => {
     expect(v.filter((x) => x.includes("signer/ok.ts"))).toEqual([]);
   });
 
+  it("формат реестра ядра (/diag) — только в src/agent/declines: импорт, тип, import(), путь dist (Р36 п. 1)", () => {
+    const v = importGraphViolations(
+      virtual({
+        "src/agent/declines/r.ts": 'import type { DiagEntry } from "@kuzin4u/agentic-core/diag";\nexport type E = DiagEntry;\n',
+        "src/agent/signer/a.ts": 'import { diagAction } from "@kuzin4u/agentic-core/diag";\nexport const d = diagAction;\n',
+        "src/agent/compose.ts": 'export type T = import("@kuzin4u/agentic-core/diag").DiagRegistry;\n',
+        "src/shared/b.ts": 'export * from "@kuzin4u/agentic-core/dist/src/diag/index.js";\n',
+        "src/agent/policy/ok.ts": 'import type { DiagEntry } from "../declines/r.js";\nexport type D = DiagEntry;\n',
+      }),
+    );
+    expect(v.filter((x) => x.includes("(Р36)"))).toEqual([
+      "src/agent/compose.ts: «@kuzin4u/agentic-core/diag» — только в src/agent/declines/ (Р36)",
+      "src/agent/signer/a.ts: «@kuzin4u/agentic-core/diag» — только в src/agent/declines/ (Р36)",
+      "src/shared/b.ts: «@kuzin4u/agentic-core/dist/src/diag/index.js» — только в src/agent/declines/ (Р36)",
+    ]);
+  });
+
   it("каталог ядра (/catalog) — только в src/agent/catalog: импорт, тип, import(), путь dist (Р32 п. 6)", () => {
     const v = importGraphViolations(
       virtual({

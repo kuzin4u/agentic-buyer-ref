@@ -86,8 +86,8 @@ describe("клиент мандатов на PaoStub", () => {
       parentId: "m_other",
       cart: { merchantId: "shop_1", lines: [{ sku: "sku_1", qty: 1, price: RUB(1000) }], total: RUB(1000) },
     };
-    await expect(core.mandates.request(cart, { idempotencyKey: "idem_c4" })).rejects.toMatchObject({ reason: "DRAFT_INVALID" });
-    await expect(core.mandates.request(cart, { idempotencyKey: "idem_c5" }, intent)).rejects.toMatchObject({ reason: "DRAFT_INVALID" });
+    await expect(core.mandates.request(cart, { idempotencyKey: "idem_c4" })).rejects.toMatchObject({ reason: "MANDATE_DRAFT_INVALID" });
+    await expect(core.mandates.request(cart, { idempotencyKey: "idem_c5" }, intent)).rejects.toMatchObject({ reason: "MANDATE_DRAFT_INVALID" });
     expect(stand.calls("POST /pao/v1/mandates")).toHaveLength(1);
   });
 
@@ -95,17 +95,17 @@ describe("клиент мандатов на PaoStub", () => {
     const { core, stand } = await setup();
     const err = await core.mandates.request({ ...INTENT, merchantScope: [] }, { idempotencyKey: "idem_bad" }).catch((e: unknown) => e);
     expect(err).toBeInstanceOf(MandateRefused);
-    expect(err).toMatchObject({ reason: "DRAFT_INVALID" });
+    expect(err).toMatchObject({ reason: "MANDATE_DRAFT_INVALID" });
     expect(stand.calls("POST /pao/v1/mandates")).toEqual([]);
   });
 
-  it("платформа вернула другие пределы — REPLY_MISMATCH (ревью К1.2 № 5)", async () => {
+  it("платформа вернула другие пределы — MANDATE_REPLY_MISMATCH (ревью К1.2 № 5)", async () => {
     const { core, consents } = await setup();
     consents.tamper = (m) => ({ ...m, amount_limit: 900000 });
-    await expect(core.mandates.request(INTENT, { idempotencyKey: "idem_t" })).rejects.toMatchObject({ reason: "REPLY_MISMATCH" });
+    await expect(core.mandates.request(INTENT, { idempotencyKey: "idem_t" })).rejects.toMatchObject({ reason: "MANDATE_REPLY_MISMATCH" });
   });
 
-  it("корзина: другой состав в ответе — REPLY_MISMATCH; получатели в другом порядке — тот же мандат", async () => {
+  it("корзина: другой состав в ответе — MANDATE_REPLY_MISMATCH; получатели в другом порядке — тот же мандат", async () => {
     const { core, consents } = await setup();
     const intent = await core.mandates.request({ ...INTENT, merchantScope: ["shop_1", "shop_2"] }, { idempotencyKey: "idem_i3" });
     const cart: MandateDraft = {
@@ -118,15 +118,15 @@ describe("клиент мандатов на PaoStub", () => {
     consents.tamper = (m) => ({ ...m, merchant_scope: ["shop_2", "shop_1"] });
     await expect(core.mandates.request(cart, { idempotencyKey: "idem_c2" }, intent)).resolves.toMatchObject({ kind: "CART" });
     consents.tamper = (m) => ({ ...m, cart: { ...m.cart!, items: [{ sku: "sku_1", qty: 3, price: 1000 }], total: 3000 } });
-    await expect(core.mandates.request(cart, { idempotencyKey: "idem_c3" }, intent)).rejects.toMatchObject({ reason: "REPLY_MISMATCH" });
-    // Р33 п. 4: порядок отзыва CART не как у родителя — REPLY_MISMATCH
+    await expect(core.mandates.request(cart, { idempotencyKey: "idem_c3" }, intent)).rejects.toMatchObject({ reason: "MANDATE_REPLY_MISMATCH" });
+    // Р33 п. 4: порядок отзыва CART не как у родителя — MANDATE_REPLY_MISMATCH
     consents.tamper = (m) => ({ ...m, revocation_order: "bank:pr_1:revocation:v2" });
-    await expect(core.mandates.request(cart, { idempotencyKey: "idem_c6" }, intent)).rejects.toMatchObject({ reason: "REPLY_MISMATCH" });
+    await expect(core.mandates.request(cart, { idempotencyKey: "idem_c6" }, intent)).rejects.toMatchObject({ reason: "MANDATE_REPLY_MISMATCH" });
   });
 
   // Р33 п. 4: ответ с мандатом без порядка отзыва — свой код, журнал, текст человеку; покупки по мандату нет. Версия ПАО
   // Платформы подтверждена конфигурацией (Р33 п. 10); без подтверждения — PLATFORM_PROTOCOL_UNSUPPORTED (protocol-version).
-  it("мандат без revocation_order — REVOCATION_ORDER_MISSING, событие в журнал, текст человеку", async () => {
+  it("мандат без revocation_order — MANDATE_REVOCATION_ORDER_MISSING, событие в журнал, текст человеку", async () => {
     const { core, consents, stand } = await setup({ versions: ["1.4.0"] });
     consents.tamper = (m) => {
       const r = { ...m };
@@ -135,7 +135,7 @@ describe("клиент мандатов на PaoStub", () => {
     };
     const err = (await core.mandates.request(INTENT, { idempotencyKey: "idem_ro" }).catch((e: unknown) => e)) as MandateRefused;
     expect(err).toBeInstanceOf(MandateRefused);
-    expect(err.reason).toBe("REVOCATION_ORDER_MISSING");
+    expect(err.reason).toBe("MANDATE_REVOCATION_ORDER_MISSING");
     expect(err.message).toContain(REVOCATION_ORDER_MISSING_TEXT);
     expect((core.journal as MemoryJournal).entries.filter((e) => e.kind === "mandate.revocation_order_missing")).toEqual([
       expect.objectContaining({ reason: "MANDATE_REVOCATION_ORDER_MISSING" }),
@@ -149,27 +149,27 @@ describe("клиент мандатов на PaoStub", () => {
     const m = await core.mandates.request(INTENT, { idempotencyKey: "idem_ro2" });
     const ev = consents.sign(m.id);
     delete consents.mandates.get(m.id)!.revocation_order;
-    await expect(core.mandates.awaitSigned(m, feed(ev))).rejects.toMatchObject({ reason: "REVOCATION_ORDER_MISSING" });
+    await expect(core.mandates.awaitSigned(m, feed(ev))).rejects.toMatchObject({ reason: "MANDATE_REVOCATION_ORDER_MISSING" });
     expect((core.journal as MemoryJournal).entries.filter((e) => e.kind === "mandate.revocation_order_missing")).toHaveLength(1);
   });
 
   // РП35: после 201 — статус; CART под отозванным или истёкшим INTENT приходит 201 со статусом REVOKED или EXPIRED.
-  it.each(["REVOKED", "EXPIRED", "REJECTED"] as const)("201 со статусом %s — NOT_ACTIVE, нового мандата нет", async (status) => {
+  it.each(["REVOKED", "EXPIRED", "REJECTED"] as const)("201 со статусом %s — MANDATE_NOT_ACTIVE, нового мандата нет", async (status) => {
     const { core, consents, stand } = await setup();
     consents.tamper = (m) => ({ ...m, status });
-    await expect(core.mandates.request(INTENT, { idempotencyKey: `idem_s_${status}` })).rejects.toMatchObject({ reason: "NOT_ACTIVE" });
+    await expect(core.mandates.request(INTENT, { idempotencyKey: `idem_s_${status}` })).rejects.toMatchObject({ reason: "MANDATE_NOT_ACTIVE" });
     expect(stand.calls("POST /pao/v1/mandates")).toHaveLength(1);
     expect(stand.calls("GET /pao/v1/mandates/{id}")).toEqual([]);
   });
 
-  // РП34: статус — только из GET. ACTIVE в 201 (повтор позже 24 ч) — сверка по GET; у платформы отозван — NOT_ACTIVE.
-  it("201 со статусом ACTIVE — статус из GET; GET отдал REVOKED — NOT_ACTIVE", async () => {
+  // РП34: статус — только из GET. ACTIVE в 201 (повтор позже 24 ч) — сверка по GET; у платформы отозван — MANDATE_NOT_ACTIVE.
+  it("201 со статусом ACTIVE — статус из GET; GET отдал REVOKED — MANDATE_NOT_ACTIVE", async () => {
     const { core, consents, stand } = await setup();
     consents.tamper = (m) => {
       consents.mandates.set(m.id!, { ...m, status: "REVOKED" });
       return { ...m, status: "ACTIVE" };
     };
-    await expect(core.mandates.request(INTENT, { idempotencyKey: "idem_a1" })).rejects.toMatchObject({ reason: "NOT_ACTIVE" });
+    await expect(core.mandates.request(INTENT, { idempotencyKey: "idem_a1" })).rejects.toMatchObject({ reason: "MANDATE_NOT_ACTIVE" });
     expect(stand.calls("GET /pao/v1/mandates/{id}")).toHaveLength(1);
     consents.tamper = (m) => {
       consents.mandates.set(m.id!, { ...m, status: "ACTIVE" });
@@ -184,22 +184,22 @@ describe("клиент мандатов на PaoStub", () => {
       consents.mandates.set(m.id!, { ...r });
       return { ...m, status: "ACTIVE" };
     };
-    await expect(core.mandates.request(INTENT, { idempotencyKey: "idem_a3" })).rejects.toMatchObject({ reason: "REVOCATION_ORDER_MISSING" });
+    await expect(core.mandates.request(INTENT, { idempotencyKey: "idem_a3" })).rejects.toMatchObject({ reason: "MANDATE_REVOCATION_ORDER_MISSING" });
   });
 
-  it("GET вернул другой мандат — REPLY_MISMATCH (ревью К2.2 № 6)", async () => {
+  it("GET вернул другой мандат — MANDATE_REPLY_MISMATCH (ревью К2.2 № 6)", async () => {
     const { core, consents } = await setup();
     consents.tamper = (m) => {
       consents.mandates.set(m.id!, { ...m, id: "m_other", status: "ACTIVE" });
       return { ...m, status: "ACTIVE" };
     };
-    await expect(core.mandates.request(INTENT, { idempotencyKey: "idem_g1" })).rejects.toMatchObject({ reason: "REPLY_MISMATCH" });
+    await expect(core.mandates.request(INTENT, { idempotencyKey: "idem_g1" })).rejects.toMatchObject({ reason: "MANDATE_REPLY_MISMATCH" });
   });
 
   it("INTENT с родителем — отказ до обращения (ревью К2.2 № 6)", async () => {
     const { core, stand } = await setup();
     const intent = await core.mandates.request(INTENT, { idempotencyKey: "idem_i4" });
-    await expect(core.mandates.request(INTENT, { idempotencyKey: "idem_i5" }, intent)).rejects.toMatchObject({ reason: "DRAFT_INVALID" });
+    await expect(core.mandates.request(INTENT, { idempotencyKey: "idem_i5" }, intent)).rejects.toMatchObject({ reason: "MANDATE_DRAFT_INVALID" });
     expect(stand.calls("POST /pao/v1/mandates")).toHaveLength(1);
   });
 
@@ -209,15 +209,15 @@ describe("клиент мандатов на PaoStub", () => {
     const m = await core.mandates.request(INTENT, { idempotencyKey: "idem_f" });
     const err = await core.mandates.awaitSigned(m, feed(event("mandate.signed", m.id))).catch((e: unknown) => e);
     expect(err).toBeInstanceOf(MandateRefused);
-    expect(err).toMatchObject({ reason: "NOT_ACTIVE" });
+    expect(err).toMatchObject({ reason: "MANDATE_NOT_ACTIVE" });
   });
 
-  it("подписи нет — SIGNATURE_PENDING; rejected / revoked / exhausted при PENDING_SIGNATURE — NOT_ACTIVE (SPEC §9, Р29 п. 5)", async () => {
+  it("подписи нет — MANDATE_SIGNATURE_PENDING; rejected / revoked / exhausted при PENDING_SIGNATURE — MANDATE_NOT_ACTIVE (SPEC §9, Р29 п. 5)", async () => {
     const { core, stand } = await setup();
     const m = await core.mandates.request(INTENT, { idempotencyKey: "idem_p" });
-    await expect(core.mandates.awaitSigned(m, feed())).rejects.toMatchObject({ reason: "SIGNATURE_PENDING" });
+    await expect(core.mandates.awaitSigned(m, feed())).rejects.toMatchObject({ reason: "MANDATE_SIGNATURE_PENDING" });
     for (const t of ["mandate.rejected", "mandate.revoked", "mandate.exhausted"] as const) {
-      await expect(core.mandates.awaitSigned(m, feed(event(t, m.id)))).rejects.toMatchObject({ reason: "NOT_ACTIVE" });
+      await expect(core.mandates.awaitSigned(m, feed(event(t, m.id)))).rejects.toMatchObject({ reason: "MANDATE_NOT_ACTIVE" });
     }
     // каждое событие — GET (Р34 п. 5), плюс GET до ожидания
     expect(stand.calls("GET /pao/v1/mandates/{id}")).toHaveLength(4 + 3);
@@ -235,7 +235,7 @@ describe("клиент мандатов на PaoStub", () => {
         },
       })
       .catch((e: unknown) => e);
-    expect(err).toMatchObject({ reason: "NOT_ACTIVE" });
+    expect(err).toMatchObject({ reason: "MANDATE_NOT_ACTIVE" });
   });
 
   it("итератор ленты запускается до первого GET: событие, прочитанное во время GET, не теряется (ревью К2.4 № 1)", async () => {
@@ -258,11 +258,11 @@ describe("клиент мандатов на PaoStub", () => {
     expect(gets()).toBe(before + 1);
   });
 
-  it.each(["REJECTED", "REVOKED", "EXPIRED"] as const)("статус %s у платформы — NOT_ACTIVE по событию и до ожидания", async (status) => {
+  it.each(["REJECTED", "REVOKED", "EXPIRED"] as const)("статус %s у платформы — MANDATE_NOT_ACTIVE по событию и до ожидания", async (status) => {
     const { core, consents } = await setup();
     const m = await core.mandates.request(INTENT, { idempotencyKey: `idem_n_${status}` });
     consents.mandates.get(m.id)!.status = status;
-    await expect(core.mandates.awaitSigned(m, feed())).rejects.toMatchObject({ reason: "NOT_ACTIVE" });
+    await expect(core.mandates.awaitSigned(m, feed())).rejects.toMatchObject({ reason: "MANDATE_NOT_ACTIVE" });
   });
 
   it("ответ (б): mandate.* без читаемого mandate_id — GET ожидаемого мандата; не мандатный тип — без GET (Р34 п. 6)", async () => {
@@ -273,7 +273,7 @@ describe("клиент мандатов на PaoStub", () => {
     // не мандатный пропуск и неизвестный тип — мандат не перечитывается
     await expect(
       core.mandates.awaitSigned(m, feed({ kind: "ignored", eventId: "e1", detail: "INVALID_DATA", type: "operation.settled" }, { kind: "ignored", eventId: "e2", detail: "UNKNOWN_TYPE" })),
-    ).rejects.toMatchObject({ reason: "SIGNATURE_PENDING" });
+    ).rejects.toMatchObject({ reason: "MANDATE_SIGNATURE_PENDING" });
     expect(gets() - before).toBe(1); // только GET до ожидания
     // человек подписал, а событие пришло без mandate_id — сигнал о мандате был: GET даёт ACTIVE
     const signal = { kind: "ignored", eventId: "e3", detail: "INVALID_DATA", type: "mandate.signed" } as const;
@@ -290,7 +290,7 @@ describe("клиент мандатов на PaoStub", () => {
   it("событие о чужом мандате — без GET; подпись прочитана раньше ожидания — мандат действует без события", async () => {
     const { core, consents, stand } = await setup();
     const m = await core.mandates.request(INTENT, { idempotencyKey: "idem_o" });
-    await expect(core.mandates.awaitSigned(m, feed(event("mandate.signed", "m_other")))).rejects.toMatchObject({ reason: "SIGNATURE_PENDING" });
+    await expect(core.mandates.awaitSigned(m, feed(event("mandate.signed", "m_other")))).rejects.toMatchObject({ reason: "MANDATE_SIGNATURE_PENDING" });
     expect(stand.calls("GET /pao/v1/mandates/{id}")).toHaveLength(1);
     consents.sign(m.id);
     await expect(core.mandates.awaitSigned(m, feed())).resolves.toMatchObject({ status: "ACTIVE" });
@@ -309,7 +309,7 @@ describe("клиент мандатов на PaoStub", () => {
     const signed = await core.mandates.awaitSigned(m, feed(consents.sign(m.id)));
     consents.asOf = asOf;
     expect((await core.mandates.check(signed)).outcome).toBe("STATE_UNKNOWN");
-    await expect(core.mandates.requireActive(signed)).rejects.toMatchObject({ reason: "OUT_OF_SCOPE" });
+    await expect(core.mandates.requireActive(signed)).rejects.toMatchObject({ reason: "MANDATE_OUT_OF_SCOPE" });
   });
 
   it("as_of не дата-время — ответ не по схеме ПАО: UNKNOWN в адаптере («Открыто» № 4)", async () => {
@@ -334,10 +334,10 @@ describe("клиент мандатов на PaoStub", () => {
   it("без действующего мандата — отказ без обращений (Т2)", async () => {
     const { core, stand } = await setup();
     const before = stand.stub.calls.length;
-    await expect(core.mandates.requireActive(null)).rejects.toMatchObject({ reason: "NO_MANDATE" });
+    await expect(core.mandates.requireActive(null)).rejects.toMatchObject({ reason: "MANDATE_NONE" });
     const m = await core.mandates.request(INTENT, { idempotencyKey: "idem_n" });
     const after = stand.stub.calls.length;
-    await expect(core.mandates.requireActive(m)).rejects.toMatchObject({ reason: "NO_MANDATE" });
+    await expect(core.mandates.requireActive(m)).rejects.toMatchObject({ reason: "MANDATE_NONE" });
     expect(stand.stub.calls.length).toBe(after);
     expect(after - before).toBe(1);
   });

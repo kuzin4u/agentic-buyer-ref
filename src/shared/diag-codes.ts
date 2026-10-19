@@ -1,0 +1,51 @@
+// Коды агента вне ПАО и каталога ядра (Р36 п. 2): перечень — источник истины для реестра AGENT_DIAG
+// (src/agent/declines/registry.ts); запись на каждый код проверяет тип реестра и тест полноты.
+import type { FailureCode } from "./domain.js";
+
+export const AGENT_DIAG_CODES = [
+  // словарь ядра вне ПАО (FailureCode): агент выводит их сам из ответа Платформы (Р33)
+  "MANDATE_REVOCATION_ORDER_MISSING",
+  "PLATFORM_PROTOCOL_UNSUPPORTED",
+  "UNKNOWN",
+  // предупреждение: версия ПАО Платформы не определена (Р33 п. 10)
+  "PLATFORM_VERSION_UNKNOWN",
+  // остановка и приостановка агента
+  "EVENTS_CURSOR_INVALID",
+  "AGENT_EXCLUDED",
+  "AGENT_CLASS_MISMATCH",
+  "AGENT_SELF_UNKNOWN",
+  // самопроверка при старте (Р36 п. 6): параметры и версия ПАО ядра
+  "PARAMS_INVALID",
+  "CORE_PAO_MISMATCH",
+  // подписант и связка ключей
+  "KEY_MISMATCH",
+  "NO_ACTIVE_KEY",
+  "NO_KEY",
+  "KEY_AMBIGUOUS",
+  "KEYSTORE_LOCKED",
+  "KEYSTORE_WRITE_FAILED",
+  "NOT_ADMITTED",
+  "KEY_REJECTED",
+  "KEY_NOT_ACTIVE",
+  "KEY_REVOKED",
+  "KEY_EXPIRED",
+  // клиент мандатов (MandateRefusal; порядок отзыва — MANDATE_REVOCATION_ORDER_MISSING выше)
+  "MANDATE_DRAFT_INVALID",
+  "MANDATE_REPLY_MISMATCH",
+  "MANDATE_NOT_ACTIVE",
+  "MANDATE_SIGNATURE_PENDING",
+  "MANDATE_NONE",
+  "MANDATE_OUT_OF_SCOPE",
+  // каталог: ошибка вызова живой проверки (рядом с LIVE_* ядра, Р32 п. 4)
+  "LIVE_CALL_ERROR",
+  // причины operation.declined (SPEC §7б): в PAO_DIAG ядра их нет
+  "AOI_MISSING",
+  "AOI_MISMATCH",
+  "INSUFFICIENT_FUNDS",
+  "DECLINE_REASON_UNKNOWN",
+] as const;
+
+export type AgentDiagCode = (typeof AGENT_DIAG_CODES)[number];
+
+/** Код, которым агент отказывает, останавливается или приостанавливается: отказ ПАО или код агента (Р36). */
+export type DiagCode = FailureCode | AgentDiagCode;

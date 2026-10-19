@@ -3,6 +3,7 @@
 // перезапуска, безопасный, потому что действие — по GET (п. 3, 5). Чтений в работе — не больше одного; сигналы во время
 // чтения сливаются в одно следующее; чтения — не чаще event_poll_interval_ms (уточнение 1 владельца).
 import { PlatformFailure, type PlatformEventType } from "../../shared/domain.js";
+import type { DiagCode } from "../../shared/diag-codes.js";
 import type { EventsPort, FeedItem } from "../ports/events.js";
 import { CursorInvalid, EVENT_ID, type EventCursorStore } from "./cursor.js";
 
@@ -20,7 +21,7 @@ export interface EventsJournal {
 }
 
 /** Остановка агента целиком (порт подписи, `RequestSigning.stop`); ключ через неё не проходит (инвариант 2). */
-export type StopAgent = (reason: string, detail: string) => void;
+export type StopAgent = (reason: DiagCode, detail: string) => void;
 
 /** Лента остановлена: курсор не читается или отвергнут Платформой; агент уже остановлен (Р34 п. 4). */
 export class EventsStopped extends Error {
@@ -132,6 +133,12 @@ export class EventFeed {
       this.#running = null;
       throw e;
     }
+  }
+
+  /** Самопроверка при старте (Р36 п. 6): курсор читается до обращений к Платформе; не читается — остановка агента
+   *  (EVENTS_CURSOR_INVALID, UNREADABLE) и EventsStopped; файла нет — events.cursor_initial. */
+  checkCursor(): void {
+    this.#load();
   }
 
   #load(): string | null {

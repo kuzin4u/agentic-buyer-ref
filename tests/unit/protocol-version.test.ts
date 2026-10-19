@@ -13,7 +13,7 @@ import { SignerStopped } from "../../src/agent/signer/index.js";
 import { loadParams } from "../../src/shared/config.js";
 import { PlatformFailure } from "../../src/shared/domain.js";
 import { Consents, INTENT } from "../support/consents.js";
-import { coreOn } from "../support/core.js";
+import { coreOn, startCause } from "../support/core.js";
 import { AGENT, PaoStand, type StandOptions } from "../support/pao-stand.js";
 
 const CONFIG = "GET /.well-known/pao-configuration";
@@ -79,7 +79,7 @@ describe("версия ПАО в конфигурации — наибольше
 describe("шаг 1 — при подключении (стадия 0, до GET /pao/v1/agent)", () => {
   it("versions 1.3.0 — PLATFORM_PROTOCOL_UNSUPPORTED, агент остановлен, допуска и мандатов нет", async () => {
     const { core, ops, kinds, stand: s } = await setup({ configuration: { versions: ["1.3.0"] } });
-    const err = (await core.start().catch((e: unknown) => e)) as PlatformFailure;
+    const err = (await startCause(core.start()).catch((e: unknown) => e)) as PlatformFailure;
     expect(err).toBeInstanceOf(PlatformFailure);
     expect(err.code).toBe("PLATFORM_PROTOCOL_UNSUPPORTED");
     expect(err.message).toContain(protocolUnsupportedText("1.3.0"));
@@ -88,7 +88,7 @@ describe("шаг 1 — при подключении (стадия 0, до GET /
       expect.objectContaining({ reason: "PLATFORM_PROTOCOL_UNSUPPORTED", detail: "CONFIGURATION" }),
     ]);
     // остановка, а не «не допущен»: ни повторный допуск, ни мандат не обращаются к Платформе
-    await expect(core.start()).rejects.toThrow(SignerStopped);
+    await expect(startCause(core.start())).rejects.toThrow(SignerStopped);
     await expect(core.mandates.request(INTENT, { idempotencyKey: "idem_v1" })).rejects.toThrow(SignerStopped);
     expect(ops()).toEqual([CONFIG]);
     expect(s.stub.violations).toEqual([]);
@@ -123,12 +123,31 @@ describe("шаг 1 — при подключении (стадия 0, до GET /
     expect(conf[0]!.idempotencyKey).toBeUndefined();
   });
 
+  // CO-1 ядра v0.8.0 (AG-ДГ К1): у операции без подписи нет заголовков агента; подписанный допуск их несёт.
+  it("конфигурация — без x-agent-code, x-timestamp, x-nonce и signature; GET /pao/v1/agent — с ними", async () => {
+    const consents: Consents = new Consents(() => s.clock);
+    const s: PaoStand = (stand = new PaoStand({ configuration: { versions: ["1.4.0"] }, handlers: consents.handlers() }));
+    const sent: [string, Headers][] = [];
+    const fetchImpl: typeof fetch = (url, init) => {
+      sent.push([new URL(String(url)).pathname, new Headers(init?.headers)]);
+      return fetch(url, init);
+    };
+    const { core } = await coreOn(s, { fetch: fetchImpl });
+    await core.start();
+    const AGENT_HEADERS = ["x-agent-code", "x-timestamp", "x-nonce", "signature", "signature-input"];
+    const present = (h: Headers) => AGENT_HEADERS.filter((n) => h.has(n));
+    expect(sent.map(([p, h]) => [p, present(h)])).toEqual([
+      [CONFIG.slice(4), []],
+      ["/pao/v1/agent", AGENT_HEADERS],
+    ]);
+  });
+
   // Ревью К2.3 № 9: по схеме — только versions; прочие поля конфигурации игнорируются (ПАО §7).
   it("versions 1.3.0 при поле вне перечня 1.4.0 — всё равно PLATFORM_PROTOCOL_UNSUPPORTED", async () => {
     const { core, ops, stand: s } = await setup({
       handlers: { [CONFIG]: () => ({ body: { versions: ["1.3.0"], algorithms: ["rsa-pss"], endpoints: 1 } as never }) },
     });
-    await expect(core.start()).rejects.toMatchObject({ code: "PLATFORM_PROTOCOL_UNSUPPORTED" });
+    await expect(startCause(core.start())).rejects.toMatchObject({ code: "PLATFORM_PROTOCOL_UNSUPPORTED" });
     expect(ops()).toEqual([CONFIG]);
     expectOnlyConfigViolation(s);
   });
@@ -192,7 +211,7 @@ describe("шаг 1 — при подключении (стадия 0, до GET /
     // все попытки адаптера (pao_max_attempts) первого допуска — 503
     const attempts = loadParams().pao_max_attempts;
     s.stub.fail("GET /pao/v1/agent", { code: "STATE_UNAVAILABLE" }, attempts);
-    await expect(core.start()).rejects.toBeInstanceOf(PlatformFailure);
+    await expect(startCause(core.start())).rejects.toBeInstanceOf(PlatformFailure);
     await core.start();
     expect(s.stub.calls.map((c) => [c.op, c.status])).toEqual([
       [CONFIG, 404],
@@ -274,7 +293,7 @@ describe("шаг 2 — версия не определена: по первом
     await core.start();
     await core.mandates.request(INTENT, { idempotencyKey: "idem_c1" });
     withoutOrder(consents);
-    await expect(core.mandates.request(INTENT, { idempotencyKey: "idem_c2" })).rejects.toMatchObject({ reason: "REVOCATION_ORDER_MISSING" });
+    await expect(core.mandates.request(INTENT, { idempotencyKey: "idem_c2" })).rejects.toMatchObject({ reason: "MANDATE_REVOCATION_ORDER_MISSING" });
     expect(kinds("agent.stopped")).toEqual([]);
     consents.tamper = undefined;
     await expect(core.mandates.request(INTENT, { idempotencyKey: "idem_c3" })).resolves.toMatchObject({ status: "PENDING_SIGNATURE" });
@@ -286,7 +305,7 @@ describe("шаг 2 — версия не определена: по первом
     withoutOrder(consents);
     const err = await core.mandates.request(INTENT, { idempotencyKey: "idem_k1" }).catch((e: unknown) => e);
     expect(err).toBeInstanceOf(MandateRefused);
-    expect(err).toMatchObject({ reason: "REVOCATION_ORDER_MISSING" });
+    expect(err).toMatchObject({ reason: "MANDATE_REVOCATION_ORDER_MISSING" });
     expect(kinds("platform.protocol_unsupported")).toEqual([]);
     expect(kinds("agent.stopped")).toEqual([]);
   });

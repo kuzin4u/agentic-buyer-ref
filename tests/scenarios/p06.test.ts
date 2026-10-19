@@ -29,7 +29,7 @@ describe("П06 — мандат без обязательного реквизи
     await core.start();
     const err = (await core.mandates.request({ ...INTENT, ...patch }, { idempotencyKey: "idem-p06" }).catch((e: unknown) => e)) as MandateRefused;
     expect(err).toBeInstanceOf(MandateRefused);
-    expect(err.reason).toBe("DRAFT_INVALID");
+    expect(err.reason).toBe("MANDATE_DRAFT_INVALID");
     expect(consents.mandates.size).toBe(0);
     expect(s.log()).toEqual([CONFIGURATION, { op: "GET /pao/v1/agent", status: 200 }]);
     expect(s.stub.violations).toEqual([]);

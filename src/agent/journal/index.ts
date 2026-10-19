@@ -20,7 +20,7 @@ export type JournalKind =
   | "key.foreign"
   /** обращение подписано ключом kid */
   | "request.signed"
-  /** допуск не пройден этим ключом или целиком (код отказа в reason); допуск можно повторить */
+  /** допуск не пройден этим ключом или целиком (код отказа в reason); повтор — по действию кода в реестре (дополнение 2 к Р36) */
   | "admission.failed"
   /** рабочая подпись приостановлена до успешной повторной сверки с реестром (Р27) */
   | "signing.suspended"
@@ -48,7 +48,9 @@ export type JournalKind =
   /** Платформа отвергла адрес подписки (400) — push нет, работа по ленте (Р34 п. 8) */
   | "events.subscription_rejected"
   /** подписка не удалась иначе (503 сверх попыток, UNKNOWN) — работа по ленте, повтор при следующем старте (дополнение Р34 п. 1) */
-  | "events.subscription_failed";
+  | "events.subscription_failed"
+  /** проверка самопроверки при старте (Р36 п. 6): check — имя, status — ok / warn / fail, reason — код из реестра при warn и fail */
+  | "agent.selfcheck";
 
 export interface JournalEntry {
   at: string;
@@ -60,6 +62,10 @@ export interface JournalEntry {
   detail?: string;
   /** идентификатор объекта Платформы по маске адаптера — event_id события ленты (Р34 п. 11) */
   ref?: string;
+  /** имя проверки самопроверки (agent.selfcheck, Р36 п. 6) */
+  check?: string;
+  /** итог проверки самопроверки: ok, warn или fail */
+  status?: "ok" | "warn" | "fail";
 }
 
 export interface Journal {

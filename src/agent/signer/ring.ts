@@ -9,11 +9,12 @@
 import type { Signer } from "@kuzin4u/agentic-core";
 import { PlatformFailure, type AgentKey, type AgentSelf } from "../../shared/domain.js";
 import type { StandParams } from "../../shared/config.js";
+import type { DiagCode } from "../../shared/diag-codes.js";
 import { ruleForFailure } from "../declines/index.js";
 import type { Journal, JournalKind } from "../journal/index.js";
 import type { PaymentPlatform } from "../ports/payment-platform.js";
 import type { RequestSigning } from "../ports/request-signing.js";
-import { SignerKeyRejected, SignerStopped, SignerSuspended } from "./errors.js";
+import { SignerKeyRejected, SignerStopped, SignerSuspended, type SignerStopReason } from "./errors.js";
 import { KeystoreLocked, generateKey, listKeys, loadKey, lockDir, markKey, pruneKey, readMeta, writeMeta, type KeyMeta, type KeyState, type LoadedKey } from "./keystore.js";
 import { kidOf } from "./kid.js";
 
@@ -50,9 +51,9 @@ export class KeyRing {
   readonly #now: () => Date;
   readonly #held = new Map<string, Held>();
   #currentKid: string | null = null;
-  #stopped: string | null = null;
+  #stopped: SignerStopReason | null = null;
   /** приостановка рабочей подписи до успешной повторной сверки (Р27); остановка сильнее приостановки */
-  #suspended: string | null = null;
+  #suspended: DiagCode | null = null;
   /** счётчик приостановок: сверка снимает только ту, что поставлена до её начала (не позднее, из параллельного ответа) */
   #suspensions = 0;
   /** метка идущей сверки: порт сверки обходит приостановку только пока жива его метка (снимается в finally) */
@@ -85,8 +86,8 @@ export class KeyRing {
     return Object.freeze({
       current: () => this.#current(false),
       keyRevoked: (kid: string, failure?: unknown) => this.#keyRevoked(kid, failure, false),
-      stop: (reason: string, detail?: string) => this.#stop(reason, detail),
-      suspend: (reason: string) => this.#suspend(reason),
+      stop: (reason: DiagCode, detail?: string) => this.#stop(reason, detail),
+      suspend: (reason: DiagCode) => this.#suspend(reason),
     });
   }
 
@@ -104,8 +105,8 @@ export class KeyRing {
     const signing: RequestSigning = Object.freeze({
       current: () => this.#current(false, live()),
       keyRevoked: (kid: string, failure?: unknown) => this.#keyRevoked(kid, failure, false, live()),
-      stop: (reason: string, detail?: string) => this.#stop(reason, detail),
-      suspend: (reason: string) => this.#suspend(reason),
+      stop: (reason: DiagCode, detail?: string) => this.#stop(reason, detail),
+      suspend: (reason: DiagCode) => this.#suspend(reason),
     });
     const before = this.#suspensions;
     this.#recheckToken = token;
@@ -132,7 +133,8 @@ export class KeyRing {
    * Неподтверждённые ключи не пробуются.
    * SIGNATURE_INVALID — повтор тем же ключом с новой подписью не больше maxRetries таблицы отказов (SPEC §7а: один), затем
    * остановка.
-   * Прочие сбои (503, тайм-аут) — допуск можно повторить; AGENT_UNKNOWN / AGENT_SUSPENDED — остановка (адаптер);
+   * Прочие сбои (503, тайм-аут) — допуск не состоялся; можно ли повторить, решает место сборки по действию кода в реестре
+   * (дополнение 2 к Р36: UNKNOWN, в т. ч. тайм-аут, — остановка); AGENT_UNKNOWN / AGENT_SUSPENDED — остановка (адаптер);
    * класс в реестре не BUYER — остановка AGENT_CLASS_MISMATCH (Р27, после проверки статуса).
    */
   async start(admit: Admit): Promise<AgentSelf> {
@@ -141,8 +143,8 @@ export class KeyRing {
     const signing: RequestSigning = Object.freeze({
       current: () => this.#current(true),
       keyRevoked: (kid: string, failure?: unknown) => this.#keyRevoked(kid, failure, true),
-      stop: (reason: string, detail?: string) => this.#stop(reason, detail),
-      suspend: (reason: string) => this.#suspend(reason),
+      stop: (reason: DiagCode, detail?: string) => this.#stop(reason, detail),
+      suspend: (reason: DiagCode) => this.#suspend(reason),
     });
     this.#admission = "admitting";
     try {
@@ -157,6 +159,8 @@ export class KeyRing {
         } catch (e) {
           if (!(e instanceof PlatformFailure) || this.#stopped !== null) throw e;
           this.#record("admission.failed", this.#currentKid, e.code);
+          // Недостижимо при maxRetries ≥ 1 (дополнение 2 к Р36 п. 4 (в), тест): адаптер на каждом AGENT_KEY_REVOKED вызывает
+          // keyRevoked, второй отказ — NO_ACTIVE_KEY. Станет достижимо (смена ключей) — по действию реестра (new_key).
           if (e.code === "AGENT_KEY_REVOKED") this.#halt("AGENT_KEY_REVOKED", e);
           if (e.code === "SIGNATURE_INVALID") {
             if (attempt > signatureRetries) this.#halt("SIGNATURE_INVALID", e);
@@ -286,14 +290,14 @@ export class KeyRing {
     return this.#current(admitting, rechecking);
   }
 
-  #suspend(reason: string): void {
+  #suspend(reason: DiagCode): void {
     if (this.#stopped !== null || this.#admission !== "admitted" || this.#suspended !== null) return;
     this.#suspended = reason;
     this.#suspensions++;
     this.#record("signing.suspended", undefined, reason);
   }
 
-  #stop(reason: string, detail?: string): void {
+  #stop(reason: SignerStopReason, detail?: string): void {
     if (this.#stopped !== null) return;
     this.#stopped = reason;
     this.#record("agent.stopped", undefined, reason, detail);
@@ -456,7 +460,7 @@ export class KeyRing {
   }
 
   /** Состояние ключа: сначала в памяти, затем в хранилище; переход в revoked пишется в журнал с причиной. */
-  #mark(kid: string, to: KeyState, reason?: string): void {
+  #mark(kid: string, to: KeyState, reason?: DiagCode): void {
     const h = this.#held.get(kid)!;
     if (h.state === to) return;
     h.state = to;
@@ -480,12 +484,12 @@ export class KeyRing {
     h.disk = to;
   }
 
-  #halt(reason: string, cause?: unknown, detail?: string): never {
+  #halt(reason: DiagCode, cause?: unknown, detail?: string): never {
     this.#stop(reason, detail);
     throw new SignerStopped(reason, cause === undefined ? undefined : { cause });
   }
 
-  #record(kind: JournalKind, kid?: string, reason?: string, detail?: string): void {
+  #record(kind: JournalKind, kid?: string, reason?: SignerStopReason, detail?: string): void {
     this.#o.journal.record({ at: this.#now().toISOString(), kind, ...(kid && { kid }), ...(reason && { reason }), ...(detail && { detail }) });
   }
 }

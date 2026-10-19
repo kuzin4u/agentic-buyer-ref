@@ -4,23 +4,25 @@ import { createRequire } from "node:module";
 import { dirname } from "node:path";
 import { PAO_ERRORS, PAO_VERSION } from "@kuzin4u/agentic-core/pao";
 
-// Каркас ядра (AG-01): зависимость от agentic-core v0.7.0 (Р33; прежде v0.6.0 — Р31, v0.3.0 — AG-05 К1.1) и структура src по CLAUDE.md.
+// Каркас ядра (AG-01): зависимость от agentic-core v0.8.0 (AG-ДГ К1, передача #29; прежде v0.7.0 — Р33, v0.6.0 — Р31, v0.3.0 — AG-05 К1.1) и структура src по CLAUDE.md.
 describe("зависимость от agentic-core", () => {
-  it("подключена по git+https с тегом v0.7.0", () => {
+  it("подключена по git+https с тегом v0.8.0", () => {
     const pkg = JSON.parse(readFileSync("package.json", "utf8"));
     expect(pkg.dependencies["@kuzin4u/agentic-core"]).toBe(
-      "git+https://github.com/kuzin4u/agentic-core.git#v0.7.0",
+      "git+https://github.com/kuzin4u/agentic-core.git#v0.8.0",
     );
     const lock = JSON.parse(readFileSync("package-lock.json", "utf8"));
     const entry = lock.packages["node_modules/@kuzin4u/agentic-core"];
-    expect(entry.version).toBe("0.7.0");
+    expect(entry.version).toBe("0.8.0");
     expect(lock.packages[""].dependencies["@kuzin4u/agentic-core"]).toBe(pkg.dependencies["@kuzin4u/agentic-core"]);
-    // 60fc4ce… — коммит тега v0.7.0 (лёгкий тег). Копия ядра одна: зависимость стенда v0.5.0 (#v0.5.0)
-    // npm сводит к ней же — стенд в тестах работает на core v0.7.0: основной вход ядра (подпись, проверка запросов,
-    // хранилища, SQL-миграции) в v0.5.0 → v0.7.0 не менялся (CHANGELOG ядра), из /pao стенд во время работы ничего не
-    // использует; dist стенда собран против типов v0.5.0 — остаточный риск, ловят С0 и этот тест (Р33, К2а).
+    // 47d6070… — коммит тега v0.8.0 (слияние PR #30 ядра, CO-ДГ). Копия ядра одна: зависимость стенда v0.5.0 (#v0.5.0)
+    // npm сводит к ней же — стенд в тестах работает на core v0.8.0: основной вход ядра (подпись, проверка запросов,
+    // хранилища, SQL-миграции) в v0.5.0 → v0.8.0 не менялся (CHANGELOG ядра); из /pao стенд во время работы ничего не
+    // использует, а изменение CO-1 в v0.8.0 касается только PaoClient; dist стенда собран против типов v0.5.0 —
+    // остаточный риск, ловят С0 и этот тест (Р33, К2а). npm install ставит новый тег только явной командой
+    // `npm install "@kuzin4u/agentic-core@git+https://…#v0.8.0"` и переписывает адреса на github: / git+ssh.
     expect(entry.resolved).toBe(
-      "git+https://github.com/kuzin4u/agentic-core.git#60fc4ce255bbe4ec39953a4da2bd685de7ae39ba",
+      "git+https://github.com/kuzin4u/agentic-core.git#47d607058891cf59c72316ddbf88a906c7049c56",
     );
   });
 
@@ -54,7 +56,7 @@ describe("зависимость от agentic-core", () => {
       expect(dirname(dir), "package.json ядра не найден").not.toBe(dir);
       dir = dirname(dir);
     }
-    expect(JSON.parse(readFileSync(`${dir}/package.json`, "utf8")).version).toBe("0.7.0");
+    expect(JSON.parse(readFileSync(`${dir}/package.json`, "utf8")).version).toBe("0.8.0");
   });
 
   it("даёт ПАО 1.4.0 и таблицу ошибок с полем retry", () => {

@@ -14,6 +14,7 @@ import { SignerStopped, generateKey, kidOf, listKeys } from "../../src/agent/sig
 import { readMeta } from "../../src/agent/signer/keystore.js";
 import { PlatformFailure } from "../../src/shared/domain.js";
 import { AGENT } from "../support/pao-stand.js";
+import { startCause, lastEntry } from "../support/core.js";
 
 const OPERATOR = "buyref-operator";
 
@@ -67,16 +68,16 @@ const CONF = { route: "GET /.well-known/pao-configuration", status: 404 };
 
 /** Отказ подписи на допуске (SPEC §7а): один повтор с новой подписью (новый x-nonce, Р21), затем остановка. */
 async function expectSignatureStop(core: Awaited<ReturnType<typeof coreAt>>["core"], journal: MemoryJournal, log: Call[]) {
-  const err = (await core.start().catch((e: unknown) => e)) as SignerStopped;
+  const err = (await startCause(core.start()).catch((e: unknown) => e)) as SignerStopped;
   expect(err).toBeInstanceOf(SignerStopped);
   expect(err.reason).toBe("SIGNATURE_INVALID");
   expect(err.cause).toMatchObject({ code: "SIGNATURE_INVALID", httpStatus: 401 });
   expect(log.map(({ route, status }) => ({ route, status }))).toEqual([CONF, { route: SELF, status: 401 }, { route: SELF, status: 401 }]);
   expect(log[1]!.nonce).toBeTruthy();
   expect(log[2]!.nonce).not.toBe(log[1]!.nonce);
-  expect(journal.entries.at(-1)).toMatchObject({ kind: "agent.stopped", reason: "SIGNATURE_INVALID" });
+  expect(lastEntry(journal)).toMatchObject({ kind: "agent.stopped", reason: "SIGNATURE_INVALID" });
   // остановка, а не «ещё не допущен»: повторный допуск — та же причина и ни одного обращения
-  await expect(core.start()).rejects.toMatchObject({ reason: "SIGNATURE_INVALID" });
+  await expect(startCause(core.start())).rejects.toMatchObject({ reason: "SIGNATURE_INVALID" });
   await expect(core.platform.agentSelf()).rejects.toThrow(SignerStopped);
   expect(log).toHaveLength(3);
 }
@@ -158,7 +159,7 @@ describe("С0 — подпись агента принимается Платф�
     expect(s.admit(application(descriptor.public_key, "SELLER"), OPERATOR)).toMatchObject({ admitted: true });
     const { core, journal } = await coreAt(s, dir);
 
-    await expect(core.start()).rejects.toMatchObject({ reason: "AGENT_CLASS_MISMATCH" });
+    await expect(startCause(core.start())).rejects.toMatchObject({ reason: "AGENT_CLASS_MISMATCH" });
     expect(calls()).toEqual([CONF, { route: SELF, status: 200 }]);
     expect(journal.entries.filter((e) => e.kind === "agent.stopped")).toEqual([
       expect.objectContaining({ reason: "AGENT_CLASS_MISMATCH", detail: "SELLER" }),
@@ -171,10 +172,10 @@ describe("С0 — подпись агента принимается Платф�
     generateKey(dir);
     const { core, journal } = await coreAt(s, dir);
 
-    const err = await core.start().catch((e: unknown) => e);
+    const err = await startCause(core.start()).catch((e: unknown) => e);
     expect(err).toBeInstanceOf(PlatformFailure);
     expect(err).toMatchObject({ code: "AGENT_UNKNOWN", retry: "never", httpStatus: 401 });
     expect(calls()).toEqual([CONF, { route: SELF, status: 401 }]);
-    expect(journal.entries.at(-1)).toMatchObject({ kind: "agent.stopped", reason: "AGENT_UNKNOWN" });
+    expect(lastEntry(journal)).toMatchObject({ kind: "agent.stopped", reason: "AGENT_UNKNOWN" });
   });
 });

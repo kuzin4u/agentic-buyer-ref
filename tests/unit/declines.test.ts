@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { readFileSync } from "node:fs";
 import { PAO_CLIENT_CODES, PAO_ERRORS } from "@kuzin4u/agentic-core/pao";
-import { FAILURE_RULES, ruleForDeclineReason, ruleForFailure } from "../../src/agent/declines/index.js";
+import { AGENT_STOP_CODES, FAILURE_RULES, ruleForDeclineReason, ruleForFailure } from "../../src/agent/declines/index.js";
 import { EVENTS_CURSOR_INVALID } from "../../src/agent/events/index.js";
 
 const spec = readFileSync("docs/core/SPEC.md", "utf8");
@@ -17,6 +17,14 @@ describe("таблица отказов", () => {
   it("Р33 п. 4: MANDATE_REVOCATION_ORDER_MISSING — стоп без повтора, событие в журнал; строка в SPEC §7а", () => {
     expect(ruleForFailure("MANDATE_REVOCATION_ORDER_MISSING")).toMatchObject({ action: "STOP", retry: "never", maxRetries: 0, defect: false, journal: true });
     for (const c of AGENT_CODES) expect(spec).toMatch(new RegExp(`^\\| ${c} \\| — \\| never \\|`, "m"));
+  });
+
+  it("Р37 п. 1: коды клиента ПАО — без повтора, агент не останавливается; строки в SPEC §7а", () => {
+    expect(ruleForFailure("PAO_CLIENT_REDIRECT")).toMatchObject({ action: "STOP", retry: "after_fix", maxRetries: 0, defect: false, journal: true });
+    expect(ruleForFailure("PAO_CLIENT_SIGNER_MISSING")).toMatchObject({ action: "STOP", retry: "after_fix", maxRetries: 0, defect: true, journal: true });
+    expect(AGENT_STOP_CODES.has("PAO_CLIENT_REDIRECT")).toBe(false);
+    expect(spec).toMatch(/^\| PAO_CLIENT_REDIRECT \| 3xx \| after_fix \|/m);
+    expect(spec).toMatch(/^\| PAO_CLIENT_SIGNER_MISSING \| — \| after_fix \|/m);
   });
 
   it.each(Object.entries(PAO_ERRORS))("%s: retry совпадает с ПАО", (code, row) => {

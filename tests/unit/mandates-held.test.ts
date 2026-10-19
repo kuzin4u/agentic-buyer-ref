@@ -118,6 +118,19 @@ describe("держимые мандаты (Р37 п. 4)", () => {
     expect(kinds(journal, "mandate.status_changed")).toEqual([]);
   });
 
+  it("404 только у одного при INVALID_DATA — он выходит (mandate.vanished), второй перечитан и держится (ревью К2.4 № 9)", async () => {
+    let goneId: string | null = null;
+    const { core, journal, stand: s, a, b, kinds } = await setup((c) => ({
+      [GET]: (req) => (req.path.id === goneId ? { error: { code: "MANDATE_NOT_FOUND" } } : c.handlers()![GET]!(req)),
+    }));
+    goneId = a.id;
+    const before = s.stub.calls.length;
+    await core.mandates.refreshHeld(invalid("mandate.signed"));
+    expect(s.stub.calls.slice(before).map((c) => [c.op, c.status])).toEqual([[GET, 404], [GET, 200]]);
+    expect(core.mandates.held().map((m) => m.id)).toEqual([b.id]);
+    expect(kinds(journal, "mandate.vanished").map((e) => e.mandate)).toEqual([a.id]);
+  });
+
   it("ACTIVE с другими пределами или порядком отзыва — выход и agent.refused MANDATE_REPLY_MISMATCH", async () => {
     const { core, journal, consents, a, b, kinds } = await setup();
     consents.mandates.get(a.id)!.amount_limit += 1;

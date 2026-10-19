@@ -8,7 +8,7 @@ import { FAILURE_RULES } from "../../src/agent/declines/index.js";
 import { JOURNAL_FIELDS, MemoryJournal, type JournalCode, type JournalEntry } from "../../src/agent/journal/index.js";
 import { AGENT_DIAG_CODES, type AgentDiagCode } from "../../src/shared/diag-codes.js";
 import type { FailureCode } from "../../src/shared/domain.js";
-import { Consents, INTENT, feed } from "../support/consents.js";
+import { Consents, INTENT, event, feed } from "../support/consents.js";
 import { CREDENTIALS, DRAFT, coreOn, startCause } from "../support/core.js";
 import { expectJournalClean } from "../support/journal.js";
 import { AGENT, PaoStand, type StandOptions } from "../support/pao-stand.js";
@@ -170,6 +170,58 @@ describe("записи ядра (Р37 п. 3)", () => {
     await expect(core.mandates.request(INTENT, { idempotencyKey: "idem_journal_ro" })).rejects.toMatchObject({ reason: "MANDATE_REVOCATION_ORDER_MISSING" });
     expect(journal.entries.filter((e) => e.kind === "mandate.revocation_order_missing").map((e) => e.reason)).toEqual(["MANDATE_REVOCATION_ORDER_MISSING"]);
     expectJournalClean(journal.entries, AGENT, s.stub.calls, ["idem_journal_ro"]);
+  });
+
+  it("отказ агента действовать (Т15, Р37 п. 5): каждый путь — ровно одна agent.refused с кодом и mandate; текст — не в журнале", async () => {
+    const { core, journal, consents, stand: s } = await setup({ configuration: { versions: ["1.4.0"] } });
+    await core.start();
+    const refused = () => journal.entries.filter((e) => e.kind === "agent.refused").map((e) => [e.reason, e.mandate]);
+    const messages: string[] = [];
+    const fail = async (p: Promise<unknown>, reason: string) => {
+      const e = (await p.catch((x: unknown) => x)) as Error & { reason?: string };
+      expect(e.reason).toBe(reason);
+      messages.push(e.message);
+    };
+    // отказ до обращения: ни запроса к ПАО, ни pao.call
+    const calls0 = s.stub.calls.length;
+    const pao0 = journal.entries.filter((e) => e.kind === "pao.call").length;
+    await fail(core.mandates.requireActive(null), "MANDATE_NONE");
+    await fail(core.mandates.request({ ...INTENT, keyTermsShown: false }, { idempotencyKey: "idem_journal_r1" }), "MANDATE_DRAFT_INVALID");
+    expect(s.stub.calls).toHaveLength(calls0);
+    expect(journal.entries.filter((e) => e.kind === "pao.call")).toHaveLength(pao0);
+    // ответ POST: другой статус, другие пределы
+    consents.tamper = (m) => ({ ...m, status: "REJECTED" });
+    await fail(core.mandates.request(INTENT, { idempotencyKey: "idem_journal_r2" }), "MANDATE_NOT_ACTIVE");
+    consents.tamper = (m) => ({ ...m, subject: "другое" });
+    await fail(core.mandates.request(INTENT, { idempotencyKey: "idem_journal_r3" }), "MANDATE_REPLY_MISMATCH");
+    consents.tamper = undefined;
+    // ожидание подписи: лента кончилась без подписи; отзыв во время ожидания
+    const p1 = await core.mandates.request(INTENT, { idempotencyKey: "idem_journal_r4" });
+    await fail(core.mandates.awaitSigned(p1, feed()), "MANDATE_SIGNATURE_PENDING");
+    consents.mandates.get(p1.id)!.status = "REVOKED";
+    await fail(core.mandates.awaitSigned(p1, feed(event("mandate.revoked", p1.id))), "MANDATE_NOT_ACTIVE");
+    // requireActive: не ACTIVE; verify не подтвердил
+    const p2 = await core.mandates.request(INTENT, { idempotencyKey: "idem_journal_r5" });
+    await fail(core.mandates.requireActive(p2), "MANDATE_NONE");
+    const active = await core.mandates.awaitSigned(p2, feed(consents.sign(p2.id)));
+    consents.outcome = "OUT_OF_SCOPE";
+    await fail(core.mandates.requireActive(active), "MANDATE_OUT_OF_SCOPE");
+    // id не по маске (вызывающий снаружи) — запись без mandate
+    await fail(core.mandates.requireActive({ ...active, id: "m 1/../x", status: "REJECTED" }), "MANDATE_NONE");
+    expect(refused()).toEqual([
+      ["MANDATE_NONE", undefined],
+      ["MANDATE_DRAFT_INVALID", undefined],
+      ["MANDATE_NOT_ACTIVE", "m_1"],
+      ["MANDATE_REPLY_MISMATCH", "m_2"],
+      ["MANDATE_SIGNATURE_PENDING", p1.id],
+      ["MANDATE_NOT_ACTIVE", p1.id],
+      ["MANDATE_NONE", p2.id],
+      ["MANDATE_OUT_OF_SCOPE", p2.id],
+      ["MANDATE_NONE", undefined],
+    ]);
+    const text = JSON.stringify(journal.entries);
+    for (const m of messages) expect(text).not.toContain(m);
+    expectJournalClean(journal.entries, AGENT, s.stub.calls);
   });
 
   it("close — agent.closed без причины, а не agent.stopped с CLOSED (Р36 (в))", async () => {

@@ -93,7 +93,7 @@ describe("реестр кодов агента (Р36)", () => {
   });
 
   it("каждый код-литерал причины в src — в полном реестре (остановка, приостановка, журнал, отказ мандата, коды фактов)", () => {
-    const call = /(?:\.stop|\.suspend|#halt|#stop|#suspend|#mark|#record|new MandateRefused|new SignerStopped|new SignerSuspended)\(([^)]*)\)/g;
+    const call = /(?:\.stop|\.suspend|#halt|#stop|#suspend|#mark|#record|new MandateRefused|#refuse|new SignerStopped|new SignerSuspended)\(([^)]*)\)/g;
     const literal = /"([A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+)"/g;
     const codes = /codes: \[([^\]]*)\]/g;
     const reason = /reason: "([A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+)"(?!\s*\|)/g; // не объединение типов (domain.ts)

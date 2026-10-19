@@ -376,6 +376,36 @@ describe("ядро и события на стенде v0.5.0 (Р34)", { timeout
     expect(a.c.mandates.held().map((x) => x.id)).toEqual([m.id]);
   });
 
+  it("404 у держимого мандата на mandate.revoked — mandate.vanished, курсор сдвинут, лента работает дальше (решение владельца по К2.3, вариант (а))", async () => {
+    const { s, core, replace } = await setup();
+    const a = core();
+    await a.c.start();
+    const m = await a.c.mandates.request(INTENT, { idempotencyKey: "idem-held-4" });
+    expect((await s.issuer.sign(m.id)).statusCode).toBe(200);
+    const abort = new AbortController();
+    await expect(a.c.mandates.awaitSigned(m, a.c.events.items(abort.signal), abort.signal)).resolves.toMatchObject({ status: "ACTIVE" });
+    abort.abort();
+    await a.c.events.signal();
+    const cursor = a.c.events.cursor();
+    expect((await s.issuer.revoke(m.id)).statusCode).toBe(200);
+    replace.set(`GET /pao/v1/mandates/${m.id}`, () => Response.json({ code: "MANDATE_NOT_FOUND", message: "m", retry: "after_human" }, { status: 404 }));
+    await a.c.events.signal();
+    expect(a.c.events.cursor()).not.toBe(cursor);
+    expect(a.journal.entries.filter((e) => e.kind === "mandate.vanished")).toEqual([
+      expect.objectContaining({ kind: "mandate.vanished", mandate: m.id, reason: "MANDATE_NOT_FOUND" }),
+    ]);
+    expect(a.c.mandates.held()).toEqual([]);
+    // лента идёт дальше: новый мандат подписывается и ожидание по ленте завершается
+    replace.delete(`GET /pao/v1/mandates/${m.id}`);
+    const m2 = await a.c.mandates.request({ ...INTENT, subject: "второй" }, { idempotencyKey: "idem-held-5" });
+    expect((await s.issuer.sign(m2.id)).statusCode).toBe(200);
+    const abort2 = new AbortController();
+    const waiting = a.c.mandates.awaitSigned(m2, a.c.events.items(abort2.signal), abort2.signal);
+    await a.c.events.signal();
+    await expect(waiting).resolves.toMatchObject({ id: m2.id, status: "ACTIVE" });
+    abort2.abort();
+  });
+
   it("каталог состояния совпадает с каталогом ключей или вложен (в обе стороны) — отказ сборки", async () => {
     const d = tmp("ev-same-");
     const pao = { baseUrl: "http://127.0.0.1:1", agentCode: AGENT };

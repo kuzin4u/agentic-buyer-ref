@@ -15,7 +15,7 @@ describe("зависимость от agentic-core", () => {
     const entry = lock.packages["node_modules/@kuzin4u/agentic-core"];
     expect(entry.version).toBe("0.7.0");
     expect(lock.packages[""].dependencies["@kuzin4u/agentic-core"]).toBe(pkg.dependencies["@kuzin4u/agentic-core"]);
-    // 60fc4ce… — коммит тега v0.7.0 (лёгкий тег). Копия ядра одна: зависимость стенда v0.4.0 (#v0.5.0)
+    // 60fc4ce… — коммит тега v0.7.0 (лёгкий тег). Копия ядра одна: зависимость стенда v0.5.0 (#v0.5.0)
     // npm сводит к ней же — стенд в тестах работает на core v0.7.0: основной вход ядра (подпись, проверка запросов,
     // хранилища, SQL-миграции) в v0.5.0 → v0.7.0 не менялся (CHANGELOG ядра), из /pao стенд во время работы ничего не
     // использует; dist стенда собран против типов v0.5.0 — остаточный риск, ловят С0 и этот тест (Р33, К2а).
@@ -24,18 +24,18 @@ describe("зависимость от agentic-core", () => {
     );
   });
 
-  it("стенд Платформы для С0 — dev-зависимость по git+https с тегом v0.4.0 (Р24, PS-12; К2а, Р33 п. 9)", () => {
+  it("стенд Платформы для С0 — dev-зависимость по git+https с тегом v0.5.0 (Р24, PS-12; К2а, Р33 п. 9; К1.2, Р34 п. 10)", () => {
     const pkg = JSON.parse(readFileSync("package.json", "utf8"));
     expect(pkg.devDependencies["agentic-ps-platform"]).toBe(
-      "git+https://github.com/kuzin4u/agentic-ps-platform.git#v0.4.0",
+      "git+https://github.com/kuzin4u/agentic-ps-platform.git#v0.5.0",
     );
     expect(pkg.dependencies["agentic-ps-platform"]).toBeUndefined();
     const lock = JSON.parse(readFileSync("package-lock.json", "utf8"));
     const entry = lock.packages["node_modules/agentic-ps-platform"];
-    expect(entry).toMatchObject({ version: "0.4.0", dev: true });
-    // 4948c74… — коммит тега v0.4.0 (слияние PR #30 платформы, источник копии ПАО 1.4.0). npm install переписывает адрес на git+ssh — в lock только git+https.
+    expect(entry).toMatchObject({ version: "0.5.0", dev: true });
+    // 96ced44… — коммит тега v0.5.0 (PS-08: лента и подписка, передача #28; ПАО 1.4.0 прежний, РП39 п. 8). npm install переписывает адрес на git+ssh — в lock только git+https.
     expect(entry.resolved).toBe(
-      "git+https://github.com/kuzin4u/agentic-ps-platform.git#4948c74b295bb5a8e22ca19c3e706e85570769b7",
+      "git+https://github.com/kuzin4u/agentic-ps-platform.git#96ced448d1d324f8f521abd1f8c243f0ae312fc3",
     );
     expect(readFileSync("package-lock.json", "utf8")).not.toMatch(/git\+ssh:|"github:/);
     expect(Object.keys(lock.packages).filter((k) => k.endsWith("node_modules/@kuzin4u/agentic-core"))).toEqual([

@@ -4,7 +4,7 @@
 // verify — остаток и as_of задаёт тест. Остаток здесь не вычисляется из операций:
 // его ведёт платформа (инвариант 6), тест лишь назначает значение. Порядок отзыва задаёт «Платформа» (ПАО 1.4.0, РП37):
 // поле запроса не берётся, у CART — как у родителя (если родитель здесь есть). Стенд Платформы этого пока не проверяет:
-// стенд v0.4.0 (ПАО 1.4.0, К2а) мандаты уже отдаёт; переход этих тестов на createStand — STATUS «Открыто».
+// стенд v0.5.0 (ПАО 1.4.0; К2а, К1.2 AG-06) мандаты уже отдаёт; переход этих тестов на createStand — STATUS «Открыто».
 import type * as Pao from "@kuzin4u/agentic-core/pao";
 import type { PaoStubOptions } from "@kuzin4u/agentic-core/pao";
 import type { MandateDraft, Money, PlatformEvent, PlatformEventType } from "../../src/shared/domain.js";

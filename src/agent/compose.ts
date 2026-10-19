@@ -55,8 +55,8 @@ export interface AgentCore {
    *  повторить. После допуска — подписка на push, если задан `pushUrl` (Р34 п. 8): адрес отвергнут (400) —
    *  events.subscription_rejected; прочий отказ Платформы после повторов адаптера (503, UNKNOWN) —
    *  events.subscription_failed; в обоих случаях старт успешен, работа по ленте, повтор подписки — при следующем старте
-   *  (дополнение Р34 п. 1). Коды остановки агента и остановленная подпись на подписке — отказ старта без AgentNotReady
-   *  (отчёт уже ready: true; STATUS «Открыто», ревью К2.2 № 4). */
+   *  (дополнение Р34 п. 1) — events.subscription: warn. Коды остановки агента и остановленная подпись на подписке —
+   *  events.subscription: fail, AgentNotReady (ревью К2.2 № 4, дополнение 2 п. 5). */
   start(): Promise<AgentSelf>;
   /** Повторная сверка с реестром (Р27): снимает приостановку подписи при ACTIVE и BUYER; не ACTIVE или не BUYER — остановка;
    *  ответ снова не по схеме или сбой — приостановка остаётся. Расписание сверок — за вызывающим (AG-12). */
@@ -149,16 +149,18 @@ export function createAgentCore(o: AgentCoreOptions): AgentCore {
   // Подписка (Р34 п. 8, дополнение п. 2): Idempotency-Key — от (код агента, адрес, типы, идентификатор запуска).
   // Идентификатор запуска — случайный при старте и не хранится: повторы внутри запуска идут тем же ключом (адаптер,
   // инвариант 9), а новый запуск — новым ключом, поэтому A → B → A не вернёт сохранённый ответ первого PUT.
-  const subscribe = async (url: string, run: string): Promise<void> => {
+  const subscribe = async (url: string, run: string): Promise<CheckResult> => {
     const types = [...PLATFORM_EVENT_TYPES];
     const idempotencyKey = `sub-${createHash("sha256").update(`${o.pao.agentCode}\n${url}\n${types.join(",")}\n${run}`).digest("hex").slice(0, 32)}`;
     try {
       await platform.subscribe(url, types, { idempotencyKey });
+      return OK;
     } catch (e) {
       // остановка агента (AGENT_SUSPENDED и др.) и дефекты — наружу; адрес и тело в журнал не идут
       if (!(e instanceof PlatformFailure) || AGENT_STOP_CODES.has(e.code)) throw e;
       const kind = e.code === "REQUEST_INVALID" ? "events.subscription_rejected" : "events.subscription_failed";
       journal.record({ at: at(), kind, reason: e.code });
+      return { status: "warn", code: e.code };
     }
   };
   // Сверка с реестром одна на всех (Р27): событие agent.* и вызов recheck() снаружи ждут одну и ту же.
@@ -191,6 +193,15 @@ export function createAgentCore(o: AgentCoreOptions): AgentCore {
     start: async () => {
       lastReport = null;
       const results: Partial<Record<SelfCheckName, CheckResult>> = { "config.params": OK, "core.pao": OK };
+      // Отказ проверки: код — в отчёт; по действию кода в реестре stop — подписант остановлен (дополнение 2 п. 2; мог уже
+      // остановиться сам — SIGNATURE_INVALID, SPEC §7а); отчёт — в журнал; наружу — AgentNotReady с исходной ошибкой.
+      const fail = (check: SelfCheckName, code: DiagCode, cause: unknown): AgentNotReady => {
+        results[check] = { status: "fail", code };
+        if (stopsAgent(DIAG, code)) signing.stop(code);
+        lastReport = selfCheckReport(results, now());
+        recordReport(journal, lastReport);
+        return new AgentNotReady(lastReport, { cause });
+      };
       let connected = false;
       let self: AgentSelf;
       try {
@@ -214,17 +225,22 @@ export function createAgentCore(o: AgentCoreOptions): AgentCore {
         const check = failedCheck(code);
         // выбор ключа идёт после загрузки хранилища: хранилище проверено (ревью К2.2 № 1)
         if (check === "keys.active") results["keys.store"] = OK;
-        results[check] = { status: "fail", code };
-        // дополнение 2 п. 2: по действию кода в реестре; подписант мог уже остановиться сам (SIGNATURE_INVALID — SPEC §7а)
-        if (stopsAgent(DIAG, code)) signing.stop(code);
-        lastReport = selfCheckReport(results, now());
-        recordReport(journal, lastReport);
-        throw new AgentNotReady(lastReport, { cause: e });
+        throw fail(check, code, e);
       }
       results["platform.admission"] = OK;
+      // Подписка — часть старта (ревью К2.2 № 4): код остановки агента или остановленная подпись — отказ с отчётом, а не
+      // ready: true с голой ошибкой; прочий отказ — предупреждение, старт успешен (дополнение Р34 п. 1).
+      if (o.pushUrl !== undefined) {
+        try {
+          results["events.subscription"] = await subscribe(o.pushUrl, randomUUID());
+        } catch (e) {
+          const code = startFailureCode(e);
+          if (code === null) throw e;
+          throw fail("events.subscription", code, e);
+        }
+      }
       lastReport = selfCheckReport(results, now());
       recordReport(journal, lastReport);
-      if (o.pushUrl !== undefined) await subscribe(o.pushUrl, randomUUID());
       return self;
     },
     recheck,

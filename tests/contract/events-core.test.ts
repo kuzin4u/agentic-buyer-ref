@@ -6,10 +6,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createStand, type Stand } from "agentic-ps-platform/stand";
 import { afterEach, describe, expect, it } from "vitest";
-import { createAgentCore, type AgentCore } from "../../src/agent/compose.js";
+import { checkSelfCheckReport } from "@kuzin4u/agentic-core/diag";
+import { DIAG, createAgentCore, type AgentCore } from "../../src/agent/compose.js";
+import { AgentNotReady } from "../../src/agent/declines/index.js";
 import { CURSOR_FILE } from "../../src/agent/events/index.js";
 import { MemoryJournal } from "../../src/agent/journal/index.js";
-import { generateKey } from "../../src/agent/signer/index.js";
+import { SignerStopped, generateKey } from "../../src/agent/signer/index.js";
 import { INTENT } from "../support/consents.js";
 import { AGENT } from "../support/pao-stand.js";
 
@@ -138,6 +140,10 @@ describe("ядро и события на стенде v0.5.0 (Р34)", { timeout
     const a = core("https://agent.example.invalid/pao/events");
     await expect(a.c.start()).resolves.toMatchObject({ status: "ACTIVE" });
     expect(a.journal.entries).toContainEqual(expect.objectContaining({ kind: "events.subscription_rejected", reason: "REQUEST_INVALID" }));
+    // дополнение 2 к Р36 п. 5: отказ адреса — предупреждение в отчёте, готовность не снята
+    expect(checkSelfCheckReport(a.c.selfCheck()!, DIAG)).toEqual([]);
+    expect(a.c.selfCheck()).toMatchObject({ ready: true });
+    expect(a.c.selfCheck()!.checks.at(-1)).toEqual({ check: "events.subscription", status: "warn", code: "REQUEST_INVALID" });
     await a.c.events.signal();
     expect(a.c.events.cursor()).toBeNull();
   });
@@ -244,9 +250,61 @@ describe("ядро и события на стенде v0.5.0 (Р34)", { timeout
     await expect(a.c.start()).resolves.toMatchObject({ status: "ACTIVE" });
     const failed = a.journal.entries.filter((e) => e.kind === "events.subscription_failed");
     expect(failed).toEqual([{ at: expect.any(String), kind: "events.subscription_failed", reason: code }]);
+    // отчёт самопроверки: подписка — предупреждение, готовность не снята (дополнение 2 к Р36 п. 5)
+    expect(checkSelfCheckReport(a.c.selfCheck()!, DIAG)).toEqual([]);
+    expect(a.c.selfCheck()).toMatchObject({ ready: true });
+    expect(a.c.selfCheck()!.checks.at(-1)).toEqual({ check: "events.subscription", status: "warn", code });
     expect(JSON.stringify(a.journal.entries)).not.toContain(pushUrl);
     await a.c.events.signal();
     expect(a.c.events.cursor()).toBeNull();
+  });
+
+  // Дополнение 2 к Р36 п. 5 (ревью К2.2 № 4): код остановки агента на подписке после допуска — AgentNotReady с отчётом,
+  // selfCheck() не показывает ready: true; подписант остановлен.
+  it("подписка: 403 AGENT_SUSPENDED после допуска — AgentNotReady, events.subscription: fail, ready: false, подпись остановлена", async () => {
+    const { core, replace, pushUrl } = await setup();
+    replace.set("PUT /pao/v1/subscription", () =>
+      Response.json({ code: "AGENT_SUSPENDED", message: "x", norm: "x", retry: "never" }, { status: 403 }),
+    );
+    const a = core(pushUrl);
+    const err = await a.c.start().catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(AgentNotReady);
+    const report = (err as AgentNotReady).report;
+    expect(checkSelfCheckReport(report, DIAG)).toEqual([]);
+    expect(report.ready).toBe(false);
+    expect(report.checks.slice(-2)).toEqual([
+      { check: "platform.admission", status: "ok" },
+      { check: "events.subscription", status: "fail", code: "AGENT_SUSPENDED" },
+    ]);
+    expect((err as AgentNotReady).cause).toMatchObject({ code: "AGENT_SUSPENDED" });
+    expect(a.c.selfCheck()).toBe(report);
+    await expect(a.c.platform.agentSelf()).rejects.toThrow(SignerStopped);
+    expect(JSON.stringify(a.journal.entries)).not.toContain(pushUrl);
+  });
+
+  it("подписка: остановленная подпись (AGENT_KEY_REVOKED, запасного ключа нет — NO_ACTIVE_KEY) — events.subscription: fail, AgentNotReady", async () => {
+    const { core, replace, pushUrl } = await setup();
+    replace.set("PUT /pao/v1/subscription", () =>
+      Response.json({ code: "AGENT_KEY_REVOKED", message: "x", norm: "x", retry: "new_key" }, { status: 401 }),
+    );
+    const a = core(pushUrl);
+    const err = await a.c.start().catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(AgentNotReady);
+    const report = (err as AgentNotReady).report;
+    expect(checkSelfCheckReport(report, DIAG)).toEqual([]);
+    expect(report.ready).toBe(false);
+    expect(report.checks.at(-1)).toEqual({ check: "events.subscription", status: "fail", code: "NO_ACTIVE_KEY" });
+    expect((err as AgentNotReady).cause).toBeInstanceOf(SignerStopped);
+    expect(a.c.selfCheck()).toBe(report);
+  });
+
+  it("подписка прошла — events.subscription: ok, ready: true", async () => {
+    const { core, pushUrl } = await setup();
+    const a = core(pushUrl);
+    await a.c.start();
+    expect(checkSelfCheckReport(a.c.selfCheck()!, DIAG)).toEqual([]);
+    expect(a.c.selfCheck()).toMatchObject({ ready: true });
+    expect(a.c.selfCheck()!.checks.at(-1)).toEqual({ check: "events.subscription", status: "ok" });
   });
 
   it("каталог состояния совпадает с каталогом ключей или вложен (в обе стороны) — отказ сборки", async () => {

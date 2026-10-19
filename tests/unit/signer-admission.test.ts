@@ -4,8 +4,9 @@ import { chmodSync, copyFileSync, existsSync, mkdirSync, rmSync, writeFileSync }
 import { join } from "node:path";
 import { SignerKeyRejected, SignerStopped, SignerSuspended, generateKey, listKeys } from "../../src/agent/signer/index.js";
 import { markKey, readMeta, writeMeta } from "../../src/agent/signer/keystore.js";
+import { FAILURE_RULES } from "../../src/agent/declines/index.js";
 import { PlatformFailure } from "../../src/shared/domain.js";
-import { CREDENTIALS, DRAFT, coreOn, startCause, lastEntry } from "../support/core.js";
+import { CREDENTIALS, DRAFT, coreOn, lastEntry, startCause } from "../support/core.js";
 import { PaoStand } from "../support/pao-stand.js";
 
 const DAY = 86_400_000;
@@ -122,6 +123,22 @@ describe("допуск: SPEC §7а и состояние ключей между
     stand.revoke(stand.descriptors[1]!.kid);
     const { core } = await coreOn(stand);
     await expect(startCause(core.start())).rejects.toMatchObject({ reason: "NO_ACTIVE_KEY" });
+    expect(stand.calls("GET /pao/v1/agent").map((c) => c.status)).toEqual([401, 401]);
+  });
+
+  // Дополнение 2 к Р36 п. 4 (в): остановка связки ключей на PlatformFailure(AGENT_KEY_REVOKED) при допуске (ring.ts, #halt)
+  // недостижима — адаптер на каждом AGENT_KEY_REVOKED вызывает keyRevoked, второй отказ даёт NO_ACTIVE_KEY. Условие —
+  // maxRetries ≥ 1 (иначе адаптер вернёт отказ раньше keyRevoked и связка остановится с причиной AGENT_KEY_REVOKED,
+  // хотя действие реестра — new_key). Путь станет достижим (смена ключей) — привести к правилу «по действию реестра».
+  it("(в) все ключи отозваны — остановка всегда NO_ACTIVE_KEY, причины AGENT_KEY_REVOKED у остановки не бывает", async () => {
+    expect(FAILURE_RULES.AGENT_KEY_REVOKED.maxRetries).toBeGreaterThanOrEqual(1);
+    stand = new PaoStand({ keys: 3 });
+    for (const d of stand.descriptors) stand.revoke(d.kid);
+    const { core, journal } = await coreOn(stand);
+    await expect(startCause(core.start())).rejects.toMatchObject({ reason: "NO_ACTIVE_KEY", cause: expect.objectContaining({ code: "AGENT_KEY_REVOKED" }) });
+    expect(journal.entries.filter((e) => e.kind === "agent.stopped").map((e) => e.reason)).toEqual(["NO_ACTIVE_KEY"]);
+    expect(core.selfCheck()!.checks.filter((c) => c.status === "fail")).toEqual([{ check: "keys.active", status: "fail", code: "NO_ACTIVE_KEY" }]);
+    // путь «переход и второй отказ», а не немедленный NO_ACTIVE_KEY
     expect(stand.calls("GET /pao/v1/agent").map((c) => c.status)).toEqual([401, 401]);
   });
 

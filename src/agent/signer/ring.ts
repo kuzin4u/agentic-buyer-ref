@@ -159,6 +159,8 @@ export class KeyRing {
         } catch (e) {
           if (!(e instanceof PlatformFailure) || this.#stopped !== null) throw e;
           this.#record("admission.failed", this.#currentKid, e.code);
+          // Недостижимо при maxRetries ≥ 1 (дополнение 2 к Р36 п. 4 (в), тест): адаптер на каждом AGENT_KEY_REVOKED вызывает
+          // keyRevoked, второй отказ — NO_ACTIVE_KEY. Станет достижимо (смена ключей) — по действию реестра (new_key).
           if (e.code === "AGENT_KEY_REVOKED") this.#halt("AGENT_KEY_REVOKED", e);
           if (e.code === "SIGNATURE_INVALID") {
             if (attempt > signatureRetries) this.#halt("SIGNATURE_INVALID", e);

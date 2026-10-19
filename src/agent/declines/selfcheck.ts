@@ -1,5 +1,6 @@
 // Отчёт самопроверки при старте (Р36 п. 6, дополнение 2): формат К17 п. 8 ядра; «готов» — нет ни одного fail.
-// Проверки — в порядке старта: без сети (параметры, ПАО ядра, ключи, курсор), затем Платформа (версия, допуск).
+// Проверки — в порядке старта: без сети (параметры, ПАО ядра, ключи, курсор), затем Платформа (версия, допуск, подписка —
+// при адресе push, дополнение 2 п. 5).
 import { buildSelfCheckReport, diagAction, type DiagRegistry, type SelfCheckItem, type SelfCheckReport } from "@kuzin4u/agentic-core/diag";
 import type { DiagCode } from "../../shared/diag-codes.js";
 import { AGENT_VERSION } from "./registry.js";
@@ -14,6 +15,8 @@ export const SELF_CHECKS = [
   "events.cursor",
   "platform.protocol",
   "platform.admission",
+  // только при адресе push: отказ подписки — предупреждение, код остановки агента — отказ (ревью К2.2 № 4)
+  "events.subscription",
 ] as const;
 
 export type SelfCheckName = (typeof SELF_CHECKS)[number];

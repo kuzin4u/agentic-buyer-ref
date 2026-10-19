@@ -55,15 +55,6 @@ function belowMin(version: string): boolean {
   return a < x || (a === x && b < y);
 }
 
-/** Подписант для обращений без подписи (конфигурация): подпись ими не вызывается; вызов — дефект, а не обход. */
-const UNSIGNED = Object.freeze({
-  kid: "unsigned",
-  alg: "none",
-  sign(): Buffer {
-    throw new Error("обращение без подписи не подписывается");
-  },
-});
-
 /** Валюты Платформы ПС по ПАО 1.4.0 — допустимое множество, не источник валюты (Р29 п. 2). */
 export const PAO_CURRENCIES = ["RUB"] as const;
 
@@ -170,7 +161,8 @@ export class PaoPlatform implements PaymentPlatform {
   async checkProtocol(): Promise<ProtocolCheck> {
     let versions: string[] | undefined;
     try {
-      const r: unknown = await this.client({}, UNSIGNED).call("GET /.well-known/pao-configuration", {});
+      // Клиент без подписанта (ядро v0.9.0, Р37 п. 1): по типам он допускает только операции без подписи.
+      const r: unknown = await this.client({}).call("GET /.well-known/pao-configuration", {});
       // По схеме — только `versions` (string[]); прочие поля конфигурации агенту не нужны и игнорируются (ПАО §7):
       // алгоритм или ключ Платформы вне перечня не прячет явную версию ниже 1.4.0 (ревью К2.3 № 9).
       if (typeof r !== "object" || r === null || Array.isArray(r)) return this.unknownVersion("BAD_RESPONSE");
@@ -181,6 +173,9 @@ export class PaoPlatform implements PaymentPlatform {
       // Тело и сообщение исключения не переносятся (инвариант 1). Наружу — всё, что не ответ и не разбор: дефект агента
       // (например, вызов подписи) не маскируется под «адрес не отвечает» (ревью К2.3 № 4).
       if (e instanceof SyntaxError) return this.unknownVersion("BAD_RESPONSE");
+      // Отказ самого клиента — не «адрес не отвечает»: 3xx — ответ указывает на другой адрес, агент не стартует (Р37 п. 2);
+      // PAO_CLIENT_SIGNER_MISSING — дефект агента, не маскируется (ревью К0 № 1).
+      if (e instanceof PaoCallError && e.clientCode !== undefined) throw toFailure(e);
       if (e instanceof PaoCallError) return this.unknownVersion("NO_RESPONSE");
       throw e;
     }
@@ -212,14 +207,16 @@ export class PaoPlatform implements PaymentPlatform {
     return (this.o.now ?? (() => new Date()))().toISOString();
   }
 
-  /** Одно обращение без повторов клиента; тайм-аут — pao_request_timeout_ms. Retry-After и HTTP-статус ответа — в last. */
-  private client(last: { retryAfter?: number; status?: number }, signer: ReturnType<RequestSigning["current"]>): PaoClient {
+  /** Одно обращение без повторов клиента; тайм-аут — pao_request_timeout_ms. Retry-After и HTTP-статус ответа — в last.
+   *  Без подписанта — только операции без подписи (конфигурация); подписанная — PAO_CLIENT_SIGNER_MISSING до запроса.
+   *  Свой fetch получает init целиком, вместе с redirect: "manual" клиента (передача #34 п. 4). */
+  private client(last: { retryAfter?: number; status?: number }, signer?: ReturnType<RequestSigning["current"]>): PaoClient {
     const timeoutMs = this.o.params.pao_request_timeout_ms;
     const f = this.fetchImpl;
     return new PaoClient({
       baseUrl: this.o.baseUrl,
       agentCode: this.o.agentCode,
-      signer,
+      ...(signer && { signer }),
       maxAttempts: 1,
       fetch: async (url, init) => {
         const res = await f(url, { ...init, signal: AbortSignal.timeout(timeoutMs) });

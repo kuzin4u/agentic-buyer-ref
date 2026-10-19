@@ -6,7 +6,7 @@ import { relative, resolve } from "node:path";
 import { ConfigError, loadParams, type StandParams } from "../shared/config.js";
 import { PLATFORM_EVENT_TYPES, PlatformFailure, type AgentSelf } from "../shared/domain.js";
 import type { PaymentPlatform, PlatformCapabilities } from "./ports/payment-platform.js";
-import { PAO_DIAG, PaoPlatform, assertPaoVersion, type PaoPlatformOptions } from "./adapters/pao/index.js";
+import { PAO_CLIENT_DIAG, PAO_DIAG, PaoPlatform, assertPaoVersion, type PaoPlatformOptions } from "./adapters/pao/index.js";
 import { CATALOG_DIAG } from "./catalog/index.js";
 import { MemoryJournal, type Journal, type JournalEntry } from "./journal/index.js";
 import { MandateClient } from "./mandates/index.js";
@@ -27,8 +27,9 @@ import {
 } from "./declines/index.js";
 import type { DiagCode } from "../shared/diag-codes.js";
 
-/** Полный реестр кодов агента (Р36 п. 1): ПАО и каталог — записи ядра, свои — AGENT_DIAG; код в двух — ошибка сборки. */
-export const DIAG: DiagRegistry = mergeDiag(PAO_DIAG, CATALOG_DIAG, AGENT_DIAG);
+/** Полный реестр кодов агента (Р36 п. 1): ПАО, клиент ПАО (Р37 п. 1) и каталог — записи ядра, свои — AGENT_DIAG; код в
+ *  двух — ошибка сборки. */
+export const DIAG: DiagRegistry = mergeDiag(PAO_DIAG, PAO_CLIENT_DIAG, CATALOG_DIAG, AGENT_DIAG);
 
 export interface AgentCore {
   params: StandParams;
@@ -203,6 +204,9 @@ export function createAgentCore(o: AgentCoreOptions): AgentCore {
         return new AgentNotReady(lastReport, { cause });
       };
       let connected = false;
+      // идёт запрос конфигурации: её отказ (PlatformFailure: PAO_CLIENT_REDIRECT, PLATFORM_PROTOCOL_UNSUPPORTED) — проверка
+      // platform.protocol, а не допуск (Р37 п. 2); прочее (SignerStopped) — по failedCheck (ревью К0 № 3)
+      let protocolPending = false;
       let self: AgentSelf;
       try {
         self = await ring.start(async (admission) => {
@@ -213,7 +217,9 @@ export function createAgentCore(o: AgentCoreOptions): AgentCore {
             results["events.cursor"] = OK;
             // Р33 п. 10, шаг 1: до допуска и до любого обращения с мандатом. События версии пишет адаптер, остановку агента —
             // тоже он (порт подписи); отказ PLATFORM_PROTOCOL_UNSUPPORTED связка ключей пробрасывает как есть.
+            protocolPending = true;
             const p = await platform.checkProtocol();
+            protocolPending = false;
             results["platform.protocol"] = p.status === "confirmed" ? OK : { status: "warn", code: "PLATFORM_VERSION_UNKNOWN" };
             connected = true;
           }
@@ -222,7 +228,7 @@ export function createAgentCore(o: AgentCoreOptions): AgentCore {
       } catch (e) {
         const code = startFailureCode(e);
         if (code === null) throw e;
-        const check = failedCheck(code);
+        const check = protocolPending && e instanceof PlatformFailure ? "platform.protocol" : failedCheck(code);
         // выбор ключа идёт после загрузки хранилища: хранилище проверено (ревью К2.2 № 1)
         if (check === "keys.active") results["keys.store"] = OK;
         throw fail(check, code, e);

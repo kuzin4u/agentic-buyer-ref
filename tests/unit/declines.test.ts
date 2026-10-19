@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { readFileSync } from "node:fs";
-import { PAO_ERRORS } from "@kuzin4u/agentic-core/pao";
+import { PAO_CLIENT_CODES, PAO_ERRORS } from "@kuzin4u/agentic-core/pao";
 import { FAILURE_RULES, ruleForDeclineReason, ruleForFailure } from "../../src/agent/declines/index.js";
 import { EVENTS_CURSOR_INVALID } from "../../src/agent/events/index.js";
 
@@ -10,8 +10,8 @@ const AGENT_CODES = ["MANDATE_REVOCATION_ORDER_MISSING", "PLATFORM_PROTOCOL_UNSU
 const specRows = [...spec.matchAll(/^\| ([A-Z_]+) \| (\d{3}) \| (\w+) \|/gm)].map((m) => ({ code: m[1]!, http: Number(m[2]), retry: m[3]! }));
 
 describe("таблица отказов", () => {
-  it("коды ядра = коды ПАО 1.4.0 + коды агента вне ПАО (Р33) + UNKNOWN", () => {
-    expect(Object.keys(FAILURE_RULES).sort()).toEqual([...Object.keys(PAO_ERRORS), ...AGENT_CODES, "UNKNOWN"].sort());
+  it("коды ядра = коды ПАО 1.4.0 + коды агента вне ПАО (Р33) + коды клиента ПАО (Р37 п. 1) + UNKNOWN", () => {
+    expect(Object.keys(FAILURE_RULES).sort()).toEqual([...Object.keys(PAO_ERRORS), ...AGENT_CODES, ...PAO_CLIENT_CODES, "UNKNOWN"].sort());
   });
 
   it("Р33 п. 4: MANDATE_REVOCATION_ORDER_MISSING — стоп без повтора, событие в журнал; строка в SPEC §7а", () => {

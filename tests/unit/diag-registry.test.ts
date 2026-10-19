@@ -5,14 +5,14 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { CATALOG_DIAG, CATALOG_DIAG_CODES } from "@kuzin4u/agentic-core/catalog";
 import { checkDiagRegistry, diagAction } from "@kuzin4u/agentic-core/diag";
-import { PAO_DIAG, PAO_ERRORS, PAO_RETRY_ACTION } from "@kuzin4u/agentic-core/pao";
+import { PAO_CLIENT_CODES, PAO_CLIENT_DIAG, PAO_DIAG, PAO_ERRORS, PAO_RETRY_ACTION } from "@kuzin4u/agentic-core/pao";
 import { DIAG } from "../../src/agent/compose.js";
 import { AGENT_DIAG, DECLINE_REASONS, FAILURE_RULES, mergeDiag, ruleForDeclineReason, type DiagAction, type ReasonAction } from "../../src/agent/declines/index.js";
 import { REVOCATION_ORDER_MISSING_TEXT } from "../../src/agent/mandates/index.js";
 import { AGENT_DIAG_CODES } from "../../src/shared/diag-codes.js";
 
 const PAO_CODES = Object.keys(PAO_ERRORS);
-const ALL_CODES = [...PAO_CODES, ...CATALOG_DIAG_CODES, ...AGENT_DIAG_CODES];
+const ALL_CODES = [...PAO_CODES, ...PAO_CLIENT_CODES, ...CATALOG_DIAG_CODES, ...AGENT_DIAG_CODES];
 
 function srcFiles(dir: string): string[] {
   return readdirSync(dir, { withFileTypes: true }).flatMap((e) => (e.isDirectory() ? srcFiles(join(dir, e.name)) : [join(dir, e.name)]));
@@ -24,13 +24,16 @@ describe("реестр кодов агента (Р36)", () => {
     expect(new Set(AGENT_DIAG_CODES).size).toBe(AGENT_DIAG_CODES.length);
   });
 
-  it("записи ядра не повторяются; полный реестр — ПАО, каталог и агент, полон", () => {
+  it("записи ядра не повторяются; полный реестр — ПАО, клиент ПАО (Р37 п. 1), каталог и агент, полон", () => {
     const own = Object.keys(AGENT_DIAG);
-    expect(own.filter((c) => Object.hasOwn(PAO_DIAG, c) || Object.hasOwn(CATALOG_DIAG, c))).toEqual([]);
+    expect(own.filter((c) => Object.hasOwn(PAO_DIAG, c) || Object.hasOwn(PAO_CLIENT_DIAG, c) || Object.hasOwn(CATALOG_DIAG, c))).toEqual([]);
     expect(checkDiagRegistry(ALL_CODES, DIAG, { langs: ["ru"] })).toEqual([]);
     expect(Object.keys(DIAG)).toHaveLength(ALL_CODES.length);
     // текст ПАО — из ядра, а не своя копия
     expect(DIAG.MANDATE_NOT_FOUND).toBe(PAO_DIAG.MANDATE_NOT_FOUND);
+    expect(DIAG.PAO_CLIENT_REDIRECT).toBe(PAO_CLIENT_DIAG.PAO_CLIENT_REDIRECT);
+    // передача #34 п. 3: оба реестра ядра полны по своим перечням
+    expect(checkDiagRegistry([...PAO_CODES, ...PAO_CLIENT_CODES], { ...PAO_DIAG, ...PAO_CLIENT_DIAG })).toEqual([]);
   });
 
   it("код в двух реестрах — ошибка сборки", () => {

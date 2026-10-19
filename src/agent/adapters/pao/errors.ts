@@ -34,6 +34,13 @@ const safeCode = (v: unknown): string | null => (typeof v === "string" && /^[A-Z
 export function toFailure(e: unknown, idempotencyKey: string | null = null): PlatformFailure {
   if (e instanceof PlatformFailure) return e;
   if (e instanceof PaoCallError) {
+    // Отказ самого клиента (К18, Р37 п. 1): код — из clientCode, не из тела; запрос на другой адрес или в сеть не уходил.
+    if (e.clientCode !== undefined) {
+      const key = e.idempotencyKey ?? idempotencyKey;
+      // код клиента вне словаря (dist ядра новее типов) — UNKNOWN, а не TypeError (инвариант 4; ревью К0 № 6)
+      if (!Object.hasOwn(FAILURE_RULES, e.clientCode)) return new PlatformFailure("UNKNOWN", "never", null, e.status, key, "код клиента ПАО вне словаря");
+      return new PlatformFailure(e.clientCode, FAILURE_RULES[e.clientCode].retry, null, e.status, key);
+    }
     const raw = safeCode(e.body?.code);
     const code = raw !== null && Object.hasOwn(CODES, raw) ? CODES[raw as ErrorCode] : undefined;
     const key = e.idempotencyKey ?? idempotencyKey;

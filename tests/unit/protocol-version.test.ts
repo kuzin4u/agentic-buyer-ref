@@ -3,11 +3,15 @@
 // PLATFORM_VERSION_UNKNOWN в журнал и работа дальше; после подтверждения ответ без порядка отзыва —
 // MANDATE_REVOCATION_ORDER_MISSING на этом мандате.
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { PaoCallError, PaoClient } from "@kuzin4u/agentic-core/pao";
 import { PAO_MIN_PLATFORM_VERSION, highestPaoVersion, protocolUnsupportedText } from "../../src/agent/adapters/pao/adapter.js";
 import { mandateDraftToPao } from "../../src/agent/adapters/pao/map.js";
+import { AgentNotReady } from "../../src/agent/declines/index.js";
 import { MandateRefused } from "../../src/agent/mandates/index.js";
 import { SignerStopped } from "../../src/agent/signer/index.js";
 import { loadParams } from "../../src/shared/config.js";
@@ -330,3 +334,127 @@ describe("шаг 2 — версия не определена: по первом
 function noOrderMandate(id: string) {
   return { ...mandateDraftToPao(INTENT, new Set(["RUB"])), id, agent_code: AGENT, status: "ACTIVE", created_at: "2026-10-01T00:00:00Z" };
 }
+
+// Р37 п. 1–2 (ядро v0.9.0, передача #34): клиент ПАО перенаправлениям не следует. Свой fetch адаптера передаёт init
+// целиком, вместе с redirect: "manual" — иначе fetch прошёл бы на второй адрес раньше, чем клиент откажет.
+describe("перенаправления 3xx (Р37 п. 1–2)", () => {
+  /** Второй адрес (куда указывает Location) считает обращения; перенаправляющий адрес отвечает 302 на него. */
+  async function redirector() {
+    const hits = { redirector: 0, foreign: 0 };
+    const foreign = createServer((_, res) => {
+      hits.foreign++;
+      res.writeHead(200, { "content-type": "application/json" }).end('{"versions":["1.4.0"]}');
+    });
+    const from = createServer((_, res) => {
+      hits.redirector++;
+      res.writeHead(302, { location: `http://127.0.0.1:${(foreign.address() as AddressInfo).port}/` }).end();
+    });
+    await Promise.all([foreign, from].map((srv) => new Promise<void>((ok) => srv.listen(0, "127.0.0.1", ok))));
+    const url = `http://127.0.0.1:${(from.address() as AddressInfo).port}/`;
+    const close = () => Promise.all([foreign, from].map((srv) => new Promise((ok) => srv.close(ok))));
+    return { hits, url, close };
+  }
+
+  it("3xx у конфигурации — platform.protocol: fail PAO_CLIENT_REDIRECT, агент не стартует; на второй адрес ничего не ушло; подписант не остановлен — старт повторяется", async () => {
+    const r = await redirector();
+    try {
+      const consents: Consents = new Consents(() => s.clock);
+      const s: PaoStand = (stand = new PaoStand({ handlers: consents.handlers() }));
+      let redirect = true;
+      const fetchImpl: typeof fetch = (url, init) =>
+        redirect && String(url).endsWith(CONFIG.slice(4)) ? fetch(r.url, init) : fetch(url, init);
+      const { core, journal } = await coreOn(s, { fetch: fetchImpl });
+      const err = await core.start().catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(AgentNotReady);
+      const report = (err as AgentNotReady).report;
+      expect(report.checks.filter((c) => c.status === "fail")).toEqual([{ check: "platform.protocol", status: "fail", code: "PAO_CLIENT_REDIRECT" }]);
+      expect((err as AgentNotReady).cause).toMatchObject({ code: "PAO_CLIENT_REDIRECT", retry: "after_fix", httpStatus: 302 });
+      expect(r.hits).toEqual({ redirector: 1, foreign: 0 });
+      expect(s.stub.calls).toEqual([]);
+      // журнал — отказ внутри допуска (нюанс Р37: запись общая для ring.start, ключ не виноват) и отчёт; больше ничего
+      expect(journal.entries.filter((e) => e.kind !== "agent.selfcheck").map((e) => [e.kind, e.reason])).toEqual([
+        ["key.loaded", undefined],
+        ["events.cursor_initial", undefined],
+        ["admission.failed", "PAO_CLIENT_REDIRECT"],
+      ]);
+      // адрес исправлен — тот же агент стартует (after_fix, Р36 доп. 2 п. 2)
+      redirect = false;
+      await core.start();
+      expect(core.selfCheck()?.ready).toBe(true);
+      expect(s.stub.calls.map((c) => [c.op, c.status])).toEqual([[CONFIG, 200], ["GET /pao/v1/agent", 200]]);
+      expect(s.stub.violations).toEqual([]);
+    } finally {
+      await r.close();
+    }
+  });
+
+  it("3xx у подписанного метода — отказ PAO_CLIENT_REDIRECT без повтора; на второй адрес ничего не ушло; агент работает дальше", async () => {
+    const r = await redirector();
+    try {
+      const consents: Consents = new Consents(() => s.clock);
+      const s: PaoStand = (stand = new PaoStand({ handlers: consents.handlers() }));
+      let redirect = false;
+      const fetchImpl: typeof fetch = (url, init) =>
+        redirect && String(url).endsWith("/pao/v1/agent") ? fetch(r.url, init) : fetch(url, init);
+      const { core, journal } = await coreOn(s, { fetch: fetchImpl });
+      await core.start();
+      redirect = true;
+      const err = await core.platform.agentSelf().catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(PlatformFailure);
+      expect(err).toMatchObject({ code: "PAO_CLIENT_REDIRECT", retry: "after_fix", httpStatus: 302 });
+      expect(r.hits).toEqual({ redirector: 1, foreign: 0 });
+      expect(journal.entries.filter((e) => e.kind === "agent.stopped")).toEqual([]);
+      redirect = false;
+      await expect(core.platform.agentSelf()).resolves.toMatchObject({ status: "ACTIVE" });
+      // перенаправленный запрос до заглушки не дошёл: допуск и одно чтение после возврата адреса
+      expect(s.stub.calls.map((c) => [c.op, c.status])).toEqual([[CONFIG, 200], ["GET /pao/v1/agent", 200], ["GET /pao/v1/agent", 200]]);
+      expect(s.stub.violations).toEqual([]);
+    } finally {
+      await r.close();
+    }
+  });
+
+  it("3xx у изменяющего метода — отказ с прежним Idempotency-Key, без второго запроса; после возврата адреса — тот же ключ (ревью К0 № 4)", async () => {
+    const r = await redirector();
+    try {
+      const consents: Consents = new Consents(() => s.clock);
+      const s: PaoStand = (stand = new PaoStand({ handlers: consents.handlers() }));
+      let redirect = false;
+      const fetchImpl: typeof fetch = (url, init) =>
+        redirect && String(url).endsWith("/pao/v1/mandates") ? fetch(r.url, init) : fetch(url, init);
+      const { core } = await coreOn(s, { fetch: fetchImpl });
+      await core.start();
+      redirect = true;
+      const err = await core.platform.requestMandate(INTENT, { idempotencyKey: "idem_m_redirect" }).catch((e: unknown) => e);
+      expect(err).toMatchObject({ code: "PAO_CLIENT_REDIRECT", retry: "after_fix", httpStatus: 302, idempotencyKey: "idem_m_redirect" });
+      expect(r.hits).toEqual({ redirector: 1, foreign: 0 });
+      redirect = false;
+      await expect(core.platform.requestMandate(INTENT, { idempotencyKey: "idem_m_redirect" })).resolves.toMatchObject({ status: "PENDING_SIGNATURE" });
+      const posts = s.stub.calls.filter((c) => c.op === "POST /pao/v1/mandates");
+      expect(posts.map((c) => [c.status, c.idempotencyKey])).toEqual([[201, "idem_m_redirect"]]);
+      expect(s.stub.violations).toEqual([]);
+    } finally {
+      await r.close();
+    }
+  });
+
+  it("PAO_CLIENT_SIGNER_MISSING на конфигурации — дефект агента: fail, а не «адрес не отвечает» (ревью К0 № 1)", async () => {
+    const consents: Consents = new Consents(() => s.clock);
+    const s: PaoStand = (stand = new PaoStand({ handlers: consents.handlers() }));
+    const { core, journal } = await coreOn(s);
+    const spy = vi
+      .spyOn(PaoClient.prototype, "call")
+      .mockRejectedValueOnce(new PaoCallError(0, undefined, 0, undefined, { clientCode: "PAO_CLIENT_SIGNER_MISSING" }));
+    try {
+      const err = await core.start().catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(AgentNotReady);
+      expect((err as AgentNotReady).report.checks.filter((c) => c.status === "fail")).toEqual([
+        { check: "platform.protocol", status: "fail", code: "PAO_CLIENT_SIGNER_MISSING" },
+      ]);
+      expect(journal.entries.filter((e) => e.kind === "platform.version_unknown")).toEqual([]);
+      expect(s.stub.calls).toEqual([]);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+});

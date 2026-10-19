@@ -75,6 +75,9 @@ export const FAILURE_RULES: Readonly<Record<FailureCode, DeclineRule>> = {
   MANDATE_REVOCATION_ORDER_MISSING: rule("STOP", "never", 0, false, true),
   // Р33 п. 10: Платформа ниже ПАО 1.4.0 — останавливается агент целиком (AGENT_STOP_CODES); не дефект агента.
   PLATFORM_PROTOCOL_UNSUPPORTED: rule("STOP", "never", 0, false, true),
+  // Р37 п. 1: отказы клиента ПАО ядра (after_fix ядра) — без повтора; агент не останавливается (не AGENT_STOP_CODES).
+  PAO_CLIENT_REDIRECT: rule("STOP", "after_fix", 0, false, true),
+  PAO_CLIENT_SIGNER_MISSING: rule("STOP", "after_fix", 0, true),
   // Неопознанный ответ платформы — не дефект агента, но остановка и событие в журнал (SPEC §7а).
   UNKNOWN: rule("STOP", "never", 0, false, true),
 };

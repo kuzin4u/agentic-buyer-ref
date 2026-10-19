@@ -1,7 +1,6 @@
 // Клиент мандатов на PaoStub через адаптер pao (AG-05 К2): Т2, Т3, Т3а; Р29 пп. 4–5.
 import { afterEach, describe, expect, it } from "vitest";
 import { MandateRefused, REVOCATION_ORDER_MISSING_TEXT, missingTerms } from "../../src/agent/mandates/index.js";
-import type { MemoryJournal } from "../../src/agent/journal/index.js";
 import type { MandateDraft } from "../../src/shared/domain.js";
 import { Consents, INTENT, RUB, event, feed } from "../support/consents.js";
 import { coreOn } from "../support/core.js";
@@ -18,9 +17,9 @@ async function setup(configuration?: StandOptions["configuration"]) {
   const consents: Consents = new Consents(() => s.clock);
   const s = new PaoStand({ handlers: consents.handlers(), ...(configuration && { configuration }) });
   stand = s;
-  const { core } = await coreOn(s);
+  const { core, journal } = await coreOn(s);
   await core.start();
-  return { core, consents, stand: s };
+  return { core, journal, consents, stand: s };
 }
 
 describe("проект мандата — A7 п. 2.2, Т3а", () => {
@@ -127,7 +126,7 @@ describe("клиент мандатов на PaoStub", () => {
   // Р33 п. 4: ответ с мандатом без порядка отзыва — свой код, журнал, текст человеку; покупки по мандату нет. Версия ПАО
   // Платформы подтверждена конфигурацией (Р33 п. 10); без подтверждения — PLATFORM_PROTOCOL_UNSUPPORTED (protocol-version).
   it("мандат без revocation_order — MANDATE_REVOCATION_ORDER_MISSING, событие в журнал, текст человеку", async () => {
-    const { core, consents, stand } = await setup({ versions: ["1.4.0"] });
+    const { core, journal, consents, stand } = await setup({ versions: ["1.4.0"] });
     consents.tamper = (m) => {
       const r = { ...m };
       delete r.revocation_order;
@@ -137,7 +136,7 @@ describe("клиент мандатов на PaoStub", () => {
     expect(err).toBeInstanceOf(MandateRefused);
     expect(err.reason).toBe("MANDATE_REVOCATION_ORDER_MISSING");
     expect(err.message).toContain(REVOCATION_ORDER_MISSING_TEXT);
-    expect((core.journal as MemoryJournal).entries.filter((e) => e.kind === "mandate.revocation_order_missing")).toEqual([
+    expect(journal.entries.filter((e) => e.kind === "mandate.revocation_order_missing")).toEqual([
       expect.objectContaining({ reason: "MANDATE_REVOCATION_ORDER_MISSING" }),
     ]);
     // ответ без поля схеме 1.4.0 не противоречит (поле необязательно) — отказ ядра, а не схемы
@@ -145,12 +144,12 @@ describe("клиент мандатов на PaoStub", () => {
   });
 
   it("GET после mandate.signed без revocation_order — тот же отказ, мандат не действует", async () => {
-    const { core, consents } = await setup();
+    const { core, journal, consents } = await setup();
     const m = await core.mandates.request(INTENT, { idempotencyKey: "idem_ro2" });
     const ev = consents.sign(m.id);
     delete consents.mandates.get(m.id)!.revocation_order;
     await expect(core.mandates.awaitSigned(m, feed(ev))).rejects.toMatchObject({ reason: "MANDATE_REVOCATION_ORDER_MISSING" });
-    expect((core.journal as MemoryJournal).entries.filter((e) => e.kind === "mandate.revocation_order_missing")).toHaveLength(1);
+    expect(journal.entries.filter((e) => e.kind === "mandate.revocation_order_missing")).toHaveLength(1);
   });
 
   // РП35: после 201 — статус; CART под отозванным или истёкшим INTENT приходит 201 со статусом REVOKED или EXPIRED.

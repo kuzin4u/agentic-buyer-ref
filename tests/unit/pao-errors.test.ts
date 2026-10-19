@@ -23,6 +23,16 @@ describe("отказ ПАО → отказ ядра", () => {
     expect(toFailure(new Error("сбой")).code).toBe("UNKNOWN");
   });
 
+  it("отказ клиента ПАО (clientCode, К18) — свой код, after_fix; тело не читается (Р37 п. 1)", () => {
+    const r = toFailure(new PaoCallError(302, undefined, 1, "idem_1", { clientCode: "PAO_CLIENT_REDIRECT" }));
+    expect([r.code, r.retry, r.platformCode, r.httpStatus, r.idempotencyKey]).toEqual(["PAO_CLIENT_REDIRECT", "after_fix", null, 302, "idem_1"]);
+    const s = toFailure(new PaoCallError(0, undefined, 0, undefined, { clientCode: "PAO_CLIENT_SIGNER_MISSING" }));
+    expect([s.code, s.retry]).toEqual(["PAO_CLIENT_SIGNER_MISSING", "after_fix"]);
+    // код клиента вне словаря (dist ядра новее типов) — UNKNOWN, never (ревью К0 № 6)
+    const u = toFailure(new PaoCallError(0, undefined, 0, undefined, { clientCode: "PAO_CLIENT_NEW" as "PAO_CLIENT_REDIRECT" }));
+    expect([u.code, u.retry]).toEqual(["UNKNOWN", "never"]);
+  });
+
   it("известный код с чужим HTTP-статусом — UNKNOWN, never", () => {
     const f = toFailure(new PaoCallError(500, { code: "UPSTREAM_UNAVAILABLE", message: "m", retry: "same_key" }, 1));
     expect([f.code, f.retry, f.platformCode]).toEqual(["UNKNOWN", "never", "UPSTREAM_UNAVAILABLE"]);

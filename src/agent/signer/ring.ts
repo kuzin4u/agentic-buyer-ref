@@ -300,7 +300,9 @@ export class KeyRing {
   #stop(reason: SignerStopReason, detail?: string): void {
     if (this.#stopped !== null) return;
     this.#stopped = reason;
-    this.#record("agent.stopped", undefined, reason, detail);
+    // штатное закрытие — не код реестра (Р36 (в)): своя запись без причины (Р37 п. 3)
+    if (reason === "CLOSED") this.#record("agent.closed");
+    else this.#record("agent.stopped", undefined, reason, detail);
   }
 
   /** Завершение: подпись и запись в хранилище останавливаются (CLOSED), затем каталог освобождается. */
@@ -489,7 +491,7 @@ export class KeyRing {
     throw new SignerStopped(reason, cause === undefined ? undefined : { cause });
   }
 
-  #record(kind: JournalKind, kid?: string, reason?: SignerStopReason, detail?: string): void {
+  #record(kind: JournalKind, kid?: string, reason?: DiagCode, detail?: string): void {
     this.#o.journal.record({ at: this.#now().toISOString(), kind, ...(kid && { kid }), ...(reason && { reason }), ...(detail && { detail }) });
   }
 }

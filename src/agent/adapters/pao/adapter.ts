@@ -13,12 +13,14 @@ import {
   type PaoOperations,
 } from "@kuzin4u/agentic-core/pao";
 import { PAO_RETRY_AFTER_MAX_SEC, type StandParams } from "../../../shared/config.js";
-import { PlatformFailure, type AgentSelf, type MandateRef, type PlatformEventType } from "../../../shared/domain.js";
+import { PlatformFailure, type AgentSelf, type FailureCode, type MandateRef, type PlatformEventType } from "../../../shared/domain.js";
 import type { PaymentPlatform, PlatformCapabilities, ProtocolCheck, Mutation } from "../../ports/payment-platform.js";
 import type { RequestSigning } from "../../ports/request-signing.js";
 import { AGENT_STOP_CODES, ruleForFailure } from "../../declines/index.js";
 import { toFailure } from "./errors.js";
 import * as map from "./map.js";
+
+const CONFIG = "GET /.well-known/pao-configuration";
 
 /** Версия копии ПАО у агента (docs/core/protocol/SOURCE.md, Р20). */
 export const PAO_COPY_VERSION = "1.4.0";
@@ -55,15 +57,6 @@ function belowMin(version: string): boolean {
   return a < x || (a === x && b < y);
 }
 
-/** Подписант для обращений без подписи (конфигурация): подпись ими не вызывается; вызов — дефект, а не обход. */
-const UNSIGNED = Object.freeze({
-  kid: "unsigned",
-  alg: "none",
-  sign(): Buffer {
-    throw new Error("обращение без подписи не подписывается");
-  },
-});
-
 /** Валюты Платформы ПС по ПАО 1.4.0 — допустимое множество, не источник валюты (Р29 п. 2). */
 export const PAO_CURRENCIES = ["RUB"] as const;
 
@@ -78,8 +71,34 @@ export interface ProtocolJournal {
   record(
     entry:
       | { at: string; kind: "platform.version_unknown"; reason: "PLATFORM_VERSION_UNKNOWN"; detail: "NO_VERSION" | "BAD_RESPONSE" | "NO_RESPONSE" }
-      | { at: string; kind: "platform.protocol_unsupported"; reason: "PLATFORM_PROTOCOL_UNSUPPORTED"; detail: "CONFIGURATION" | "MANDATE" },
+      | { at: string; kind: "platform.protocol_unsupported"; reason: "PLATFORM_PROTOCOL_UNSUPPORTED"; detail: "CONFIGURATION" | "MANDATE" }
+      | PaoCallEntry,
   ): void;
+}
+
+/** Попытка обращения к ПАО (Т15, Р37 п. 3): ключ операции — шаблон пути без подстановок; mandate — по маске
+ *  идентификатора; detail — HTTP-статус ответа (нет ответа — без detail). Тел, заголовков, Idempotency-Key и x-nonce нет. */
+type PaoCallEntry = {
+  at: string;
+  kind: "pao.call";
+  method: PaoOperationKey;
+  attempt: number;
+  result: "ok" | "refused" | "unknown";
+  mandate?: string;
+  reason?: FailureCode;
+  detail?: string;
+};
+
+/** mandate_id обращения: из пути операции над мандатом, из запроса или тела (mandate_id), у POST мандата — из ответа. */
+function mandateOf(op: PaoOperationKey, args: unknown, r?: unknown): string | undefined {
+  const field = (o: unknown, k: string): unknown => (typeof o === "object" && o !== null ? (o as Record<string, unknown>)[k] : undefined);
+  const a = args as { path?: unknown; query?: unknown; body?: unknown };
+  const v =
+    (op.includes("/mandates/{id}") ? field(a.path, "id") : undefined) ??
+    field(a.query, "mandate_id") ??
+    field(a.body, "mandate_id") ??
+    (op === "POST /pao/v1/mandates" ? field(r, "id") : undefined);
+  return map.safeId(v) ?? undefined;
 }
 
 /** Операции, ответ которых — мандат или выписка с цепочкой мандатов (Р33 п. 10, шаг 2). */
@@ -111,8 +130,9 @@ export interface PaoPlatformOptions {
   /** подпись из модуля signer через порт; ключ адаптеру не передаётся (инвариант 2) */
   signing: RequestSigning;
   params: StandParams;
-  /** события версии ПАО Платформы (Р33 п. 10); у адаптера допуска не нужен — мандатов он не запрашивает */
-  journal?: ProtocolJournal;
+  /** события версии ПАО Платформы (Р33 п. 10) и попытки обращений (pao.call, Р37 п. 3) — у каждого адаптера, в т. ч.
+   *  допуска и сверки с реестром: без журнала обращения не собрать (ревью К2.1 № 2) */
+  journal: ProtocolJournal;
   fetch?: typeof fetch;
   sleep?: (ms: number) => Promise<void>;
   now?: () => Date;
@@ -169,18 +189,32 @@ export class PaoPlatform implements PaymentPlatform {
    */
   async checkProtocol(): Promise<ProtocolCheck> {
     let versions: string[] | undefined;
+    const last: { retryAfter?: number; status?: number } = {};
     try {
-      const r: unknown = await this.client({}, UNSIGNED).call("GET /.well-known/pao-configuration", {});
+      // Клиент без подписанта (ядро v0.9.0, Р37 п. 1): по типам он допускает только операции без подписи.
+      const r: unknown = await this.client(last).call(CONFIG, {});
       // По схеме — только `versions` (string[]); прочие поля конфигурации агенту не нужны и игнорируются (ПАО §7):
       // алгоритм или ключ Платформы вне перечня не прячет явную версию ниже 1.4.0 (ревью К2.3 № 9).
-      if (typeof r !== "object" || r === null || Array.isArray(r)) return this.unknownVersion("BAD_RESPONSE");
-      const v = (r as { versions?: unknown }).versions;
-      if (v !== undefined && !isStringArray(v)) return this.unknownVersion("BAD_RESPONSE");
+      // Ответ не по форме — попытка unknown, как в call() (ревью К2.2 № 2).
+      const v = typeof r === "object" && r !== null && !Array.isArray(r) ? (r as { versions?: unknown }).versions : null;
+      if (v === null || (v !== undefined && !isStringArray(v))) {
+        this.logCall(CONFIG, 1, "unknown", last.status ?? 200, "UNKNOWN");
+        return this.unknownVersion("BAD_RESPONSE");
+      }
+      this.logCall(CONFIG, 1, "ok", last.status ?? 200);
       versions = v;
     } catch (e) {
       // Тело и сообщение исключения не переносятся (инвариант 1). Наружу — всё, что не ответ и не разбор: дефект агента
       // (например, вызов подписи) не маскируется под «адрес не отвечает» (ревью К2.3 № 4).
+      // попытка — только запрос, ушедший в сеть: PAO_CLIENT_SIGNER_MISSING в pao.call не пишется (ревью К2.2 № 1)
+      if (e instanceof SyntaxError || (e instanceof PaoCallError && e.clientCode !== "PAO_CLIENT_SIGNER_MISSING")) {
+        const f = toFailure(e);
+        this.logCall(CONFIG, 1, f.code === "UNKNOWN" ? "unknown" : "refused", f.httpStatus || (last.status ?? 0), f.code);
+      }
       if (e instanceof SyntaxError) return this.unknownVersion("BAD_RESPONSE");
+      // Отказ самого клиента — не «адрес не отвечает»: 3xx — ответ указывает на другой адрес, агент не стартует (Р37 п. 2);
+      // PAO_CLIENT_SIGNER_MISSING — дефект агента, не маскируется (ревью К0 № 1).
+      if (e instanceof PaoCallError && e.clientCode !== undefined) throw toFailure(e);
       if (e instanceof PaoCallError) return this.unknownVersion("NO_RESPONSE");
       throw e;
     }
@@ -196,7 +230,7 @@ export class PaoPlatform implements PaymentPlatform {
   }
 
   private unknownVersion(detail: "NO_VERSION" | "BAD_RESPONSE" | "NO_RESPONSE"): ProtocolCheck {
-    this.o.journal?.record({ at: this.at(), kind: "platform.version_unknown", reason: "PLATFORM_VERSION_UNKNOWN", detail });
+    this.o.journal.record({ at: this.at(), kind: "platform.version_unknown", reason: "PLATFORM_VERSION_UNKNOWN", detail });
     return { status: "unknown", detail };
   }
 
@@ -204,22 +238,38 @@ export class PaoPlatform implements PaymentPlatform {
    *  Остановку агента делает вызывающий: шаг 1 — checkProtocol, шаг 2 — call по AGENT_STOP_CODES. */
   private unsupported(step: "CONFIGURATION" | "MANDATE", version: string | null, httpStatus: number, key: string | null): PlatformFailure {
     this.protocolUnsupported = true;
-    this.o.journal?.record({ at: this.at(), kind: "platform.protocol_unsupported", reason: "PLATFORM_PROTOCOL_UNSUPPORTED", detail: step });
+    this.o.journal.record({ at: this.at(), kind: "platform.protocol_unsupported", reason: "PLATFORM_PROTOCOL_UNSUPPORTED", detail: step });
     return new PlatformFailure("PLATFORM_PROTOCOL_UNSUPPORTED", "never", null, httpStatus, key, protocolUnsupportedText(version));
+  }
+
+  /** Запись pao.call (Р37 п. 3): на каждую попытку, attempt > 1 — попытка повтора (Т15). */
+  private logCall(method: PaoOperationKey, attempt: number, result: PaoCallEntry["result"], httpStatus: number, reason?: FailureCode, mandate?: string): void {
+    this.o.journal.record({
+      at: this.at(),
+      kind: "pao.call",
+      method,
+      attempt,
+      result,
+      ...(mandate !== undefined && { mandate }),
+      ...(reason !== undefined && { reason }),
+      ...(httpStatus > 0 && { detail: String(httpStatus) }),
+    });
   }
 
   private at(): string {
     return (this.o.now ?? (() => new Date()))().toISOString();
   }
 
-  /** Одно обращение без повторов клиента; тайм-аут — pao_request_timeout_ms. Retry-After и HTTP-статус ответа — в last. */
-  private client(last: { retryAfter?: number; status?: number }, signer: ReturnType<RequestSigning["current"]>): PaoClient {
+  /** Одно обращение без повторов клиента; тайм-аут — pao_request_timeout_ms. Retry-After и HTTP-статус ответа — в last.
+   *  Без подписанта — только операции без подписи (конфигурация); подписанная — PAO_CLIENT_SIGNER_MISSING до запроса.
+   *  Свой fetch получает init целиком, вместе с redirect: "manual" клиента (передача #34 п. 4). */
+  private client(last: { retryAfter?: number; status?: number }, signer?: ReturnType<RequestSigning["current"]>): PaoClient {
     const timeoutMs = this.o.params.pao_request_timeout_ms;
     const f = this.fetchImpl;
     return new PaoClient({
       baseUrl: this.o.baseUrl,
       agentCode: this.o.agentCode,
-      signer,
+      ...(signer && { signer }),
       maxAttempts: 1,
       fetch: async (url, init) => {
         const res = await f(url, { ...init, signal: AbortSignal.timeout(timeoutMs) });
@@ -243,9 +293,12 @@ export class PaoPlatform implements PaymentPlatform {
     const key = args.idempotencyKey ?? null;
     let waitedSec = 0;
     let rotations = 0;
+    // попытки обращения для журнала: повторы тем же ключом и переход на другой ключ (Т15)
+    let tries = 0;
     for (let attempt = 1; ; ) {
       const last: { retryAfter?: number; status?: number } = {};
       const signer = this.o.signing.current(); // остановлен — SignerStopped, обращения нет
+      tries++;
       let failure: PlatformFailure;
       try {
         const r = await this.client(last, signer).call(op, args);
@@ -261,7 +314,9 @@ export class PaoPlatform implements PaymentPlatform {
           if (!this.protocolConfirmed && mandateWithoutOrder(op, r)) throw this.unsupported("MANDATE", null, last.status ?? 200, key);
           throw new PlatformFailure("UNKNOWN", "never", null, last.status ?? 200, key, "ответ ПАО не по схеме");
         }
-        return to(r);
+        const out = to(r);
+        this.logCall(op, tries, "ok", last.status ?? 200, undefined, mandateOf(op, args, r));
+        return out;
       } catch (e) {
         failure = toFailure(e, key);
         // Заголовки 2xx пришли, но ответ не разобран (не JSON, пустое тело, не по схеме, обрыв или тайм-аут при чтении
@@ -270,6 +325,11 @@ export class PaoPlatform implements PaymentPlatform {
         if (failure.code === "UNKNOWN" && failure.httpStatus === 0 && last.status !== undefined && last.status >= 200 && last.status < 300) {
           failure = new PlatformFailure("UNKNOWN", "never", null, last.status, key, "ответ ПАО не по схеме");
         }
+      }
+      // попытка — только запрос, ушедший в сеть (ревью К2.2 № 1): отказ клиента до сети (PAO_CLIENT_SIGNER_MISSING) — не попытка;
+      // SignerStopped и пустой Idempotency-Key — тоже до сети, сюда не доходят
+      if (failure.code !== "PAO_CLIENT_SIGNER_MISSING") {
+        this.logCall(op, tries, failure.code === "UNKNOWN" ? "unknown" : "refused", failure.httpStatus, failure.code, mandateOf(op, args));
       }
       const rule = ruleForFailure(failure.code);
       // Отказ в допуске — остановка агента целиком (SPEC §7а, П03).

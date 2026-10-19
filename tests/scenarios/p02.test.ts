@@ -1,5 +1,6 @@
 // П02 (профиль contour, Р23): обращение с отозванным ключом. Т1, A2 п. 5.4, SPEC §7а (AGENT_KEY_REVOKED, retry new_key).
 import { afterEach, describe, expect, it } from "vitest";
+import { MemoryJournal } from "../../src/agent/journal/index.js";
 import { PaoPlatform } from "../../src/agent/adapters/pao/index.js";
 import { SignerStopped, loadKey } from "../../src/agent/signer/index.js";
 import { loadParams } from "../../src/shared/config.js";
@@ -20,7 +21,7 @@ describe("П02 — обращение с отозванным ключом", () 
     stand.revoke(signer.kid);
     // Подпись одним и тем же ключом без перехода — чтобы увидеть ответ платформы на повтор.
     const fixed = { current: () => signer, keyRevoked: () => signer, stop: () => {}, suspend: () => {} };
-    const platform = new PaoPlatform({ baseUrl, agentCode: AGENT, signing: fixed, params: loadParams() });
+    const platform = new PaoPlatform({ baseUrl, agentCode: AGENT, signing: fixed, params: loadParams(), journal: new MemoryJournal() });
     for (let i = 0; i < 2; i++) {
       await expect(platform.issueCredential(DRAFT, { idempotencyKey: "idem-p02" })).rejects.toMatchObject({
         code: "AGENT_KEY_REVOKED",
@@ -48,12 +49,15 @@ describe("П02 — обращение с отозванным ключом", () 
     expect(calls[0]!.idempotencyKey).toBe("idem-p02");
     expect(calls[1]!.idempotencyKey).toBe("idem-p02");
     expect(calls[1]!.nonce).not.toBe(calls[0]!.nonce);
-    const kinds = journal.entries.filter((e) => e.kind !== "key.loaded").slice(-4);
+    const kinds = journal.entries.filter((e) => e.kind !== "key.loaded").slice(-6);
+    // попытка повтора видна в журнале (Т15, Р37 п. 3): вторая попытка — после отказа с переходом на ключ
     expect(kinds).toMatchObject([
       { kind: "request.signed", kid: newest!.kid },
+      { kind: "pao.call", method: OP, attempt: 1, result: "refused", reason: "AGENT_KEY_REVOKED", detail: "401" },
       { kind: "key.revoked", kid: newest!.kid, reason: "AGENT_KEY_REVOKED" },
       { kind: "key.switched", kid: older!.kid },
       { kind: "request.signed", kid: older!.kid },
+      { kind: "pao.call", method: OP, attempt: 2, result: "ok", detail: "201" },
     ]);
   });
 

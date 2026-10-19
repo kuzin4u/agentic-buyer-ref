@@ -1,5 +1,15 @@
-// Журнал решений агента; без реквизитов и персональных данных в открытом виде.
-// Записи — только идентификаторы (kid, коды отказов); ключевого материала журнал не получает (инвариант 2).
+// Журнал решений агента (SPEC §4, Т15, Р37); без реквизитов и персональных данных в открытом виде.
+// Записи — только идентификаторы (kid, mandate_id, event_id) и коды реестра; ключевого материала журнал не получает
+// (инвариант 2). Набор полей закрыт (JOURNAL_FIELDS): тел ответов, Idempotency-Key, x-nonce и текста фида в нём нет.
+import type { A5SignalCode, CatalogIssueCode, LiveCheckCode } from "../catalog/index.js";
+import type { DiagCode } from "../../shared/diag-codes.js";
+
+/** Код причины в записи — только код полного реестра DIAG (Р37 п. 3): отказ, остановка, код каталога ядра. */
+export type JournalCode = DiagCode | CatalogIssueCode | A5SignalCode | LiveCheckCode;
+
+/** Итог обращения или решения: подтверждён, отказ с кодом, исход не подтверждён (инвариант 4). */
+export type JournalResult = "ok" | "refused" | "unknown";
+
 
 export type JournalKind =
   /** ключ из хранилища загружен */
@@ -26,8 +36,10 @@ export type JournalKind =
   | "signing.suspended"
   /** повторная сверка прошла (ACTIVE и BUYER) — подпись возобновлена */
   | "signing.resumed"
-  /** агент остановлен */
+  /** агент остановлен (reason — код реестра) */
   | "agent.stopped"
+  /** штатное закрытие подписанта (close); не остановка по коду — в реестр не входит (Р36 (в), Р37) */
+  | "agent.closed"
   /** ротация остановлена: KEY_INVALID подряд сверх предела таблицы отказов (Р31); инцидент, нужен человек */
   | "key.rotation_stopped"
   /** ответ Платформы с мандатом без порядка отзыва — мандат не подтверждён, покупки нет (Р33 п. 4) */
@@ -50,14 +62,36 @@ export type JournalKind =
   /** подписка не удалась иначе (503 сверх попыток, UNKNOWN) — работа по ленте, повтор при следующем старте (дополнение Р34 п. 1) */
   | "events.subscription_failed"
   /** проверка самопроверки при старте (Р36 п. 6): check — имя, status — ok / warn / fail, reason — код из реестра при warn и fail */
-  | "agent.selfcheck";
+  | "agent.selfcheck"
+  /** попытка обращения к ПАО (Т15, Р37 п. 3): method — ключ операции, attempt — номер попытки (> 1 — попытка повтора),
+   *  result и reason — итог попытки; detail — HTTP-статус */
+  | "pao.call"
+  /** держимый мандат отозван — особое событие Т15 (Р37 п. 4); мандат больше не держится */
+  | "mandate.revoked"
+  /** держимый мандат не ACTIVE (истёк, исчерпан и т. п.) — больше не держится; detail — статус (Р37 п. 4) */
+  | "mandate.status_changed"
+  /** аномалия: держимый ACTIVE-мандат пропал у Платформы — GET 404, reason MANDATE_NOT_FOUND; больше не держится, лента
+   *  идёт дальше (Р37 п. 4, решение владельца по К2.3 — вариант (а)) */
+  | "mandate.vanished"
+  /** отказ агента действовать — особое событие Т15 (Р37 п. 5); reason — код реестра */
+  | "agent.refused"
+  /** товар исключён из выдачи (Р32 п. 1, 5): reason — код ошибки модели каталога; пишет конвейер (Р37 п. 5) */
+  | "offer.excluded"
+  /** товар с сигналом A5 — показ с пометкой (Р32 п. 1): reason — код сигнала; пишет конвейер */
+  | "offer.flagged"
+  /** проект мандата корзины не готовится (Р32 п. 2): reason — код сигнала A5; пишет конвейер */
+  | "cart.refused"
+  /** заказа нет: живая проверка не ok (Р32 п. 3–4): reason — код LIVE_*; пишет конвейер */
+  | "order.live_refused";
 
 export interface JournalEntry {
   at: string;
+  /** код агента — ставит место сборки (compose), писатели его не передают (Р37 п. 3) */
+  agent?: string;
   kind: JournalKind;
   kid?: string;
-  /** код отказа или причина остановки */
-  reason?: string;
+  /** код отказа или причина остановки — код реестра (Р37 п. 3) */
+  reason?: JournalCode;
   /** уточнение причины — только значение перечня ПАО (например, класс из реестра при AGENT_CLASS_MISMATCH, Р27) */
   detail?: string;
   /** идентификатор объекта Платформы по маске адаптера — event_id события ленты (Р34 п. 11) */
@@ -66,7 +100,32 @@ export interface JournalEntry {
   check?: string;
   /** итог проверки самопроверки: ok, warn или fail */
   status?: "ok" | "warn" | "fail";
+  /** mandate_id мандата, к которому относится запись */
+  mandate?: string;
+  /** ключ операции ПАО по контракту — шаблон пути без подстановок (`POST /pao/v1/mandates/{id}/verify`) */
+  method?: string;
+  /** итог обращения или решения */
+  result?: JournalResult;
+  /** номер попытки обращения, с 1 */
+  attempt?: number;
 }
+
+/** Закрытый набор полей записи (Р37 п. 3): тест сверяет ключи записей с ним. */
+export const JOURNAL_FIELDS = [
+  "at",
+  "agent",
+  "kind",
+  "kid",
+  "reason",
+  "detail",
+  "ref",
+  "check",
+  "status",
+  "mandate",
+  "method",
+  "result",
+  "attempt",
+] as const satisfies readonly (keyof JournalEntry)[];
 
 export interface Journal {
   record(entry: JournalEntry): void;

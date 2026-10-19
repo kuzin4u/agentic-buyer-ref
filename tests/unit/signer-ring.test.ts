@@ -42,7 +42,8 @@ describe("плановая ротация против стенда ПАО", () 
     expect(fresh).toBeDefined();
     // регистрация подписана прежним ключом; переход — только после ответа платформы
     const reg = journal.entries.findIndex((e) => e.kind === "key.registered");
-    expect(journal.entries[reg - 1]).toMatchObject({ kind: "request.signed", kid: old });
+    expect(journal.entries[reg - 2]).toMatchObject({ kind: "request.signed", kid: old });
+    expect(journal.entries[reg - 1]).toMatchObject({ kind: "pao.call", method: "POST /pao/v1/agent/keys", attempt: 1, result: "ok" });
     expect(journal.entries.slice(reg)).toContainEqual(expect.objectContaining({ kind: "key.switched", kid: fresh }));
     expect(stand.calls("POST /pao/v1/agent/keys")).toMatchObject([{ status: 201, idempotencyKey: `agent-key-${fresh}` }]);
 

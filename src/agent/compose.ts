@@ -81,7 +81,7 @@ export interface AgentCoreOptions {
   pushUrl?: string;
   journal?: Journal;
   now?: () => Date;
-  pao: Omit<PaoPlatformOptions, "params" | "signing">;
+  pao: Omit<PaoPlatformOptions, "params" | "signing" | "journal">;
 }
 
 /** Один каталог внутри другого или они совпадают (по пути; символические ссылки — забота оператора, Р34 нюансы К2.3). */
@@ -139,7 +139,8 @@ export function createAgentCore(o: AgentCoreOptions): AgentCore {
   if (nested(o.stateDir, o.keysDir)) throw new ConfigError("каталог состояния совпадает с каталогом ключей или вложен в него (или наоборот)");
   const ring = new KeyRing({ dir: o.keysDir, params, journal, ...(o.now && { now: o.now }) });
   // Рабочий адаптер получает порт, закрытый до допуска; запрос допуска идёт через отдельный адаптер с портом допуска.
-  // События версии ПАО (Р33 п. 10) пишет адаптер — через ту же обёртку.
+  // События версии ПАО (Р33 п. 10) и попытки обращений (pao.call) пишет адаптер — через ту же обёртку; журнал получают и
+  // адаптеры допуска и сверки с реестром (ревью К2.1 № 2).
   const platform = new PaoPlatform({ ...o.pao, params, signing: ring.port(), journal });
   const at = (): string => now().toISOString();
   // Остановка по курсору — через порт подписи: агент целиком, запись agent.stopped — у связки ключей (Р34 п. 4).
@@ -172,7 +173,7 @@ export function createAgentCore(o: AgentCoreOptions): AgentCore {
   // Сверка с реестром одна на всех (Р27): событие agent.* и вызов recheck() снаружи ждут одну и ту же.
   let rechecking: Promise<AgentSelf> | null = null;
   const recheck = (): Promise<AgentSelf> =>
-    (rechecking ??= ring.recheck((s) => new PaoPlatform({ ...o.pao, params, signing: s }).agentSelf()).finally(() => {
+    (rechecking ??= ring.recheck((s) => new PaoPlatform({ ...o.pao, params, signing: s, journal }).agentSelf()).finally(() => {
       rechecking = null;
     }));
   // agent.key_revoked / agent.suspended / agent.reinstated — сигнал: статус и ключи — по GET /pao/v1/agent (Р34 п. 5).
@@ -228,7 +229,7 @@ export function createAgentCore(o: AgentCoreOptions): AgentCore {
             results["platform.protocol"] = p.status === "confirmed" ? OK : { status: "warn", code: "PLATFORM_VERSION_UNKNOWN" };
             connected = true;
           }
-          return new PaoPlatform({ ...o.pao, params, signing: admission }).agentSelf();
+          return new PaoPlatform({ ...o.pao, params, signing: admission, journal }).agentSelf();
         });
       } catch (e) {
         const code = startFailureCode(e);

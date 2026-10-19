@@ -375,8 +375,10 @@ describe("перенаправления 3xx (Р37 п. 1–2)", () => {
       expect(journal.entries.filter((e) => e.kind !== "agent.selfcheck").map((e) => [e.kind, e.reason])).toEqual([
         ["key.loaded", undefined],
         ["events.cursor_initial", undefined],
+        ["pao.call", "PAO_CLIENT_REDIRECT"],
         ["admission.failed", "PAO_CLIENT_REDIRECT"],
       ]);
+      expect(journal.entries.find((e) => e.kind === "pao.call")).toMatchObject({ method: CONFIG, attempt: 1, result: "refused", detail: "302" });
       // адрес исправлен — тот же агент стартует (after_fix, Р36 доп. 2 п. 2)
       redirect = false;
       await core.start();

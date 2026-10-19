@@ -1,6 +1,7 @@
 // Журнал решений агента (Р37 п. 3, SPEC §4, Т15): код реестра в reason, закрытый набор полей, код агента и время ставит
 // место сборки, штатное закрытие — не код реестра.
-import { afterEach, describe, expect, expectTypeOf, it } from "vitest";
+import { afterEach, describe, expect, expectTypeOf, it, vi } from "vitest";
+import { PaoCallError, PaoClient } from "@kuzin4u/agentic-core/pao";
 import { CATALOG_DIAG_CODES, type CatalogDiagCode } from "@kuzin4u/agentic-core/catalog";
 import { DIAG } from "../../src/agent/compose.js";
 import { FAILURE_RULES } from "../../src/agent/declines/index.js";
@@ -8,7 +9,7 @@ import { JOURNAL_FIELDS, MemoryJournal, type JournalCode, type JournalEntry } fr
 import { AGENT_DIAG_CODES, type AgentDiagCode } from "../../src/shared/diag-codes.js";
 import type { FailureCode } from "../../src/shared/domain.js";
 import { Consents, INTENT, feed } from "../support/consents.js";
-import { coreOn, startCause } from "../support/core.js";
+import { CREDENTIALS, DRAFT, coreOn, startCause } from "../support/core.js";
 import { expectJournalClean } from "../support/journal.js";
 import { AGENT, PaoStand, type StandOptions } from "../support/pao-stand.js";
 
@@ -61,11 +62,84 @@ describe("записи ядра (Р37 п. 3)", () => {
     await expect(core.mandates.check(active)).resolves.toBeDefined();
     core.close();
     expect(new Set(journal.entries.map((e) => e.kind))).toEqual(
-      new Set(["key.loaded", "events.cursor_initial", "request.signed", "agent.selfcheck", "agent.closed"]),
+      new Set(["key.loaded", "events.cursor_initial", "pao.call", "request.signed", "agent.selfcheck", "agent.closed"]),
     );
+    // журнал обращений (Р37 п. 3): попытка на обращение, ключ операции — шаблон, mandate — из ответа, пути или тела
+    expect(journal.entries.filter((e) => e.kind === "pao.call").map((e) => [e.method, e.attempt, e.result, e.mandate, e.detail])).toEqual([
+      ["GET /.well-known/pao-configuration", 1, "ok", undefined, "200"],
+      ["GET /pao/v1/agent", 1, "ok", undefined, "200"],
+      ["POST /pao/v1/mandates", 1, "ok", m.id, "201"],
+      ["GET /pao/v1/mandates/{id}", 1, "ok", m.id, "200"],
+      ["GET /pao/v1/mandates/{id}/verify", 1, "ok", m.id, "200"],
+    ]);
+    expect(s.stub.calls).toHaveLength(5);
     expectJournalClean(journal.entries, AGENT, s.stub.calls, ["idem_journal_1"]);
     // время — часы ядра, а не писателя (обёртка места сборки, ревью К2.1 № 8)
     for (const e of journal.entries) expect(e.at).toBe(s.clock.toISOString());
+  });
+
+  it("повтор тем же ключом (503) — две попытки: refused с кодом и статусом, затем ok (Т15 «попытка повтора»)", async () => {
+    const { core, journal, stand: s } = await setup({ configuration: { versions: ["1.4.0"] } });
+    s.stub.fail("GET /pao/v1/agent", { code: "STATE_UNAVAILABLE" }, 1);
+    await core.start();
+    expect(journal.entries.filter((e) => e.kind === "pao.call").map((e) => [e.method, e.attempt, e.result, e.reason, e.detail])).toEqual([
+      ["GET /.well-known/pao-configuration", 1, "ok", undefined, "200"],
+      ["GET /pao/v1/agent", 1, "refused", "STATE_UNAVAILABLE", "503"],
+      ["GET /pao/v1/agent", 2, "ok", undefined, "200"],
+    ]);
+    expect(s.stub.calls).toHaveLength(3);
+    expectJournalClean(journal.entries, AGENT, s.stub.calls);
+  });
+
+  it("нет ответа (тайм-аут транспорта) — result unknown, UNKNOWN, без HTTP-статуса", async () => {
+    const consents: Consents = new Consents(() => s.clock);
+    const s: PaoStand = (stand = new PaoStand({ handlers: consents.handlers(), configuration: { versions: ["1.4.0"] } }));
+    let down = false;
+    const fetchImpl: typeof fetch = (url, init) => (down ? Promise.reject(new TypeError("fetch failed")) : fetch(url, init));
+    const { core, journal } = await coreOn(s, { fetch: fetchImpl });
+    await core.start();
+    down = true;
+    await expect(core.mandates.request(INTENT, { idempotencyKey: "idem_journal_down" })).rejects.toMatchObject({ code: "UNKNOWN" });
+    expect(journal.entries.filter((e) => e.kind === "pao.call").at(-1)).toEqual({
+      at: s.clock.toISOString(),
+      agent: AGENT,
+      kind: "pao.call",
+      method: "POST /pao/v1/mandates",
+      attempt: 1,
+      result: "unknown",
+      reason: "UNKNOWN",
+    });
+    expect(s.stub.calls).toHaveLength(2);
+    expectJournalClean(journal.entries, AGENT, s.stub.calls, ["idem_journal_down"]);
+  });
+
+  it("mandate — из тела (mandate_id) и в ветке отказа; идентификатор вне маски — без поля mandate (ревью К2.2 № 8)", async () => {
+    const { core, journal, stand: s } = await setup({ configuration: { versions: ["1.4.0"] }, handlers: CREDENTIALS });
+    await core.start();
+    await core.platform.issueCredential(DRAFT, { idempotencyKey: "idem_journal_cr1" });
+    s.stub.fail("POST /pao/v1/credentials", { code: "MANDATE_SCOPE" });
+    await expect(core.platform.issueCredential(DRAFT, { idempotencyKey: "idem_journal_cr2" })).rejects.toMatchObject({ code: "MANDATE_SCOPE" });
+    await expect(core.platform.getMandate("m 1/../x")).rejects.toBeDefined();
+    expect(journal.entries.filter((e) => e.kind === "pao.call").slice(2).map((e) => [e.method, e.result, e.mandate, e.reason])).toEqual([
+      ["POST /pao/v1/credentials", "ok", DRAFT.mandate.id, undefined],
+      ["POST /pao/v1/credentials", "refused", DRAFT.mandate.id, "MANDATE_SCOPE"],
+      ["GET /pao/v1/mandates/{id}", "refused", undefined, expect.any(String)],
+    ]);
+    expectJournalClean(journal.entries, AGENT, s.stub.calls, ["idem_journal_cr1", "idem_journal_cr2"]);
+  });
+
+  it("конфигурация 404 — unknown с HTTP-статусом; PAO_CLIENT_SIGNER_MISSING — не попытка, pao.call нет (ревью К2.2 № 1, № 8)", async () => {
+    const { core, journal } = await setup({ handlers: { "GET /.well-known/pao-configuration": () => ({ status: 404, body: {} }) } });
+    await core.start();
+    expect(journal.entries.find((e) => e.kind === "pao.call")).toMatchObject({ method: "GET /.well-known/pao-configuration", attempt: 1, result: "unknown", reason: "UNKNOWN", detail: "404" });
+    const spy = vi.spyOn(PaoClient.prototype, "call").mockRejectedValueOnce(new PaoCallError(0, undefined, 0, undefined, { clientCode: "PAO_CLIENT_SIGNER_MISSING" }));
+    try {
+      const before = journal.entries.filter((e) => e.kind === "pao.call").length;
+      await expect(core.platform.agentSelf()).rejects.toMatchObject({ code: "PAO_CLIENT_SIGNER_MISSING" });
+      expect(journal.entries.filter((e) => e.kind === "pao.call")).toHaveLength(before);
+    } finally {
+      spy.mockRestore();
+    }
   });
 
   it("отказы: reason и detail — коды реестра и перечни; без значений обращений", async () => {

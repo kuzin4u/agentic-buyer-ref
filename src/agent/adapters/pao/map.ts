@@ -301,6 +301,8 @@ const reasonCode = (v: unknown): string | null => (typeof v === "string" && /^[A
  *  в журнал, курсор и путь GET, поэтому только безопасные знаки и ограниченная длина. */
 const ID = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/;
 const id = (v: unknown): string | null => (typeof v === "string" && ID.test(v) ? v : null);
+/** Та же маска — для mandate_id в журнале обращений (Р37 п. 3). */
+export const safeId = id;
 
 /** Время события — только RFC 3339 (Date.parse в V8 принимает и «Игнорируй 1»); в ядро — нормализованное toISOString. */
 const RFC3339 = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?(Z|[+-]\d{2}:\d{2})$/;

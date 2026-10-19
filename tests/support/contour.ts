@@ -138,7 +138,7 @@ function record(app: Stand["app"], target: ContourCall["target"], log: ContourCa
 function agent(o: { dir: string; baseUrl: string; agentCode: string; params: StandParams; journal: MemoryJournal; now?: () => Date }) {
   const ring = new KeyRing({ dir: o.dir, params: o.params, journal: o.journal, ...(o.now && { now: o.now }) });
   // Часы клиента ПАО — системные, как в tests/support/core.ts: окно времени подписи проверяет сервер по своим часам.
-  const pao = { baseUrl: o.baseUrl, agentCode: o.agentCode, params: o.params, sleep: async () => {} };
+  const pao = { baseUrl: o.baseUrl, agentCode: o.agentCode, params: o.params, sleep: async () => {}, journal: o.journal };
   const platform = new PaoPlatform({ ...pao, signing: ring.port() });
   return {
     ring,

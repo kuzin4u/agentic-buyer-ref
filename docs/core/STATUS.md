@@ -349,6 +349,7 @@ cd ~/repos/agentic-buyer-ref && git checkout main && git pull && claude
 
 ## Открыто
 
+- Из Р38 (сессия 17, AG-07 ч. 2, PR #40, К2.1; ревью reviewer К2.1 № 8): маска идентификатора `^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$` — в шести копиях (`pipeline/machine.ts`, `pipeline/purchase.ts`, `mandates/client.ts`, `adapters/pao/map.ts`, `events/cursor.ts`, `events/push.ts`); маска — единственная защита от текста в `mandate` и `ref` журнала (инвариант 5) — одна общая в `shared/` отдельным кирпичом (решение владельца, 20.10.2026).
 - Из Р38 (сессия 17, AG-07 ч. 2, PR #40, п. 8): **полный прогон покупки 0–6 на стенде Платформы** — сейчас на стенде по-настоящему стадии 0–3 и ворота перед 5, стадии 4–6 — тестовым портом `PaymentSteps` (стенд v0.5.0 без `/pao/v1/credentials`, `/pao/v1/operations`, `/pao/v1/confirmations`); пересмотр — после PS-14, PS-16 и AG-11.
 - Из Р37 (сессия 16, AG-07 ч. 1, PR #35): **ломающее для оболочки** — `core.journal` — обёртка (код агента и время ядра), `agent.stopped` с `CLOSED` → `agent.closed`, `PaoPlatformOptions.journal` обязателен, `reason` записи — код реестра; передать оболочке при выпуске (тег агента), в описании выпуска — «Переход».
 - Из Р37 (сессия 16, AG-07 ч. 1, PR #35, К2.4; ревью reviewer К2.4 № 6): в `agent.refused` нет исхода `verify` (`OUT_OF_SCOPE` / `STATE_UNKNOWN`) и статуса при `MANDATE_NOT_ACTIVE` — для прибора по Т15 это потеря измерения; `detail` — значение перечня ПАО — решить через `/decision` в AG-07 ч. 2 (конвейер) или AG-08.

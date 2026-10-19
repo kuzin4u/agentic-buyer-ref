@@ -36,6 +36,8 @@ export const AGENT_DIAG_CODES = [
   "MANDATE_SIGNATURE_PENDING",
   "MANDATE_NONE",
   "MANDATE_OUT_OF_SCOPE",
+  // конвейер стадий (Р38): запрещённый переход машины покупки — дефект вызывающего или конвейера
+  "PIPELINE_TRANSITION_FORBIDDEN",
   // каталог: ошибка вызова живой проверки (рядом с LIVE_* ядра, Р32 п. 4)
   "LIVE_CALL_ERROR",
   // причины operation.declined (SPEC §7б): в PAO_DIAG ядра их нет

@@ -218,8 +218,9 @@ describe("границы модулей в ESLint", { timeout: 60_000 }, () => {
 
 // Ревью К2 № 13 (AG-05): клиент мандатов видит из портов только порт мандатов (состав AG-К5), не PaymentPlatform целиком.
 // Импорты — разбором компилятора (preProcessFile: import, export … from, import(), import type).
-describe("mandates → только ports/mandates и ports/mutation", () => {
-  const ALLOWED = [/^\.\/[\w-]+\.js$/, /^\.\.\/ports\/(mandates|mutation)\.js$/, /^\.\.\/\.\.\/shared\/[\w-]+\.js$/];
+// Р34 п. 5: ожидание подписи читает элементы ленты — тип FeedItem из порта событий (не сам порт: ленту даёт вызывающий).
+describe("mandates → только ports/mandates, ports/mutation и ports/events", () => {
+  const ALLOWED = [/^\.\/[\w-]+\.js$/, /^\.\.\/ports\/(mandates|mutation|events)\.js$/, /^\.\.\/\.\.\/shared\/[\w-]+\.js$/];
   const files = readdirSync("src/agent/mandates").filter((f) => SOURCE_FILE.test(f));
   it("файлы клиента найдены; подкаталогов нет (иначе проверка их бы не видела)", () => {
     expect(files.length).toBeGreaterThan(0);
@@ -229,6 +230,11 @@ describe("mandates → только ports/mandates и ports/mutation", () => {
     const { importedFiles } = ts.preProcessFile(readFileSync(`src/agent/mandates/${f}`, "utf8"), true, true);
     const bad = importedFiles.map((i) => i.fileName).filter((n) => !ALLOWED.some((re) => re.test(n)));
     expect(bad).toEqual([]);
+  });
+  it.each(files)("src/agent/mandates/%s: из ports/events — только import type (ленту даёт вызывающий)", (f) => {
+    const src = readFileSync(`src/agent/mandates/${f}`, "utf8");
+    const lines = src.split("\n").filter((l) => l.includes('"../ports/events.js"'));
+    expect(lines.filter((l) => !/^import type \{[^}]*\} from "\.\.\/ports\/events\.js";$/.test(l))).toEqual([]);
   });
   it("поломка: импорт payment-platform ловится", () => {
     const { importedFiles } = ts.preProcessFile('import type { PaymentPlatform } from "../ports/payment-platform.js";', true, true);

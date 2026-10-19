@@ -3,7 +3,8 @@
 // Остаток и счётчики агент не вычисляет — только переносит ответ verify (инвариант 6, A3 п. 4.3).
 // По типу мандата нет закрытых перечней со switch/never: условие ставится только там, где тип что-то требует (CART).
 import type { StandParams } from "../../shared/config.js";
-import { PlatformFailure, type Cart, type Mandate, type MandateCheck, type MandateDraft, type MandateRef, type PlatformEvent } from "../../shared/domain.js";
+import { PlatformFailure, type Cart, type Mandate, type MandateCheck, type MandateDraft, type MandateRef } from "../../shared/domain.js";
+import type { FeedItem } from "../ports/events.js";
 import type { MandatePort } from "../ports/mandates.js";
 import type { Mutation } from "../ports/mutation.js";
 import { MandateRefused, REVOCATION_ORDER_MISSING_TEXT } from "./errors.js";
@@ -136,24 +137,50 @@ export class MandateClient {
     }
   }
 
-  /** Ожидание подписи человека (SPEC §9, Р29 п. 5). Событие — только сигнал: до AG-06 подпись событий не проверяется.
-   *  Мандат действует, когда платформа вернула его со статусом ACTIVE; событие при другом статусе — остановка.
-   *  Сверку по getMandate не снимать и после AG-06: истина — у платформы, а не в событии. */
-  async awaitSigned(mandate: Mandate, events: AsyncIterable<PlatformEvent>, signal?: AbortSignal): Promise<Mandate> {
-    for await (const e of events) {
-      if (signal?.aborted) break;
-      if (e.mandateId !== mandate.id) continue;
-      if (e.type === "mandate.signed") {
-        const actual = await this.#reread(mandate.id);
-        if (actual.status !== "ACTIVE") {
-          throw new MandateRefused("NOT_ACTIVE", `событие mandate.signed, а статус мандата у платформы — ${actual.status}`);
-        }
+  /**
+   * Ожидание подписи человека (SPEC §9, Р29 п. 5, Р34 п. 5). Источник — лента событий (`EventFeed.items()`); событие —
+   * только сигнал перечитать мандат по GET, мандат действует только по GET ACTIVE с пределами запроса:
+   *  - итератор ленты запускается до первого GET — слушатель ленты зарегистрирован, событие, прочитанное во время GET,
+   *    попадает в очередь (ревью К2.4 № 1); GET до ожидания: ACTIVE — действует, PENDING_SIGNATURE — ждать;
+   *  - mandate.signed этого мандата — GET: ACTIVE — действует, иной статус — остановка (Р29 п. 5);
+   *  - mandate.rejected / revoked / exhausted этого мандата — остановка при любом статусе по GET: событие о смене статуса
+   *    и иной статус у платформы — неподтверждённое состояние (SPEC §9, инвариант 4);
+   *  - пропуск INVALID_DATA мандатного типа (mandate_id не читается — ответ (б) владельца) — GET ожидаемого мандата, как
+   *    до ожидания: ACTIVE — действует, PENDING_SIGNATURE — ждать, иной — остановка.
+   * Лента кончилась или ожидание прервано без подписи — SIGNATURE_PENDING (SPEC §7а: ждать человека).
+   */
+  async awaitSigned(mandate: Mandate, events: AsyncIterable<FeedItem>, signal?: AbortSignal): Promise<Mandate> {
+    /** mode: "wait" — PENDING_SIGNATURE допустим; "signed" — нужен ACTIVE; "changed" — остановка при любом статусе */
+    const settle = async (mode: "wait" | "signed" | "changed"): Promise<Mandate | null> => {
+      const actual = await this.#reread(mandate.id);
+      if (actual.status === "ACTIVE" && mode !== "changed") {
         if (!sameTerms(mandate, actual)) throw new MandateRefused("REPLY_MISMATCH", "подписан мандат с другими пределами");
         return actual;
       }
-      if (e.type === "mandate.rejected" || e.type === "mandate.revoked" || e.type === "mandate.exhausted") {
-        throw new MandateRefused("NOT_ACTIVE", `мандат не действует: ${e.type}`);
+      if (actual.status === "PENDING_SIGNATURE" && mode === "wait") return null;
+      throw new MandateRefused("NOT_ACTIVE", `событие о мандате и статус у платформы — ${actual.status}`);
+    };
+    const it = events[Symbol.asyncIterator]();
+    let next = it.next(); // запуск итератора: слушатель ленты — до GET
+    next.catch(() => undefined); // отказ ленты — при ожидании ниже; если GET упал раньше — не «необработанный»
+    try {
+      const ready = await settle("wait");
+      if (ready) return ready;
+      for (let r = await next; !r.done; r = await (next = it.next())) {
+        if (signal?.aborted) break;
+        const item = r.value;
+        if (item.kind === "event") {
+          if (!item.event.type.startsWith("mandate.") || item.event.mandateId !== mandate.id) continue;
+          const done = await settle(item.event.type === "mandate.signed" ? "signed" : "changed");
+          if (done) return done;
+        } else if (item.detail === "INVALID_DATA" && item.type.startsWith("mandate.")) {
+          const done = await settle("wait");
+          if (done) return done;
+        }
       }
+    } finally {
+      // итератор ленты освобождается (отписка слушателя) и при раннем выходе; ждать его не нужно
+      void it.return?.()?.catch(() => undefined);
     }
     // Подписи нет — агент не продолжает (SPEC §7а PRINCIPAL_SIGNATURE_PENDING: ждать человека).
     throw new MandateRefused("SIGNATURE_PENDING", "мандат ещё не подписан человеком");

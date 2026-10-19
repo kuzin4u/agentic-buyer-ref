@@ -16,6 +16,19 @@ import { AGENT } from "../support/pao-stand.js";
 
 /** Стенд в процессе теста под параллельной нагрузкой прогона бывает медленнее 5 с по умолчанию (нюанс К2.3). */
 const STAND_TIMEOUT_MS = 20_000;
+/** Событие agent.* для подмены ленты: стенд agent.* в ленту не пишет (РП39 п. 3). */
+const AGENT_EVENT = { event_id: "evt_a1", type: "agent.key_revoked", at: "2026-10-19T09:00:00Z", data: {} };
+
+/** Подмена страниц ленты по очереди; курсор evt_a1 стенд не знает — без пустой страницы в конце был бы 400 и
+ *  остановка EVENTS_CURSOR_INVALID, как положено. */
+function feedPages(replace: Map<string, () => Response>, pages: unknown[][]): void {
+  replace.set("GET /pao/v1/events", () => {
+    const page = pages.shift() ?? [];
+    if (pages.length === 0) replace.delete("GET /pao/v1/events");
+    return Response.json(page);
+  });
+}
+
 let stand: Stand | undefined;
 const cores: AgentCore[] = [];
 const dirs: string[] = [];
@@ -127,6 +140,84 @@ describe("ядро и события на стенде v0.5.0 (Р34)", { timeout
     expect(a.journal.entries).toContainEqual(expect.objectContaining({ kind: "events.subscription_rejected", reason: "REQUEST_INVALID" }));
     await a.c.events.signal();
     expect(a.c.events.cursor()).toBeNull();
+  });
+
+  it("П04 на ленте: подпись после первого чтения → mandate.signed (по push или опросу) → GET ACTIVE (Р34 п. 5, Р29 п. 5)", async () => {
+    const { s, core, pushUrl, calls } = await setup();
+    const a = core(pushUrl);
+    await a.c.start();
+    const m = await a.c.mandates.request(INTENT, { idempotencyKey: "idem-p04" });
+    const abort = new AbortController();
+    const waiting = a.c.mandates.awaitSigned(m, a.c.events.items(abort.signal), abort.signal);
+    // подпись — после того как ожидание уже прочитало ленту (статус был PENDING_SIGNATURE)
+    for (let i = 0; i < 200 && !calls.some((c) => c.route === "GET /pao/v1/events"); i++) await new Promise((r) => setTimeout(r, 5));
+    expect((await s.issuer.sign(m.id)).statusCode).toBe(200);
+    await s.deliverEvents();
+    const [got] = s.agentReceiver.received;
+    if (!got) throw new Error("push не доставлен");
+    a.c.acceptPush(JSON.stringify(got.event), { "x-event-id": got.header_event_id });
+
+    await expect(waiting).resolves.toMatchObject({ id: m.id, status: "ACTIVE" });
+    abort.abort();
+    expect(a.journal.entries).toContainEqual(expect.objectContaining({ kind: "event.handled", ref: got.event_id, detail: "mandate.signed" }));
+    // статус — по GET после события: до ожидания и после mandate.signed
+    expect(calls.filter((c) => c.route === `GET /pao/v1/mandates/${m.id}`)).toHaveLength(2);
+    // полный журнал: кроме чтений ленты (их число зависит от опроса) — ровно эти обращения, по порядку
+    expect(calls.filter((c) => c.route !== "GET /pao/v1/events").map((c) => c.route)).toEqual([
+      "GET /.well-known/pao-configuration",
+      "GET /pao/v1/agent",
+      "PUT /pao/v1/subscription",
+      "POST /pao/v1/mandates",
+      `GET /pao/v1/mandates/${m.id}`,
+      `GET /pao/v1/mandates/${m.id}`,
+    ]);
+    // ошибок нет, кроме 404 конфигурации (стенд её не отдаёт до PS-05, Р33 п. 10)
+    expect(calls.filter((c) => c.status >= 400).map((c) => c.route)).toEqual(["GET /.well-known/pao-configuration"]);
+  });
+
+  it("agent.* в ленте — сверка GET /pao/v1/agent, курсор двигается (Р34 п. 5)", async () => {
+    const { core, calls, replace } = await setup();
+    const a = core();
+    await a.c.start();
+    feedPages(replace, [[AGENT_EVENT], []]);
+    const from = calls.length;
+    await a.c.events.signal();
+    expect(calls.slice(from).map((c) => [c.route, c.status])).toEqual([
+      ["GET /pao/v1/events", 200],
+      ["GET /pao/v1/agent", 200],
+      ["GET /pao/v1/events", 200],
+    ]);
+    expect(a.c.events.cursor()).toBe("evt_a1");
+    expect(a.journal.entries).toContainEqual(expect.objectContaining({ kind: "event.handled", ref: "evt_a1", detail: "agent.key_revoked" }));
+  });
+
+  it("agent.*: сверка не прошла (503) — курсор на месте, записи нет; после восстановления — одна обработка (Р34 п. 3)", async () => {
+    const { core, calls, replace } = await setup();
+    const a = core();
+    await a.c.start();
+    feedPages(replace, [[AGENT_EVENT], [AGENT_EVENT], []]);
+    replace.set("GET /pao/v1/agent", () => {
+      replace.delete("GET /pao/v1/agent");
+      return Response.json({ code: "STATE_UNAVAILABLE", message: "x", norm: "x", retry: "same_key" }, { status: 503 });
+    });
+    await expect(a.c.events.signal()).rejects.toMatchObject({ code: "STATE_UNAVAILABLE" });
+    expect(a.c.events.cursor()).toBeNull();
+    expect(a.journal.entries.filter((e) => e.kind === "event.handled")).toEqual([]);
+    await a.c.events.signal();
+    expect(a.c.events.cursor()).toBe("evt_a1");
+    expect(a.journal.entries.filter((e) => e.kind === "event.handled")).toHaveLength(1);
+    expect(calls.filter((c) => c.route === "GET /pao/v1/agent").map((c) => c.status)).toEqual([200, 503, 200]);
+  });
+
+  it("agent.* во время внешней сверки — дождаться её и сверить заново, без «сверка уже идёт» (ревью К2.4 № 3–4)", async () => {
+    const { core, calls, replace } = await setup();
+    const a = core();
+    await a.c.start();
+    feedPages(replace, [[AGENT_EVENT], []]);
+    const external = a.c.recheck();
+    await Promise.all([external, a.c.events.signal()]);
+    expect(calls.filter((c) => c.route === "GET /pao/v1/agent").map((c) => c.status)).toEqual([200, 200, 200]);
+    expect(a.c.events.cursor()).toBe("evt_a1");
   });
 
   it("A → B → A тремя запусками: действует последний адрес, ключи разные (дополнение Р34 п. 2)", async () => {

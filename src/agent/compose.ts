@@ -107,6 +107,20 @@ export function createAgentCore(o: AgentCoreOptions): AgentCore {
       journal.record({ at: at(), kind, reason: e.code });
     }
   };
+  // Сверка с реестром одна на всех (Р27): событие agent.* и вызов recheck() снаружи ждут одну и ту же.
+  let rechecking: Promise<AgentSelf> | null = null;
+  const recheck = (): Promise<AgentSelf> =>
+    (rechecking ??= ring.recheck((s) => new PaoPlatform({ ...o.pao, params, signing: s }).agentSelf()).finally(() => {
+      rechecking = null;
+    }));
+  // agent.key_revoked / agent.suspended / agent.reinstated — сигнал: статус и ключи — по GET /pao/v1/agent (Р34 п. 5).
+  // Идёт чужая сверка — её GET мог уйти до смены статуса: дождаться её и сверить заново (ревью К2.4 № 4).
+  // Сверка не прошла (503, остановка) — слушатель падает, курсор на месте, событие прочитается снова (Р34 п. 3).
+  events.listen(async (item) => {
+    if (item.kind !== "event" || !item.event.type.startsWith("agent.")) return;
+    while (rechecking) await rechecking.catch(() => undefined);
+    await recheck();
+  });
   return {
     params,
     platform,
@@ -129,7 +143,7 @@ export function createAgentCore(o: AgentCoreOptions): AgentCore {
       if (o.pushUrl !== undefined) await subscribe(o.pushUrl, randomUUID());
       return self;
     },
-    recheck: () => ring.recheck((signing) => new PaoPlatform({ ...o.pao, params, signing }).agentSelf()),
+    recheck,
     maintainKeys: () => ring.maintain(platform),
     close: () => ring.close(),
   };

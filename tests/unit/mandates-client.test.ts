@@ -203,7 +203,7 @@ describe("клиент мандатов на PaoStub", () => {
     expect(stand.calls("POST /pao/v1/mandates")).toHaveLength(1);
   });
 
-  // Поправка 3 ревью плана: событие до AG-06 не подписано — истина у платформы.
+  // Поправка 3 ревью плана: событие до ПАО 1.5.0 не подписано — истина у платформы (Р29 п. 5, Р34 п. 5).
   it("подделанное mandate.signed при статусе не ACTIVE — остановка", async () => {
     const { core } = await setup();
     const m = await core.mandates.request(INTENT, { idempotencyKey: "idem_f" });
@@ -212,13 +212,88 @@ describe("клиент мандатов на PaoStub", () => {
     expect(err).toMatchObject({ reason: "NOT_ACTIVE" });
   });
 
-  it("подписи нет — SIGNATURE_PENDING; отклонение — NOT_ACTIVE", async () => {
-    const { core } = await setup();
+  it("подписи нет — SIGNATURE_PENDING; rejected / revoked / exhausted при PENDING_SIGNATURE — NOT_ACTIVE (SPEC §9, Р29 п. 5)", async () => {
+    const { core, stand } = await setup();
     const m = await core.mandates.request(INTENT, { idempotencyKey: "idem_p" });
     await expect(core.mandates.awaitSigned(m, feed())).rejects.toMatchObject({ reason: "SIGNATURE_PENDING" });
     for (const t of ["mandate.rejected", "mandate.revoked", "mandate.exhausted"] as const) {
       await expect(core.mandates.awaitSigned(m, feed(event(t, m.id)))).rejects.toMatchObject({ reason: "NOT_ACTIVE" });
     }
+    // каждое событие — GET (Р34 п. 5), плюс GET до ожидания
+    expect(stand.calls("GET /pao/v1/mandates/{id}")).toHaveLength(4 + 3);
+  });
+
+  it("событие о смене статуса при ACTIVE у платформы — остановка, а не «действует» (ревью К2.4 № 2)", async () => {
+    const { core, consents } = await setup();
+    const m = await core.mandates.request(INTENT, { idempotencyKey: "idem_r" });
+    const err = await core.mandates
+      .awaitSigned(m, {
+        async *[Symbol.asyncIterator]() {
+          yield* feed(event("mandate.signed", "m_other")); // итератор запущен до GET; GET до ожидания — PENDING
+          consents.mandates.get(m.id)!.status = "ACTIVE";
+          yield* feed(event("mandate.revoked", m.id));
+        },
+      })
+      .catch((e: unknown) => e);
+    expect(err).toMatchObject({ reason: "NOT_ACTIVE" });
+  });
+
+  it("итератор ленты запускается до первого GET: событие, прочитанное во время GET, не теряется (ревью К2.4 № 1)", async () => {
+    const { core, stand } = await setup();
+    const m = await core.mandates.request(INTENT, { idempotencyKey: "idem_it" });
+    const gets = () => stand.calls("GET /pao/v1/mandates/{id}").length;
+    const before = gets();
+    let atFirstNext = -1;
+    await core.mandates
+      .awaitSigned(m, {
+        [Symbol.asyncIterator]: () => ({
+          next: async () => {
+            if (atFirstNext < 0) atFirstNext = gets();
+            return { done: true, value: undefined };
+          },
+        }),
+      })
+      .catch(() => undefined);
+    expect(atFirstNext).toBe(before);
+    expect(gets()).toBe(before + 1);
+  });
+
+  it.each(["REJECTED", "REVOKED", "EXPIRED"] as const)("статус %s у платформы — NOT_ACTIVE по событию и до ожидания", async (status) => {
+    const { core, consents } = await setup();
+    const m = await core.mandates.request(INTENT, { idempotencyKey: `idem_n_${status}` });
+    consents.mandates.get(m.id)!.status = status;
+    await expect(core.mandates.awaitSigned(m, feed())).rejects.toMatchObject({ reason: "NOT_ACTIVE" });
+  });
+
+  it("ответ (б): mandate.* без читаемого mandate_id — GET ожидаемого мандата; не мандатный тип — без GET (Р34 п. 6)", async () => {
+    const { core, consents, stand } = await setup();
+    const m = await core.mandates.request(INTENT, { idempotencyKey: "idem_b" });
+    const gets = () => stand.calls("GET /pao/v1/mandates/{id}").length;
+    const before = gets();
+    // не мандатный пропуск и неизвестный тип — мандат не перечитывается
+    await expect(
+      core.mandates.awaitSigned(m, feed({ kind: "ignored", eventId: "e1", detail: "INVALID_DATA", type: "operation.settled" }, { kind: "ignored", eventId: "e2", detail: "UNKNOWN_TYPE" })),
+    ).rejects.toMatchObject({ reason: "SIGNATURE_PENDING" });
+    expect(gets() - before).toBe(1); // только GET до ожидания
+    // человек подписал, а событие пришло без mandate_id — сигнал о мандате был: GET даёт ACTIVE
+    const signal = { kind: "ignored", eventId: "e3", detail: "INVALID_DATA", type: "mandate.signed" } as const;
+    const pending = core.mandates.awaitSigned(m, {
+      async *[Symbol.asyncIterator]() {
+        yield* feed({ kind: "ignored", eventId: "e0", detail: "UNKNOWN_TYPE" }); // итератор запущен до GET (PENDING)
+        consents.mandates.get(m.id)!.status = "ACTIVE";
+        yield* feed(signal);
+      },
+    });
+    await expect(pending).resolves.toMatchObject({ id: m.id, status: "ACTIVE" });
+  });
+
+  it("событие о чужом мандате — без GET; подпись прочитана раньше ожидания — мандат действует без события", async () => {
+    const { core, consents, stand } = await setup();
+    const m = await core.mandates.request(INTENT, { idempotencyKey: "idem_o" });
+    await expect(core.mandates.awaitSigned(m, feed(event("mandate.signed", "m_other")))).rejects.toMatchObject({ reason: "SIGNATURE_PENDING" });
+    expect(stand.calls("GET /pao/v1/mandates/{id}")).toHaveLength(1);
+    consents.sign(m.id);
+    await expect(core.mandates.awaitSigned(m, feed())).resolves.toMatchObject({ status: "ACTIVE" });
   });
 
   // Границы окна — от стендовых параметров и часов стенда, не литералами.

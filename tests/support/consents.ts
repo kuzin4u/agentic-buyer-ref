@@ -7,6 +7,7 @@
 // стенд v0.5.0 (ПАО 1.4.0; К2а, К1.2 AG-06) мандаты уже отдаёт; переход этих тестов на createStand — STATUS «Открыто».
 import type * as Pao from "@kuzin4u/agentic-core/pao";
 import type { PaoStubOptions } from "@kuzin4u/agentic-core/pao";
+import type { FeedItem } from "../../src/agent/ports/events.js";
 import type { MandateDraft, Money, PlatformEvent, PlatformEventType } from "../../src/shared/domain.js";
 import { AGENT } from "./pao-stand.js";
 
@@ -96,7 +97,7 @@ export function event(type: PlatformEventType, mandateId: string): PlatformEvent
   return { eventId: `ev_${++eventSeq}`, type, at: "2026-10-12T09:00:00Z", mandateId, opRef: null, confirmationId: null, declineReason: null };
 }
 
-/** Источник событий для awaitSigned: до AG-06 — список, который задаёт тест. */
-export async function* feed(...events: PlatformEvent[]): AsyncGenerator<PlatformEvent> {
-  for (const e of events) yield e;
+/** Элементы ленты для awaitSigned на PaoStub (ленты у него нет, Р34 п. 10): список, который задаёт тест. */
+export async function* feed(...items: (PlatformEvent | FeedItem)[]): AsyncGenerator<FeedItem> {
+  for (const i of items) yield "kind" in i ? i : { kind: "event", event: i };
 }

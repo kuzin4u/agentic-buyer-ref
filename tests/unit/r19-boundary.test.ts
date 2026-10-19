@@ -235,3 +235,23 @@ describe("mandates → только ports/mandates и ports/mutation", () => {
     expect(importedFiles.map((i) => i.fileName).filter((n) => !ALLOWED.some((re) => re.test(n)))).toEqual(["../ports/payment-platform.js"]);
   });
 });
+
+// Р34: модуль событий видит из портов только порт событий; из shared — доменные типы; файловая система и zod — для курсора.
+describe("events → только ports/events", () => {
+  const ALLOWED = [/^\.\/[\w-]+\.js$/, /^\.\.\/ports\/events\.js$/, /^\.\.\/\.\.\/shared\/domain\.js$/, /^node:(fs|path)$/, /^zod$/];
+  const files = readdirSync("src/agent/events").filter((f) => SOURCE_FILE.test(f));
+  it("файлы модуля найдены; подкаталогов нет", () => {
+    expect(files.length).toBeGreaterThan(0);
+    expect(readdirSync("src/agent/events", { withFileTypes: true }).filter((d) => d.isDirectory())).toEqual([]);
+  });
+  it.each(files)("src/agent/events/%s", (f) => {
+    const { importedFiles } = ts.preProcessFile(readFileSync(`src/agent/events/${f}`, "utf8"), true, true);
+    const bad = importedFiles.map((i) => i.fileName).filter((n) => !ALLOWED.some((re) => re.test(n)));
+    expect(bad).toEqual([]);
+  });
+  it("поломка: импорт адаптера или подписанта ловится", () => {
+    const src = 'import { PaoPlatform } from "../adapters/pao/index.js";\nimport { KeyRing } from "../signer/index.js";';
+    const { importedFiles } = ts.preProcessFile(src, true, true);
+    expect(importedFiles.map((i) => i.fileName).filter((n) => !ALLOWED.some((re) => re.test(n)))).toHaveLength(2);
+  });
+});

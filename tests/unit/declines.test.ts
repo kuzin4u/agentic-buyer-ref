@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import { readFileSync } from "node:fs";
 import { PAO_ERRORS } from "@kuzin4u/agentic-core/pao";
 import { FAILURE_RULES, ruleForDeclineReason, ruleForFailure } from "../../src/agent/declines/index.js";
+import { EVENTS_CURSOR_INVALID } from "../../src/agent/events/index.js";
 
 const spec = readFileSync("docs/core/SPEC.md", "utf8");
 /** коды агента вне ПАО — своя часть §7а (Р33) */
@@ -32,6 +33,11 @@ describe("таблица отказов", () => {
     expect(ruleForFailure("KEY_INVALID")).toMatchObject({ action: "NEW_KEY", maxRetries: 2, defect: true, journal: true });
     // SPEC §7а: «после 3 отказов подряд» = первый отказ + maxRetries
     expect(spec).toMatch(/\| KEY_INVALID \| 422 \| after_fix \|[^\n]*после 3 отказов подряд/);
+  });
+
+  it("Р34 п. 4: EVENTS_CURSOR_INVALID — причина остановки агента (не отказ Платформы), строка в SPEC §7а", () => {
+    expect(Object.keys(FAILURE_RULES)).not.toContain(EVENTS_CURSOR_INVALID);
+    expect(spec).toMatch(new RegExp(`^\\| ${EVENTS_CURSOR_INVALID} \\| — \\| never \\|[^\\n]*UNREADABLE[^\\n]*REJECTED`, "m"));
   });
 
   it("UNKNOWN — остановка без повтора", () => {

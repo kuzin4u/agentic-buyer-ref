@@ -7,8 +7,9 @@ import type { AgentDiagCode } from "../../shared/diag-codes.js";
 
 export type { DiagAction, DiagEntry, DiagRegistry, DiagSource };
 
-/** Версия агента, с которой действуют записи (package.json). */
-const SINCE = "0.0.1";
+/** Версия агента (package.json; тест diag-registry): с неё действуют записи, она же — в отчёте самопроверки. */
+export const AGENT_VERSION = "0.0.1";
+const SINCE = AGENT_VERSION;
 /** Версия ПАО, с которой агент сверяет причины operation.declined (Р20, SPEC §7б). */
 const SINCE_PAO = "1.2.0";
 
@@ -61,6 +62,14 @@ export const AGENT_DIAG: Readonly<Record<AgentDiagCode, DiagEntry>> = {
     "Покупки временно приостановлены. Повторите позже.",
     "Ответ GET /pao/v1/agent после допуска не по схеме: подпись приостановлена до успешной повторной сверки с реестром.",
     "Р27"),
+  PARAMS_INVALID: e("PARAMS_INVALID", ["agent", "environment"], "after_fix",
+    STOPPED,
+    "Стендовые параметры не прочитаны или не по схеме (config/params.stand.json): агент не собран, сеть не трогалась. Причина — в сообщении ошибки.",
+    "Р36 п. 6; CLAUDE.md «Стендовые значения»"),
+  CORE_PAO_MISMATCH: e("CORE_PAO_MISMATCH", ["agent"], "after_fix",
+    STOPPED,
+    "Версия ПАО в подключённом agentic-core не совпадает с копией ПАО агента: переход — через решение (Р20). Агент не собран, сеть не трогалась.",
+    "Р20; Р36 п. 6"),
   KEY_MISMATCH: e("KEY_MISMATCH", ["agent", "platform"], "stop",
     TECH,
     "Ключ в реестре Платформы не совпадает с ключом в хранилище агента (kid, открытый ключ или алгоритм). Сверьте хранилище ключей и регистрацию.",

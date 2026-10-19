@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { SignerKeyRejected, SignerStopped, SignerSuspended, generateKey, listKeys } from "../../src/agent/signer/index.js";
 import { markKey, readMeta, writeMeta } from "../../src/agent/signer/keystore.js";
 import { PlatformFailure } from "../../src/shared/domain.js";
-import { CREDENTIALS, DRAFT, coreOn } from "../support/core.js";
+import { CREDENTIALS, DRAFT, coreOn, startCause, lastEntry } from "../support/core.js";
 import { PaoStand } from "../support/pao-stand.js";
 
 const DAY = 86_400_000;
@@ -26,8 +26,8 @@ describe("допуск не подтверждён — подписи нет", (
     const { core, journal } = await coreOn(stand);
     stand.stub.fail("GET /pao/v1/agent", { code: "UPSTREAM_UNAVAILABLE" }, core.params.pao_max_attempts);
 
-    await expect(core.start()).rejects.toMatchObject({ code: "UPSTREAM_UNAVAILABLE" });
-    expect(journal.entries.at(-1)).toMatchObject({ kind: "admission.failed", reason: "UPSTREAM_UNAVAILABLE" });
+    await expect(startCause(core.start())).rejects.toMatchObject({ code: "UPSTREAM_UNAVAILABLE" });
+    expect(lastEntry(journal)).toMatchObject({ kind: "admission.failed", reason: "UPSTREAM_UNAVAILABLE" });
     await expect(core.platform.issueCredential(DRAFT, { idempotencyKey: "i1" })).rejects.toThrow(SignerStopped);
     expect(stand.calls(OP)).toHaveLength(0);
 
@@ -41,7 +41,7 @@ describe("допуск: SPEC §7а и состояние ключей между
     stand = new PaoStand({ keys: 0 });
     generateKey(stand.dir); // ключ не внесён в реестр — платформа не примет подпись
     const { core } = await coreOn(stand);
-    const err = (await core.start().catch((e: unknown) => e)) as SignerStopped;
+    const err = (await startCause(core.start()).catch((e: unknown) => e)) as SignerStopped;
     expect(err).toBeInstanceOf(SignerStopped);
     expect(err.reason).toBe("SIGNATURE_INVALID");
     expect(err.cause).toMatchObject({ code: "SIGNATURE_INVALID" });
@@ -70,7 +70,7 @@ describe("допуск: SPEC §7а и состояние ключей между
     const { core, journal } = await coreOn(stand);
     stand.stub.fail("GET /pao/v1/agent", { code: "UPSTREAM_UNAVAILABLE" }, core.params.pao_max_attempts + 1); // первый отказ съест 401
     // 401 (newest) → переход на older → 503 на все попытки адаптера
-    await expect(core.start()).rejects.toMatchObject({ code: "UPSTREAM_UNAVAILABLE" });
+    await expect(startCause(core.start())).rejects.toMatchObject({ code: "UPSTREAM_UNAVAILABLE" });
     await expect(core.start()).resolves.toMatchObject({ status: "ACTIVE" });
     const signed = journal.entries.filter((e) => e.kind === "request.signed").map((e) => e.kid);
     expect(signed[0]).toBe(newest!.kid);
@@ -84,7 +84,7 @@ describe("допуск: SPEC §7а и состояние ключей между
     stand.revoke(newest!.kid);
     const { core, journal } = await coreOn(stand);
     stand.stub.fail("GET /pao/v1/agent", { code: "UPSTREAM_UNAVAILABLE" }, core.params.pao_max_attempts + 1);
-    await expect(core.start()).rejects.toMatchObject({ code: "UPSTREAM_UNAVAILABLE" }); // переход newest → middle, затем 503
+    await expect(startCause(core.start())).rejects.toMatchObject({ code: "UPSTREAM_UNAVAILABLE" }); // переход newest → middle, затем 503
     stand.revoke(middle!.kid);
     await expect(core.start()).resolves.toMatchObject({ status: "ACTIVE" }); // middle отозван → переход на oldest
     expect(listKeys(stand.dir)).toContainEqual({ kid: oldest!.kid, state: "active" });
@@ -100,7 +100,7 @@ describe("допуск: SPEC §7а и состояние ключей между
     writeMeta(stand.dir, { [newest!.kid]: readMeta(stand.dir)[newest!.kid]! }); // older в метаданных нет
     stand.revoke(newest!.kid);
     const { core } = await coreOn(stand);
-    await expect(core.start()).rejects.toMatchObject({ reason: "NO_ACTIVE_KEY", cause: expect.objectContaining({ code: "AGENT_KEY_REVOKED" }) });
+    await expect(startCause(core.start())).rejects.toMatchObject({ reason: "NO_ACTIVE_KEY", cause: expect.objectContaining({ code: "AGENT_KEY_REVOKED" }) });
     expect(stand.calls("GET /pao/v1/agent")).toHaveLength(1);
     expect(listKeys(stand.dir)).toContainEqual({ kid: older!.kid, state: "active" });
   });
@@ -112,7 +112,7 @@ describe("допуск: SPEC §7а и состояние ключей между
     writeMeta(stand.dir, { ...meta, [older!.kid]: { ...meta[older!.kid]!, valid_to: "2026-10-01T00:00:00Z" } });
     stand.revoke(newest!.kid);
     const { core } = await coreOn(stand);
-    await expect(core.start()).rejects.toMatchObject({ reason: "NO_ACTIVE_KEY" });
+    await expect(startCause(core.start())).rejects.toMatchObject({ reason: "NO_ACTIVE_KEY" });
     expect(stand.calls("GET /pao/v1/agent")).toHaveLength(1);
   });
 
@@ -121,7 +121,7 @@ describe("допуск: SPEC §7а и состояние ключей между
     stand.revoke(stand.descriptors[2]!.kid);
     stand.revoke(stand.descriptors[1]!.kid);
     const { core } = await coreOn(stand);
-    await expect(core.start()).rejects.toMatchObject({ reason: "NO_ACTIVE_KEY" });
+    await expect(startCause(core.start())).rejects.toMatchObject({ reason: "NO_ACTIVE_KEY" });
     expect(stand.calls("GET /pao/v1/agent").map((c) => c.status)).toEqual([401, 401]);
   });
 
@@ -139,7 +139,7 @@ describe("допуск: SPEC §7а и состояние ключей между
     stand = new PaoStand({ keys: 2 });
     rmSync(join(stand.dir, "keys.meta.json"));
     const { core } = await coreOn(stand);
-    await expect(core.start()).rejects.toMatchObject({ reason: "KEY_AMBIGUOUS" });
+    await expect(startCause(core.start())).rejects.toMatchObject({ reason: "KEY_AMBIGUOUS" });
     expect(stand.stub.calls).toHaveLength(0);
   });
 
@@ -147,7 +147,7 @@ describe("допуск: SPEC §7а и состояние ключей между
     stand = new PaoStand({ keys: 2 });
     writeFileSync(join(stand.dir, "keys.meta.json"), "{", { mode: 0o600 });
     const { core } = await coreOn(stand);
-    await expect(core.start()).rejects.toThrow(SignerKeyRejected);
+    await expect(startCause(core.start())).rejects.toThrow(SignerKeyRejected);
     expect(stand.stub.calls).toHaveLength(0);
   });
 
@@ -215,9 +215,9 @@ describe("допуск и хранилище: третье ревью 3b", () =>
     const last = [...stand.descriptors].sort((a, b) => (a.kid < b.kid ? -1 : 1))[1]!.kid;
     chmodSync(join(stand.dir, `${last}.pem`), 0o644);
     const { core, journal } = await coreOn(stand);
-    await expect(core.start()).rejects.toThrow(SignerKeyRejected);
+    await expect(startCause(core.start())).rejects.toThrow(SignerKeyRejected);
     expect(journal.entries.filter((e) => e.kind === "key.loaded")).toHaveLength(0);
-    expect(journal.entries.at(-1)).toMatchObject({ kind: "admission.failed", reason: "KEY_REJECTED" });
+    expect(lastEntry(journal)).toMatchObject({ kind: "admission.failed", reason: "KEY_REJECTED" });
     expect(stand.stub.calls).toHaveLength(0);
     chmodSync(join(stand.dir, `${last}.pem`), 0o600);
     await expect(core.start()).resolves.toMatchObject({ status: "ACTIVE" });
@@ -259,7 +259,7 @@ describe("один процесс на каталог ключей", () => {
     const first = await coreOn(stand);
     await first.core.start();
     const second = await coreOn(stand);
-    await expect(second.core.start()).rejects.toMatchObject({ reason: "KEYSTORE_LOCKED" });
+    await expect(startCause(second.core.start())).rejects.toMatchObject({ reason: "KEYSTORE_LOCKED" });
     expect(stand.calls("GET /pao/v1/agent")).toHaveLength(1);
     first.core.close();
     const third = await coreOn(stand);
@@ -284,7 +284,7 @@ describe("один процесс на каталог ключей", () => {
     stand = new PaoStand();
     writeFileSync(join(stand.dir, ".lock"), "", { mode: 0o600 });
     const { core } = await coreOn(stand);
-    await expect(core.start()).rejects.toMatchObject({ reason: "KEYSTORE_LOCKED" });
+    await expect(startCause(core.start())).rejects.toMatchObject({ reason: "KEYSTORE_LOCKED" });
     expect(stand.stub.calls).toHaveLength(0);
   });
 
@@ -292,8 +292,8 @@ describe("один процесс на каталог ключей", () => {
     stand = new PaoStand();
     mkdirSync(join(stand.dir, ".lock"), { mode: 0o700 }); // на месте файла блокировки — каталог
     const { core, journal } = await coreOn(stand);
-    await expect(core.start()).rejects.toThrow(SignerKeyRejected);
-    expect(journal.entries.at(-1)).toMatchObject({ kind: "admission.failed", reason: "KEY_REJECTED" });
+    await expect(startCause(core.start())).rejects.toThrow(SignerKeyRejected);
+    expect(lastEntry(journal)).toMatchObject({ kind: "admission.failed", reason: "KEY_REJECTED" });
     rmSync(join(stand.dir, ".lock"), { recursive: true });
     await expect(core.start()).resolves.toMatchObject({ status: "ACTIVE" });
   });
@@ -334,7 +334,7 @@ describe("после допуска", () => {
     await core.start();
     stand.status = "EXCLUDED";
     await expect(core.platform.agentSelf()).resolves.toMatchObject({ status: "EXCLUDED" });
-    expect(journal.entries.at(-1)).toMatchObject({ kind: "agent.stopped", reason: "AGENT_EXCLUDED" });
+    expect(lastEntry(journal)).toMatchObject({ kind: "agent.stopped", reason: "AGENT_EXCLUDED" });
     await expect(core.platform.issueCredential(DRAFT, { idempotencyKey: "i1" })).rejects.toThrow(SignerStopped);
     expect(stand.calls(OP)).toHaveLength(0);
   });
@@ -344,13 +344,13 @@ describe("после допуска", () => {
     stand = new PaoStand({ handlers: CREDENTIALS });
     stand.agentClass = "SELLER";
     const { core, journal } = await coreOn(stand);
-    await expect(core.start()).rejects.toMatchObject({ reason: "AGENT_CLASS_MISMATCH" });
+    await expect(startCause(core.start())).rejects.toMatchObject({ reason: "AGENT_CLASS_MISMATCH" });
     expect(stand.stub.calls.map((c) => c.op)).toEqual(["GET /.well-known/pao-configuration", "GET /pao/v1/agent"]);
     expect(journal.entries.filter((e) => e.kind === "agent.stopped")).toEqual([
       expect.objectContaining({ reason: "AGENT_CLASS_MISMATCH", detail: "SELLER" }),
     ]);
     await expect(core.platform.issueCredential(DRAFT, { idempotencyKey: "i1" })).rejects.toThrow(SignerStopped);
-    await expect(core.start()).rejects.toThrow(SignerStopped);
+    await expect(startCause(core.start())).rejects.toThrow(SignerStopped);
     expect(stand.stub.calls).toHaveLength(2);
   });
 
@@ -359,7 +359,7 @@ describe("после допуска", () => {
     stand.status = "SUSPENDED";
     stand.agentClass = "SELLER";
     const { core, journal } = await coreOn(stand);
-    await expect(core.start()).rejects.toMatchObject({ reason: "AGENT_SUSPENDED" });
+    await expect(startCause(core.start())).rejects.toMatchObject({ reason: "AGENT_SUSPENDED" });
     // причину в журнал пишет первым адаптер — порядок «статус → класс» проверяется и там
     expect(journal.entries.filter((e) => e.kind === "agent.stopped")).toEqual([expect.objectContaining({ reason: "AGENT_SUSPENDED" })]);
   });
@@ -374,16 +374,20 @@ describe("после допуска", () => {
     expect(journal.entries.filter((e) => e.kind === "agent.stopped")).toEqual([expect.objectContaining({ reason: "AGENT_SUSPENDED" })]);
   });
 
-  it("нет class в ответе реестра при допуске — UNKNOWN, допуск не состоялся, подписи нет; повтор допуска возможен", async () => {
+  // Дополнение 2 к Р36 (а): UNKNOWN — действие реестра stop, подписант остановлен (fail-closed); повтор допуска — после
+  // разделения UNKNOWN в AG-12 (сбой среды — retry_same_key). Прежде (Р27) — «повтор допуска возможен».
+  it("нет class в ответе реестра при допуске — UNKNOWN, допуск не состоялся, подписи нет; агент остановлен", async () => {
     stand = new PaoStand({ handlers: CREDENTIALS });
     stand.agentClass = undefined;
     const { core, journal } = await coreOn(stand);
-    await expect(core.start()).rejects.toMatchObject({ code: "UNKNOWN" });
+    await expect(startCause(core.start())).rejects.toMatchObject({ code: "UNKNOWN" });
     await expect(core.platform.issueCredential(DRAFT, { idempotencyKey: "i1" })).rejects.toThrow(SignerStopped);
     expect(stand.calls(OP)).toHaveLength(0);
     expect(journal.entries.map((e) => e.kind)).not.toContain("signing.suspended");
+    expect(lastEntry(journal)).toMatchObject({ kind: "agent.stopped", reason: "UNKNOWN" });
     stand.agentClass = "BUYER";
-    await expect(core.start()).resolves.toMatchObject({ agentClass: "BUYER" });
+    await expect(startCause(core.start())).rejects.toMatchObject({ reason: "UNKNOWN" });
+    expect(stand.calls("GET /pao/v1/agent")).toHaveLength(1);
   });
 
   // Р27 (уточнение): после допуска ответ не по схеме — приостановка до успешной повторной сверки, не бессрочная остановка.
@@ -448,7 +452,7 @@ describe("после допуска", () => {
     await core.start();
     stand.agentClass = "SERVICE";
     await expect(core.platform.agentSelf()).resolves.toMatchObject({ agentClass: "SERVICE" });
-    expect(journal.entries.at(-1)).toEqual(expect.objectContaining({ kind: "agent.stopped", reason: "AGENT_CLASS_MISMATCH", detail: "SERVICE" }));
+    expect(lastEntry(journal)).toEqual(expect.objectContaining({ kind: "agent.stopped", reason: "AGENT_CLASS_MISMATCH", detail: "SERVICE" }));
     await expect(core.platform.issueCredential(DRAFT, { idempotencyKey: "i1" })).rejects.toThrow(SignerStopped);
     expect(stand.calls(OP)).toHaveLength(0);
   });

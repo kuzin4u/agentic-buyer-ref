@@ -4,7 +4,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { SignerStopped } from "../../src/agent/signer/index.js";
 import { PlatformFailure } from "../../src/shared/domain.js";
-import { CREDENTIALS, DRAFT, coreOn } from "../support/core.js";
+import { CREDENTIALS, DRAFT, coreOn, startCause, lastEntry } from "../support/core.js";
 import { PaoStand, CONFIGURATION } from "../support/pao-stand.js";
 
 let stand: PaoStand;
@@ -18,9 +18,9 @@ describe("П03 — исключённый или отсутствующий в �
     stand.exclude([OP]);
     const { core, journal } = await coreOn(stand);
 
-    await expect(core.start()).rejects.toThrow(SignerStopped);
+    await expect(startCause(core.start())).rejects.toThrow(SignerStopped);
     expect(stand.calls("GET /pao/v1/agent")).toMatchObject([{ status: 200 }]);
-    expect(journal.entries.at(-1)).toMatchObject({ kind: "agent.stopped", reason: "AGENT_EXCLUDED" });
+    expect(lastEntry(journal)).toMatchObject({ kind: "agent.stopped", reason: "AGENT_EXCLUDED" });
     await expect(core.platform.issueCredential(DRAFT, { idempotencyKey: "idem-p03" })).rejects.toThrow(SignerStopped);
     expect(stand.log()).toEqual([CONFIGURATION, { op: "GET /pao/v1/agent", status: 200 }]);
     expect(stand.stub.violations).toEqual([]);
@@ -38,7 +38,7 @@ describe("П03 — исключённый или отсутствующий в �
       httpStatus: 403,
     });
     expect(stand.calls(OP)).toHaveLength(1);
-    expect(journal.entries.at(-1)).toMatchObject({ kind: "agent.stopped", reason: "AGENT_SUSPENDED" });
+    expect(lastEntry(journal)).toMatchObject({ kind: "agent.stopped", reason: "AGENT_SUSPENDED" });
     await expect(core.platform.issueCredential(DRAFT, { idempotencyKey: "idem-p03" })).rejects.toThrow(SignerStopped);
     await expect(core.platform.agentSelf()).rejects.toThrow(SignerStopped);
     expect(stand.log()).toEqual([CONFIGURATION, { op: "GET /pao/v1/agent", status: 200 }, { op: OP, status: 403 }]);
@@ -49,11 +49,11 @@ describe("П03 — исключённый или отсутствующий в �
     stand = new PaoStand({ unregistered: true });
     const { core, journal } = await coreOn(stand);
 
-    const err = await core.start().catch((e: unknown) => e);
+    const err = await startCause(core.start()).catch((e: unknown) => e);
     expect(err).toBeInstanceOf(PlatformFailure);
     expect(err).toMatchObject({ code: "AGENT_UNKNOWN", retry: "never", httpStatus: 401 });
     expect(stand.calls("GET /pao/v1/agent")).toHaveLength(1);
-    expect(journal.entries.at(-1)).toMatchObject({ kind: "agent.stopped", reason: "AGENT_UNKNOWN" });
+    expect(lastEntry(journal)).toMatchObject({ kind: "agent.stopped", reason: "AGENT_UNKNOWN" });
     await expect(core.platform.agentSelf()).rejects.toThrow(SignerStopped);
     expect(stand.log()).toEqual([CONFIGURATION, { op: "GET /pao/v1/agent", status: 401 }]);
     expect(stand.stub.violations).toEqual([]);

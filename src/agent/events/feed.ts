@@ -135,6 +135,12 @@ export class EventFeed {
     }
   }
 
+  /** Самопроверка при старте (Р36 п. 6): курсор читается до обращений к Платформе; не читается — остановка агента
+   *  (EVENTS_CURSOR_INVALID, UNREADABLE) и EventsStopped; файла нет — events.cursor_initial. */
+  checkCursor(): void {
+    this.#load();
+  }
+
   #load(): string | null {
     if (this.#stopped) throw this.#stopped;
     if (this.#after !== undefined) return this.#after;

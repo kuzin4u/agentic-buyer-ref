@@ -6,13 +6,26 @@ import { relative, resolve } from "node:path";
 import { ConfigError, loadParams, type StandParams } from "../shared/config.js";
 import { PLATFORM_EVENT_TYPES, PlatformFailure, type AgentSelf } from "../shared/domain.js";
 import type { PaymentPlatform, PlatformCapabilities } from "./ports/payment-platform.js";
-import { PAO_DIAG, PaoPlatform, type PaoPlatformOptions } from "./adapters/pao/index.js";
+import { PAO_DIAG, PaoPlatform, assertPaoVersion, type PaoPlatformOptions } from "./adapters/pao/index.js";
 import { CATALOG_DIAG } from "./catalog/index.js";
 import { MemoryJournal, type Journal, type JournalEntry } from "./journal/index.js";
 import { MandateClient } from "./mandates/index.js";
-import { EventFeed, FileCursorStore, acceptPush, type PushReply } from "./events/index.js";
-import { KeyRing } from "./signer/index.js";
-import { AGENT_DIAG, AGENT_STOP_CODES, mergeDiag, type DiagRegistry } from "./declines/index.js";
+import { EventFeed, EventsStopped, FileCursorStore, acceptPush, type PushReply } from "./events/index.js";
+import { KeyRing, SignerKeyRejected, SignerStopped } from "./signer/index.js";
+import {
+  AGENT_DIAG,
+  AGENT_STOP_CODES,
+  AgentNotReady,
+  failedCheck,
+  mergeDiag,
+  selfCheckReport,
+  stopsAgent,
+  type CheckResult,
+  type DiagRegistry,
+  type SelfCheckName,
+  type SelfCheckReport,
+} from "./declines/index.js";
+import type { DiagCode } from "../shared/diag-codes.js";
 
 /** Полный реестр кодов агента (Р36 п. 1): ПАО и каталог — записи ядра, свои — AGENT_DIAG; код в двух — ошибка сборки. */
 export const DIAG: DiagRegistry = mergeDiag(PAO_DIAG, CATALOG_DIAG, AGENT_DIAG);
@@ -30,15 +43,20 @@ export interface AgentCore {
   events: EventFeed;
   /** Приём push (Р34 п. 2): только форма и сигнал ленте; HTTP-сервер — у оболочки. Заголовки — в нижнем регистре. */
   acceptPush(body: string, headers: Readonly<Record<string, string | string[] | undefined>>): PushReply;
-  /** Стадия 0: версия ПАО Платформы (Р33 п. 10) — ниже 1.4.0: PlatformFailure(PLATFORM_PROTOCOL_UNSUPPORTED), агент
-   *  остановлен, допуска нет; не определена — предупреждение platform.version_unknown в журнал и допуск. Затем
-   *  ключи из хранилища и сверка с реестром платформы; до успеха никакие обращения, кроме допуска, не подписываются.
-   *  Исходы отказа: SignerStopped (EXCLUDED, SUSPENDED по ответу, класс не BUYER — Р27, нет ключа) или PlatformFailure (AGENT_UNKNOWN,
-   *  AGENT_SUSPENDED кодом) — в обоих случаях подпись остановлена; прочие сбои (503, тайм-аут, ответ не по схеме —
-   *  UNKNOWN, Р27) — допуск можно повторить. После допуска — подписка на push, если задан `pushUrl` (Р34 п. 8):
-   *  адрес отвергнут (400) — events.subscription_rejected; прочий отказ Платформы после повторов адаптера (503, UNKNOWN) —
+  /** Самопроверка при старте (Р36 п. 6): отчёт последнего start() (и успешного, и с отказом); до start() — null. */
+  selfCheck(): SelfCheckReport | null;
+  /** Стадия 0 с самопроверкой (Р36 п. 6, дополнение 2). Порядок: ключи из хранилища и выбор ключа допуска, курсор ленты
+   *  (оба — до обращений к Платформе), версия ПАО Платформы (Р33 п. 10: ниже 1.4.0 — агент остановлен, допуска нет; не
+   *  определена — предупреждение platform.version_unknown и допуск), затем сверка с реестром (GET /pao/v1/agent); до
+   *  успеха никакие обращения, кроме допуска, не подписываются. Отчёт — в журнал (agent.selfcheck) и в selfCheck().
+   *  Отказ — AgentNotReady с отчётом, исходная ошибка (SignerStopped, PlatformFailure, EventsStopped, SignerKeyRejected) — в
+   *  cause; действие кода в реестре stop (нет ключа, EXCLUDED / SUSPENDED, класс не BUYER, AGENT_UNKNOWN, UNKNOWN —
+   *  ответ не по схеме или тайм-аут) — подписант остановлен; иначе (503, KEY_REJECTED) агент не допущен и start() можно
+   *  повторить. После допуска — подписка на push, если задан `pushUrl` (Р34 п. 8): адрес отвергнут (400) —
+   *  events.subscription_rejected; прочий отказ Платформы после повторов адаптера (503, UNKNOWN) —
    *  events.subscription_failed; в обоих случаях старт успешен, работа по ленте, повтор подписки — при следующем старте
-   *  (дополнение Р34 п. 1). Коды остановки агента и остановленная подпись — отказ старта. */
+   *  (дополнение Р34 п. 1). Коды остановки агента и остановленная подпись на подписке — отказ старта без AgentNotReady
+   *  (отчёт уже ready: true; STATUS «Открыто», ревью К2.2 № 4). */
   start(): Promise<AgentSelf>;
   /** Повторная сверка с реестром (Р27): снимает приостановку подписи при ACTIVE и BUYER; не ACTIVE или не BUYER — остановка;
    *  ответ снова не по схеме или сбой — приостановка остаётся. Расписание сверок — за вызывающим (AG-12). */
@@ -72,21 +90,51 @@ function nested(a: string, b: string): boolean {
   return inside(a, b) || inside(b, a);
 }
 
+const OK: CheckResult = { status: "ok" };
+
+/** Код реестра по отказу старта; null — не отказ проверки (дефект), уходит наружу как есть. */
+function startFailureCode(e: unknown): DiagCode | null {
+  if (e instanceof SignerStopped) return e.reason === "CLOSED" ? null : e.reason;
+  if (e instanceof PlatformFailure) return e.code;
+  if (e instanceof EventsStopped) return "EVENTS_CURSOR_INVALID";
+  if (e instanceof SignerKeyRejected) return "KEY_REJECTED";
+  return null;
+}
+
+/** Отчёт — в журнал: по записи на проверку, только имя, итог и код (Р36 п. 6). */
+function recordReport(journal: Journal, report: SelfCheckReport): void {
+  for (const c of report.checks) {
+    journal.record({ at: report.checked_at, kind: "agent.selfcheck", check: c.check, status: c.status, ...(c.code !== undefined && { reason: c.code }) });
+  }
+}
+
 export function createAgentCore(o: AgentCoreOptions): AgentCore {
-  const params = loadParams(o.paramsPath);
-  if (nested(o.stateDir, o.keysDir)) throw new ConfigError("каталог состояния совпадает с каталогом ключей или вложен в него (или наоборот)");
+  const now = o.now ?? (() => new Date());
   const journal = o.journal ?? new MemoryJournal();
+  // Самопроверка без сети при сборке (Р36 п. 6, дополнение 2 п. 1): без параметров агент не собрать — отказ сборки с отчётом.
+  const notReady = (results: Partial<Record<SelfCheckName, CheckResult>>, cause: unknown): AgentNotReady => {
+    const report = selfCheckReport(results, now());
+    recordReport(journal, report);
+    return new AgentNotReady(report, { cause });
+  };
+  let params: StandParams;
+  try {
+    params = loadParams(o.paramsPath);
+  } catch (e) {
+    if (e instanceof ConfigError) throw notReady({ "config.params": { status: "fail", code: "PARAMS_INVALID" } }, e);
+    throw e;
+  }
+  try {
+    assertPaoVersion();
+  } catch (e) {
+    throw notReady({ "config.params": OK, "core.pao": { status: "fail", code: "CORE_PAO_MISMATCH" } }, e);
+  }
+  if (nested(o.stateDir, o.keysDir)) throw new ConfigError("каталог состояния совпадает с каталогом ключей или вложен в него (или наоборот)");
   const ring = new KeyRing({ dir: o.keysDir, params, journal, ...(o.now && { now: o.now }) });
   // Рабочий адаптер получает порт, закрытый до допуска; запрос допуска идёт через отдельный адаптер с портом допуска.
   // События версии ПАО (Р33 п. 10) пишет адаптер; время записи — по часам ядра, как у прочих событий журнала.
-  const now = o.now ?? (() => new Date());
   const protocolJournal = { record: (e: JournalEntry) => journal.record({ ...e, at: now().toISOString() }) };
   const platform = new PaoPlatform({ ...o.pao, params, signing: ring.port(), journal: protocolJournal });
-  // Р33 п. 10, шаг 1: до допуска и до любого обращения с мандатом. События версии пишет адаптер, остановку агента — тоже
-  // он (порт подписи); отказ PLATFORM_PROTOCOL_UNSUPPORTED связка ключей пробрасывает как есть (агент уже остановлен).
-  const connect = async (): Promise<void> => {
-    await platform.checkProtocol();
-  };
   const at = (): string => now().toISOString();
   // Остановка по курсору — через порт подписи: агент целиком, запись agent.stopped — у связки ключей (Р34 п. 4).
   const signing = ring.port();
@@ -122,6 +170,7 @@ export function createAgentCore(o: AgentCoreOptions): AgentCore {
   // agent.key_revoked / agent.suspended / agent.reinstated — сигнал: статус и ключи — по GET /pao/v1/agent (Р34 п. 5).
   // Идёт чужая сверка — её GET мог уйти до смены статуса: дождаться её и сверить заново (ревью К2.4 № 4).
   // Сверка не прошла (503, остановка) — слушатель падает, курсор на месте, событие прочитается снова (Р34 п. 3).
+  let lastReport: SelfCheckReport | null = null;
   events.listen(async (item) => {
     if (item.kind !== "event" || !item.event.type.startsWith("agent.")) return;
     while (rechecking) await rechecking.catch(() => undefined);
@@ -136,17 +185,45 @@ export function createAgentCore(o: AgentCoreOptions): AgentCore {
     diag: DIAG,
     events,
     acceptPush: (body, headers) => acceptPush({ wake: () => events.signal(), journal, now }, body, headers),
-    // Конфигурация читается после загрузки ключей (сбой хранилища — до обращения к Платформе) и перед GET /pao/v1/agent;
-    // один раз за start, повтор допуска (SIGNATURE_INVALID) её не повторяет.
+    selfCheck: () => lastReport,
+    // Ключи загружаются до обращений к Платформе (сбой хранилища — без сети), затем курсор ленты и конфигурация, затем
+    // GET /pao/v1/agent; курсор и конфигурация — один раз за start, повтор допуска (SIGNATURE_INVALID) их не повторяет.
     start: async () => {
+      lastReport = null;
+      const results: Partial<Record<SelfCheckName, CheckResult>> = { "config.params": OK, "core.pao": OK };
       let connected = false;
-      const self = await ring.start(async (admission) => {
-        if (!connected) {
-          await connect();
-          connected = true;
-        }
-        return new PaoPlatform({ ...o.pao, params, signing: admission }).agentSelf();
-      });
+      let self: AgentSelf;
+      try {
+        self = await ring.start(async (admission) => {
+          if (!connected) {
+            results["keys.store"] = OK;
+            results["keys.active"] = OK;
+            events.checkCursor();
+            results["events.cursor"] = OK;
+            // Р33 п. 10, шаг 1: до допуска и до любого обращения с мандатом. События версии пишет адаптер, остановку агента —
+            // тоже он (порт подписи); отказ PLATFORM_PROTOCOL_UNSUPPORTED связка ключей пробрасывает как есть.
+            const p = await platform.checkProtocol();
+            results["platform.protocol"] = p.status === "confirmed" ? OK : { status: "warn", code: "PLATFORM_VERSION_UNKNOWN" };
+            connected = true;
+          }
+          return new PaoPlatform({ ...o.pao, params, signing: admission }).agentSelf();
+        });
+      } catch (e) {
+        const code = startFailureCode(e);
+        if (code === null) throw e;
+        const check = failedCheck(code);
+        // выбор ключа идёт после загрузки хранилища: хранилище проверено (ревью К2.2 № 1)
+        if (check === "keys.active") results["keys.store"] = OK;
+        results[check] = { status: "fail", code };
+        // дополнение 2 п. 2: по действию кода в реестре; подписант мог уже остановиться сам (SIGNATURE_INVALID — SPEC §7а)
+        if (stopsAgent(DIAG, code)) signing.stop(code);
+        lastReport = selfCheckReport(results, now());
+        recordReport(journal, lastReport);
+        throw new AgentNotReady(lastReport, { cause: e });
+      }
+      results["platform.admission"] = OK;
+      lastReport = selfCheckReport(results, now());
+      recordReport(journal, lastReport);
       if (o.pushUrl !== undefined) await subscribe(o.pushUrl, randomUUID());
       return self;
     },

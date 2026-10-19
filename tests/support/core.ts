@@ -1,6 +1,9 @@
 // Ядро агента против тестового стенда ПАО (tests/support/pao-stand.ts).
-import { createAgentCore } from "../../src/agent/compose.js";
-import { MemoryJournal } from "../../src/agent/journal/index.js";
+import { expect } from "vitest";
+import { checkSelfCheckReport } from "@kuzin4u/agentic-core/diag";
+import { DIAG, createAgentCore } from "../../src/agent/compose.js";
+import { AgentNotReady } from "../../src/agent/declines/index.js";
+import { MemoryJournal, type JournalEntry } from "../../src/agent/journal/index.js";
 import type { CredentialDraft } from "../../src/shared/domain.js";
 import type { PaoStubOptions } from "@kuzin4u/agentic-core/pao";
 import { AGENT, type PaoStand } from "./pao-stand.js";
@@ -42,4 +45,22 @@ export async function coreOn(stand: PaoStand, o: { fetch?: typeof fetch; paramsP
     pao: { baseUrl, agentCode: AGENT, sleep: async () => {}, ...(o.fetch && { fetch: o.fetch }) },
   });
   return { core, journal };
+}
+
+/** Отказ start() — только AgentNotReady с отчётом самопроверки (Р36 п. 6, дополнение 2 п. 3): отчёт по формату К17 и
+ *  полному реестру, ready: false, ровно один fail; тесты проверяют исходную ошибку из cause тем же утверждением, что и
+ *  до отчёта. Отказ не AgentNotReady — регресс, тест падает (ревью К2.2 № 3). */
+export function startCause<T>(p: Promise<T>): Promise<T> {
+  return p.catch((e: unknown) => {
+    if (!(e instanceof AgentNotReady)) throw new Error(`start() отклонён не AgentNotReady: ${String(e)}`, { cause: e });
+    expect(checkSelfCheckReport(e.report, DIAG)).toEqual([]);
+    expect(e.report.ready).toBe(false);
+    expect(e.report.checks.filter((c) => c.status === "fail")).toHaveLength(1);
+    throw e.cause;
+  });
+}
+
+/** Последняя запись журнала до отчёта самопроверки: start() дописывает в конец записи agent.selfcheck (Р36 п. 6). */
+export function lastEntry(journal: { entries: readonly JournalEntry[] }): JournalEntry | undefined {
+  return journal.entries.filter((e) => e.kind !== "agent.selfcheck").at(-1);
 }

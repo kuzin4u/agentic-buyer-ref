@@ -167,24 +167,28 @@ export interface KeyDraft {
   publicKey: string;
 }
 
+/** Перечень типов событий ПАО 1.4.0 (§5); вне перечня — пропуск с записью в журнал (ПАО §7, Р34 п. 6). */
+export const PLATFORM_EVENT_TYPES = [
+  "mandate.signed",
+  "mandate.rejected",
+  "mandate.revoked",
+  "mandate.exhausted",
+  "confirmation.required",
+  "confirmation.approved",
+  "confirmation.rejected",
+  "confirmation.expired",
+  "operation.authorized",
+  "operation.declined",
+  "operation.settled",
+  "operation.refunded",
+  "agent.key_revoked",
+  "agent.suspended",
+  "agent.reinstated",
+  "dispute.updated",
+] as const;
+
 /** События платформы в понятиях ядра; исходное тело в ядро не передаётся. */
-export type PlatformEventType =
-  | "mandate.signed"
-  | "mandate.rejected"
-  | "mandate.revoked"
-  | "mandate.exhausted"
-  | "confirmation.required"
-  | "confirmation.approved"
-  | "confirmation.rejected"
-  | "confirmation.expired"
-  | "operation.authorized"
-  | "operation.declined"
-  | "operation.settled"
-  | "operation.refunded"
-  | "agent.key_revoked"
-  | "agent.suspended"
-  | "agent.reinstated"
-  | "dispute.updated";
+export type PlatformEventType = (typeof PLATFORM_EVENT_TYPES)[number];
 
 export interface PlatformEvent {
   eventId: string;

@@ -109,12 +109,13 @@ describe("держимые мандаты (Р37 п. 4)", () => {
     expect(kinds(journal, "mandate.revoked").map((e) => e.mandate)).toEqual([a.id, c.id]);
   });
 
-  it("GET «мандата нет» (404 MANDATE_NOT_FOUND) — выход и mandate.status_changed с кодом (нюанс Р37, вопрос владельцу)", async () => {
-    const { core, journal, stand: s, a, kinds } = await setup();
+  it("GET 404 у держимого — аномалия mandate.vanished с MANDATE_NOT_FOUND, выход; прочие держатся (решение владельца, вариант (а))", async () => {
+    const { core, journal, stand: s, a, b, kinds } = await setup();
     s.stub.fail(GET, { code: "MANDATE_NOT_FOUND" });
     await core.mandates.refreshHeld(on("mandate.revoked", a.id));
-    expect(core.mandates.held().map((m) => m.id)).not.toContain(a.id);
-    expect(kinds(journal, "mandate.status_changed").map((e) => [e.mandate, e.reason])).toEqual([[a.id, "MANDATE_NOT_FOUND"]]);
+    expect(core.mandates.held().map((m) => m.id)).toEqual([b.id]);
+    expect(kinds(journal, "mandate.vanished")).toEqual([{ at: s.clock.toISOString(), agent: AGENT, kind: "mandate.vanished", mandate: a.id, reason: "MANDATE_NOT_FOUND" }]);
+    expect(kinds(journal, "mandate.status_changed")).toEqual([]);
   });
 
   it("ACTIVE с другими пределами или порядком отзыва — выход и agent.refused MANDATE_REPLY_MISMATCH", async () => {
@@ -163,7 +164,7 @@ describe("держимые мандаты (Р37 п. 4)", () => {
 
 describe("событие во время GET перед удержанием (ревью К2.3 № 1)", () => {
   it("mandate.revoked пришёл, пока GET после mandate.signed в пути, — перечитать: REVOKED, не держится", async () => {
-    let core: Awaited<ReturnType<typeof coreOn>>["core"] | undefined;
+    const agent: { core?: Awaited<ReturnType<typeof coreOn>>["core"] } = {};
     let race: string | null = null;
     const consents: Consents = new Consents(() => s.clock);
     const base = consents.handlers()!;
@@ -175,7 +176,7 @@ describe("событие во время GET перед удержанием (р
         [GET]: (req) => {
           const r = base[GET]!(req);
           if (race !== null && req.path.id === race) {
-            void core!.mandates.refreshHeld(on("mandate.revoked", race));
+            void agent.core!.mandates.refreshHeld(on("mandate.revoked", race));
             consents.mandates.get(race)!.status = "REVOKED";
             race = null;
           }
@@ -183,7 +184,8 @@ describe("событие во время GET перед удержанием (р
         },
       },
     }));
-    ({ core } = await coreOn(s));
+    const { core } = await coreOn(s);
+    agent.core = core;
     await core.start();
     const m = await core.mandates.request(INTENT, { idempotencyKey: "idem_held_race" });
     const ev = consents.sign(m.id);

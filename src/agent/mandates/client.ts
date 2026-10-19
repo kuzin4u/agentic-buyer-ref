@@ -25,16 +25,18 @@ export interface MandateJournal {
       | { at: string; kind: "mandate.revocation_order_missing"; reason: "MANDATE_REVOCATION_ORDER_MISSING" }
       /** держимый мандат отозван (Т15) или больше не ACTIVE — не держится (Р37 п. 4); detail — статус, reason — код отказа GET */
       | { at: string; kind: "mandate.revoked"; mandate: string }
-      | { at: string; kind: "mandate.status_changed"; mandate: string; detail?: MandateStatus; reason?: FailureCode }
+      | { at: string; kind: "mandate.status_changed"; mandate: string; detail: MandateStatus }
+      /** аномалия: держимый ACTIVE-мандат пропал у Платформы (GET 404) — решение владельца по К2.3, вариант (а) */
+      | { at: string; kind: "mandate.vanished"; mandate: string; reason: "MANDATE_NOT_FOUND" }
       /** отказ агента действовать (Т15, Р37 п. 5): код клиента мандатов */
       | { at: string; kind: "agent.refused"; reason: MandateRefusal; mandate?: string },
   ): void;
 }
 
-/** Отказ GET держимого мандата, после которого мандат не действует: Платформа ответила 404 — мандата нет (Р37 п. 4,
- *  нюанс; вопрос владельцу в PR #35). По копии ПАО у GET мандата других кодов «мандата нет» нет: прочие отказы (503,
- *  UNKNOWN и др.) — сбой: слушатель падает, курсор ленты не двигается (Р34 п. 3). */
-const GONE: ReadonlySet<FailureCode> = new Set<FailureCode>(["MANDATE_NOT_FOUND"]);
+/** GET 404 держимого мандата — ответ Платформы, а не сбой (решение владельца по К2.3, вариант (а)): мандат выходит,
+ *  запись-аномалия mandate.vanished, лента идёт дальше — один пропавший мандат не останавливает агента. Других кодов
+ *  «мандата нет» у GET мандата по копии ПАО нет: прочие отказы (503, UNKNOWN и др.) — сбой, курсор на месте (Р34 п. 3). */
+const VANISHED = "MANDATE_NOT_FOUND" satisfies FailureCode;
 
 export interface MandateClientOptions {
   port: MandatePort;
@@ -159,7 +161,7 @@ export class MandateClient {
    *  - mandate.* с mandate_id держимого мандата — GET этого мандата; чужой или ожидающий подписи — не здесь (awaitSigned);
    *  - пропуск INVALID_DATA мандатного типа (mandate_id не читается) — GET всех держимых по очереди;
    *  - ACTIVE с прежними пределами — держится; иначе выходит: REVOKED — mandate.revoked (Т15), прочий статус или отказ
-   *    GET «мандата нет» — mandate.status_changed, другой мандат или пределы — agent.refused;
+   *    GET 404 — mandate.vanished (аномалия), другой мандат или пределы — agent.refused;
    *  - сбой GET (503, UNKNOWN и др.) — наружу: слушатель падает, курсор не двигается, событие прочитается снова (Р34 п. 3).
    */
   async refreshHeld(item: FeedItem): Promise<void> {
@@ -204,9 +206,9 @@ export class MandateClient {
         this.o.journal.record({ at: at(), kind: "agent.refused", reason: e.reason, mandate: id });
         return;
       }
-      if (e instanceof PlatformFailure && GONE.has(e.code)) {
+      if (e instanceof PlatformFailure && e.code === VANISHED) {
         this.#held.delete(id);
-        this.o.journal.record({ at: at(), kind: "mandate.status_changed", mandate: id, reason: e.code });
+        this.o.journal.record({ at: at(), kind: "mandate.vanished", mandate: id, reason: VANISHED });
         return;
       }
       throw e;

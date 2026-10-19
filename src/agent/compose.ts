@@ -8,7 +8,7 @@ import { PLATFORM_EVENT_TYPES, PlatformFailure, type AgentSelf } from "../shared
 import type { PaymentPlatform, PlatformCapabilities } from "./ports/payment-platform.js";
 import { PAO_CLIENT_DIAG, PAO_DIAG, PaoPlatform, assertPaoVersion, type PaoPlatformOptions } from "./adapters/pao/index.js";
 import { CATALOG_DIAG } from "./catalog/index.js";
-import { MemoryJournal, type Journal, type JournalEntry } from "./journal/index.js";
+import { MemoryJournal, type Journal } from "./journal/index.js";
 import { MandateClient } from "./mandates/index.js";
 import { EventFeed, EventsStopped, FileCursorStore, acceptPush, type PushReply } from "./events/index.js";
 import { KeyRing, SignerKeyRejected, SignerStopped } from "./signer/index.js";
@@ -37,6 +37,8 @@ export interface AgentCore {
   capabilities: PlatformCapabilities;
   /** клиент мандатов на порту мандатов той же платформы */
   mandates: MandateClient;
+  /** запись в журнал через обёртку места сборки — с кодом агента и временем ядра (Р37 п. 3); читать записи — из журнала,
+   *  переданного при сборке */
   journal: Journal;
   /** Полный реестр кодов (Р36): кто ошибся, действие, тексты для человека и оператора. */
   diag: DiagRegistry;
@@ -103,19 +105,23 @@ function startFailureCode(e: unknown): DiagCode | null {
 }
 
 /** Отчёт — в журнал: по записи на проверку, только имя, итог и код (Р36 п. 6). */
-function recordReport(journal: Journal, report: SelfCheckReport): void {
+function recordReport(journal: Journal, report: SelfCheckReport, results: Partial<Record<SelfCheckName, CheckResult>>): void {
   for (const c of report.checks) {
-    journal.record({ at: report.checked_at, kind: "agent.selfcheck", check: c.check, status: c.status, ...(c.code !== undefined && { reason: c.code }) });
+    // код — из CheckResult (DiagCode), а не из отчёта ядра, где он строка (ревью К2.1 № 6); время записи ставит обёртка
+    const r = results[c.check as SelfCheckName];
+    journal.record({ at: report.checked_at, kind: "agent.selfcheck", check: c.check, status: c.status, ...(r !== undefined && r.status !== "ok" && { reason: r.code }) });
   }
 }
 
 export function createAgentCore(o: AgentCoreOptions): AgentCore {
   const now = o.now ?? (() => new Date());
-  const journal = o.journal ?? new MemoryJournal();
+  const sink = o.journal ?? new MemoryJournal();
+  // Одна обёртка для всех писателей (Р37 п. 3): время — по часам ядра, код агента — отсюда; подсистемы его не знают.
+  const journal: Journal = { record: (e) => sink.record({ ...e, at: now().toISOString(), agent: o.pao.agentCode }) };
   // Самопроверка без сети при сборке (Р36 п. 6, дополнение 2 п. 1): без параметров агент не собрать — отказ сборки с отчётом.
   const notReady = (results: Partial<Record<SelfCheckName, CheckResult>>, cause: unknown): AgentNotReady => {
     const report = selfCheckReport(results, now());
-    recordReport(journal, report);
+    recordReport(journal, report, results);
     return new AgentNotReady(report, { cause });
   };
   let params: StandParams;
@@ -133,9 +139,8 @@ export function createAgentCore(o: AgentCoreOptions): AgentCore {
   if (nested(o.stateDir, o.keysDir)) throw new ConfigError("каталог состояния совпадает с каталогом ключей или вложен в него (или наоборот)");
   const ring = new KeyRing({ dir: o.keysDir, params, journal, ...(o.now && { now: o.now }) });
   // Рабочий адаптер получает порт, закрытый до допуска; запрос допуска идёт через отдельный адаптер с портом допуска.
-  // События версии ПАО (Р33 п. 10) пишет адаптер; время записи — по часам ядра, как у прочих событий журнала.
-  const protocolJournal = { record: (e: JournalEntry) => journal.record({ ...e, at: now().toISOString() }) };
-  const platform = new PaoPlatform({ ...o.pao, params, signing: ring.port(), journal: protocolJournal });
+  // События версии ПАО (Р33 п. 10) пишет адаптер — через ту же обёртку.
+  const platform = new PaoPlatform({ ...o.pao, params, signing: ring.port(), journal });
   const at = (): string => now().toISOString();
   // Остановка по курсору — через порт подписи: агент целиком, запись agent.stopped — у связки ключей (Р34 п. 4).
   const signing = ring.port();
@@ -200,7 +205,7 @@ export function createAgentCore(o: AgentCoreOptions): AgentCore {
         results[check] = { status: "fail", code };
         if (stopsAgent(DIAG, code)) signing.stop(code);
         lastReport = selfCheckReport(results, now());
-        recordReport(journal, lastReport);
+        recordReport(journal, lastReport, results);
         return new AgentNotReady(lastReport, { cause });
       };
       let connected = false;
@@ -246,7 +251,7 @@ export function createAgentCore(o: AgentCoreOptions): AgentCore {
         }
       }
       lastReport = selfCheckReport(results, now());
-      recordReport(journal, lastReport);
+      recordReport(journal, lastReport, results);
       return self;
     },
     recheck,

@@ -40,9 +40,10 @@ describe("место сборки ядра", () => {
   });
 
   it("без ключей в хранилище допуск не начинается: остановка до обращения к платформе", async () => {
-    const core = createAgentCore({ pao, keysDir, stateDir });
+    const journal = new MemoryJournal();
+    const core = createAgentCore({ pao, keysDir, stateDir, journal });
     await expect(startCause(core.start())).rejects.toThrow(SignerStopped);
-    expect(core.journal).toMatchObject({
+    expect(journal).toMatchObject({
       entries: [
         expect.objectContaining({ kind: "agent.stopped", reason: "NO_KEY" }),
         expect.objectContaining({ kind: "agent.selfcheck", check: "config.params", status: "ok" }),

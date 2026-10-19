@@ -249,7 +249,7 @@ describe("ядро и события на стенде v0.5.0 (Р34)", { timeout
     const a = core(pushUrl);
     await expect(a.c.start()).resolves.toMatchObject({ status: "ACTIVE" });
     const failed = a.journal.entries.filter((e) => e.kind === "events.subscription_failed");
-    expect(failed).toEqual([{ at: expect.any(String), kind: "events.subscription_failed", reason: code }]);
+    expect(failed).toEqual([{ at: expect.any(String), agent: AGENT, kind: "events.subscription_failed", reason: code }]);
     // отчёт самопроверки: подписка — предупреждение, готовность не снята (дополнение 2 к Р36 п. 5)
     expect(checkSelfCheckReport(a.c.selfCheck()!, DIAG)).toEqual([]);
     expect(a.c.selfCheck()).toMatchObject({ ready: true });

@@ -14,6 +14,7 @@ import type {
   MandateRef,
   Operation,
 } from "../../shared/domain.js";
+import type { EventsPort } from "./events.js";
 import type { MandatePort } from "./mandates.js";
 import type { Mutation } from "./mutation.js";
 
@@ -49,8 +50,8 @@ export type ProtocolCheck =
    *  BAD_RESPONSE — ответ не по схеме, NO_RESPONSE — адрес не отвечает или отказ */
   | { status: "unknown"; detail: "NO_VERSION" | "BAD_RESPONSE" | "NO_RESPONSE" };
 
-/** Порт платформы целиком; части по составу AG-К5 выделяются по мере задач (мандаты — AG-05, MandatePort). */
-export interface PaymentPlatform extends MandatePort {
+/** Порт платформы целиком; части по составу AG-К5 выделяются по мере задач (мандаты — AG-05, MandatePort; события — AG-06, EventsPort). */
+export interface PaymentPlatform extends MandatePort, EventsPort {
   capabilities(): PlatformCapabilities;
   /** Стадия 0, до допуска: версия протокола Платформы (Р33 п. 10); обращение без подписи. */
   checkProtocol(): Promise<ProtocolCheck>;

@@ -79,7 +79,7 @@ const json = (status: number, body: unknown, headers: Record<string, string> = {
   new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json", ...headers } });
 
 describe("адаптер ПАО против заглушки agentic-core", () => {
-  it("заявляет возможности ПАО; подписанные события — только после AG-06", async () => {
+  it("заявляет возможности ПАО; события не подписаны до ПАО 1.5.0 (Р34 п. 11)", async () => {
     const { platform } = await setup();
     expect(platform.capabilities()).toMatchObject({
       platform: "pao",
@@ -228,6 +228,46 @@ describe("fail-closed без заглушки", () => {
     expect(err).toMatchObject({ code: "UNKNOWN", retry: "never", httpStatus: 200 });
     expect(err.message).not.toContain("MAYBE_LATER");
     expect(calls).toHaveLength(1);
+  });
+
+  it("лента: элемент неизвестного типа — пропуск, а не UNKNOWN всего ответа (Р34 п. 6, ПАО §7)", async () => {
+    const at = "2026-10-19T09:00:00Z";
+    const { platform, calls } = fake(() =>
+      json(200, [
+        // тип вне перечня YAML 1.4.0 (deal.* в перечне есть — Р17, у агента тоже пропуск)
+        { event_id: "evt_1", type: "future.kind", at, data: {} },
+        { event_id: "evt_2", type: "deal.funded", at, data: { deal_id: "d_1" } },
+        { event_id: "evt_3", type: "mandate.signed", at, data: { mandate_id: "m_1" } },
+      ]),
+    );
+    const feed = await platform.listEvents("evt_0");
+    expect(feed).toEqual([
+      { kind: "ignored", eventId: "evt_1", detail: "UNKNOWN_TYPE" },
+      { kind: "ignored", eventId: "evt_2", detail: "UNKNOWN_TYPE" },
+      { kind: "event", event: expect.objectContaining({ eventId: "evt_3", type: "mandate.signed", mandateId: "m_1" }) },
+    ]);
+    expect(calls).toHaveLength(1);
+  });
+
+  it("лента: элемент без event_id — UNKNOWN всего ответа (Р34 п. 6)", async () => {
+    const { platform } = fake(() => json(200, [{ type: "mandate.signed", at: "2026-10-19T09:00:00Z", data: { mandate_id: "m_1" } }]));
+    await expect(platform.listEvents(null)).rejects.toMatchObject({ code: "UNKNOWN", httpStatus: 200 });
+  });
+
+  it("подписка: ответ с другим адресом или составом — UNKNOWN (Р34 п. 8)", async () => {
+    const url = "https://agent.example/pao/events";
+    for (const body of [{ url: "https://evil.example/x", events: ["mandate.signed"] }, { url, events: [] }]) {
+      const { platform, calls } = fake(() => json(200, body));
+      await expect(platform.subscribe(url, ["mandate.signed"], { idempotencyKey: "idem-s" })).rejects.toMatchObject({ code: "UNKNOWN", httpStatus: 200 });
+      expect(calls).toHaveLength(1); // UNKNOWN — без повтора
+    }
+    // без Idempotency-Key — отказ до обращения (инвариант 9)
+    const empty = fake(() => json(200, { url, events: ["mandate.signed"] }));
+    await expect(empty.platform.subscribe(url, ["mandate.signed"], { idempotencyKey: "" })).rejects.toMatchObject({ code: "UNKNOWN" });
+    expect(empty.calls).toHaveLength(0);
+    const { platform, calls } = fake(() => json(200, { url, events: ["mandate.signed"] }));
+    await platform.subscribe(url, ["mandate.signed"], { idempotencyKey: "idem-s" });
+    expect(new Headers(calls[0]?.headers).get("idempotency-key")).toBe("idem-s");
   });
 
   it("неизвестные поля ответа принимаются (ПАО §7)", async () => {

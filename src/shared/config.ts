@@ -36,6 +36,8 @@ export const StandParamsSchema = z
   live_check_timeout_ms: positive.max(TIMER_MAX_MS),
   live_check_max_age_sec: secToMs,
   live_check_clock_skew_sec: secToMs,
+  // Лента событий (Р34 п. 9): наименьший промежуток между чтениями и пауза опроса без push.
+  event_poll_interval_ms: positive.max(TIMER_MAX_MS),
 })
   // Обращения и ожидание повторов укладываются в registry_cache_ttl_sec (инвариант 4, Р20).
   .refine(

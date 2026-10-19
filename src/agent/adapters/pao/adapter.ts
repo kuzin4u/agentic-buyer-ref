@@ -13,7 +13,7 @@ import {
   type PaoOperations,
 } from "@kuzin4u/agentic-core/pao";
 import { PAO_RETRY_AFTER_MAX_SEC, type StandParams } from "../../../shared/config.js";
-import { PlatformFailure, type AgentSelf, type MandateRef } from "../../../shared/domain.js";
+import { PlatformFailure, type AgentSelf, type MandateRef, type PlatformEventType } from "../../../shared/domain.js";
 import type { PaymentPlatform, PlatformCapabilities, ProtocolCheck, Mutation } from "../../ports/payment-platform.js";
 import type { RequestSigning } from "../../ports/request-signing.js";
 import { AGENT_STOP_CODES, ruleForFailure } from "../../declines/index.js";
@@ -154,7 +154,7 @@ export class PaoPlatform implements PaymentPlatform {
       verifiableMandate: true,
       disputeResolution: true,
       humanConfirmation: true,
-      // Подпись событий и ответов Платформы не проверяется до AG-06.
+      // События и ответы Платформы не подписаны до ПАО 1.5.0 (РП39 п. 6): событие — сигнал, статус — по GET (Р34).
       signedEvents: false,
       guaranteeContour: true,
       conditionalSettlement: false,
@@ -254,9 +254,9 @@ export class PaoPlatform implements PaymentPlatform {
         // ПАО §7). Текст нарушений (в нём значения из тела) в отказ не переносится (инвариант 1). Ключ со статусом вне
         // перечня делает UNKNOWN весь ответ GET /agent — осознанный fail-closed (ревью 3b № 10): по ПАО §7 новое
         // значение перечня — не совместимое изменение версии 1.4.0, реестр с ним не подтверждает и остальное.
-        // Список событий (GET /pao/v1/events, AG-06) так проверять нельзя: неизвестный тип события ПАО §7 велит
-        // игнорировать — STATUS «Открыто», AG-06.
-        const schema = PAO_OPERATIONS[op].response;
+        // Ленту (GET /pao/v1/events) так проверять нельзя: неизвестный тип события ПАО §7 велит пропускать, а не
+        // отвергать весь ответ — её разбирает map.feedFromPao по элементам (Р34 п. 6).
+        const schema = op === "GET /pao/v1/events" ? undefined : PAO_OPERATIONS[op].response;
         if (schema !== undefined && validatePao(schema, r).length > 0) {
           if (!this.protocolConfirmed && mandateWithoutOrder(op, r)) throw this.unsupported("MANDATE", null, last.status ?? 200, key);
           throw new PlatformFailure("UNKNOWN", "never", null, last.status ?? 200, key, "ответ ПАО не по схеме");
@@ -303,7 +303,7 @@ export class PaoPlatform implements PaymentPlatform {
       self = await this.call("GET /pao/v1/agent", {}, map.agentSelfFromPao);
     } catch (e) {
       // Р27: ответ 2xx получен, но не по схеме — состояние агента в реестре не подтверждено: приостановка подписи
-      // до успешной повторной сверки (не бессрочно: подпись ответов Платформы до AG-06 не проверяется).
+      // до успешной повторной сверки (не бессрочно: ответы Платформы не подписаны до ПАО 1.5.0, Р34 п. 11).
       if (e instanceof PlatformFailure && e.code === "UNKNOWN" && e.httpStatus >= 200 && e.httpStatus < 300) {
         this.o.signing.suspend("AGENT_SELF_UNKNOWN");
       }
@@ -398,6 +398,21 @@ export class PaoPlatform implements PaymentPlatform {
 
   getDispute(id: string) {
     return this.call("GET /pao/v1/disputes/{id}", { path: { id } }, map.disputeFromPao);
+  }
+
+  /** Лента (Р34 п. 1): `after` — курсор агента; 400 REQUEST_INVALID на курсор — отказ как есть, решает модуль events. */
+  listEvents(after: string | null) {
+    return this.call("GET /pao/v1/events", after === null ? {} : { query: { after } }, map.feedFromPao);
+  }
+
+  /** Подписка (Р34 п. 8, РП40 п. 1): ответ — та же подписка; другой адрес или состав в ответе — UNKNOWN. */
+  async subscribe(url: string, types: readonly PlatformEventType[], m: Mutation) {
+    const events = [...types];
+    // ответ — не та подписка: UNKNOWN; httpStatus 0 — call подставит статус ответа 2xx и ключ (как «не по схеме»)
+    await this.call("PUT /pao/v1/subscription", { body: { url, events }, idempotencyKey: keyOf(m) }, (r) => {
+      const same = r.events.length === events.length && events.every((t) => r.events.includes(t));
+      if (r.url !== url || !same) throw new PlatformFailure("UNKNOWN", "never", null, 0, null, "ответ ПАО: подписка не та");
+    });
   }
 }
 

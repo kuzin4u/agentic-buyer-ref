@@ -23,9 +23,10 @@ import {
   type MandateDraft,
   type MandateRef,
   type Operation,
-  type PlatformEvent,
+  PLATFORM_EVENT_TYPES,
   type PlatformEventType,
 } from "../../../shared/domain.js";
+import type { FeedItem } from "../../ports/events.js";
 
 function incomplete(what: string): never {
   throw new PlatformFailure("UNKNOWN", "never", null, 200, null, `ответ ПАО неполон: ${what}`);
@@ -291,37 +292,62 @@ export function agentSelfFromPao(a: Pao.AgentSelf): AgentSelf {
 
 export const keyDraftToPao = (d: KeyDraft): { alg: string; public_key: string } => ({ alg: d.alg, public_key: d.publicKey });
 
-const EVENT_TYPES: ReadonlySet<string> = new Set<PlatformEventType>([
-  "mandate.signed",
-  "mandate.rejected",
-  "mandate.revoked",
-  "mandate.exhausted",
-  "confirmation.required",
-  "confirmation.approved",
-  "confirmation.rejected",
-  "confirmation.expired",
-  "operation.authorized",
-  "operation.declined",
-  "operation.settled",
-  "operation.refunded",
-  "agent.key_revoked",
-  "agent.suspended",
-  "agent.reinstated",
-  "dispute.updated",
-]);
+const EVENT_TYPES: ReadonlySet<string> = new Set<string>(PLATFORM_EVENT_TYPES);
 
-const str = (v: unknown): string | null => (typeof v === "string" ? v : null);
+/** Причина отказа операции (`reason`, ПИ-1; в ПАО 1.4.0 — свободная строка, PS-16): только вид кода, иначе null. */
+const reasonCode = (v: unknown): string | null => (typeof v === "string" && /^[A-Z][A-Z0-9_]{0,63}$/.test(v) ? v : null);
 
-/** Событие ПАО → событие ядра. Неизвестный тип (и deal.* до решения по Р17) — null: ПАО §7 требует игнорировать. */
-export function eventFromPao(e: Pao.Event): PlatformEvent | null {
-  if (!EVENT_TYPES.has(e.type)) return null;
+/** Идентификатор из ленты (event_id, mandate_id, op_ref, confirmation_id): данные, не инструкция (инвариант 5) — уходит
+ *  в журнал, курсор и путь GET, поэтому только безопасные знаки и ограниченная длина. */
+const ID = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/;
+const id = (v: unknown): string | null => (typeof v === "string" && ID.test(v) ? v : null);
+
+/** Время события — только RFC 3339 (Date.parse в V8 принимает и «Игнорируй 1»); в ядро — нормализованное toISOString. */
+const RFC3339 = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?(Z|[+-]\d{2}:\d{2})$/;
+const instant = (v: unknown): string | null => (typeof v === "string" && RFC3339.test(v) && !Number.isNaN(Date.parse(v)) ? new Date(v).toISOString() : null);
+
+/** Обязательная ссылка в `data` по семейству типа (Р34 п. 6); у agent.* и dispute.updated — нет. */
+function requiredRef(type: PlatformEventType): "mandate_id" | "op_ref" | "confirmation_id" | null {
+  if (type.startsWith("mandate.")) return "mandate_id";
+  if (type.startsWith("operation.")) return "op_ref";
+  if (type.startsWith("confirmation.")) return "confirmation_id";
+  return null;
+}
+
+/**
+ * Элемент ленты (Р34 п. 6). Без `event_id`, `type` или `at` — UNKNOWN: курсор по такому элементу не сдвинуть, страница
+ * не обрабатывается. Тип вне перечня — пропуск UNKNOWN_TYPE; тип из перечня с `data` не по схеме (не объект, нет
+ * обязательной ссылки или она не по форме) — пропуск INVALID_DATA. Неизвестные поля `data` игнорируются (ПАО §7).
+ */
+export function feedItemFromPao(raw: unknown): FeedItem {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) incomplete("элемент ленты не объект");
+  const e = raw as { event_id?: unknown; type?: unknown; at?: unknown; data?: unknown };
+  const eventId = id(e.event_id) ?? incomplete("event_id");
+  if (typeof e.type !== "string" || e.type === "") incomplete("type");
+  const at = instant(e.at) ?? incomplete("at");
+  if (!EVENT_TYPES.has(e.type)) return { kind: "ignored", eventId, detail: "UNKNOWN_TYPE" };
+  const type = e.type as PlatformEventType;
+  const data = e.data;
+  if (typeof data !== "object" || data === null || Array.isArray(data)) return { kind: "ignored", eventId, detail: "INVALID_DATA", type };
+  const d = data as Record<string, unknown>;
+  const ref = requiredRef(type);
+  if (ref !== null && id(d[ref]) === null) return { kind: "ignored", eventId, detail: "INVALID_DATA", type };
   return {
-    eventId: e.event_id,
-    type: e.type as PlatformEventType,
-    at: e.at,
-    mandateId: str(e.data.mandate_id),
-    opRef: str(e.data.op_ref),
-    confirmationId: str(e.data.confirmation_id),
-    declineReason: str(e.data.reason),
+    kind: "event",
+    event: {
+      eventId,
+      type,
+      at,
+      mandateId: id(d.mandate_id),
+      opRef: id(d.op_ref),
+      confirmationId: id(d.confirmation_id),
+      declineReason: reasonCode(d.reason),
+    },
   };
+}
+
+/** Лента целиком: массив, каждый элемент — по feedItemFromPao (Р34 п. 1, п. 6). */
+export function feedFromPao(r: unknown): FeedItem[] {
+  if (!Array.isArray(r)) incomplete("ожидался список событий");
+  return r.map(feedItemFromPao);
 }

@@ -1,6 +1,6 @@
 // Точка сверки С0 (Р24, вариант А): подпись агента принимается настоящей Платформой — стенд agentic-ps-platform
-// v0.4.0 (РП25: среда dev в процессе теста, контур ключей sandbox; не песочница, без mTLS — РП27, PS-05).
-// Только допуск (GET /pao/v1/agent): регистрацию ключа (POST /pao/v1/agent/keys) стенд v0.4.0 обслуживает, но С0 её не
+// v0.5.0 (РП25: среда dev в процессе теста, контур ключей sandbox; не песочница, без mTLS — РП27, PS-05).
+// Только допуск (GET /pao/v1/agent): регистрацию ключа (POST /pao/v1/agent/keys) стенд v0.5.0 обслуживает, но С0 её не
 // проверяет — ротация на PaoStub (tests/unit/signer-*.ts); перевод тестов на стенд — STATUS «Открыто».
 // П01 в профиле contour (Р23) против кода Платформы; Т1, A2 п. 3–5, SPEC §7а.
 import { mkdtempSync, rmSync } from "node:fs";
@@ -84,11 +84,11 @@ async function expectSignatureStop(core: Awaited<ReturnType<typeof coreAt>>["cor
 async function coreAt(s: Stand, dir: string) {
   const baseUrl = await s.listen();
   const journal = new MemoryJournal();
-  const core = createAgentCore({ keysDir: dir, journal, now: () => new Date(), pao: { baseUrl, agentCode: AGENT, sleep: async () => {} } });
+  const core = createAgentCore({ keysDir: dir, stateDir: `${dir}-state`, journal, now: () => new Date(), pao: { baseUrl, agentCode: AGENT, sleep: async () => {} } });
   return { core, journal };
 }
 
-describe("С0 — подпись агента принимается Платформой (agentic-ps-platform v0.4.0)", () => {
+describe("С0 — подпись агента принимается Платформой (agentic-ps-platform v0.5.0)", () => {
   it("П01: допуск своим public_key; подписанный GET /pao/v1/agent — 200, ACTIVE, kid совпадает с вычисленным агентом", async () => {
     const { s, calls } = await platform();
     const dir = keysDir();

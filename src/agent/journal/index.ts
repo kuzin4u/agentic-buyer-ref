@@ -36,7 +36,19 @@ export type JournalKind =
    *  предупреждение, работа продолжается; detail — NO_VERSION, BAD_RESPONSE или NO_RESPONSE */
   | "platform.version_unknown"
   /** Платформа ниже ПАО 1.4.0 — агент остановлен (Р33 п. 10); detail — CONFIGURATION или MANDATE (на каком шаге) */
-  | "platform.protocol_unsupported";
+  | "platform.protocol_unsupported"
+  /** событие ленты обработано (Р34 п. 3, 5); ref — event_id, detail — тип из перечня ПАО 1.4.0 */
+  | "event.handled"
+  /** событие ленты пропущено, курсор сдвинут (Р34 п. 6); detail — UNKNOWN_TYPE или INVALID_DATA, тип вне перечня не пишется */
+  | "event.ignored"
+  /** push не по форме — ответ 400, ленту не будит (Р34 п. 2); detail — причина */
+  | "event.push_rejected"
+  /** курсора ленты нет — первый запуск или сброс оператором: лента с начала (Р34 п. 4) */
+  | "events.cursor_initial"
+  /** Платформа отвергла адрес подписки (400) — push нет, работа по ленте (Р34 п. 8) */
+  | "events.subscription_rejected"
+  /** подписка не удалась иначе (503 сверх попыток, UNKNOWN) — работа по ленте, повтор при следующем старте (дополнение Р34 п. 1) */
+  | "events.subscription_failed";
 
 export interface JournalEntry {
   at: string;
@@ -46,6 +58,8 @@ export interface JournalEntry {
   reason?: string;
   /** уточнение причины — только значение перечня ПАО (например, класс из реестра при AGENT_CLASS_MISMATCH, Р27) */
   detail?: string;
+  /** идентификатор объекта Платформы по маске адаптера — event_id события ленты (Р34 п. 11) */
+  ref?: string;
 }
 
 export interface Journal {

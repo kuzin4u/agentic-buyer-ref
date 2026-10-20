@@ -98,6 +98,8 @@ export class PurchaseMachine {
   #state: PurchaseState = "NEW";
   #reason: DiagCode | null = null;
   #mandate: string | undefined;
+  /** ворота перед стадией 5 пройдены (Р38 п. 3, К4): без них переход в AUTHORIZING запрещён */
+  #gate5 = false;
   private readonly now: () => Date;
 
   constructor(private readonly o: PurchaseMachineOptions) {
@@ -128,6 +130,10 @@ export class PurchaseMachine {
     const from = this.#state;
     // в STOPPED — только stop() с кодом: to("STOPPED") в обход типа — тоже запрещённый переход (ревью К2.1 № 3)
     if ((next as PurchaseState) === "STOPPED" || !allowed(from, next)) this.forbid(next);
+    // к авторизации — только через ворота: таблица разрешает переход, условие стадии 5 — пропуск ворот (К4); пропуск
+    // одноразовый и живёт до следующего перехода: от прежних ворот (до нового CART, до стадии 4) не остаётся
+    if (next === "AUTHORIZING" && !this.#gate5) this.forbid(next);
+    this.#gate5 = false;
     this.#state = next;
     this.o.journal.record({ at: this.#at(), kind: "purchase.stage", detail: next, ...this.mandate });
   }
@@ -139,6 +145,12 @@ export class PurchaseMachine {
     this.o.journal.record({ at: this.#at(), kind: "agent.refused", reason: "PIPELINE_TRANSITION_FORBIDDEN", detail: `${from}->${next}`, ...this.mandate });
     if (!isTerminal(from)) this.stop("PIPELINE_TRANSITION_FORBIDDEN");
     throw new PurchaseTransitionForbidden(from, next);
+  }
+
+  /** Ворота перед стадией 5 пройдены: оба мандата держатся и подтверждены verify (Р38 п. 3). Ставит только конвейер
+   *  (purchase.ts) непосредственно перед переходом в AUTHORIZING; действует до ближайшего перехода (ревью К4 № 1). */
+  passGate5(): void {
+    this.#gate5 = true;
   }
 
   /** Остановка с кодом реестра; из конечного состояния — без действия (первая причина остаётся). */

@@ -315,7 +315,7 @@ export class Purchase {
     return this.#stage("AUTHORIZING", async () => {
       if (this.needsConfirmation && !this.#approved) this.#machine.forbid("AUTHORIZING");
       const c = this.#context();
-      this.#held(c.intent, c.cart);
+      await this.#gate(c.intent, c.cart);
       this.#machine.to("AUTHORIZING");
       const op = await this.#guard(async () => {
         const reply = snapshot(await this.o.payment.authorize(copy(c), m));
@@ -344,6 +344,19 @@ export class Purchase {
       this.#machine.to("DONE");
       return copy(op);
     });
+  }
+
+  /** Ворота перед стадией 5 (Р38 п. 3): INTENT и CART оба среди держимых (сигнал, без сети) и оба подтверждены verify
+   *  (решение, инвариант 6) — непосредственно перед запросом реквизита; после verify — держимые ещё раз (отзыв по ленте
+   *  во время проверки). Отзыв — agent.refused MANDATE_NOT_ACTIVE; verify не CONFIRMED — MANDATE_OUT_OF_SCOPE (запись
+   *  клиента мандатов); и то и другое — STOPPED до реквизита. */
+  async #gate(intent: Mandate, cart: Mandate): Promise<void> {
+    this.#held(intent, cart);
+    await this.#guard(() => this.o.mandates.requireActive(intent));
+    await this.#guard(() => this.o.mandates.requireActive(cart));
+    this.#held(intent, cart);
+    // без пропуска машина не пустит в AUTHORIZING: запрещённый переход по К2.1, даже если таблица его разрешает
+    this.#machine.passGate5();
   }
 
   /** Решения каталога — в журнал по каждому товару (Р37 п. 5): исключение — код модели или REGION, A5 — пометка. */

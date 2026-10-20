@@ -51,9 +51,17 @@ const PATH: Record<Exclude<PurchaseState, "STOPPED">, Exclude<PurchaseState, "ST
   DONE: ["INTENT_ACTIVE", "OFFERS", "CART_PENDING", "CART_ACTIVE", "ORDERED", "AUTHORIZING", "SETTLING", "DONE"],
 };
 
+/** Проход по состояниям; перед AUTHORIZING — пропуск ворот стадии 5, как у конвейера (К4). */
+function walk(m: PurchaseMachine, states: readonly Exclude<PurchaseState, "STOPPED">[]) {
+  for (const s of states) {
+    if (s === "AUTHORIZING") m.passGate5();
+    m.to(s);
+  }
+}
+
 function at(state: Exclude<PurchaseState, "STOPPED">) {
   const r = machine();
-  for (const s of PATH[state]) r.m.to(s);
+  walk(r.m, PATH[state]);
   r.journal.entries.length = 0;
   return r;
 }
@@ -74,7 +82,7 @@ describe("таблица переходов (Р38 п. 1)", () => {
   it("путь одной покупки 0–6 проходит по таблице, запись purchase.stage на каждый переход", () => {
     const { m, journal } = machine();
     m.bind("mnd_intent_1");
-    for (const s of PATH.DONE) m.to(s);
+    walk(m, PATH.DONE);
     expect(m.state).toBe("DONE");
     expect(journal.entries).toEqual(
       PATH.DONE.map((s) => ({ at: AT.toISOString(), kind: "purchase.stage", detail: s, mandate: "mnd_intent_1" })),
@@ -171,5 +179,38 @@ describe("mandate в записях — только по маске", () => {
     expect(() => m.to("DONE")).toThrow(PurchaseTransitionForbidden);
     expect(journal.entries).toHaveLength(3);
     for (const e of journal.entries) expect(e).not.toHaveProperty("mandate");
+  });
+});
+
+describe("ворота перед стадией 5 (Р38 п. 3, К4): без пропуска — запрещённый переход", () => {
+  for (const from of ["ORDERED", "CONFIRMING"] as const) {
+    it(`${from} → AUTHORIZING без пропуска ворот — STOPPED и agent.refused, хотя таблица переход разрешает`, () => {
+      const { m, journal } = at(from);
+      expect(allowed(from, "AUTHORIZING")).toBe(true);
+      expect(() => m.to("AUTHORIZING")).toThrow(PurchaseTransitionForbidden);
+      expect(m.state).toBe("STOPPED");
+      expect(journal.entries.map((e) => [e.kind, e.detail])).toEqual([
+        ["agent.refused", `${from}->AUTHORIZING`],
+        ["purchase.stage", "STOPPED"],
+      ]);
+    });
+  }
+
+  it("пропуск не переживает другой переход: от прежних ворот, до нового CART и до стадии 4 (ревью К4 № 1)", () => {
+    const early = at("CART_ACTIVE");
+    early.m.passGate5();
+    walk(early.m, ["OFFERS", "CART_PENDING", "CART_ACTIVE", "ORDERED"]);
+    expect(() => early.m.to("AUTHORIZING")).toThrow(PurchaseTransitionForbidden);
+    const before4 = at("ORDERED");
+    before4.m.passGate5();
+    before4.m.to("CONFIRMING");
+    expect(() => before4.m.to("AUTHORIZING")).toThrow(PurchaseTransitionForbidden);
+  });
+
+  it("с пропуском — переход по таблице", () => {
+    const { m } = at("ORDERED");
+    m.passGate5();
+    m.to("AUTHORIZING");
+    expect(m.state).toBe("AUTHORIZING");
   });
 });

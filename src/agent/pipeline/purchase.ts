@@ -8,7 +8,7 @@ import type { DiagCode } from "../../shared/diag-codes.js";
 import { liveCheck, type A5SignalCode, type CatalogIssueCode, type CatalogProduct, type LiveCheckParams, type LiveFactCode } from "../catalog/index.js";
 import { ruleForDeclineReason } from "../declines/index.js";
 import { MandateRefused, type MandateClient } from "../mandates/index.js";
-import { classifyOffer, mayDraftCart, mayOrder, type HumanA5Decision, type OrderNext } from "../policy/catalog.js";
+import { acceptedA5, classifyOffer, mayDraftCart, mayOrder, type HumanA5Decision, type OfferVerdict, type OrderNext } from "../policy/catalog.js";
 import { confirmThreshold, currencySupported, mandateRefusal, mayAuthorize, needsConfirmation, type PaymentDecision, type Thresholds } from "../policy/payment.js";
 import type { SplitWindow } from "../policy/split.js";
 import type { LiveOfferSource } from "../ports/catalog.js";
@@ -240,12 +240,14 @@ export class Purchase {
         this.#record({ kind: "agent.refused", reason: "OFFER_NOT_IN_CONTOUR", ...skuRef(String(choice.sku)) });
         this.#halt("OFFER_NOT_IN_CONTOUR");
       }
-      const d = mayDraftCart(offer.sku, { kind: "AVAILABLE", a5: [...offer.a5] }, intent.confirmationMode, choice.decision);
+      // показ — из своей выдачи: продавец, sku, цена и коды A5, к которым привязано решение человека (Р39 п. 5)
+      const verdict: OfferVerdict = { kind: "AVAILABLE", merchantId: offer.merchantId, sku: offer.sku, price: { ...offer.product.price }, a5: [...offer.a5] };
+      const d = mayDraftCart(verdict, intent.confirmationMode, choice.decision);
       if (!d.allow) {
         // EXCLUDED здесь не возникает (в contour только доступные товары): появился — дефект, а не тихий отказ (ревью К5 № 3)
         if (d.code === "EXCLUDED") this.#halt("UNKNOWN");
         // решение политики — в журнал конвейером (Р37 п. 5, Р38 п. 5): по каждому сигналу, который человек не принял
-        const accepted = choice.decision?.sku === offer.sku ? choice.decision.accepted : [];
+        const accepted = acceptedA5(verdict, choice.decision);
         const open = d.code === "A5_NEEDS_HUMAN" ? offer.a5.filter((c) => !accepted.includes(c)) : offer.a5;
         for (const reason of open) this.#record({ kind: "cart.refused", reason, detail: d.code, ...skuRef(offer.sku), ...merchantRef(offer.merchantId) });
         throw new CartRefused(d.code);
@@ -428,7 +430,7 @@ export class Purchase {
       // магазин исключён, а товаров нет — запись на код магазина, как у неразобранного фида
       if (products.length === 0) for (const reason of shopIssues) this.#record({ kind: "offer.excluded", reason, ...m });
       for (const p of products) {
-        const v = classifyOffer(p, shop, shopIssues, this.o.region);
+        const v = classifyOffer(p, shop, shopIssues, this.o.region, s.merchantId);
         const ref = { ...skuRef(p.product.sku), ...m };
         if (v.kind === "EXCLUDED") {
           if (v.reason === "MODEL") for (const reason of v.codes) this.#record({ kind: "offer.excluded", reason, ...ref });

@@ -1,2 +1,3 @@
 // Минимальная эталонная оболочка без модели (Р15).
-export {};
+export type { HumanA5Decision, ShownOffer } from "./a5-decision.js";
+export { humanA5Decision } from "./a5-decision.js";

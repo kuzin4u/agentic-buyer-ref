@@ -10,6 +10,7 @@ import { expectJournalClean } from "../support/journal.js";
 import { AGENT, type PaoStand } from "../support/pao-stand.js";
 import { SHOP, purchaseOn, signedIntent, stages, type PurchaseRun, type PurchaseSetup } from "../support/purchase.js";
 import { bakery, feedPrice, liveOffers, payments, shopOrders } from "../support/shop.js";
+import { humanA5Decision } from "../../src/agent/shell/index.js";
 
 let stand: PaoStand | undefined;
 afterEach(async () => {
@@ -158,7 +159,7 @@ describe("стадия 3 — проект корзины (Р32 п. 2): отка�
     r.purchase.offers!.contour[0]!.a5 = [];
     await expect(r.purchase.cart({ ...key(zones.contour[0]!), qty: 1, keyTermsShown: true }, { idempotencyKey: "idem-cart-1" })).rejects.toMatchObject({ code: "A5_NEEDS_HUMAN" });
     expect(r.purchase.state).toBe("OFFERS");
-    const decision = { sku: "tartine", accepted: ["A5_RETURNS_MISMATCH" as const] };
+    const decision = humanA5Decision(r.purchase.offers!.contour[0]!, ["A5_RETURNS_MISMATCH"]);
     const cart = await r.purchase.cart({ ...key(zones.contour[0]!), qty: 1, decision, keyTermsShown: true }, { idempotencyKey: "idem-cart-1" });
     expect(cart.cart!.total.amount).toBe(TARTINE);
   });
@@ -186,9 +187,37 @@ describe("стадия 3 — проект корзины (Р32 п. 2): отка�
       expect.objectContaining({ reason: "A5_RETURNS_MISMATCH", detail: "A5_NEEDS_HUMAN", ref: "tartine", merchant: "shop_1", mandate: r.purchase.intentMandate!.id }),
     ]);
     expectJournalClean(r.journal.entries, AGENT, r.stand.stub.calls, ["idem-intent-1"]);
-    const decision = { sku: "tartine", accepted: ["A5_RETURNS_MISMATCH" as const] };
+    const decision = humanA5Decision(offer, ["A5_RETURNS_MISMATCH"]);
     await r.purchase.cart({ ...key(offer), qty: 1, decision, keyTermsShown: true }, { idempotencyKey: "idem-cart-1" });
     expect(r.purchase.state).toBe("CART_PENDING");
+  });
+
+  it("решение по тому же sku другого магазина — не решение: A5_NEEDS_HUMAN, в cart.refused — все сигналы (Р39 п. 5)", async () => {
+    const profile = bakery({ returns: { days: 0, text: "Возврат в течение 14 дней" } });
+    const r = await setup({ shops: [{ ...SHOP, profile }, { ...SHOP, profile, merchantId: "shop_2" }] });
+    await signedIntent(r, { ...INTENT, merchantScope: ["shop_1", "shop_2"] });
+    const zones = await r.purchase.search();
+    const [a, b] = ["shop_1", "shop_2"].map((m) => zones.contour.find((o) => o.merchantId === m && o.sku === "tartine")!);
+    const decision = humanA5Decision(a!, a!.a5);
+    await expect(r.purchase.cart({ ...key(b!), qty: 1, decision, keyTermsShown: true }, { idempotencyKey: "idem-cart-1" })).rejects.toMatchObject({ code: "A5_NEEDS_HUMAN" });
+    expect(r.tail().filter((e) => e.kind === "cart.refused").map((e) => [e.reason, e.merchant])).toEqual([["A5_RETURNS_MISMATCH", "shop_2"]]);
+    expect(r.purchase.state).toBe("OFFERS");
+  });
+
+  it("копия решения и решение по подменённой у вызывающего выдаче — не решение: A5_NEEDS_HUMAN, все сигналы в журнал, обращений нет (Р39 п. 5, ревью К3 М4)", async () => {
+    const r = await setup({ shops: [{ ...SHOP, profile: bakery({ returns: { days: 0, text: "Возврат в течение 14 дней" } }) }] });
+    const offer = await offers(r);
+    // выдача, отданная наружу, — копия: цена подменена у вызывающего, решение — по подмене
+    const tampered = { ...offer, product: { ...offer.product, price: { ...offer.product.price, amount: 1 } } };
+    const copy = { ...humanA5Decision(offer, offer.a5) };
+    for (const decision of [humanA5Decision(tampered, tampered.a5), copy]) {
+      const from = r.stand.stub.calls.length;
+      const start = r.tail().length;
+      await expect(r.purchase.cart({ ...key(offer), qty: 1, decision, keyTermsShown: true }, { idempotencyKey: "idem-cart-1" })).rejects.toMatchObject({ code: "A5_NEEDS_HUMAN" });
+      expect(r.tail().slice(start).filter((e) => e.kind === "cart.refused").map((e) => [e.reason, e.detail])).toEqual([["A5_RETURNS_MISMATCH", "A5_NEEDS_HUMAN"]]);
+      expect(r.stand.stub.calls.slice(from)).toEqual([]);
+      expect(r.purchase.state).toBe("OFFERS");
+    }
   });
 
   it("частичное согласие человека — в cart.refused только непринятые сигналы (ревью К5 № 2)", async () => {
@@ -196,7 +225,7 @@ describe("стадия 3 — проект корзины (Р32 п. 2): отка�
     const r = await setup({ shops: [{ ...SHOP, feed, profile: bakery({ returns: { days: 0, text: "Возврат в течение 14 дней" } }) }] });
     const offer = await offers(r);
     expect([...offer.a5].sort()).toEqual(["A5_PRICE_MISMATCH", "A5_RETURNS_MISMATCH"]);
-    const decision = { sku: "tartine", accepted: ["A5_RETURNS_MISMATCH" as const] };
+    const decision = humanA5Decision(offer, ["A5_RETURNS_MISMATCH"]);
     await expect(r.purchase.cart({ ...key(offer), qty: 1, decision, keyTermsShown: true }, { idempotencyKey: "idem-cart-1" })).rejects.toMatchObject({ code: "A5_NEEDS_HUMAN" });
     expect(r.tail().filter((e) => e.kind === "cart.refused").map((e) => e.reason)).toEqual(["A5_PRICE_MISMATCH"]);
   });
@@ -205,7 +234,7 @@ describe("стадия 3 — проект корзины (Р32 п. 2): отка�
     const r = await setup({ shops: [{ ...SHOP, profile: bakery({ returns: { days: 0, text: "Возврат в течение 14 дней" } }) }] });
     await signedIntent(r, { ...INTENT, confirmationMode: "AUTONOMOUS" });
     const offer = (await r.purchase.search()).contour[0]!;
-    const decision = { sku: offer.sku, accepted: offer.a5 };
+    const decision = humanA5Decision(offer, offer.a5);
     const refused = await r.purchase.cart({ ...key(offer), qty: 1, decision, keyTermsShown: true }, { idempotencyKey: "idem-cart-1" }).catch((e: unknown) => e);
     expect(refused).toBeInstanceOf(CartRefused);
     expect(refused).toMatchObject({ code: "A5_AUTONOMOUS" });

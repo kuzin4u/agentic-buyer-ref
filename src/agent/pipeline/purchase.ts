@@ -3,12 +3,14 @@
 // «выполнены ли условия сейчас». Ход покупки задаёт вызывающий: каждое действие человека — типизированный вход метода
 // (инвариант 3). Состояние — только в памяти (Р38 п. 6).
 import type { StandParams } from "../../shared/config.js";
-import { PlatformFailure, type Mandate, type MandateDraft, type Operation } from "../../shared/domain.js";
+import { PlatformFailure, type Mandate, type MandateDraft, type Money, type Operation } from "../../shared/domain.js";
 import type { DiagCode } from "../../shared/diag-codes.js";
 import { liveCheck, type A5SignalCode, type CatalogIssueCode, type CatalogProduct, type LiveCheckParams, type LiveFactCode } from "../catalog/index.js";
 import { ruleForDeclineReason } from "../declines/index.js";
 import { MandateRefused, type MandateClient } from "../mandates/index.js";
 import { classifyOffer, mayDraftCart, mayOrder, type HumanA5Decision, type OrderNext } from "../policy/catalog.js";
+import { confirmThreshold, currencySupported, mandateRefusal, mayAuthorize, needsConfirmation, type PaymentDecision, type Thresholds } from "../policy/payment.js";
+import type { SplitWindow } from "../policy/split.js";
 import type { LiveOfferSource } from "../ports/catalog.js";
 import type { FeedItem } from "../ports/events.js";
 import type { Mutation } from "../ports/mutation.js";
@@ -34,6 +36,10 @@ export interface PipelineJournal extends PurchaseJournal {
       | { at: string; kind: "agent.refused"; reason: "MANDATE_NOT_ACTIVE"; mandate?: string }
       /** ворота: остатка Платформы по мандату не хватает на итог CART (Р38 п. 3, К4а) */
       | { at: string; kind: "agent.refused"; reason: "MANDATE_AMOUNT_LEFT_INSUFFICIENT"; mandate?: string }
+      /** политика в воротах: verify CONFIRMED, но остаток 0 или продавец, валюта вне пределов мандата (Р39 п. 1.1, 1.3) */
+      | { at: string; kind: "agent.refused"; reason: "MANDATE_OUT_OF_SCOPE"; mandate?: string }
+      /** политика до стадий 4–5: итог не в RUB; доля в окне дробления (Р39 п. 1.4, п. 4) */
+      | { at: string; kind: "agent.refused"; reason: "CURRENCY_NOT_SUPPORTED" | "SPLIT_WINDOW"; mandate?: string }
       /** выбор человека не из контура гарантий выдачи (Р38 п. 2, поправка К3) — отказ действовать; ref — sku по маске */
       | { at: string; kind: "agent.refused"; reason: "OFFER_NOT_IN_CONTOUR"; ref?: string; mandate?: string },
   ): void;
@@ -102,6 +108,8 @@ export interface PurchaseOptions {
   payment: PaymentSteps;
   /** стендовые параметры: живая проверка и порог подтверждения (Т7) — из конфигурации, не литералом */
   params: LiveCheckParams & Pick<StandParams, "confirm_above_kop">;
+  /** окно дробления (Р39 п. 4) — одно на ядро: общее для всех покупок, иначе доли разных покупок друг друга не видят */
+  split: SplitWindow;
   journal: PipelineJournal;
   /** стадия 0 (Р38 п. 2): null — последний start() дал допуск (Р36 п. 6) и подпись не остановлена; иначе код остановки */
   admission: () => DiagCode | null;
@@ -301,20 +309,29 @@ export class Purchase {
     });
   }
 
-  /** Нужна ли стадия 4 (Т7): итог CART строго выше порога `confirm_above_kop`; порог — в копейках, иная валюта —
-   *  нужна (fail-closed). Итог — из своего снимка CART. Ответ Платформы CONFIRMATION_REQUIRED на стадии 5 — `authorize`. */
+  /** Нужна ли стадия 4 (Т7): итог CART строго выше порога — меньшего из рыночного и клиентского (Р39 п. 1.5). Итога нет
+   *  или он не в RUB — нужна (fail-closed): ни `confirm()`, ни `authorize()` такую покупку дальше не пустят — валюта
+   *  проверяется в обоих до проверки стадии 4 (`#prepay`, CURRENCY_NOT_SUPPORTED). Итог — из своего снимка CART. Ответ
+   *  Платформы CONFIRMATION_REQUIRED на стадии 5 — `authorize`. */
   get needsConfirmation(): boolean {
     const total = this.#cart?.cart?.total;
-    if (total === undefined) return true;
-    return total.currency !== "RUB" || total.amount > this.o.params.confirm_above_kop;
+    if (total === undefined || !currencySupported(total)) return true;
+    return needsConfirmation(total, this.#thresholds);
+  }
+
+  /** Канала клиентского порога в ПАО нет (STATUS «Открыто», Р39) — только рыночный. */
+  get #thresholds(): Thresholds {
+    return { marketKop: this.o.params.confirm_above_kop };
   }
 
   /** Стадия 4: подтверждение человеком через порт (AG-13): исход — из события Платформы, конвейер его не создаёт
    *  (инвариант 7). Без надобности — запрещённый переход. Не APPROVED — STOPPED CONFIRMATION_REQUIRED. */
   confirm(signal?: AbortSignal): Promise<void> {
     return this.#stage("CONFIRMING", async () => {
-      if (!this.needsConfirmation) this.#machine.forbid("CONFIRMING");
+      // валюта и доля — до решения о стадии 4: код отказа не зависит от пути вызывающего (ревью К2 В1)
       const c = this.#context();
+      this.#prepay(c.intent, c.cart);
+      if (!this.needsConfirmation) this.#machine.forbid("CONFIRMING");
       this.#held(c.intent, c.cart);
       this.#machine.to("CONFIRMING");
       const status = await this.#guard(() => this.o.payment.confirm(copy(c), signal));
@@ -329,12 +346,22 @@ export class Purchase {
    *  STOPPED с кодом причины (SPEC §7б); Платформа требует подтверждения — STOPPED CONFIRMATION_REQUIRED (инвариант 7). */
   authorize(m: Mutation): Promise<Operation> {
     return this.#stage("AUTHORIZING", async () => {
-      if (this.needsConfirmation && !this.#approved) this.#machine.forbid("AUTHORIZING");
       const c = this.#context();
+      this.#prepay(c.intent, c.cart);
+      if (this.needsConfirmation && !this.#approved) this.#machine.forbid("AUTHORIZING");
       await this.#gate(c.intent, c.cart);
+      // окно дробления — повторно после ворот (доля могла появиться, пока шёл verify) и сразу место в нём, без ожидания
+      // между ними (Р39 п. 4): параллельная покупка под тем же INTENT увидит эту операцию. Место — после перехода:
+      // отказ перехода не оставит в окне операцию, которой не было (ревью К2 М4)
+      this.#prepay(c.intent, c.cart);
       this.#machine.to("AUTHORIZING");
+      const slot = this.o.split.open(c.intent.id, this.#total(c.cart));
       const op = await this.#guard(async () => {
         const reply = snapshot(await this.o.payment.authorize(copy(c), m));
+        // отказ и CONFIRMATION_REQUIRED окно не занимают; сбой и неизвестный исход — занимают (fail-closed)
+        if (reply.status === "DECLINED" || reply.status === "CONFIRMATION_REQUIRED") slot.settle("REFUSED");
+        else if (reply.status === "AUTHORIZED") slot.settle("APPROVED");
+        else slot.settle("UNKNOWN");
         if (reply.status === "DECLINED") this.#halt(ruleForDeclineReason(reply.declineReason).code);
         if (reply.status === "CONFIRMATION_REQUIRED") this.#halt("CONFIRMATION_REQUIRED");
         if (reply.status !== "AUTHORIZED") this.#halt("UNKNOWN");
@@ -362,23 +389,22 @@ export class Purchase {
     });
   }
 
-  /** Ворота перед стадией 5 (Р38 п. 3): INTENT и CART оба среди держимых (сигнал, без сети), оба подтверждены verify
-   *  и остаток каждого по verify не меньше итога CART (К4а; решение, инвариант 6) — непосредственно перед запросом реквизита; после verify — держимые ещё раз (отзыв по ленте
-   *  во время проверки). Отзыв — agent.refused MANDATE_NOT_ACTIVE; verify не CONFIRMED — MANDATE_OUT_OF_SCOPE (запись
-   *  клиента мандатов); и то и другое — STOPPED до реквизита. */
+  /** Ворота перед стадией 5 (Р38 п. 3): INTENT и CART оба среди держимых (сигнал, без сети), затем verify каждого и
+   *  решение политики по нему (Р39 п. 1.1–1.3: остаток > 0 и не меньше итога, продавец и валюта в пределах; инвариант 6) —
+   *  непосредственно перед запросом реквизита; после verify — держимые ещё раз (отзыв по ленте во время проверки). Отзыв —
+   *  agent.refused MANDATE_NOT_ACTIVE; verify не CONFIRMED — MANDATE_OUT_OF_SCOPE (запись клиента мандатов); отказ
+   *  политики — agent.refused с её кодом; всё — STOPPED до реквизита. */
   async #gate(intent: Mandate, cart: Mandate): Promise<void> {
-    const total = cart.cart?.total;
-    if (total === undefined) this.#halt("MANDATE_REPLY_MISMATCH");
+    const total = this.#total(cart);
+    // продавец — из подписанного CART, как его видит Платформа (ревью К2 М3); с выдачей сверен клиентом мандатов
+    const merchantId = cart.cart!.merchantId;
     this.#held(intent, cart);
-    for (const m of [intent, cart]) {
-      const c = await this.#guard(() => this.o.mandates.requireActive(m));
-      // остатка Платформы хватает на итог CART (К4а): у CART по копии ПАО 1.4.0 остаток без родителя, поэтому — оба
-      // мандата (меньшее из двух, как у CART после PS-10, передача #36); агент остаток не вычисляет (инвариант 6)
-      if (c.amountLeft.currency !== total.currency || c.amountLeft.amount < total.amount) {
-        this.#record({ kind: "agent.refused", reason: "MANDATE_AMOUNT_LEFT_INSUFFICIENT", ...maskedMandate(m.id) });
-        this.#halt("MANDATE_AMOUNT_LEFT_INSUFFICIENT");
-      }
-    }
+    // verify по одному: не CONFIRMED — отказ клиента мандатов (MANDATE_OUT_OF_SCOPE, его запись); остальное решает
+    // политика (Р39 п. 1.1–1.3) — после каждого verify, чтобы по INTENT вне пределов CART уже не проверялся
+    const intentCheck = await this.#guard(() => this.o.mandates.requireActive(intent));
+    this.#refuse(mandateRefusal(intent, intentCheck, total));
+    const cartCheck = await this.#guard(() => this.o.mandates.requireActive(cart));
+    this.#refuse(mayAuthorize({ intent, cart, merchantId, total }, { intent: intentCheck, cart: cartCheck }));
     this.#held(intent, cart);
     // без пропуска машина не пустит в AUTHORIZING: запрещённый переход по К2.1, даже если таблица его разрешает
     this.#machine.passGate5();
@@ -444,6 +470,28 @@ export class Purchase {
       this.#record({ kind: "agent.refused", reason: "MANDATE_NOT_ACTIVE", ...maskedMandate(m.id) });
       this.#halt("MANDATE_NOT_ACTIVE");
     }
+  }
+
+  /** Итог CART из своего снимка; CART без корзины — ответ не той формы (инвариант 4). */
+  #total(cart: Mandate): Money {
+    const total = cart.cart?.total;
+    if (total === undefined) this.#halt("MANDATE_REPLY_MISMATCH");
+    return total;
+  }
+
+  /** Политика до стадий 4–5 (Р39 п. 1.4, п. 4): итог не в RUB; доля в окне дробления по корневому INTENT. Отказ —
+   *  agent.refused и STOPPED до запроса подтверждения и реквизита, без повтора (инвариант 7, 9). */
+  #prepay(intent: Mandate, cart: Mandate): void {
+    const total = this.#total(cart);
+    if (!currencySupported(total)) this.#refuse({ allow: false, code: "CURRENCY_NOT_SUPPORTED" });
+    if (this.o.split.isShare(intent.id, total, confirmThreshold(this.#thresholds))) this.#refuse({ allow: false, code: "SPLIT_WINDOW" });
+  }
+
+  /** Отказ политики — запись и STOPPED; mandate — по которому вышел отказ, иначе INTENT покупки (`#record`). */
+  #refuse(d: PaymentDecision | null): void {
+    if (d === null || d.allow) return;
+    this.#record({ kind: "agent.refused", reason: d.code, ...(d.mandate && maskedMandate(d.mandate.id)) });
+    this.#halt(d.code);
   }
 
   #halt(code: DiagCode): never {

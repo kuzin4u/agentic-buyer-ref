@@ -558,6 +558,40 @@ describe("ворота перед стадией 5 (Р38 п. 3, К4): оба м�
     expect(r.payment.calls).toEqual([]);
   });
 
+  for (const [which, left, stop] of [
+    ["CART", TARTINE - 1, true],
+    ["INTENT", TARTINE - 1, true],
+    ["INTENT", 0, true],
+    ["CART", TARTINE, false],
+    ["INTENT", TARTINE, false],
+  ] as const) {
+    it(`остаток ${which} по verify ${left} при итоге CART ${TARTINE} — ${stop ? "STOPPED MANDATE_AMOUNT_LEFT_INSUFFICIENT, реквизита нет" : "ворота пройдены"} (К4а)`, async () => {
+      const r = await setup();
+      await ordered(r);
+      const intentId = r.purchase.intentMandate!.id;
+      const cartId = r.purchase.cartMandate!.id;
+      const id = which === "INTENT" ? intentId : cartId;
+      r.consents.left.set(id, left);
+      const before = verified(r).length;
+      const call = r.purchase.authorize({ idempotencyKey: "idem-pay-1" });
+      if (!stop) {
+        await call;
+        expect(verified(r).slice(before)).toEqual([intentId, cartId]);
+        expect(r.tail().filter((e) => e.kind === "agent.refused")).toEqual([]);
+        expect(r.payment.calls).toEqual(["authorize"]);
+        return;
+      }
+      await expect(call).rejects.toMatchObject({ code: "MANDATE_AMOUNT_LEFT_INSUFFICIENT" });
+      expect(r.tail().slice(-2).map((e) => [e.kind, e.reason, e.mandate])).toEqual([
+        ["agent.refused", "MANDATE_AMOUNT_LEFT_INSUFFICIENT", id],
+        ["purchase.stage", "MANDATE_AMOUNT_LEFT_INSUFFICIENT", intentId],
+      ]);
+      // по INTENT не хватает — CART уже не проверяется
+      expect(verified(r).slice(before)).toEqual(which === "INTENT" ? [intentId] : [intentId, cartId]);
+      expect(r.payment.calls).toEqual([]);
+    });
+  }
+
   it("сбой verify в воротах — STOPPED с кодом Платформы, agent.refused не пишется (Р38 п. 4)", async () => {
     const r = await setup();
     await ordered(r);

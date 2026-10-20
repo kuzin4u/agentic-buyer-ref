@@ -27,6 +27,8 @@ export interface PipelineJournal extends PurchaseJournal {
       | { at: string; kind: "offer.flagged"; reason: A5SignalCode; ref?: string; mandate?: string }
       /** ворота: держимый мандат вышел (отзыв, иной статус) — отказ действовать (Р38 п. 3) */
       | { at: string; kind: "agent.refused"; reason: "MANDATE_NOT_ACTIVE"; mandate?: string }
+      /** ворота: остатка Платформы по мандату не хватает на итог CART (Р38 п. 3, К4а) */
+      | { at: string; kind: "agent.refused"; reason: "MANDATE_AMOUNT_LEFT_INSUFFICIENT"; mandate?: string }
       /** выбор человека не из контура гарантий выдачи (Р38 п. 2, поправка К3) — отказ действовать; ref — sku по маске */
       | { at: string; kind: "agent.refused"; reason: "OFFER_NOT_IN_CONTOUR"; ref?: string; mandate?: string },
   ): void;
@@ -346,14 +348,23 @@ export class Purchase {
     });
   }
 
-  /** Ворота перед стадией 5 (Р38 п. 3): INTENT и CART оба среди держимых (сигнал, без сети) и оба подтверждены verify
-   *  (решение, инвариант 6) — непосредственно перед запросом реквизита; после verify — держимые ещё раз (отзыв по ленте
+  /** Ворота перед стадией 5 (Р38 п. 3): INTENT и CART оба среди держимых (сигнал, без сети), оба подтверждены verify
+   *  и остаток каждого по verify не меньше итога CART (К4а; решение, инвариант 6) — непосредственно перед запросом реквизита; после verify — держимые ещё раз (отзыв по ленте
    *  во время проверки). Отзыв — agent.refused MANDATE_NOT_ACTIVE; verify не CONFIRMED — MANDATE_OUT_OF_SCOPE (запись
    *  клиента мандатов); и то и другое — STOPPED до реквизита. */
   async #gate(intent: Mandate, cart: Mandate): Promise<void> {
+    const total = cart.cart?.total;
+    if (total === undefined) this.#halt("MANDATE_REPLY_MISMATCH");
     this.#held(intent, cart);
-    await this.#guard(() => this.o.mandates.requireActive(intent));
-    await this.#guard(() => this.o.mandates.requireActive(cart));
+    for (const m of [intent, cart]) {
+      const c = await this.#guard(() => this.o.mandates.requireActive(m));
+      // остатка Платформы хватает на итог CART (К4а): у CART по копии ПАО 1.4.0 остаток без родителя, поэтому — оба
+      // мандата (меньшее из двух, как у CART после PS-10, передача #36); агент остаток не вычисляет (инвариант 6)
+      if (c.amountLeft.currency !== total.currency || c.amountLeft.amount < total.amount) {
+        this.#record({ kind: "agent.refused", reason: "MANDATE_AMOUNT_LEFT_INSUFFICIENT", ...maskedMandate(m.id) });
+        this.#halt("MANDATE_AMOUNT_LEFT_INSUFFICIENT");
+      }
+    }
     this.#held(intent, cart);
     // без пропуска машина не пустит в AUTHORIZING: запрещённый переход по К2.1, даже если таблица его разрешает
     this.#machine.passGate5();

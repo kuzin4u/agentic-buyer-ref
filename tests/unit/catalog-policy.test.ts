@@ -175,13 +175,18 @@ describe("сигнал A5 — пометка и решение человека 
     expect(acceptedA5(two, P, part)).toEqual(["A5_PRICE_MISMATCH"]);
   });
 
-  it("структурная копия и подделка с приведением типа — не решение: политика принимает только выданное оболочкой (инвариант 7)", () => {
+  it("структурная копия и подделка с приведением типа — A5_DECISION_FORGED раньше остальных правил, в том числе без сигналов и в автономном режиме (Р40 п. 3 б, инвариант 7)", () => {
     const copy = { ...yes } as HumanA5Decision;
     const forged = { merchantId: v.merchantId, sku: v.sku, price: v.price, shown: v.a5, accepted: v.a5 } as unknown as HumanA5Decision;
     for (const d of [copy, forged]) {
       expect(issuedByShell(d)).toBe(false);
-      expect(mayDraftCart(v, P, d)).toEqual({ allow: false, code: "A5_NEEDS_HUMAN" });
+      expect(mayDraftCart(v, P, d)).toEqual({ allow: false, code: "A5_DECISION_FORGED" });
+      expect(mayDraftCart({ ...v, a5: [] }, P, d)).toEqual({ allow: false, code: "A5_DECISION_FORGED" });
+      expect(mayDraftCart(v, AUTO, d)).toEqual({ allow: false, code: "A5_DECISION_FORGED" });
+      expect(acceptedA5(v, P, d)).toEqual([]);
     }
+    // исключённый товар — EXCLUDED и с подделкой (правило а раньше б)
+    expect(mayDraftCart({ kind: "EXCLUDED", reason: "REGION" }, P, copy)).toEqual({ allow: false, code: "EXCLUDED" });
     expect(issuedByShell(yes)).toBe(true);
   });
 

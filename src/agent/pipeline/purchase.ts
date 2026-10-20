@@ -43,7 +43,10 @@ export interface PipelineJournal extends PurchaseJournal {
       /** политика до стадий 4–5: итог не в RUB; доля в окне дробления (Р39 п. 1.4, п. 4) */
       | { at: string; kind: "agent.refused"; reason: "CURRENCY_NOT_SUPPORTED" | "SPLIT_WINDOW"; mandate?: string }
       /** выбор человека не из контура гарантий выдачи (Р38 п. 2, поправка К3) — отказ действовать; ref — sku по маске */
-      | { at: string; kind: "agent.refused"; reason: "OFFER_NOT_IN_CONTOUR"; ref?: string; mandate?: string },
+      | { at: string; kind: "agent.refused"; reason: "OFFER_NOT_IN_CONTOUR"; ref?: string; mandate?: string }
+      /** решение человека по A5 не выдано оболочкой (Р40 п. 4) — отказ действовать; ref — sku, merchant — код продавца, по
+       *  маске; mandate — корневой INTENT из машины */
+      | { at: string; kind: "agent.refused"; reason: "A5_DECISION_FORGED"; ref?: string; mandate?: string; merchant?: string },
   ): void;
 }
 
@@ -418,12 +421,17 @@ export class Purchase {
   }
 
   /** Политика по сигналам A5 перед проектом CART (Р32 п. 2, Р40 п. 3–4): отказ — cart.refused по каждому сигналу, который
-   *  человек не принял, и CartRefused; покупка остаётся в OFFERS. */
+   *  человек не принял, и CartRefused; покупка остаётся в OFFERS. Подделка решения — agent.refused и STOPPED. */
   #draftable(verdict: OfferVerdict, purchase: CartPurchase, decision: HumanA5Decision | undefined): void {
     const d = mayDraftCart(verdict, purchase, decision);
     if (d.allow) return;
     // EXCLUDED здесь не возникает (в contour только доступные товары): появился — дефект, а не тихий отказ (ревью К5 № 3)
     if (d.code === "EXCLUDED" || verdict.kind !== "AVAILABLE") this.#halt("UNKNOWN");
+    // решение не из оболочки — дефект или подмена вызывающего, а не «решения нет» (Р40 п. 4, как OFFER_NOT_IN_CONTOUR)
+    if (d.code === "A5_DECISION_FORGED") {
+      this.#record({ kind: "agent.refused", reason: "A5_DECISION_FORGED", ...skuRef(verdict.sku), ...merchantRef(verdict.merchantId) });
+      this.#halt("A5_DECISION_FORGED");
+    }
     // решение политики — в журнал конвейером (Р37 п. 5, Р38 п. 5): по каждому сигналу, который человек не принял
     const accepted = acceptedA5(verdict, purchase, decision);
     const open = d.code === "A5_NEEDS_HUMAN" ? verdict.a5.filter((c) => !accepted.includes(c)) : verdict.a5;

@@ -61,14 +61,19 @@ export function acceptedA5(verdict: OfferVerdict, purchase: Pick<CartPurchase, "
 
 const sameSet = <T>(a: readonly T[], b: readonly T[]): boolean => new Set(a).size === new Set(b).size && a.every((x) => b.includes(x));
 
-export type CartDraftDecision = { allow: true } | { allow: false; code: "EXCLUDED" | "A5_AUTONOMOUS" | "A5_NEEDS_HUMAN" | "A5_DECISION_STALE" };
+export type CartDraftDecision =
+  | { allow: true }
+  | { allow: false; code: "EXCLUDED" | "A5_DECISION_FORGED" | "A5_AUTONOMOUS" | "A5_NEEDS_HUMAN" | "A5_DECISION_STALE" };
 
 /** Можно ли готовить проект мандата корзины (Р40 п. 3). Сумма и порог `confirm_above_kop` здесь не участвуют: решение
  *  по A5 — отдельно от подтверждения выше порога (Т7), при сумме выше порога нужны оба. Сигналы покрыты, только если
  *  человек принял все по этому же показу в этой покупке (`acceptedA5`); выданное оболочкой решение, которое показ не
- *  покрывает (потрачено, другая покупка, другой показ), — `A5_DECISION_STALE`: человеку — показ заново. */
+ *  покрывает (потрачено, другая покупка, другой показ), — `A5_DECISION_STALE`: человеку — показ заново. Решение передано, но
+ *  не выдано оболочкой (копия, подделка) — `A5_DECISION_FORGED` раньше остальных правил, в том числе без сигналов и в
+ *  автономном режиме: подмена решения человека — не «решения нет». */
 export function mayDraftCart(verdict: OfferVerdict, purchase: CartPurchase, decision: HumanA5Decision | undefined): CartDraftDecision {
   if (verdict.kind !== "AVAILABLE") return { allow: false, code: "EXCLUDED" };
+  if (decision !== undefined && !issuedByShell(decision)) return { allow: false, code: "A5_DECISION_FORGED" };
   if (verdict.a5.length === 0) return { allow: true };
   if (purchase.mode === "AUTONOMOUS") return { allow: false, code: "A5_AUTONOMOUS" };
   if (issuedByShell(decision) && !covers(verdict, purchase.intentId, decision)) return { allow: false, code: "A5_DECISION_STALE" };

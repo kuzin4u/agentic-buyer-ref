@@ -3,7 +3,7 @@
 import type { ConfirmationMode, Money } from "../../shared/domain.js";
 import type { A5SignalCode, CatalogIssueCode, CatalogShop, LiveFact, LiveFactCode, ProductFacts } from "../catalog/index.js";
 import type { HumanA5Decision } from "../shell/a5-decision.js";
-import { issuedByShell } from "./a5-issued.js";
+import { isSpent, issuedByShell } from "./a5-issued.js";
 
 export type { HumanA5Decision };
 
@@ -33,31 +33,51 @@ export function classifyOffer(p: ProductFacts, shop: CatalogShop, shopIssues: Ca
   return { kind: "AVAILABLE", merchantId, sku: p.product.sku, price: { ...p.product.price }, a5: [...p.signals] };
 }
 
-/** Коды, которые человек принял по этому показу (Р39 п. 5): решение выдано оболочкой (`issuedByShell`) и привязано к
- *  тому же продавцу, `sku`, цене и набору показанных кодов; иначе — ни одного (решение по другому показу — не решение). */
-export function acceptedA5(verdict: OfferVerdict, decision: HumanA5Decision | undefined): A5SignalCode[] {
-  if (verdict.kind !== "AVAILABLE" || !issuedByShell(decision)) return [];
-  const sameShow =
+/** Покупка, для которой готовится корзина: корневой INTENT и режим подтверждения из него. */
+export interface CartPurchase {
+  intentId: string;
+  mode: ConfirmationMode;
+}
+
+/** Решение выдано оболочкой и покрывает этот показ в этой покупке (Р39 п. 5, Р40 п. 1–2): не потрачено, тот же корневой
+ *  INTENT, продавец, `sku`, цена и набор показанных кодов. */
+function covers(verdict: OfferVerdict, intentId: string, decision: HumanA5Decision | undefined): decision is HumanA5Decision {
+  if (verdict.kind !== "AVAILABLE" || !issuedByShell(decision) || isSpent(decision)) return false;
+  return (
+    decision.intentId === intentId &&
     decision.merchantId === verdict.merchantId &&
     decision.sku === verdict.sku &&
     decision.price.amount === verdict.price.amount &&
     decision.price.currency === verdict.price.currency &&
-    sameSet(decision.shown, verdict.a5);
-  return sameShow ? verdict.a5.filter((c) => decision.accepted.includes(c)) : [];
+    sameSet(decision.shown, verdict.a5)
+  );
+}
+
+/** Коды, которые человек принял по этому показу в этой покупке; решение не покрывает показ (`covers`) — ни одного. */
+export function acceptedA5(verdict: OfferVerdict, purchase: Pick<CartPurchase, "intentId">, decision: HumanA5Decision | undefined): A5SignalCode[] {
+  if (verdict.kind !== "AVAILABLE" || !covers(verdict, purchase.intentId, decision)) return [];
+  return verdict.a5.filter((c) => decision.accepted.includes(c));
 }
 
 const sameSet = <T>(a: readonly T[], b: readonly T[]): boolean => new Set(a).size === new Set(b).size && a.every((x) => b.includes(x));
 
-export type CartDraftDecision = { allow: true } | { allow: false; code: "EXCLUDED" | "A5_AUTONOMOUS" | "A5_NEEDS_HUMAN" };
+export type CartDraftDecision =
+  | { allow: true }
+  | { allow: false; code: "EXCLUDED" | "A5_DECISION_FORGED" | "A5_AUTONOMOUS" | "A5_NEEDS_HUMAN" | "A5_DECISION_STALE" };
 
-/** Можно ли готовить проект мандата корзины. Сумма и порог `confirm_above_kop` здесь не участвуют: решение по A5 —
- *  отдельно от подтверждения выше порога (Т7), при сумме выше порога нужны оба. Сигналы покрыты, только если человек
- *  принял все по этому же показу (`acceptedA5`). */
-export function mayDraftCart(verdict: OfferVerdict, mode: ConfirmationMode, decision: HumanA5Decision | undefined): CartDraftDecision {
+/** Можно ли готовить проект мандата корзины (Р40 п. 3). Сумма и порог `confirm_above_kop` здесь не участвуют: решение
+ *  по A5 — отдельно от подтверждения выше порога (Т7), при сумме выше порога нужны оба. Сигналы покрыты, только если
+ *  человек принял все по этому же показу в этой покупке (`acceptedA5`); выданное оболочкой решение, которое показ не
+ *  покрывает (потрачено, другая покупка, другой показ), — `A5_DECISION_STALE`: человеку — показ заново. Решение передано, но
+ *  не выдано оболочкой (копия, подделка) — `A5_DECISION_FORGED` раньше остальных правил, в том числе без сигналов и в
+ *  автономном режиме: подмена решения человека — не «решения нет». */
+export function mayDraftCart(verdict: OfferVerdict, purchase: CartPurchase, decision: HumanA5Decision | undefined): CartDraftDecision {
   if (verdict.kind !== "AVAILABLE") return { allow: false, code: "EXCLUDED" };
+  if (decision !== undefined && !issuedByShell(decision)) return { allow: false, code: "A5_DECISION_FORGED" };
   if (verdict.a5.length === 0) return { allow: true };
-  if (mode === "AUTONOMOUS") return { allow: false, code: "A5_AUTONOMOUS" };
-  return acceptedA5(verdict, decision).length === verdict.a5.length ? { allow: true } : { allow: false, code: "A5_NEEDS_HUMAN" };
+  if (purchase.mode === "AUTONOMOUS") return { allow: false, code: "A5_AUTONOMOUS" };
+  if (issuedByShell(decision) && !covers(verdict, purchase.intentId, decision)) return { allow: false, code: "A5_DECISION_STALE" };
+  return acceptedA5(verdict, purchase, decision).length === verdict.a5.length ? { allow: true } : { allow: false, code: "A5_NEEDS_HUMAN" };
 }
 
 /** Что дальше после отказа живой проверки (Р32 п. 4). Автоматического повтора нет ни в одном случае (инвариант 9). */

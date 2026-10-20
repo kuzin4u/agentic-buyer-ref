@@ -8,14 +8,15 @@ import type { DiagCode } from "../../shared/diag-codes.js";
 import { liveCheck, type A5SignalCode, type CatalogIssueCode, type CatalogProduct, type LiveCheckParams, type LiveFactCode } from "../catalog/index.js";
 import { ruleForDeclineReason } from "../declines/index.js";
 import { MandateRefused, type MandateClient } from "../mandates/index.js";
-import { acceptedA5, classifyOffer, mayDraftCart, mayOrder, type HumanA5Decision, type OfferVerdict, type OrderNext } from "../policy/catalog.js";
+import { issuedByShell, spend } from "../policy/a5-issued.js";
+import { acceptedA5, classifyOffer, mayDraftCart, mayOrder, type CartPurchase, type HumanA5Decision, type OfferVerdict, type OrderNext } from "../policy/catalog.js";
 import { confirmThreshold, currencySupported, mandateRefusal, mayAuthorize, needsConfirmation, type PaymentDecision, type Thresholds } from "../policy/payment.js";
 import type { SplitWindow } from "../policy/split.js";
 import type { LiveOfferSource } from "../ports/catalog.js";
 import type { FeedItem } from "../ports/events.js";
 import type { Mutation } from "../ports/mutation.js";
 import type { OfferSource, PaymentContext, PaymentSteps, ShopOffers, ShopOrder, ShopPort } from "../ports/shop.js";
-import { PurchaseMachine, PurchaseTransitionForbidden, allowed, type PurchaseJournal, type PurchaseState } from "./machine.js";
+import { PurchaseMachine, PurchaseTransitionForbidden, allowed, type PurchaseJournal, type PurchaseState, type StopCause } from "./machine.js";
 
 /** Записи конвейера сверх записей машины (Р38 п. 5, Р37 п. 5). */
 export interface PipelineJournal extends PurchaseJournal {
@@ -28,8 +29,8 @@ export interface PipelineJournal extends PurchaseJournal {
       | { at: string; kind: "offer.excluded"; detail: "REGION"; ref?: string; mandate?: string; merchant?: string }
       /** сигнал A5 — показ с пометкой */
       | { at: string; kind: "offer.flagged"; reason: A5SignalCode; ref?: string; mandate?: string; merchant?: string }
-      /** проект CART не готовится (Р32 п. 2): reason — код сигнала A5, detail — решение политики */
-      | { at: string; kind: "cart.refused"; reason: A5SignalCode; detail: "A5_NEEDS_HUMAN" | "A5_AUTONOMOUS"; ref?: string; mandate?: string; merchant?: string }
+      /** проект CART не готовится (Р32 п. 2, Р40 п. 4): reason — код сигнала A5, detail — решение политики */
+      | { at: string; kind: "cart.refused"; reason: A5SignalCode; detail: CartRefusal; ref?: string; mandate?: string; merchant?: string }
       /** заказа нет — живая проверка не ok (Р32 п. 3–4): reason — код проверки, detail — следующий шаг */
       | { at: string; kind: "order.live_refused"; reason: LiveFactCode; detail: OrderNext; ref?: string; mandate?: string; merchant?: string }
       /** ворота: держимый мандат вышел (отзыв, иной статус) — отказ действовать (Р38 п. 3) */
@@ -42,7 +43,10 @@ export interface PipelineJournal extends PurchaseJournal {
       /** политика до стадий 4–5: итог не в RUB; доля в окне дробления (Р39 п. 1.4, п. 4) */
       | { at: string; kind: "agent.refused"; reason: "CURRENCY_NOT_SUPPORTED" | "SPLIT_WINDOW"; mandate?: string }
       /** выбор человека не из контура гарантий выдачи (Р38 п. 2, поправка К3) — отказ действовать; ref — sku по маске */
-      | { at: string; kind: "agent.refused"; reason: "OFFER_NOT_IN_CONTOUR"; ref?: string; mandate?: string },
+      | { at: string; kind: "agent.refused"; reason: "OFFER_NOT_IN_CONTOUR"; ref?: string; mandate?: string }
+      /** решение человека по A5 не выдано оболочкой (Р40 п. 4) — отказ действовать; ref — sku, merchant — код продавца, по
+       *  маске; mandate — корневой INTENT из машины */
+      | { at: string; kind: "agent.refused"; reason: "A5_DECISION_FORGED"; ref?: string; mandate?: string; merchant?: string },
   ): void;
 }
 
@@ -71,9 +75,13 @@ export interface CartChoice {
   keyTermsShown: boolean;
 }
 
+/** Исход политики по сигналам A5, при котором корзина не готовится: решения нет или не все сигналы приняты, автономный
+ *  режим, решение устарело — потрачено, из другой покупки или по другому показу (Р40 п. 3). */
+export type CartRefusal = "A5_NEEDS_HUMAN" | "A5_AUTONOMOUS" | "A5_DECISION_STALE";
+
 /** Проект корзины не готовится (Р32 п. 2): покупка остаётся в OFFERS, обращений не было (Р38 п. 4, поправка К3). */
 export class CartRefused extends Error {
-  constructor(readonly code: "EXCLUDED" | "A5_AUTONOMOUS" | "A5_NEEDS_HUMAN") {
+  constructor(readonly code: "EXCLUDED" | CartRefusal) {
     super(`Корзина не готовится: ${code}`);
     this.name = "CartRefused";
   }
@@ -240,20 +248,18 @@ export class Purchase {
         this.#record({ kind: "agent.refused", reason: "OFFER_NOT_IN_CONTOUR", ...skuRef(String(choice.sku)) });
         this.#halt("OFFER_NOT_IN_CONTOUR");
       }
-      // показ — из своей выдачи: продавец, sku, цена и коды A5, к которым привязано решение человека (Р39 п. 5)
+      // показ — из своей выдачи: продавец, sku, цена и коды A5, к которым привязано решение человека (Р39 п. 5), и
+      // покупка — корневой INTENT (Р40 п. 1)
       const verdict: OfferVerdict = { kind: "AVAILABLE", merchantId: offer.merchantId, sku: offer.sku, price: { ...offer.product.price }, a5: [...offer.a5] };
-      const d = mayDraftCart(verdict, intent.confirmationMode, choice.decision);
-      if (!d.allow) {
-        // EXCLUDED здесь не возникает (в contour только доступные товары): появился — дефект, а не тихий отказ (ревью К5 № 3)
-        if (d.code === "EXCLUDED") this.#halt("UNKNOWN");
-        // решение политики — в журнал конвейером (Р37 п. 5, Р38 п. 5): по каждому сигналу, который человек не принял
-        const accepted = acceptedA5(verdict, choice.decision);
-        const open = d.code === "A5_NEEDS_HUMAN" ? offer.a5.filter((c) => !accepted.includes(c)) : offer.a5;
-        for (const reason of open) this.#record({ kind: "cart.refused", reason, detail: d.code, ...skuRef(offer.sku), ...merchantRef(offer.merchantId) });
-        throw new CartRefused(d.code);
-      }
+      const purchase: CartPurchase = { intentId: intent.id, mode: intent.confirmationMode };
+      this.#draftable(verdict, purchase, choice.decision);
       this.#held(intent);
       await this.#guard(() => this.o.mandates.requireActive(intent));
+      // вторая защита: решение — повторно непосредственно перед тратой, без ожидания между ними (при `#busy` и привязке к
+      // INTENT потратить его на другую корзину во время verify нельзя — недостижимо, нюанс К2 Р40). Тратится только
+      // решение, которое покрыло сигналы этого товара, при любом исходе запроса CART (Р40 п. 2, fail-closed)
+      this.#draftable(verdict, purchase, choice.decision);
+      if (verdict.a5.length > 0 && issuedByShell(choice.decision)) spend(choice.decision);
       const cart = snapshot(await this.#guard(() => this.o.mandates.request(cartDraft(intent, offer, choice), m, intent)));
       this.#offer = offer;
       this.#cart = cart;
@@ -328,14 +334,16 @@ export class Purchase {
   }
 
   /** Стадия 4: подтверждение человеком через порт (AG-13): исход — из события Платформы, конвейер его не создаёт
-   *  (инвариант 7). Без надобности — запрещённый переход. Не APPROVED — STOPPED CONFIRMATION_REQUIRED. */
+   *  (инвариант 7). Без надобности — запрещённый переход. До запроса — та же проверка по мандату, что в воротах стадии 5
+   *  (Р40 п. 5): человека не просят подтвердить покупку, которую ворота затем отклонят. Не APPROVED — STOPPED
+   *  CONFIRMATION_REQUIRED. */
   confirm(signal?: AbortSignal): Promise<void> {
     return this.#stage("CONFIRMING", async () => {
       // валюта и доля — до решения о стадии 4: код отказа не зависит от пути вызывающего (ревью К2 В1)
       const c = this.#context();
       this.#prepay(c.intent, c.cart);
       if (!this.needsConfirmation) this.#machine.forbid("CONFIRMING");
-      this.#held(c.intent, c.cart);
+      await this.#scope(c.intent, c.cart);
       this.#machine.to("CONFIRMING");
       const status = await this.#guard(() => this.o.payment.confirm(copy(c), signal));
       this.#held(c.intent, c.cart);
@@ -392,13 +400,20 @@ export class Purchase {
     });
   }
 
-  /** Ворота перед стадией 5 (Р38 п. 3): INTENT и CART оба среди держимых (сигнал, без сети), затем verify каждого и
-   *  решение политики по нему (Р39 п. 1.1–1.3: остаток > 0, в валюте итога и не меньше итога, продавец и валюта в
-   *  пределах; инвариант 6) —
-   *  непосредственно перед запросом реквизита; после verify — держимые ещё раз (отзыв по ленте во время проверки). Отзыв —
-   *  agent.refused MANDATE_NOT_ACTIVE; verify не CONFIRMED — MANDATE_OUT_OF_SCOPE (запись клиента мандатов); отказ
-   *  политики — agent.refused с её кодом; всё — STOPPED до реквизита. */
+  /** Ворота перед стадией 5 (Р38 п. 3): проверка по мандату (`#scope`) непосредственно перед запросом реквизита, затем
+   *  пропуск машины в AUTHORIZING. */
   async #gate(intent: Mandate, cart: Mandate): Promise<void> {
+    await this.#scope(intent, cart);
+    // без пропуска машина не пустит в AUTHORIZING: запрещённый переход по К2.1, даже если таблица его разрешает
+    this.#machine.passGate5();
+  }
+
+  /** Проверка по мандату (Р38 п. 3, Р40 п. 5) — в воротах стадии 5 и до стадии 4: INTENT и CART оба среди держимых
+   *  (сигнал, без сети), затем verify каждого и решение политики по нему (Р39 п. 1.1–1.3: остаток > 0, в валюте итога и
+   *  не меньше итога, продавец и валюта в пределах; инвариант 6); после verify — держимые ещё раз (отзыв по ленте во время
+   *  проверки). Отзыв — agent.refused MANDATE_NOT_ACTIVE; verify не CONFIRMED — MANDATE_OUT_OF_SCOPE (запись клиента
+   *  мандатов); отказ политики — agent.refused с её кодом; всё — STOPPED до запроса подтверждения или реквизита. */
+  async #scope(intent: Mandate, cart: Mandate): Promise<void> {
     const total = this.#total(cart);
     // продавец — из подписанного CART, как его видит Платформа (ревью К2 М3); с выдачей сверен клиентом мандатов
     const merchantId = cart.cart!.merchantId;
@@ -410,8 +425,28 @@ export class Purchase {
     const cartCheck = await this.#guard(() => this.o.mandates.requireActive(cart));
     this.#refuse(mayAuthorize({ intent, cart, merchantId, total }, { intent: intentCheck, cart: cartCheck }));
     this.#held(intent, cart);
-    // без пропуска машина не пустит в AUTHORIZING: запрещённый переход по К2.1, даже если таблица его разрешает
-    this.#machine.passGate5();
+  }
+
+  /** Политика по сигналам A5 перед проектом CART (Р32 п. 2, Р40 п. 3–4): отказ — cart.refused по каждому сигналу, который
+   *  человек не принял, и CartRefused; покупка остаётся в OFFERS. Подделка решения — agent.refused и STOPPED. */
+  #draftable(verdict: OfferVerdict, purchase: CartPurchase, decision: HumanA5Decision | undefined): void {
+    // EXCLUDED здесь не возникает (в contour только доступные товары): появился — дефект, а не тихий отказ (ревью К5 № 3);
+    // в записи остановки — уточнение CART_POLICY_EXCLUDED, без agent.refused и cart.refused (Р40 п. 6, Р-109). Показ не
+    // AVAILABLE — то же до решения политики (второй слой)
+    if (verdict.kind !== "AVAILABLE") this.#halt("UNKNOWN", "CART_POLICY_EXCLUDED");
+    const d = mayDraftCart(verdict, purchase, decision);
+    if (d.allow) return;
+    if (d.code === "EXCLUDED") this.#halt("UNKNOWN", "CART_POLICY_EXCLUDED");
+    // решение не из оболочки — дефект или подмена вызывающего, а не «решения нет» (Р40 п. 4, как OFFER_NOT_IN_CONTOUR)
+    if (d.code === "A5_DECISION_FORGED") {
+      this.#record({ kind: "agent.refused", reason: "A5_DECISION_FORGED", ...skuRef(verdict.sku), ...merchantRef(verdict.merchantId) });
+      this.#halt("A5_DECISION_FORGED");
+    }
+    // решение политики — в журнал конвейером (Р37 п. 5, Р38 п. 5): по каждому сигналу, который человек не принял
+    const accepted = acceptedA5(verdict, purchase, decision);
+    const open = d.code === "A5_NEEDS_HUMAN" ? verdict.a5.filter((c) => !accepted.includes(c)) : verdict.a5;
+    for (const reason of open) this.#record({ kind: "cart.refused", reason, detail: d.code, ...skuRef(verdict.sku), ...merchantRef(verdict.merchantId) });
+    throw new CartRefused(d.code);
   }
 
   /** Решения каталога — в журнал по каждому товару (Р37 п. 5): исключение — код модели или REGION, A5 — пометка. */
@@ -498,8 +533,8 @@ export class Purchase {
     this.#halt(d.code);
   }
 
-  #halt(code: DiagCode): never {
-    this.#machine.stop(code);
+  #halt(code: DiagCode, cause?: StopCause): never {
+    this.#machine.stop(code, cause);
     throw new PurchaseStopped(code);
   }
 

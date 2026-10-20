@@ -3,6 +3,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { CartRefused, OrderRefused, PurchaseMachine, PurchaseStopped, PurchaseTransitionForbidden, type Offer } from "../../src/agent/pipeline/index.js";
 import { MandateRefused } from "../../src/agent/mandates/index.js";
+import { isSpent } from "../../src/agent/policy/a5-issued.js";
 import { loadParams } from "../../src/shared/config.js";
 import { PlatformFailure } from "../../src/shared/domain.js";
 import { INTENT, event } from "../support/consents.js";
@@ -41,6 +42,9 @@ function fillWindow(r: PurchaseRun, root: string, n: number, sum: number, round:
 }
 /** цена tartine по фиду, коп. */
 const TARTINE = feedPrice(SHOP, "tartine").amount;
+
+/** Покупка, в которой человек видел показ: корневой INTENT (Р40 п. 1). */
+const shownIn = (r: PurchaseRun) => ({ intentId: r.purchase.intentMandate!.id });
 
 /** Выбор человека — ключом товара выдачи. */
 const key = (o: Offer) => ({ merchantId: o.merchantId, sku: o.sku });
@@ -159,7 +163,7 @@ describe("стадия 3 — проект корзины (Р32 п. 2): отка�
     r.purchase.offers!.contour[0]!.a5 = [];
     await expect(r.purchase.cart({ ...key(zones.contour[0]!), qty: 1, keyTermsShown: true }, { idempotencyKey: "idem-cart-1" })).rejects.toMatchObject({ code: "A5_NEEDS_HUMAN" });
     expect(r.purchase.state).toBe("OFFERS");
-    const decision = humanA5Decision(r.purchase.offers!.contour[0]!, ["A5_RETURNS_MISMATCH"]);
+    const decision = humanA5Decision(shownIn(r), r.purchase.offers!.contour[0]!, ["A5_RETURNS_MISMATCH"]);
     const cart = await r.purchase.cart({ ...key(zones.contour[0]!), qty: 1, decision, keyTermsShown: true }, { idempotencyKey: "idem-cart-1" });
     expect(cart.cart!.total.amount).toBe(TARTINE);
   });
@@ -187,37 +191,128 @@ describe("стадия 3 — проект корзины (Р32 п. 2): отка�
       expect.objectContaining({ reason: "A5_RETURNS_MISMATCH", detail: "A5_NEEDS_HUMAN", ref: "tartine", merchant: "shop_1", mandate: r.purchase.intentMandate!.id }),
     ]);
     expectJournalClean(r.journal.entries, AGENT, r.stand.stub.calls, ["idem-intent-1"]);
-    const decision = humanA5Decision(offer, ["A5_RETURNS_MISMATCH"]);
+    const decision = humanA5Decision(shownIn(r), offer, ["A5_RETURNS_MISMATCH"]);
     await r.purchase.cart({ ...key(offer), qty: 1, decision, keyTermsShown: true }, { idempotencyKey: "idem-cart-1" });
     expect(r.purchase.state).toBe("CART_PENDING");
   });
 
-  it("решение по тому же sku другого магазина — не решение: A5_NEEDS_HUMAN, в cart.refused — все сигналы (Р39 п. 5)", async () => {
+  it("решение по тому же sku другого магазина — устарело: A5_DECISION_STALE, в cart.refused — все сигналы (Р39 п. 5, Р40 п. 3)", async () => {
     const profile = bakery({ returns: { days: 0, text: "Возврат в течение 14 дней" } });
     const r = await setup({ shops: [{ ...SHOP, profile }, { ...SHOP, profile, merchantId: "shop_2" }] });
     await signedIntent(r, { ...INTENT, merchantScope: ["shop_1", "shop_2"] });
     const zones = await r.purchase.search();
     const [a, b] = ["shop_1", "shop_2"].map((m) => zones.contour.find((o) => o.merchantId === m && o.sku === "tartine")!);
-    const decision = humanA5Decision(a!, a!.a5);
-    await expect(r.purchase.cart({ ...key(b!), qty: 1, decision, keyTermsShown: true }, { idempotencyKey: "idem-cart-1" })).rejects.toMatchObject({ code: "A5_NEEDS_HUMAN" });
-    expect(r.tail().filter((e) => e.kind === "cart.refused").map((e) => [e.reason, e.merchant])).toEqual([["A5_RETURNS_MISMATCH", "shop_2"]]);
+    const decision = humanA5Decision(shownIn(r), a!, a!.a5);
+    const from = r.stand.stub.calls.length;
+    await expect(r.purchase.cart({ ...key(b!), qty: 1, decision, keyTermsShown: true }, { idempotencyKey: "idem-cart-1" })).rejects.toMatchObject({ code: "A5_DECISION_STALE" });
+    expect(r.tail().filter((e) => e.kind === "cart.refused").map((e) => [e.reason, e.detail, e.merchant])).toEqual([["A5_RETURNS_MISMATCH", "A5_DECISION_STALE", "shop_2"]]);
+    expect(r.stand.stub.calls.slice(from)).toEqual([]);
     expect(r.purchase.state).toBe("OFFERS");
   });
 
-  it("копия решения и решение по подменённой у вызывающего выдаче — не решение: A5_NEEDS_HUMAN, все сигналы в журнал, обращений нет (Р39 п. 5, ревью К3 М4)", async () => {
+  it("решение по подменённой у вызывающего выдаче — устарело: A5_DECISION_STALE, все сигналы в журнал, обращений нет (Р39 п. 5, Р40 п. 3 д, ревью К3 М4)", async () => {
     const r = await setup({ shops: [{ ...SHOP, profile: bakery({ returns: { days: 0, text: "Возврат в течение 14 дней" } }) }] });
     const offer = await offers(r);
     // выдача, отданная наружу, — копия: цена подменена у вызывающего, решение — по подмене
     const tampered = { ...offer, product: { ...offer.product, price: { ...offer.product.price, amount: 1 } } };
-    const copy = { ...humanA5Decision(offer, offer.a5) };
-    for (const decision of [humanA5Decision(tampered, tampered.a5), copy]) {
-      const from = r.stand.stub.calls.length;
-      const start = r.tail().length;
-      await expect(r.purchase.cart({ ...key(offer), qty: 1, decision, keyTermsShown: true }, { idempotencyKey: "idem-cart-1" })).rejects.toMatchObject({ code: "A5_NEEDS_HUMAN" });
-      expect(r.tail().slice(start).filter((e) => e.kind === "cart.refused").map((e) => [e.reason, e.detail])).toEqual([["A5_RETURNS_MISMATCH", "A5_NEEDS_HUMAN"]]);
-      expect(r.stand.stub.calls.slice(from)).toEqual([]);
-      expect(r.purchase.state).toBe("OFFERS");
-    }
+    const decision = humanA5Decision(shownIn(r), tampered, tampered.a5);
+    const from = r.stand.stub.calls.length;
+    await expect(r.purchase.cart({ ...key(offer), qty: 1, decision, keyTermsShown: true }, { idempotencyKey: "idem-cart-1" })).rejects.toMatchObject({ code: "A5_DECISION_STALE" });
+    expect(r.tail().filter((e) => e.kind === "cart.refused").map((e) => [e.reason, e.detail])).toEqual([["A5_RETURNS_MISMATCH", "A5_DECISION_STALE"]]);
+    expect(r.stand.stub.calls.slice(from)).toEqual([]);
+    expect(r.purchase.state).toBe("OFFERS");
+  });
+
+  for (const [name, a5, mode] of [
+    ["товар с сигналом A5", true, "IMMEDIATE"],
+    ["товар без сигналов", false, "IMMEDIATE"],
+    ["автономный режим", true, "AUTONOMOUS"],
+  ] as const) {
+    it(`копия и подделка решения (${name}) — agent.refused A5_DECISION_FORGED и STOPPED, cart.refused нет, обращений нет (Р40 п. 3 б, п. 4)`, async () => {
+      for (const forge of ["copy", "cast"] as const) {
+        const r = await setup(a5 ? { shops: [{ ...SHOP, profile: bakery({ returns: { days: 0, text: "Возврат в течение 14 дней" } }) }] } : {});
+        await signedIntent(r, { ...INTENT, confirmationMode: mode });
+        const offer = (await r.purchase.search()).contour.find((o) => o.sku === "tartine")!;
+        const real = humanA5Decision(shownIn(r), offer, offer.a5);
+        // структурная копия выданного решения и литерал с приведением типа — оба не выданы оболочкой
+        const decision =
+          forge === "copy"
+            ? { ...real }
+            : ({ intentId: real.intentId, merchantId: real.merchantId, sku: real.sku, price: real.price, shown: real.shown, accepted: real.accepted } as unknown as typeof real);
+        const from = r.stand.stub.calls.length;
+        const start = r.tail().length;
+        await expect(r.purchase.cart({ ...key(offer), qty: 1, decision, keyTermsShown: true }, { idempotencyKey: "idem-cart-1" })).rejects.toBeInstanceOf(PurchaseStopped);
+        expect(r.purchase.reason).toBe("A5_DECISION_FORGED");
+        const root = r.purchase.intentMandate!.id;
+        expect(r.tail().slice(start).map((e) => [e.kind, e.reason, e.ref, e.merchant, e.mandate])).toEqual([
+          ["agent.refused", "A5_DECISION_FORGED", "tartine", "shop_1", root],
+          ["purchase.stage", "A5_DECISION_FORGED", undefined, undefined, root],
+        ]);
+        expect(r.stand.stub.calls.slice(from)).toEqual([]);
+        expectJournalClean(r.journal.entries, AGENT, r.stand.stub.calls, ["idem-intent-1"]);
+        await closeStand();
+      }
+    });
+  }
+
+  it("решение из другой покупки (другой корневой INTENT) — A5_DECISION_STALE, все сигналы в журнал, обращений нет (Р40 п. 1)", async () => {
+    const r = await setup({ shops: [{ ...SHOP, profile: bakery({ returns: { days: 0, text: "Возврат в течение 14 дней" } }) }] });
+    const offer = await offers(r);
+    const decision = humanA5Decision({ intentId: "mnd_other_purchase" }, offer, offer.a5);
+    const from = r.stand.stub.calls.length;
+    await expect(r.purchase.cart({ ...key(offer), qty: 1, decision, keyTermsShown: true }, { idempotencyKey: "idem-cart-1" })).rejects.toMatchObject({ code: "A5_DECISION_STALE" });
+    expect(r.tail().filter((e) => e.kind === "cart.refused").map((e) => [e.reason, e.detail])).toEqual([["A5_RETURNS_MISMATCH", "A5_DECISION_STALE"]]);
+    expect(r.stand.stub.calls.slice(from)).toEqual([]);
+    expect(r.purchase.state).toBe("OFFERS");
+  });
+
+  it("решение одноразовое: после CART и возврата в OFFERS то же решение — A5_DECISION_STALE, новое решение по тому же показу — CART (Р40 п. 2)", async () => {
+    const profile = bakery({ returns: { days: 0, text: "Возврат в течение 14 дней" } });
+    const r = await setup({ shops: [{ ...SHOP, profile }], live: liveOffers(SHOP, () => stand!.clock, () => ({ availability: { inStock: false } })) });
+    const offer = await offers(r);
+    const decision = humanA5Decision(shownIn(r), offer, offer.a5);
+    const cart = await r.purchase.cart({ ...key(offer), qty: 1, decision, keyTermsShown: true }, { idempotencyKey: "idem-cart-1" });
+    r.setFeed({ kind: "event", event: r.consents.sign(cart.id) });
+    await r.purchase.awaitCart();
+    await expect(r.purchase.placeOrder({ idempotencyKey: "idem-order-1" })).rejects.toBeInstanceOf(OrderRefused);
+    expect(r.purchase.state).toBe("OFFERS");
+    // показ тот же (выдача не менялась), покупка та же — решение потрачено на первый CART
+    const from = r.stand.stub.calls.length;
+    const start = r.tail().length;
+    await expect(r.purchase.cart({ ...key(offer), qty: 1, decision, keyTermsShown: true }, { idempotencyKey: "idem-cart-2" })).rejects.toMatchObject({ code: "A5_DECISION_STALE" });
+    expect(r.tail().slice(start).filter((e) => e.kind === "cart.refused").map((e) => [e.reason, e.detail])).toEqual([["A5_RETURNS_MISMATCH", "A5_DECISION_STALE"]]);
+    expect(r.stand.stub.calls.slice(from)).toEqual([]);
+    expect(r.purchase.state).toBe("OFFERS");
+    await r.purchase.cart({ ...key(offer), qty: 1, decision: humanA5Decision(shownIn(r), offer, offer.a5), keyTermsShown: true }, { idempotencyKey: "idem-cart-2" });
+    expect(r.purchase.state).toBe("CART_PENDING");
+  });
+
+  for (const [name, code, attempts] of [
+    ["отказ Платформы", "REQUEST_INVALID", 1],
+    ["сбой Платформы на всех попытках", "STATE_UNAVAILABLE", loadParams().pao_max_attempts],
+  ] as const) {
+    it(`решение тратится и при исходе запроса CART «${name}» — ${code} (fail-closed, Р40 п. 2)`, async () => {
+      const r = await setup({ shops: [{ ...SHOP, profile: bakery({ returns: { days: 0, text: "Возврат в течение 14 дней" } }) }] });
+      const offer = await offers(r);
+      const decision = humanA5Decision(shownIn(r), offer, offer.a5);
+      const before = r.stand.log().filter((c) => c.op === "POST /pao/v1/mandates").length;
+      r.stand.stub.fail("POST /pao/v1/mandates", { code }, attempts);
+      await expect(r.purchase.cart({ ...key(offer), qty: 1, decision, keyTermsShown: true }, { idempotencyKey: "idem-cart-1" })).rejects.toBeInstanceOf(PlatformFailure);
+      expect(r.purchase.reason).toBe(code);
+      // запрос CART ушёл — решение потрачено при любом исходе
+      expect(r.stand.log().filter((c) => c.op === "POST /pao/v1/mandates").length).toBe(before + attempts);
+      expect(isSpent(decision)).toBe(true);
+    });
+  }
+
+  it("товар без сигналов A5 — решение не нужно и не тратится (нюанс К2 Р40)", async () => {
+    const r = await setup();
+    const offer = await offers(r);
+    expect(offer.a5).toEqual([]);
+    const decision = humanA5Decision(shownIn(r), offer, []);
+    await r.purchase.cart({ ...key(offer), qty: 1, decision, keyTermsShown: true }, { idempotencyKey: "idem-cart-1" });
+    expect(r.purchase.state).toBe("CART_PENDING");
+    expect(isSpent(decision)).toBe(false);
   });
 
   it("частичное согласие человека — в cart.refused только непринятые сигналы (ревью К5 № 2)", async () => {
@@ -225,16 +320,18 @@ describe("стадия 3 — проект корзины (Р32 п. 2): отка�
     const r = await setup({ shops: [{ ...SHOP, feed, profile: bakery({ returns: { days: 0, text: "Возврат в течение 14 дней" } }) }] });
     const offer = await offers(r);
     expect([...offer.a5].sort()).toEqual(["A5_PRICE_MISMATCH", "A5_RETURNS_MISMATCH"]);
-    const decision = humanA5Decision(offer, ["A5_RETURNS_MISMATCH"]);
+    const decision = humanA5Decision(shownIn(r), offer, ["A5_RETURNS_MISMATCH"]);
     await expect(r.purchase.cart({ ...key(offer), qty: 1, decision, keyTermsShown: true }, { idempotencyKey: "idem-cart-1" })).rejects.toMatchObject({ code: "A5_NEEDS_HUMAN" });
     expect(r.tail().filter((e) => e.kind === "cart.refused").map((e) => e.reason)).toEqual(["A5_PRICE_MISMATCH"]);
+    // отказ политики до запроса CART — решение не потрачено (Р40 п. 2)
+    expect(isSpent(decision)).toBe(false);
   });
 
   it("сигнал A5 при автономном режиме — A5_AUTONOMOUS, решение человека не помогает", async () => {
     const r = await setup({ shops: [{ ...SHOP, profile: bakery({ returns: { days: 0, text: "Возврат в течение 14 дней" } }) }] });
     await signedIntent(r, { ...INTENT, confirmationMode: "AUTONOMOUS" });
     const offer = (await r.purchase.search()).contour[0]!;
-    const decision = humanA5Decision(offer, offer.a5);
+    const decision = humanA5Decision(shownIn(r), offer, offer.a5);
     const refused = await r.purchase.cart({ ...key(offer), qty: 1, decision, keyTermsShown: true }, { idempotencyKey: "idem-cart-1" }).catch((e: unknown) => e);
     expect(refused).toBeInstanceOf(CartRefused);
     expect(refused).toMatchObject({ code: "A5_AUTONOMOUS" });
@@ -386,14 +483,33 @@ describe("стадии 4–6 — исходы из порта PaymentSteps (ин
   it("авторизация, пока стадия 4 ждёт человека, — запрещённый переход, порт авторизации не вызван (ревью К3 № 4)", async () => {
     let release: (s: "APPROVED") => void = () => {};
     const pending = new Promise<"APPROVED">((res) => (release = res));
+    // порт подтверждения начал ждать человека — после проверки по мандату (Р40 п. 5), уже в CONFIRMING
+    let started: () => void = () => {};
+    const entered = new Promise<void>((res) => (started = res));
     const steps = payments();
-    const r = await setup({ payment: { ...steps, confirm: () => pending } });
+    const r = await setup({ payment: { ...steps, confirm: () => (started(), pending) } });
     await ordered(r, Math.floor(THRESHOLD / TARTINE) + 1);
     const waiting = r.purchase.confirm();
+    await entered;
     await expect(r.purchase.authorize({ idempotencyKey: "idem-pay-1" })).rejects.toBeInstanceOf(PurchaseTransitionForbidden);
+    expect(r.tail().filter((e) => e.reason === "PIPELINE_TRANSITION_FORBIDDEN" && e.kind === "agent.refused").map((e) => e.detail)).toEqual(["CONFIRMING->AUTHORIZING"]);
     release("APPROVED");
     await expect(waiting).rejects.toBeInstanceOf(PurchaseStopped);
     expect(r.purchase.state).toBe("STOPPED");
+    expect(steps.calls).toEqual([]);
+  });
+
+  it("авторизация, пока до стадии 4 идёт verify, — запрещённый переход ORDERED->AUTHORIZING, порты не вызваны (Р40 п. 5)", async () => {
+    const steps = payments();
+    const r = await setup({ payment: steps });
+    await ordered(r, Math.floor(THRESHOLD / TARTINE) + 1);
+    const from = r.stand.stub.calls.length;
+    const checking = r.purchase.confirm();
+    await expect(r.purchase.authorize({ idempotencyKey: "idem-pay-1" })).rejects.toBeInstanceOf(PurchaseTransitionForbidden);
+    await expect(checking).rejects.toBeInstanceOf(PurchaseStopped);
+    expect(r.tail().filter((e) => e.reason === "PIPELINE_TRANSITION_FORBIDDEN" && e.kind === "agent.refused").map((e) => e.detail)).toEqual(["ORDERED->AUTHORIZING"]);
+    // verify INTENT уже ушёл; CART после остановки не проверяется
+    expect(opsFrom(r, from)).toEqual([VERIFY]);
     expect(steps.calls).toEqual([]);
   });
 
@@ -701,6 +817,76 @@ describe("ворота перед стадией 5 (Р38 п. 3, К4): оба м�
   });
 });
 
+describe("проверка по мандату до стадии 4 (Р40 п. 5, К4а № 3): человека не просят подтвердить покупку, которую ворота отклонят", () => {
+  const ABOVE = Math.floor(THRESHOLD / TARTINE) + 1;
+
+  it("до запроса подтверждения — verify INTENT, затем CART, без иных обращений; в воротах стадии 5 — снова", async () => {
+    const r = await setup();
+    await ordered(r, ABOVE);
+    expect(r.purchase.needsConfirmation).toBe(true);
+    const intentId = r.purchase.intentMandate!.id;
+    const cartId = r.purchase.cartMandate!.id;
+    const from = r.stand.stub.calls.length;
+    const before = verified(r).length;
+    await r.purchase.confirm();
+    expect(opsFrom(r, from)).toEqual([VERIFY, VERIFY]);
+    expect(verified(r).slice(before)).toEqual([intentId, cartId]);
+    expect(r.payment.calls).toEqual(["confirm"]);
+    await r.purchase.authorize({ idempotencyKey: "idem-pay-1" });
+    expect(verified(r).slice(before)).toEqual([intentId, cartId, intentId, cartId]);
+  });
+
+  for (const which of ["INTENT", "CART"] as const) {
+    it(`остаток ${which} меньше итога — STOPPED MANDATE_AMOUNT_LEFT_INSUFFICIENT до запроса подтверждения`, async () => {
+      const r = await setup();
+      await ordered(r, ABOVE);
+      const intentId = r.purchase.intentMandate!.id;
+      const id = which === "INTENT" ? intentId : r.purchase.cartMandate!.id;
+      r.consents.left.set(id, TARTINE * ABOVE - 1);
+      const from = r.stand.stub.calls.length;
+      await expect(r.purchase.confirm()).rejects.toMatchObject({ code: "MANDATE_AMOUNT_LEFT_INSUFFICIENT" });
+      // по INTENT не хватает — CART уже не проверяется
+      expect(opsFrom(r, from)).toEqual(which === "INTENT" ? [VERIFY] : [VERIFY, VERIFY]);
+      expect(r.purchase.state).toBe("STOPPED");
+      expect(r.tail().slice(-2).map((e) => [e.kind, e.reason, e.mandate])).toEqual([
+        ["agent.refused", "MANDATE_AMOUNT_LEFT_INSUFFICIENT", id],
+        ["purchase.stage", "MANDATE_AMOUNT_LEFT_INSUFFICIENT", intentId],
+      ]);
+      // в CONFIRMING не входили, порт подтверждения не вызван
+      expect(stages(r)).not.toContain("CONFIRMING");
+      expect(r.payment.calls).toEqual([]);
+    });
+  }
+
+  for (const which of ["INTENT", "CART"] as const) {
+    it(`verify ${which} не CONFIRMED — agent.refused MANDATE_OUT_OF_SCOPE и STOPPED до запроса подтверждения`, async () => {
+      const r = await setup();
+      await ordered(r, ABOVE);
+      const id = which === "INTENT" ? r.purchase.intentMandate!.id : r.purchase.cartMandate!.id;
+      r.consents.outcomeOf.set(id, "OUT_OF_SCOPE");
+      const from = r.stand.stub.calls.length;
+      await expect(r.purchase.confirm()).rejects.toBeInstanceOf(MandateRefused);
+      expect(r.purchase.reason).toBe("MANDATE_OUT_OF_SCOPE");
+      expect(opsFrom(r, from)).toEqual(which === "INTENT" ? [VERIFY] : [VERIFY, VERIFY]);
+      expect(r.tail().filter((e) => e.kind === "agent.refused").map((e) => [e.reason, e.mandate])).toEqual([["MANDATE_OUT_OF_SCOPE", id]]);
+      expect(stages(r)).not.toContain("CONFIRMING");
+      expect(r.payment.calls).toEqual([]);
+    });
+  }
+
+  it("INTENT отозван после заказа — MANDATE_NOT_ACTIVE до запроса подтверждения, ни verify, ни порта", async () => {
+    const r = await setup();
+    await ordered(r, ABOVE);
+    const id = r.purchase.intentMandate!.id;
+    r.consents.mandates.get(id)!.status = "REVOKED";
+    await r.core.mandates.refreshHeld({ kind: "event", event: event("mandate.revoked", id) });
+    const from = r.stand.stub.calls.length;
+    await expect(r.purchase.confirm()).rejects.toMatchObject({ code: "MANDATE_NOT_ACTIVE" });
+    expect(opsFrom(r, from)).toEqual([]);
+    expect(r.payment.calls).toEqual([]);
+  });
+});
+
 describe("политика до стадий 4–5 (Р39): отказ — agent.refused и STOPPED до подтверждения и реквизита", () => {
 
   for (const which of ["INTENT", "CART"] as const) {
@@ -853,12 +1039,14 @@ describe("стадии 3–6 — запрещённые переходы до р
     }
   });
 
-  it("verify INTENT перед CART не CONFIRMED — STOPPED MANDATE_OUT_OF_SCOPE, CART не запрошен", async () => {
-    const r = await setup();
+  it("verify INTENT перед CART не CONFIRMED — STOPPED MANDATE_OUT_OF_SCOPE, CART не запрошен, решение A5 не потрачено (Р40 п. 2)", async () => {
+    const r = await setup({ shops: [{ ...SHOP, profile: bakery({ returns: { days: 0, text: "Возврат в течение 14 дней" } }) }] });
     const offer = await offers(r);
+    const decision = humanA5Decision(shownIn(r), offer, offer.a5);
     r.consents.outcome = "OUT_OF_SCOPE";
-    await expect(r.purchase.cart({ ...key(offer), qty: 1, keyTermsShown: true }, { idempotencyKey: "idem-cart-1" })).rejects.toBeInstanceOf(MandateRefused);
+    await expect(r.purchase.cart({ ...key(offer), qty: 1, decision, keyTermsShown: true }, { idempotencyKey: "idem-cart-1" })).rejects.toBeInstanceOf(MandateRefused);
     expect(r.purchase.reason).toBe("MANDATE_OUT_OF_SCOPE");
     expect(r.stand.log().filter((c) => c.op === "POST /pao/v1/mandates")).toHaveLength(1);
+    expect(isSpent(decision)).toBe(false);
   });
 });

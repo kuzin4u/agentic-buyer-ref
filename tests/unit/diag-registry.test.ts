@@ -9,6 +9,7 @@ import { PAO_CLIENT_CODES, PAO_CLIENT_DIAG, PAO_DIAG, PAO_ERRORS, PAO_RETRY_ACTI
 import { DIAG } from "../../src/agent/compose.js";
 import { AGENT_DIAG, DECLINE_REASONS, FAILURE_RULES, mergeDiag, ruleForDeclineReason, type DiagAction, type ReasonAction } from "../../src/agent/declines/index.js";
 import { REVOCATION_ORDER_MISSING_TEXT } from "../../src/agent/mandates/index.js";
+import { STOP_CAUSES } from "../../src/agent/pipeline/index.js";
 import { AGENT_DIAG_CODES } from "../../src/shared/diag-codes.js";
 
 const PAO_CODES = Object.keys(PAO_ERRORS);
@@ -105,6 +106,12 @@ describe("реестр кодов агента (Р36)", () => {
       for (const m of text.matchAll(codes)) for (const l of m[1]!.matchAll(literal)) found.add(l[1]!);
     }
     expect(found.size).toBeGreaterThan(20);
-    expect([...found].filter((c) => !Object.hasOwn(DIAG, c)).sort()).toEqual([]);
+    // уточнение остановки (Р40 п. 6) — значение detail, а не код причины: в вызове остановки вторым аргументом
+    const causes: readonly string[] = STOP_CAUSES;
+    expect([...found].filter((c) => !Object.hasOwn(DIAG, c) && !causes.includes(c)).sort()).toEqual([]);
+  });
+
+  it("уточнения остановки покупки (Р40 п. 6) с кодами реестра не пересекаются — читатель журнала их не спутает", () => {
+    expect(STOP_CAUSES.filter((c) => Object.hasOwn(DIAG, c))).toEqual([]);
   });
 });

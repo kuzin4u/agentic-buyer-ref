@@ -1,13 +1,18 @@
 // Правило каталога (Р32 п. 1–6): детерминированно, без модели (инвариант 3). На входе — факты модуля `catalog/`
 // (коды), на выходе — решение кодом; тексты для человека даёт оболочка по коду.
-import type { ConfirmationMode } from "../../shared/domain.js";
+import type { ConfirmationMode, Money } from "../../shared/domain.js";
 import type { A5SignalCode, CatalogIssueCode, CatalogShop, LiveFact, LiveFactCode, ProductFacts } from "../catalog/index.js";
+import type { HumanA5Decision } from "../shell/a5-decision.js";
+import { issuedByShell } from "./a5-issued.js";
 
-/** Товар в выдаче. `AVAILABLE` с непустым `a5` — показ с пометкой «сведения продавца противоречивы» (Р32 п. 1). */
+export type { HumanA5Decision };
+
+/** Товар в выдаче. `AVAILABLE` с непустым `a5` — показ с пометкой «сведения продавца противоречивы» (Р32 п. 1); продавец,
+ *  `sku` и цена — то, к чему привязано решение человека (Р39 п. 5). */
 export type OfferVerdict =
   | { kind: "EXCLUDED"; reason: "MODEL"; codes: CatalogIssueCode[] }
   | { kind: "EXCLUDED"; reason: "REGION" }
-  | { kind: "AVAILABLE"; a5: A5SignalCode[] };
+  | { kind: "AVAILABLE"; merchantId: string; sku: string; price: Money; a5: A5SignalCode[] };
 
 /** Доставка в регион человека (Р32 п. 5): вариант с этим регионом, вариант без региона при регионе из профиля магазина
  *  или `PICKUP`. Регион человека неизвестен — подтверждается только самовывоз (инвариант 4). */
@@ -19,36 +24,40 @@ function reachesRegion(p: ProductFacts, shop: CatalogShop, region: string | unde
   });
 }
 
-/** Решение по товару выдачи. `shopIssues` непустой — исключён весь магазин (ошибки модели или разбора фида). */
-export function classifyOffer(p: ProductFacts, shop: CatalogShop, shopIssues: CatalogIssueCode[], region: string | undefined): OfferVerdict {
+/** Решение по товару выдачи продавца `merchantId`. `shopIssues` непустой — исключён весь магазин (ошибки модели или
+ *  разбора фида). */
+export function classifyOffer(p: ProductFacts, shop: CatalogShop, shopIssues: CatalogIssueCode[], region: string | undefined, merchantId: string): OfferVerdict {
   const model = [...new Set([...shopIssues, ...p.issues])];
   if (model.length > 0) return { kind: "EXCLUDED", reason: "MODEL", codes: model };
   if (!reachesRegion(p, shop, region)) return { kind: "EXCLUDED", reason: "REGION" };
-  return { kind: "AVAILABLE", a5: [...p.signals] };
+  return { kind: "AVAILABLE", merchantId, sku: p.product.sku, price: { ...p.product.price }, a5: [...p.signals] };
 }
 
-/** Явное решение человека в оболочке в ответ на показ сигнала A5 (Р32 п. 2): по товару и по показанным кодам.
- *  Создаёт его только оболочка по действию человека; агент его не создаёт и пометку не снимает (инвариант 7). */
-export interface HumanA5Decision {
-  sku: string;
-  accepted: A5SignalCode[];
+/** Коды, которые человек принял по этому показу (Р39 п. 5): решение выдано оболочкой (`issuedByShell`) и привязано к
+ *  тому же продавцу, `sku`, цене и набору показанных кодов; иначе — ни одного (решение по другому показу — не решение). */
+export function acceptedA5(verdict: OfferVerdict, decision: HumanA5Decision | undefined): A5SignalCode[] {
+  if (verdict.kind !== "AVAILABLE" || !issuedByShell(decision)) return [];
+  const sameShow =
+    decision.merchantId === verdict.merchantId &&
+    decision.sku === verdict.sku &&
+    decision.price.amount === verdict.price.amount &&
+    decision.price.currency === verdict.price.currency &&
+    sameSet(decision.shown, verdict.a5);
+  return sameShow ? verdict.a5.filter((c) => decision.accepted.includes(c)) : [];
 }
+
+const sameSet = <T>(a: readonly T[], b: readonly T[]): boolean => new Set(a).size === new Set(b).size && a.every((x) => b.includes(x));
 
 export type CartDraftDecision = { allow: true } | { allow: false; code: "EXCLUDED" | "A5_AUTONOMOUS" | "A5_NEEDS_HUMAN" };
 
 /** Можно ли готовить проект мандата корзины. Сумма и порог `confirm_above_kop` здесь не участвуют: решение по A5 —
- *  отдельно от подтверждения выше порога (Т7), при сумме выше порога нужны оба. */
-export function mayDraftCart(
-  sku: string,
-  verdict: OfferVerdict,
-  mode: ConfirmationMode,
-  decision: HumanA5Decision | undefined,
-): CartDraftDecision {
+ *  отдельно от подтверждения выше порога (Т7), при сумме выше порога нужны оба. Сигналы покрыты, только если человек
+ *  принял все по этому же показу (`acceptedA5`). */
+export function mayDraftCart(verdict: OfferVerdict, mode: ConfirmationMode, decision: HumanA5Decision | undefined): CartDraftDecision {
   if (verdict.kind !== "AVAILABLE") return { allow: false, code: "EXCLUDED" };
   if (verdict.a5.length === 0) return { allow: true };
   if (mode === "AUTONOMOUS") return { allow: false, code: "A5_AUTONOMOUS" };
-  const covered = decision !== undefined && decision.sku === sku && verdict.a5.every((c) => decision.accepted.includes(c));
-  return covered ? { allow: true } : { allow: false, code: "A5_NEEDS_HUMAN" };
+  return acceptedA5(verdict, decision).length === verdict.a5.length ? { allow: true } : { allow: false, code: "A5_NEEDS_HUMAN" };
 }
 
 /** Что дальше после отказа живой проверки (Р32 п. 4). Автоматического повтора нет ни в одном случае (инвариант 9). */

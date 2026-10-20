@@ -57,4 +57,18 @@ describe("core.purchase() — путь 0–6 на PaoStub (Р38 п. 8, К6)", ()
     // журнал ядра: код агента и время ядра в каждой записи, закрытый набор полей, без ключей идемпотентности
     expectJournalClean(journal.entries, AGENT, s.stub.calls, ["idem-intent-1", "idem-cart-1"]);
   });
+
+  it("окно дробления — одно на ядро: покупки core.purchase() видят одно окно (Р39 п. 4, ревью К2 М6)", async () => {
+    const consents: Consents = new Consents(() => s.clock);
+    const s = new PaoStand({ handlers: consents.handlers() });
+    stand = s;
+    const { core } = await coreOn(s);
+    const ports = () => ({ offers: feedOffers(SHOP), live: liveOffers(SHOP, () => s.clock), shop: shopOrders(SHOP), payment: payments(), region: "77" });
+    // окно — закрытое поле конвейера: снаружи его не подменить и не прочитать, кроме как в тесте
+    const windowOf = (p: unknown) => (p as { o: { split: unknown } }).o.split;
+    const a = core.purchase(ports());
+    const b = core.purchase(ports());
+    expect(windowOf(a)).toBeDefined();
+    expect(windowOf(a)).toBe(windowOf(b));
+  });
 });

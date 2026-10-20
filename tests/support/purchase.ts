@@ -2,6 +2,7 @@
 // стадий (shop.ts). Ленты у PaoStub нет — элементы ленты задаёт тест (`setFeed`) до ожидания подписи.
 import { Purchase } from "../../src/agent/pipeline/index.js";
 import type { FeedItem, LiveOfferSource, OfferSource, PaymentSteps, ShopPort } from "../../src/agent/ports/index.js";
+import { SplitWindow } from "../../src/agent/policy/index.js";
 import { loadParams } from "../../src/shared/config.js";
 import type { Journal } from "../../src/agent/journal/index.js";
 import type { DiagCode } from "../../src/shared/diag-codes.js";
@@ -27,6 +28,8 @@ export interface PurchaseSetup {
   tap?: (entry: Parameters<Journal["record"]>[0]) => void;
   /** стендовые параметры поверх config/params.stand.json (граница порога и т. п.) */
   params?: Partial<ReturnType<typeof loadParams>>;
+  /** окно дробления, общее с другой покупкой (как одно на ядро у места сборки); нет — своё */
+  split?: SplitWindow;
 }
 
 /** `track` получает стенд до первого обращения — тест закрывает его и проверяет нарушения схемы в afterEach. */
@@ -41,6 +44,7 @@ export async function purchaseOn(o: PurchaseSetup, track: (s: PaoStand) => void)
   const live = o.live ?? liveOffers(first, () => s.clock);
   const shop = o.shop ?? shopOrders(first);
   const payment = o.payment ?? payments();
+  const split = o.split ?? new SplitWindow({ ...loadParams(), ...o.params }, () => s.clock);
   let items: FeedItem[] = [];
   let stream: (() => AsyncIterable<FeedItem>) | null = null;
   const purchase = new Purchase({
@@ -51,6 +55,7 @@ export async function purchaseOn(o: PurchaseSetup, track: (s: PaoStand) => void)
     shop,
     payment,
     params: { ...loadParams(), ...o.params },
+    split,
     journal: { record: (e) => (o.tap?.(e), core.journal.record(e)) },
     admission: () => o.admission ?? null,
     ...(o.region !== null && { region: o.region ?? "77" }),
@@ -68,6 +73,7 @@ export async function purchaseOn(o: PurchaseSetup, track: (s: PaoStand) => void)
     shop: shop as ShopPort & { calls?: unknown[] },
     payment: payment as PaymentSteps & { calls?: string[] },
     purchase,
+    split,
     tail,
     setFeed: (...x: FeedItem[]) => ((items = x), (stream = null)),
     /** лента с действиями по ходу ожидания (отзыв посреди ожидания подписи) */

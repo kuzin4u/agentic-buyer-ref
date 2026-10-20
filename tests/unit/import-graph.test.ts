@@ -283,4 +283,47 @@ describe("граф импортов src (Р24)", { timeout: 60_000 }, () => {
       "src/agent/policy/c.ts:1 node:module — обход статических импортов",
     ]);
   });
+
+  it("решение человека A5 (Р39 п. 5): из shell/ вне оболочки — только типы; markIssued реестра политики — только в shell/", () => {
+    const SHELL = 'export interface D { x: 1 }\nexport const humanA5Decision = () => 1;\nexport default 1;\n';
+    const ISSUED = "export const markIssued = (d: object) => d;\nexport const issuedByShell = (d: unknown) => !!d;\n";
+    const R = (n: string, what: string) => `${n} решение человека A5: ${what} — только в оболочке src/agent/shell/ (Р39 п. 5)`;
+    const v = importGraphViolations(
+      virtual({
+        "src/agent/shell/a5-decision.ts": `import { markIssued } from "../policy/a5-issued.js";\nexport const m = markIssued;\n${SHELL}`,
+        "src/agent/shell/index.ts": 'export { humanA5Decision, type D } from "./a5-decision.js";\nexport * from "./a5-decision.js";\nexport { markIssued as issuedByShell } from "../policy/a5-issued.js";\n',
+        "src/agent/policy/a5-issued.ts": ISSUED,
+        "src/agent/policy/ok.ts":
+          'import type { D } from "../shell/a5-decision.js";\nimport { type D as E } from "../shell/index.js";\nimport { issuedByShell } from "./a5-issued.js";\nexport type { D } from "../shell/a5-decision.js";\nexport { issuedByShell } from "./a5-issued.js";\nexport const f = (d: D | E) => issuedByShell(d);\n',
+        "src/agent/policy/named.ts": 'import { humanA5Decision as make } from "../shell/index.js";\nimport { issuedByShell } from "../shell/index.js";\nexport const m = [make, issuedByShell];\n',
+        "src/agent/policy/whole.ts": 'import * as shell from "../shell/a5-decision.js";\nimport def from "../shell/a5-decision.js";\nexport const m = [shell, def];\n',
+        "src/agent/pipeline/re.ts": 'export * from "../shell/a5-decision.js";\nexport { humanA5Decision } from "../shell/index.js";\n',
+        "src/agent/pipeline/dyn.ts": 'export const m = () => import("../shell/a5-decision.js");\ndeclare const require: (s: string) => unknown;\nexport const n = require("../shell/index.js");\n',
+        "src/agent/pipeline/eq.ts": 'import shell = require("../shell/a5-decision.js");\nexport const m = shell;\n',
+        "src/agent/pipeline/mark.ts": 'import { markIssued as tick } from "../policy/a5-issued.js";\nimport * as reg from "../policy/a5-issued.js";\nexport { markIssued } from "../policy/a5-issued.js";\nexport * from "../policy/a5-issued.js";\nexport const m = [tick, reg];\n',
+      }),
+    );
+    expect(v).toEqual([
+      R("src/agent/pipeline/dyn.ts:1", "import()"),
+      R("src/agent/pipeline/dyn.ts:3", "require()"),
+      R("src/agent/pipeline/eq.ts:1", "import = require"),
+      R("src/agent/pipeline/mark.ts:1", "markIssued"),
+      R("src/agent/pipeline/mark.ts:2", "namespace-импорт"),
+      R("src/agent/pipeline/mark.ts:3", "реэкспорт markIssued"),
+      R("src/agent/pipeline/mark.ts:4", "export *"),
+      R("src/agent/pipeline/re.ts:1", "export *"),
+      R("src/agent/pipeline/re.ts:2", "реэкспорт humanA5Decision"),
+      R("src/agent/policy/named.ts:1", "humanA5Decision"),
+      R("src/agent/policy/named.ts:2", "issuedByShell"),
+      R("src/agent/policy/whole.ts:1", "namespace-импорт"),
+      R("src/agent/policy/whole.ts:2", "default-импорт"),
+    ]);
+  });
+
+  it("настоящий src: фабрику решения A5 и отметку реестра упоминает только shell/ (и реестр — свою отметку) (Р39 п. 5)", () => {
+    const rel = (f: string) => f.slice(ROOT.length + 1);
+    const users = (name: string) => allFiles(join(ROOT, "src")).filter((f) => !rel(f).startsWith("src/agent/shell/") && readFileSync(f, "utf8").includes(name)).map(rel);
+    expect(users("humanA5Decision")).toEqual([]);
+    expect(users("markIssued")).toEqual(["src/agent/policy/a5-issued.ts"]);
+  });
 });

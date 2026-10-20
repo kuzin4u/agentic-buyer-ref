@@ -10,6 +10,7 @@ import { expectJournalClean } from "../support/journal.js";
 import { AGENT, type PaoStand } from "../support/pao-stand.js";
 import { SHOP, purchaseOn, signedIntent, stages, type PurchaseRun, type PurchaseSetup } from "../support/purchase.js";
 import { bakery, feedPrice, liveOffers, payments, shopOrders } from "../support/shop.js";
+import { humanA5Decision } from "../../src/agent/shell/index.js";
 
 let stand: PaoStand | undefined;
 afterEach(async () => {
@@ -26,6 +27,18 @@ async function closeStand() {
   stand = undefined;
 }
 const { confirm_above_kop: THRESHOLD } = loadParams();
+/** mandate_id каждого verify по журналу обращений PaoStub */
+const verified = (r: PurchaseRun) => r.stand.stub.calls.filter((c) => c.op === "GET /pao/v1/mandates/{id}/verify").map((c) => c.path.split("/")[4]);
+/** все обращения к контуру после `from` — лишнее обращение к любому методу видно (ревью К2 В5) */
+const opsFrom = (r: PurchaseRun, from: number) => r.stand.stub.calls.slice(from).map((c) => c.op);
+const VERIFY = "GET /pao/v1/mandates/{id}/verify";
+const { split_min_ops: MIN_OPS } = loadParams();
+/** Занять в окне дробления `n` мест (одобрены) на сумму `sum` в целом: каждое — не меньше доли суммы, целыми копейками;
+ *  `floor` — каждое не больше доли (сумма не превышает `sum`). Число операций — от `split_min_ops` из конфигурации. */
+function fillWindow(r: PurchaseRun, root: string, n: number, sum: number, round: "ceil" | "floor" = "ceil") {
+  const each = Math[round](sum / n);
+  for (let i = 0; i < n; i++) r.split.open(root, { amount: each, currency: "RUB" }).settle("APPROVED");
+}
 /** цена tartine по фиду, коп. */
 const TARTINE = feedPrice(SHOP, "tartine").amount;
 
@@ -146,7 +159,7 @@ describe("стадия 3 — проект корзины (Р32 п. 2): отка�
     r.purchase.offers!.contour[0]!.a5 = [];
     await expect(r.purchase.cart({ ...key(zones.contour[0]!), qty: 1, keyTermsShown: true }, { idempotencyKey: "idem-cart-1" })).rejects.toMatchObject({ code: "A5_NEEDS_HUMAN" });
     expect(r.purchase.state).toBe("OFFERS");
-    const decision = { sku: "tartine", accepted: ["A5_RETURNS_MISMATCH" as const] };
+    const decision = humanA5Decision(r.purchase.offers!.contour[0]!, ["A5_RETURNS_MISMATCH"]);
     const cart = await r.purchase.cart({ ...key(zones.contour[0]!), qty: 1, decision, keyTermsShown: true }, { idempotencyKey: "idem-cart-1" });
     expect(cart.cart!.total.amount).toBe(TARTINE);
   });
@@ -174,9 +187,37 @@ describe("стадия 3 — проект корзины (Р32 п. 2): отка�
       expect.objectContaining({ reason: "A5_RETURNS_MISMATCH", detail: "A5_NEEDS_HUMAN", ref: "tartine", merchant: "shop_1", mandate: r.purchase.intentMandate!.id }),
     ]);
     expectJournalClean(r.journal.entries, AGENT, r.stand.stub.calls, ["idem-intent-1"]);
-    const decision = { sku: "tartine", accepted: ["A5_RETURNS_MISMATCH" as const] };
+    const decision = humanA5Decision(offer, ["A5_RETURNS_MISMATCH"]);
     await r.purchase.cart({ ...key(offer), qty: 1, decision, keyTermsShown: true }, { idempotencyKey: "idem-cart-1" });
     expect(r.purchase.state).toBe("CART_PENDING");
+  });
+
+  it("решение по тому же sku другого магазина — не решение: A5_NEEDS_HUMAN, в cart.refused — все сигналы (Р39 п. 5)", async () => {
+    const profile = bakery({ returns: { days: 0, text: "Возврат в течение 14 дней" } });
+    const r = await setup({ shops: [{ ...SHOP, profile }, { ...SHOP, profile, merchantId: "shop_2" }] });
+    await signedIntent(r, { ...INTENT, merchantScope: ["shop_1", "shop_2"] });
+    const zones = await r.purchase.search();
+    const [a, b] = ["shop_1", "shop_2"].map((m) => zones.contour.find((o) => o.merchantId === m && o.sku === "tartine")!);
+    const decision = humanA5Decision(a!, a!.a5);
+    await expect(r.purchase.cart({ ...key(b!), qty: 1, decision, keyTermsShown: true }, { idempotencyKey: "idem-cart-1" })).rejects.toMatchObject({ code: "A5_NEEDS_HUMAN" });
+    expect(r.tail().filter((e) => e.kind === "cart.refused").map((e) => [e.reason, e.merchant])).toEqual([["A5_RETURNS_MISMATCH", "shop_2"]]);
+    expect(r.purchase.state).toBe("OFFERS");
+  });
+
+  it("копия решения и решение по подменённой у вызывающего выдаче — не решение: A5_NEEDS_HUMAN, все сигналы в журнал, обращений нет (Р39 п. 5, ревью К3 М4)", async () => {
+    const r = await setup({ shops: [{ ...SHOP, profile: bakery({ returns: { days: 0, text: "Возврат в течение 14 дней" } }) }] });
+    const offer = await offers(r);
+    // выдача, отданная наружу, — копия: цена подменена у вызывающего, решение — по подмене
+    const tampered = { ...offer, product: { ...offer.product, price: { ...offer.product.price, amount: 1 } } };
+    const copy = { ...humanA5Decision(offer, offer.a5) };
+    for (const decision of [humanA5Decision(tampered, tampered.a5), copy]) {
+      const from = r.stand.stub.calls.length;
+      const start = r.tail().length;
+      await expect(r.purchase.cart({ ...key(offer), qty: 1, decision, keyTermsShown: true }, { idempotencyKey: "idem-cart-1" })).rejects.toMatchObject({ code: "A5_NEEDS_HUMAN" });
+      expect(r.tail().slice(start).filter((e) => e.kind === "cart.refused").map((e) => [e.reason, e.detail])).toEqual([["A5_RETURNS_MISMATCH", "A5_NEEDS_HUMAN"]]);
+      expect(r.stand.stub.calls.slice(from)).toEqual([]);
+      expect(r.purchase.state).toBe("OFFERS");
+    }
   });
 
   it("частичное согласие человека — в cart.refused только непринятые сигналы (ревью К5 № 2)", async () => {
@@ -184,7 +225,7 @@ describe("стадия 3 — проект корзины (Р32 п. 2): отка�
     const r = await setup({ shops: [{ ...SHOP, feed, profile: bakery({ returns: { days: 0, text: "Возврат в течение 14 дней" } }) }] });
     const offer = await offers(r);
     expect([...offer.a5].sort()).toEqual(["A5_PRICE_MISMATCH", "A5_RETURNS_MISMATCH"]);
-    const decision = { sku: "tartine", accepted: ["A5_RETURNS_MISMATCH" as const] };
+    const decision = humanA5Decision(offer, ["A5_RETURNS_MISMATCH"]);
     await expect(r.purchase.cart({ ...key(offer), qty: 1, decision, keyTermsShown: true }, { idempotencyKey: "idem-cart-1" })).rejects.toMatchObject({ code: "A5_NEEDS_HUMAN" });
     expect(r.tail().filter((e) => e.kind === "cart.refused").map((e) => e.reason)).toEqual(["A5_PRICE_MISMATCH"]);
   });
@@ -193,7 +234,7 @@ describe("стадия 3 — проект корзины (Р32 п. 2): отка�
     const r = await setup({ shops: [{ ...SHOP, profile: bakery({ returns: { days: 0, text: "Возврат в течение 14 дней" } }) }] });
     await signedIntent(r, { ...INTENT, confirmationMode: "AUTONOMOUS" });
     const offer = (await r.purchase.search()).contour[0]!;
-    const decision = { sku: offer.sku, accepted: offer.a5 };
+    const decision = humanA5Decision(offer, offer.a5);
     const refused = await r.purchase.cart({ ...key(offer), qty: 1, decision, keyTermsShown: true }, { idempotencyKey: "idem-cart-1" }).catch((e: unknown) => e);
     expect(refused).toBeInstanceOf(CartRefused);
     expect(refused).toMatchObject({ code: "A5_AUTONOMOUS" });
@@ -520,7 +561,6 @@ describe("держимые после ожиданий (Р38 п. 3, ревью �
 
 describe("ворота перед стадией 5 (Р38 п. 3, К4): оба мандата держатся и подтверждены verify — иначе STOPPED до реквизита", () => {
   /** verify обращения к контуру по порядку: id мандата из пути */
-  const verified = (r: PurchaseRun) => r.stand.stub.calls.filter((c) => c.op === "GET /pao/v1/mandates/{id}/verify").map((c) => c.path.split("/")[4]);
 
   it("ворота — verify INTENT, затем CART, непосредственно перед портом авторизации; и после стадии 4 тоже", async () => {
     for (const qty of [1, Math.floor(THRESHOLD / TARTINE) + 1]) {
@@ -615,7 +655,6 @@ describe("ворота перед стадией 5 (Р38 п. 3, К4): оба м�
   for (const [which, left, stop] of [
     ["CART", TARTINE - 1, true],
     ["INTENT", TARTINE - 1, true],
-    ["INTENT", 0, true],
     ["CART", TARTINE, false],
     ["INTENT", TARTINE, false],
   ] as const) {
@@ -659,6 +698,143 @@ describe("ворота перед стадией 5 (Р38 п. 3, К4): оба м�
     expect(verified(r).slice(before)).toEqual(Array(attempts).fill(r.purchase.intentMandate!.id));
     expect(r.tail().slice(start).filter((e) => e.kind === "agent.refused")).toEqual([]);
     expect(r.payment.calls).toEqual([]);
+  });
+});
+
+describe("политика до стадий 4–5 (Р39): отказ — agent.refused и STOPPED до подтверждения и реквизита", () => {
+
+  for (const which of ["INTENT", "CART"] as const) {
+    it(`amount_left ${which} = 0 при CONFIRMED — вне пределов: STOPPED MANDATE_OUT_OF_SCOPE (Р39 п. 1.1, Р35)`, async () => {
+      const r = await setup();
+      await ordered(r);
+      const intentId = r.purchase.intentMandate!.id;
+      const id = which === "INTENT" ? intentId : r.purchase.cartMandate!.id;
+      r.consents.left.set(id, 0);
+      const from = r.stand.stub.calls.length;
+      await expect(r.purchase.authorize({ idempotencyKey: "idem-pay-1" })).rejects.toMatchObject({ code: "MANDATE_OUT_OF_SCOPE" });
+      // по INTENT вне пределов — verify CART не делается
+      expect(opsFrom(r, from)).toEqual(which === "INTENT" ? [VERIFY] : [VERIFY, VERIFY]);
+      expect(r.tail().slice(-2).map((e) => [e.kind, e.reason, e.mandate])).toEqual([
+        ["agent.refused", "MANDATE_OUT_OF_SCOPE", id],
+        ["purchase.stage", "MANDATE_OUT_OF_SCOPE", intentId],
+      ]);
+      expect(r.payment.calls).toEqual([]);
+    });
+  }
+
+  it("продавец заказа вне merchantScope INTENT — STOPPED MANDATE_OUT_OF_SCOPE после verify обоих, реквизита нет (Р39 п. 1.3)", async () => {
+    const r = await setup();
+    await signedIntent(r, { ...INTENT, merchantScope: ["shop_2"] });
+    const zones = await r.purchase.search();
+    await signedCart(r, zones.contour.find((o) => o.sku === "tartine")!);
+    await r.purchase.placeOrder({ idempotencyKey: "idem-order-1" });
+    const intentId = r.purchase.intentMandate!.id;
+    const cartId = r.purchase.cartMandate!.id;
+    const before = verified(r).length;
+    const from = r.stand.stub.calls.length;
+    await expect(r.purchase.authorize({ idempotencyKey: "idem-pay-1" })).rejects.toMatchObject({ code: "MANDATE_OUT_OF_SCOPE" });
+    expect(verified(r).slice(before)).toEqual([intentId, cartId]);
+    expect(opsFrom(r, from)).toEqual([VERIFY, VERIFY]);
+    expect(r.tail().slice(-2).map((e) => [e.kind, e.reason, e.mandate])).toEqual([
+      ["agent.refused", "MANDATE_OUT_OF_SCOPE", intentId],
+      ["purchase.stage", "MANDATE_OUT_OF_SCOPE", intentId],
+    ]);
+    expect(r.payment.calls).toEqual([]);
+  });
+
+  it("окно из одной операции — не дробление: тесты окна ниже требуют split_min_ops > 1", () => {
+    expect(MIN_OPS).toBeGreaterThan(1);
+  });
+
+  it("доля в окне по корневому INTENT — STOPPED SPLIT_WINDOW до verify, подтверждения и реквизита (Р39 п. 4)", async () => {
+    const r = await setup();
+    await ordered(r);
+    const intentId = r.purchase.intentMandate!.id;
+    expect(r.purchase.needsConfirmation).toBe(false);
+    // под тем же INTENT в окне split_min_ops − 1 операций: вместе с этой — split_min_ops, сумма выше порога
+    fillWindow(r, intentId, MIN_OPS - 1, THRESHOLD - TARTINE + 1);
+    const from = r.stand.stub.calls.length;
+    await expect(r.purchase.authorize({ idempotencyKey: "idem-pay-1" })).rejects.toMatchObject({ code: "SPLIT_WINDOW" });
+    expect(r.tail().slice(-2).map((e) => [e.kind, e.reason, e.mandate])).toEqual([
+      ["agent.refused", "SPLIT_WINDOW", intentId],
+      ["purchase.stage", "SPLIT_WINDOW", intentId],
+    ]);
+    expect(opsFrom(r, from)).toEqual([]);
+    expect(r.payment.calls).toEqual([]);
+  });
+
+  it("доля появилась, пока шёл verify CART (параллельная покупка под тем же INTENT), — STOPPED SPLIT_WINDOW после ворот, реквизита нет (ревью К2 В4)", async () => {
+    const r = await setup();
+    await ordered(r);
+    const intentId = r.purchase.intentMandate!.id;
+    const cartId = r.purchase.cartMandate!.id;
+    const mandates = r.core.mandates;
+    const requireActive = mandates.requireActive.bind(mandates);
+    mandates.requireActive = async (m) => {
+      const c = await requireActive(m);
+      if (m?.id === cartId) fillWindow(r, intentId, MIN_OPS - 1, THRESHOLD - TARTINE + 1);
+      return c;
+    };
+    const from = r.stand.stub.calls.length;
+    await expect(r.purchase.authorize({ idempotencyKey: "idem-pay-1" })).rejects.toMatchObject({ code: "SPLIT_WINDOW" });
+    expect(opsFrom(r, from)).toEqual([VERIFY, VERIFY]);
+    expect(verified(r).slice(-2)).toEqual([intentId, cartId]);
+    expect(r.tail().slice(-2).map((e) => [e.kind, e.reason])).toEqual([
+      ["agent.refused", "SPLIT_WINDOW"],
+      ["purchase.stage", "SPLIT_WINDOW"],
+    ]);
+    expect(r.payment.calls).toEqual([]);
+  });
+
+  it("сумма в окне ровно порог, другой INTENT или окно истекло — не доля, оплата идёт (Р39 п. 4)", async () => {
+    const { split_window_sec } = loadParams();
+    for (const kind of ["ровно порог", "другой INTENT", "окно истекло"] as const) {
+      const r = await setup();
+      await ordered(r);
+      const root = kind === "другой INTENT" ? "mnd_other" : r.purchase.intentMandate!.id;
+      // «ровно порог» — сумма в окне не больше порога вместе с этой (floor); иначе — на копейку выше
+      if (kind === "ровно порог") fillWindow(r, root, MIN_OPS - 1, THRESHOLD - TARTINE, "floor");
+      else fillWindow(r, root, MIN_OPS - 1, THRESHOLD - TARTINE + 1);
+      if (kind === "окно истекло") r.stand.clock = new Date(r.stand.clock.getTime() + (split_window_sec + 1) * 1000);
+      await r.purchase.authorize({ idempotencyKey: "idem-pay-1" });
+      expect(r.payment.calls).toEqual(["authorize"]);
+      await closeStand();
+    }
+  });
+
+  /** После стадии 5 этой покупки (итог TARTINE): ещё split_min_ops − 2 мест по копейке и проба — split_min_ops операций
+   *  на порог + 1, если операция этой покупки в окне; без неё операций на одну меньше — не доля. */
+  const isShareAfter = (r: PurchaseRun, root: string) => {
+    for (let i = 0; i < MIN_OPS - 2; i++) r.split.open(root, { amount: 1, currency: "RUB" }).settle("APPROVED");
+    return r.split.isShare(root, { amount: THRESHOLD - TARTINE - (MIN_OPS - 2) + 1, currency: "RUB" }, THRESHOLD);
+  };
+
+  for (const [reply, counts] of [
+    [{ status: "AUTHORIZED" }, true],
+    [{ status: "DECLINED", declineReason: "LIMIT_EXCEEDED" }, false],
+    [{ status: "CONFIRMATION_REQUIRED" }, false],
+    // ответ не той формы для стадии 5 — неизвестный исход (STOPPED UNKNOWN), окно занято
+    [{ status: "SETTLED" }, true],
+  ] as const) {
+    it(`ответ стадии 5 ${reply.status} — операция ${counts ? "занимает" : "не занимает"} окно дробления (Р39 п. 4)`, async () => {
+      const r = await setup({ payment: payments({ authorize: reply }) });
+      await ordered(r);
+      const intentId = r.purchase.intentMandate!.id;
+      await r.purchase.authorize({ idempotencyKey: "idem-pay-1" }).catch(() => undefined);
+      expect(r.payment.calls).toEqual(["authorize"]);
+      expect(isShareAfter(r, intentId)).toBe(counts);
+    });
+  }
+
+  it("сбой порта на стадии 5 — операция остаётся в окне (fail-closed, Р39 п. 4)", async () => {
+    const payment = payments();
+    payment.authorize = async () => {
+      throw new Error("сеть");
+    };
+    const r = await setup({ payment });
+    await ordered(r);
+    await expect(r.purchase.authorize({ idempotencyKey: "idem-pay-1" })).rejects.toThrow("сеть");
+    expect(isShareAfter(r, r.purchase.intentMandate!.id)).toBe(true);
   });
 });
 

@@ -25,6 +25,12 @@ const CATALOG_DIR = "src/agent/catalog/";
 /** Формат реестра кодов ядра — подпуть `/diag` и путь к нему в dist — только в src/agent/declines (Р36 п. 1). */
 const CORE_DIAG = /^@kuzin4u\/agentic-core\/(.*\/)?diag(\/|\.|$)/i;
 const DIAG_DIR = "src/agent/declines/";
+/** Оболочка (Р39 п. 5): решение человека по A5 создаёт только она. Вне shell/ из её модулей — только типы; из реестра
+ *  политики (`A5_ISSUED`) вне shell/ — всё, кроме отметки `markIssued`. Значения, default, namespace, export * и
+ *  import()/require — нарушение. */
+const SHELL_DIR = "src/agent/shell/";
+const A5_ISSUED = "src/agent/policy/a5-issued.ts";
+const SHELL_ONLY = new Set(["markIssued"]);
 const KEY_API = new Set(boundaries.cryptoKeyApis);
 /** Из node:crypto вне signer — только эти имена (список разрешённого) */
 const CRYPTO_ALLOWED = new Set(boundaries.cryptoAllowedOutsideSigner);
@@ -84,6 +90,19 @@ function facts(p: Project, file: string, opts: ts.CompilerOptions): FileFacts {
     if (r && !r.isExternalLibraryImport && r.resolvedFileName.startsWith(`${p.root}/src/`)) out.internal.push(r.resolvedFileName);
     else out.external.push(spec);
   };
+  const inShell = file.slice(p.root.length + 1).startsWith(SHELL_DIR);
+  /** Из файла вне shell/: какие значения модуля по спецификатору закрыты — все (модуль оболочки), только `markIssued`
+   *  (реестр политики) или никакие (null). */
+  const closedOf = (spec: string): ((name: string) => boolean) | null => {
+    if (inShell) return null;
+    const r = ts.resolveModuleName(spec, file, opts, host).resolvedModule;
+    if (!r) return null;
+    if (r.resolvedFileName.startsWith(`${p.root}/${SHELL_DIR}`)) return () => true;
+    if (r.resolvedFileName === `${p.root}/${A5_ISSUED}`) return (name) => SHELL_ONLY.has(name);
+    return null;
+  };
+  const intoShell = (spec: string): boolean => closedOf(spec) !== null;
+  const shellProblem = (n: ts.Node, what: string) => out.problems.push(`${where(n)} решение человека A5: ${what} — только в оболочке ${SHELL_DIR} (Р39 п. 5)`);
   const literal = (e: ts.Node | undefined): string | undefined =>
     e && (ts.isStringLiteral(e) || ts.isNoSubstitutionTemplateLiteral(e)) ? e.text : undefined;
 
@@ -91,6 +110,24 @@ function facts(p: Project, file: string, opts: ts.CompilerOptions): FileFacts {
     if ((ts.isImportDeclaration(n) || ts.isExportDeclaration(n)) && n.moduleSpecifier) {
       const spec = literal(n.moduleSpecifier)!;
       edge(spec);
+      const closed = closedOf(spec);
+      if (closed) {
+        if (ts.isImportDeclaration(n) && n.importClause && !n.importClause.isTypeOnly) {
+          const { name, namedBindings } = n.importClause;
+          if (name) shellProblem(n, "default-импорт");
+          if (namedBindings && ts.isNamespaceImport(namedBindings)) shellProblem(n, "namespace-импорт");
+          if (namedBindings && ts.isNamedImports(namedBindings)) {
+            for (const el of namedBindings.elements) {
+              const imported = (el.propertyName ?? el.name).text;
+              if (!el.isTypeOnly && closed(imported)) shellProblem(el, imported);
+            }
+          }
+        }
+        if (ts.isExportDeclaration(n) && !n.isTypeOnly) {
+          if (!n.exportClause || !ts.isNamedExports(n.exportClause)) shellProblem(n, "export *");
+          else for (const el of n.exportClause.elements) if (!el.isTypeOnly && closed((el.propertyName ?? el.name).text)) shellProblem(el, `реэкспорт ${(el.propertyName ?? el.name).text}`);
+        }
+      }
       if (isModule(spec)) out.problems.push(`${where(n)} ${spec} — обход статических импортов`);
       // Реэкспорт (ревью 3c № 1): из crypto — никакой; из agentic-core — ни default, ни ключевых имён, ни export *
       if (ts.isExportDeclaration(n) && isCrypto(spec)) out.problems.push(`${where(n)} ключевой API: реэкспорт из ${spec}`);
@@ -126,6 +163,7 @@ function facts(p: Project, file: string, opts: ts.CompilerOptions): FileFacts {
       if (spec === undefined) out.problems.push(`${where(n)} import = require не литералом`);
       else {
         edge(spec);
+        if (intoShell(spec)) shellProblem(n, "import = require");
         if (isCrypto(spec) || spec === CORE) out.problems.push(`${where(n)} ключевой API: import = require("${spec}")`);
       }
     } else if (ts.isImportTypeNode(n) && ts.isLiteralTypeNode(n.argument)) {
@@ -139,6 +177,7 @@ function facts(p: Project, file: string, opts: ts.CompilerOptions): FileFacts {
         if (spec === undefined) out.problems.push(`${where(n)} ${isImport ? "import()" : "require()"} не литералом`);
         else {
           edge(spec);
+          if (intoShell(spec)) shellProblem(n, isImport ? "import()" : "require()");
           // import() модуля с ключами — доступ мимо проверки имён (ревью 3c № 2)
           if (isCrypto(spec) || spec === CORE) out.problems.push(`${where(n)} ключевой API: ${isImport ? "import" : "require"}("${spec}")`);
           if (isModule(spec)) out.problems.push(`${where(n)} ${spec} — обход статических импортов`);

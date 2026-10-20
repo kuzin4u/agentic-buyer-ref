@@ -13,6 +13,7 @@ import { MandateClient } from "./mandates/index.js";
 import { EventFeed, EventsStopped, FileCursorStore, acceptPush, type PushReply } from "./events/index.js";
 import { KeyRing, SignerKeyRejected, SignerStopped } from "./signer/index.js";
 import { Purchase } from "./pipeline/index.js";
+import { SplitWindow } from "./policy/index.js";
 import type { LiveOfferSource } from "./ports/catalog.js";
 import type { OfferSource, PaymentSteps, ShopPort } from "./ports/shop.js";
 import {
@@ -205,6 +206,8 @@ export function createAgentCore(o: AgentCoreOptions): AgentCore {
   // сбой GET — слушатель падает, курсор на месте (Р34 п. 3): лента стоит для всех, и ожидание подписи другого мандата
   // (awaitSigned) получает тот же отказ — fail-closed, нюанс Р37 (ревью К2.3 № 6). awaitSigned читает ленту само.
   events.listen((item) => mandates.refreshHeld(item));
+  // окно дробления — одно на ядро: доли разных покупок под одним INTENT видят друг друга (Р39 п. 4)
+  const split = new SplitWindow(params, now);
   return {
     params,
     platform,
@@ -234,6 +237,7 @@ export function createAgentCore(o: AgentCoreOptions): AgentCore {
         shop: p.shop,
         payment: p.payment,
         params,
+        split,
         ...(p.region !== undefined && { region: p.region }),
       }),
     // Ключи загружаются до обращений к Платформе (сбой хранилища — без сети), затем курсор ленты и конфигурация, затем

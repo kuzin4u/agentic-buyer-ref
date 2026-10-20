@@ -64,11 +64,18 @@ export function allowed(from: PurchaseState, to: PurchaseState): boolean {
   return to === "STOPPED" || TRANSITIONS[from].includes(to);
 }
 
+/** Уточнения остановки без своего кода реестра (Р40 п. 6) — закрытый перечень, с кодами реестра не пересекается (тест
+ *  реестра): `CART_POLICY_EXCLUDED` — `EXCLUDED` от политики на стадии 3, внутреннее противоречие агента, остановка
+ *  `UNKNOWN`. */
+export const STOP_CAUSES = ["CART_POLICY_EXCLUDED"] as const;
+export type StopCause = (typeof STOP_CAUSES)[number];
+
 /** Часть журнала, которую видит машина: только свои записи. */
 export interface PurchaseJournal {
   record(
     entry:
-      | { at: string; kind: "purchase.stage"; detail: PurchaseState; mandate?: string; reason?: DiagCode }
+      /** detail — новое состояние; у остановки с уточнением — «STOPPED:уточнение» (Р40 п. 6, единственное значение) */
+      | { at: string; kind: "purchase.stage"; detail: PurchaseState | `STOPPED:${StopCause}`; mandate?: string; reason?: DiagCode }
       /** detail — запрошенный переход «откуда->куда», оба из PURCHASE_STATES (ревью К2.1 № 4) */
       | { at: string; kind: "agent.refused"; reason: "PIPELINE_TRANSITION_FORBIDDEN"; detail: `${PurchaseState}->${PurchaseState}`; mandate?: string },
   ): void;
@@ -153,12 +160,14 @@ export class PurchaseMachine {
     this.#gate5 = true;
   }
 
-  /** Остановка с кодом реестра; из конечного состояния — без действия (первая причина остаётся). */
-  stop(reason: DiagCode): void {
+  /** Остановка с кодом реестра; из конечного состояния — без действия (первая причина остаётся). `cause` — уточнение в
+   *  detail записи (Р40 п. 6), отдельной записи нет. */
+  stop(reason: DiagCode, cause?: StopCause): void {
     if (isTerminal(this.#state)) return;
     this.#state = "STOPPED";
     this.#reason = reason;
-    this.o.journal.record({ at: this.#at(), kind: "purchase.stage", detail: "STOPPED", reason, ...this.mandate });
+    const detail = cause === undefined ? "STOPPED" : (`STOPPED:${cause}` as const);
+    this.o.journal.record({ at: this.#at(), kind: "purchase.stage", detail, reason, ...this.mandate });
   }
 
   #at(): string {

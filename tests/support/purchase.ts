@@ -90,6 +90,7 @@ export async function signedIntent(r: PurchaseRun, draft: MandateDraft = INTENT)
   return r.purchase.awaitIntent();
 }
 
-/** Переходы покупки по журналу: состояние, при STOPPED — «STOPPED:код». */
+/** Переходы покупки по журналу: состояние, при STOPPED — «STOPPED:код»; у остановки с уточнением detail сам содержит
+ *  двоеточие (Р40 п. 6) — «STOPPED:уточнение:код». */
 export const stages = (r: { tail: () => { kind: string; detail?: string; reason?: string }[] }) =>
   r.tail().filter((e) => e.kind === "purchase.stage").map((e) => (e.reason ? `${e.detail}:${e.reason}` : e.detail));

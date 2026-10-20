@@ -144,6 +144,22 @@ describe("запрещённый переход — STOPPED и agent.refused (Р
     ]);
   });
 
+  it("остановка с уточнением — одна запись purchase.stage с detail STOPPED:CART_POLICY_EXCLUDED, код — reason (Р40 п. 6)", () => {
+    const { m, journal } = at("OFFERS");
+    m.stop("UNKNOWN", "CART_POLICY_EXCLUDED");
+    expect(m.state).toBe("STOPPED");
+    expect(m.reason).toBe("UNKNOWN");
+    expect(journal.entries.map((e) => [e.kind, e.detail, e.reason])).toEqual([["purchase.stage", "STOPPED:CART_POLICY_EXCLUDED", "UNKNOWN"]]);
+  });
+
+  it("остановка с уточнением после остановки — без действия: первая причина и журнал прежние", () => {
+    const { m, journal } = at("OFFERS");
+    m.stop("MANDATE_NOT_ACTIVE");
+    m.stop("UNKNOWN", "CART_POLICY_EXCLUDED");
+    expect(m.reason).toBe("MANDATE_NOT_ACTIVE");
+    expect(journal.entries.map((e) => [e.kind, e.detail, e.reason])).toEqual([["purchase.stage", "STOPPED", "MANDATE_NOT_ACTIVE"]]);
+  });
+
   it("код — в реестре: ошибся агент, без повтора", () => {
     expect(DIAG.PIPELINE_TRANSITION_FORBIDDEN).toMatchObject({ source: ["agent"], action: "after_fix" });
   });

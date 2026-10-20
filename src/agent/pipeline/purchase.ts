@@ -16,7 +16,7 @@ import type { LiveOfferSource } from "../ports/catalog.js";
 import type { FeedItem } from "../ports/events.js";
 import type { Mutation } from "../ports/mutation.js";
 import type { OfferSource, PaymentContext, PaymentSteps, ShopOffers, ShopOrder, ShopPort } from "../ports/shop.js";
-import { PurchaseMachine, PurchaseTransitionForbidden, allowed, type PurchaseJournal, type PurchaseState } from "./machine.js";
+import { PurchaseMachine, PurchaseTransitionForbidden, allowed, type PurchaseJournal, type PurchaseState, type StopCause } from "./machine.js";
 
 /** Записи конвейера сверх записей машины (Р38 п. 5, Р37 п. 5). */
 export interface PipelineJournal extends PurchaseJournal {
@@ -430,10 +430,13 @@ export class Purchase {
   /** Политика по сигналам A5 перед проектом CART (Р32 п. 2, Р40 п. 3–4): отказ — cart.refused по каждому сигналу, который
    *  человек не принял, и CartRefused; покупка остаётся в OFFERS. Подделка решения — agent.refused и STOPPED. */
   #draftable(verdict: OfferVerdict, purchase: CartPurchase, decision: HumanA5Decision | undefined): void {
+    // EXCLUDED здесь не возникает (в contour только доступные товары): появился — дефект, а не тихий отказ (ревью К5 № 3);
+    // в записи остановки — уточнение CART_POLICY_EXCLUDED, без agent.refused и cart.refused (Р40 п. 6, Р-109). Показ не
+    // AVAILABLE — то же до решения политики (второй слой)
+    if (verdict.kind !== "AVAILABLE") this.#halt("UNKNOWN", "CART_POLICY_EXCLUDED");
     const d = mayDraftCart(verdict, purchase, decision);
     if (d.allow) return;
-    // EXCLUDED здесь не возникает (в contour только доступные товары): появился — дефект, а не тихий отказ (ревью К5 № 3)
-    if (d.code === "EXCLUDED" || verdict.kind !== "AVAILABLE") this.#halt("UNKNOWN");
+    if (d.code === "EXCLUDED") this.#halt("UNKNOWN", "CART_POLICY_EXCLUDED");
     // решение не из оболочки — дефект или подмена вызывающего, а не «решения нет» (Р40 п. 4, как OFFER_NOT_IN_CONTOUR)
     if (d.code === "A5_DECISION_FORGED") {
       this.#record({ kind: "agent.refused", reason: "A5_DECISION_FORGED", ...skuRef(verdict.sku), ...merchantRef(verdict.merchantId) });
@@ -530,8 +533,8 @@ export class Purchase {
     this.#halt(d.code);
   }
 
-  #halt(code: DiagCode): never {
-    this.#machine.stop(code);
+  #halt(code: DiagCode, cause?: StopCause): never {
+    this.#machine.stop(code, cause);
     throw new PurchaseStopped(code);
   }
 

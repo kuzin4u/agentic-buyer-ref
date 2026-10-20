@@ -36,7 +36,8 @@ export interface PipelineJournal extends PurchaseJournal {
       | { at: string; kind: "agent.refused"; reason: "MANDATE_NOT_ACTIVE"; mandate?: string }
       /** ворота: остатка Платформы по мандату не хватает на итог CART (Р38 п. 3, К4а) */
       | { at: string; kind: "agent.refused"; reason: "MANDATE_AMOUNT_LEFT_INSUFFICIENT"; mandate?: string }
-      /** политика в воротах: verify CONFIRMED, но остаток 0 или продавец, валюта вне пределов мандата (Р39 п. 1.1, 1.3) */
+      /** политика в воротах: verify CONFIRMED, но остаток 0 или в чужой валюте, продавец или валюта итога вне пределов
+       *  мандата (Р39 п. 1.1, 1.3; К2а) */
       | { at: string; kind: "agent.refused"; reason: "MANDATE_OUT_OF_SCOPE"; mandate?: string }
       /** политика до стадий 4–5: итог не в RUB; доля в окне дробления (Р39 п. 1.4, п. 4) */
       | { at: string; kind: "agent.refused"; reason: "CURRENCY_NOT_SUPPORTED" | "SPLIT_WINDOW"; mandate?: string }
@@ -390,7 +391,8 @@ export class Purchase {
   }
 
   /** Ворота перед стадией 5 (Р38 п. 3): INTENT и CART оба среди держимых (сигнал, без сети), затем verify каждого и
-   *  решение политики по нему (Р39 п. 1.1–1.3: остаток > 0 и не меньше итога, продавец и валюта в пределах; инвариант 6) —
+   *  решение политики по нему (Р39 п. 1.1–1.3: остаток > 0, в валюте итога и не меньше итога, продавец и валюта в
+   *  пределах; инвариант 6) —
    *  непосредственно перед запросом реквизита; после verify — держимые ещё раз (отзыв по ленте во время проверки). Отзыв —
    *  agent.refused MANDATE_NOT_ACTIVE; verify не CONFIRMED — MANDATE_OUT_OF_SCOPE (запись клиента мандатов); отказ
    *  политики — agent.refused с её кодом; всё — STOPPED до реквизита. */

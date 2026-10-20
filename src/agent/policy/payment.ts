@@ -38,12 +38,13 @@ export function needsConfirmation(total: Money, t: Thresholds): boolean {
   return total.amount > confirmThreshold(t);
 }
 
-/** Р39 п. 1.1–1.2 по одному мандату — сразу после его verify: CONFIRMED и `amount_left` > 0 (иначе вне пределов: Р35,
- *  ПАО §3; инвариант 4); остаток не меньше итога и в той же валюте (К4а; у CART после PS-10 — меньшее из CART и
- *  родителя, #36). Только отказ или «дальше»: разрешения по одному мандату нет — его даёт `mayAuthorize`. */
+/** Р39 п. 1.1–1.2 по одному мандату — сразу после его verify: CONFIRMED, `amount_left` > 0 и в валюте итога (иначе вне
+ *  пределов: Р35, ПАО §3; суммы в разных валютах не сравниваются; инвариант 4); остаток не меньше итога (К4а; у CART
+ *  после PS-10 — меньшее из CART и родителя, #36). Только отказ или «дальше»: разрешения по одному мандату нет — его
+ *  даёт `mayAuthorize`. */
 export function mandateRefusal(m: Mandate, c: MandateCheck, total: Money): Extract<PaymentDecision, { allow: false }> | null {
-  if (c.outcome !== "CONFIRMED" || c.amountLeft.amount <= 0) return { allow: false, code: "MANDATE_OUT_OF_SCOPE", mandate: m };
-  if (c.amountLeft.currency !== total.currency || c.amountLeft.amount < total.amount) return { allow: false, code: "MANDATE_AMOUNT_LEFT_INSUFFICIENT", mandate: m };
+  if (c.outcome !== "CONFIRMED" || c.amountLeft.amount <= 0 || c.amountLeft.currency !== total.currency) return { allow: false, code: "MANDATE_OUT_OF_SCOPE", mandate: m };
+  if (c.amountLeft.amount < total.amount) return { allow: false, code: "MANDATE_AMOUNT_LEFT_INSUFFICIENT", mandate: m };
   return null;
 }
 

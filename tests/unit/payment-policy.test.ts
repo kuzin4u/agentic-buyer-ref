@@ -43,10 +43,15 @@ describe("mayAuthorize — порядок проверок ADP (Р39 п. 1.1–1
     expect(mayAuthorize(facts, { intent: ok(), cart: ok(0) })).toMatchObject({ code: "MANDATE_OUT_OF_SCOPE", mandate: cart });
   });
 
-  it("остаток меньше итога или в другой валюте — MANDATE_AMOUNT_LEFT_INSUFFICIENT по тому мандату (К4а, #36)", () => {
+  it("остаток меньше итога — MANDATE_AMOUNT_LEFT_INSUFFICIENT по тому мандату (К4а, #36)", () => {
     expect(mayAuthorize(facts, { intent: ok(TOTAL.amount - 1), cart: ok() })).toMatchObject({ code: "MANDATE_AMOUNT_LEFT_INSUFFICIENT", mandate: intent });
     expect(mayAuthorize(facts, { intent: ok(), cart: ok(TOTAL.amount - 1) })).toMatchObject({ code: "MANDATE_AMOUNT_LEFT_INSUFFICIENT", mandate: cart });
-    expect(mayAuthorize(facts, { intent: ok(), cart: ok(500000, "USD") })).toMatchObject({ code: "MANDATE_AMOUNT_LEFT_INSUFFICIENT", mandate: cart });
+  });
+
+  it("остаток в чужой валюте — вне пределов (MANDATE_OUT_OF_SCOPE), а не нехватка суммы, даже если сумма больше (решение владельца по В2)", () => {
+    expect(mayAuthorize(facts, { intent: ok(), cart: ok(500000, "USD") })).toMatchObject({ code: "MANDATE_OUT_OF_SCOPE", mandate: cart });
+    expect(mayAuthorize(facts, { intent: ok(1, "USD"), cart: ok() })).toMatchObject({ code: "MANDATE_OUT_OF_SCOPE", mandate: intent });
+    expect(mandateRefusal(intent, ok(500000, "USD"), TOTAL)).toMatchObject({ code: "MANDATE_OUT_OF_SCOPE", mandate: intent });
   });
 
   it("продавец вне merchantScope или валюта предела не та — MANDATE_OUT_OF_SCOPE (как MANDATE_SCOPE у ADP)", () => {

@@ -36,6 +36,14 @@ export const AGENT_DIAG_CODES = [
   "MANDATE_SIGNATURE_PENDING",
   "MANDATE_NONE",
   "MANDATE_OUT_OF_SCOPE",
+  // ворота перед стадией 5 (Р38 п. 3, К4а): verify подтвердил мандат, но остатка Платформы не хватает на итог CART
+  "MANDATE_AMOUNT_LEFT_INSUFFICIENT",
+  // конвейер стадий (Р38): запрещённый переход машины покупки — дефект вызывающего или конвейера
+  "PIPELINE_TRANSITION_FORBIDDEN",
+  // конвейер стадий (Р38 п. 2, поправка К3): выбор человека не из контура гарантий выдачи этой покупки — дефект или подмена вызывающего
+  "OFFER_NOT_IN_CONTOUR",
+  // конвейер стадий (Р38 п. 2): сумма или валюта заказа продавца не совпала с мандатом корзины (Т6)
+  "ORDER_REPLY_MISMATCH",
   // каталог: ошибка вызова живой проверки (рядом с LIVE_* ядра, Р32 п. 4)
   "LIVE_CALL_ERROR",
   // причины operation.declined (SPEC §7б): в PAO_DIAG ядра их нет

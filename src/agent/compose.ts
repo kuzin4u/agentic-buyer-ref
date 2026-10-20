@@ -12,6 +12,9 @@ import { MemoryJournal, type Journal } from "./journal/index.js";
 import { MandateClient } from "./mandates/index.js";
 import { EventFeed, EventsStopped, FileCursorStore, acceptPush, type PushReply } from "./events/index.js";
 import { KeyRing, SignerKeyRejected, SignerStopped } from "./signer/index.js";
+import { Purchase } from "./pipeline/index.js";
+import type { LiveOfferSource } from "./ports/catalog.js";
+import type { OfferSource, PaymentSteps, ShopPort } from "./ports/shop.js";
 import {
   AGENT_DIAG,
   AGENT_STOP_CODES,
@@ -46,6 +49,9 @@ export interface AgentCore {
   events: EventFeed;
   /** Приём push (Р34 п. 2): только форма и сигнал ленте; HTTP-сервер — у оболочки. Заголовки — в нижнем регистре. */
   acceptPush(body: string, headers: Readonly<Record<string, string | string[] | undefined>>): PushReply;
+  /** Новая покупка (Р38): конвейер стадий 0–6 на клиенте мандатов, ленте и журнале ядра; порты стадий — от вызывающего.
+   *  Стадия 0 — допуск последнего start() и подпись не остановлена; состояние покупки — только в памяти (Р38 п. 6). */
+  purchase(o: PurchasePorts): Purchase;
   /** Самопроверка при старте (Р36 п. 6): отчёт последнего start() (и успешного, и с отказом); до start() — null. */
   selfCheck(): SelfCheckReport | null;
   /** Стадия 0 с самопроверкой (Р36 п. 6, дополнение 2). Порядок: ключи из хранилища и выбор ключа допуска, курсор ленты
@@ -68,6 +74,15 @@ export interface AgentCore {
   maintainKeys(): Promise<void>;
   /** освободить каталог ключей (один процесс на каталог) */
   close(): void;
+}
+
+/** Порты стадий покупки от вызывающего (Р38 п. 2) и регион человека из профиля (Р32 п. 5). */
+export interface PurchasePorts {
+  offers: OfferSource;
+  live: LiveOfferSource;
+  shop: ShopPort;
+  payment: PaymentSteps;
+  region?: string;
 }
 
 export interface AgentCoreOptions {
@@ -200,6 +215,27 @@ export function createAgentCore(o: AgentCoreOptions): AgentCore {
     events,
     acceptPush: (body, headers) => acceptPush({ wake: () => events.signal(), journal, now }, body, headers),
     selfCheck: () => lastReport,
+    // остановленная подпись и курсор — код как у отказа старта; штатное закрытие (CLOSED) — UNKNOWN у конвейера.
+    // Порты вызывающего — поимённо: лишнее поле объекта не подменит допуск, клиент мандатов или журнал (ревью К2.2 № 3).
+    purchase: (p) =>
+      new Purchase({
+        mandates,
+        events: (signal) => events.items(signal),
+        journal,
+        admission: () => {
+          const stopped = ring.stopReason;
+          if (stopped !== null) return stopped === "CLOSED" ? "UNKNOWN" : stopped;
+          return lastReport?.ready === true ? null : "NOT_ADMITTED";
+        },
+        failureCode: startFailureCode,
+        now,
+        offers: p.offers,
+        live: p.live,
+        shop: p.shop,
+        payment: p.payment,
+        params,
+        ...(p.region !== undefined && { region: p.region }),
+      }),
     // Ключи загружаются до обращений к Платформе (сбой хранилища — без сети), затем курсор ленты и конфигурация, затем
     // GET /pao/v1/agent; курсор и конфигурация — один раз за start, повтор допуска (SIGNATURE_INVALID) их не повторяет.
     start: async () => {

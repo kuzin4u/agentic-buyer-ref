@@ -75,6 +75,11 @@ export class KeyRing {
   /** ротация остановлена по пределу KEY_INVALID (Р31); подпись прежним подтверждённым ключом продолжается */
   #rotationStopped = false;
 
+  /** Причина остановки подписи; null — не остановлена. Только код, без ключевого материала (инвариант 2). */
+  get stopReason(): SignerStopReason | null {
+    return this.#stopped;
+  }
+
   constructor(o: KeyRingOptions) {
     this.#o = o;
     this.#now = o.now ?? (() => new Date());

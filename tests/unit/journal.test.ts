@@ -47,7 +47,7 @@ describe("закрытый набор полей (Р37 п. 3, SPEC §4)", () => 
   it("JOURNAL_FIELDS = ключи JournalEntry = перечень SPEC §4; новое поле — через /decision", () => {
     expectTypeOf<(typeof JOURNAL_FIELDS)[number]>().toEqualTypeOf<keyof JournalEntry>();
     expect([...JOURNAL_FIELDS].sort()).toEqual(
-      ["at", "agent", "kind", "mandate", "method", "result", "attempt", "reason", "detail", "ref", "kid", "check", "status"].sort(),
+      ["at", "agent", "kind", "mandate", "merchant", "method", "result", "attempt", "reason", "detail", "ref", "kid", "check", "status"].sort(),
     );
   });
 });

@@ -75,6 +75,8 @@ export type JournalKind =
   | "mandate.vanished"
   /** отказ агента действовать — особое событие Т15 (Р37 п. 5); reason — код реестра */
   | "agent.refused"
+  /** переход машины покупки (Р38 п. 5): detail — новое состояние, mandate — INTENT, reason — код при STOPPED */
+  | "purchase.stage"
   /** товар исключён из выдачи (Р32 п. 1, 5): reason — код ошибки модели каталога; пишет конвейер (Р37 п. 5) */
   | "offer.excluded"
   /** товар с сигналом A5 — показ с пометкой (Р32 п. 1): reason — код сигнала; пишет конвейер */
@@ -92,7 +94,8 @@ export interface JournalEntry {
   kid?: string;
   /** код отказа или причина остановки — код реестра (Р37 п. 3) */
   reason?: JournalCode;
-  /** уточнение причины — только значение перечня ПАО (например, класс из реестра при AGENT_CLASS_MISMATCH, Р27) */
+  /** уточнение — только значение закрытого перечня: ПАО (класс из реестра при AGENT_CLASS_MISMATCH, Р27), агента
+   *  (NO_VERSION, REGION) или состояние машины покупки и запрошенный переход «откуда->куда» (Р38 п. 5) */
   detail?: string;
   /** идентификатор объекта Платформы по маске адаптера — event_id события ленты (Р34 п. 11) */
   ref?: string;
@@ -102,6 +105,8 @@ export interface JournalEntry {
   status?: "ok" | "warn" | "fail";
   /** mandate_id мандата, к которому относится запись */
   mandate?: string;
+  /** код продавца из выдачи по маске идентификатора — у решений каталога (Р38 п. 5, поправка К5) */
+  merchant?: string;
   /** ключ операции ПАО по контракту — шаблон пути без подстановок (`POST /pao/v1/mandates/{id}/verify`) */
   method?: string;
   /** итог обращения или решения */
@@ -122,6 +127,7 @@ export const JOURNAL_FIELDS = [
   "check",
   "status",
   "mandate",
+  "merchant",
   "method",
   "result",
   "attempt",

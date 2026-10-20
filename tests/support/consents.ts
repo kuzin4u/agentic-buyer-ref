@@ -1,7 +1,8 @@
 // Тестовая обёртка, не поведение Платформы: журнал согласий на обработчиках PaoStub до PS-06 (журнал согласий) и PS-07
 // (подпись в эмуляторе эмитента, mandate.signed) — STATUS «Ждём от платформы», строки AG-05. После них те же тесты —
 // против createStand платформы. POST /pao/v1/mandates → PENDING_SIGNATURE, подпись человека — sign(id),
-// verify — остаток и as_of задаёт тест. Остаток здесь не вычисляется из операций:
+// verify — остаток и as_of задаёт тест; исход — как в копии ПАО 1.4.0: CONFIRMED только у ACTIVE, иначе OUT_OF_SCOPE
+// (`outcome` и `outcomeOf` — подмена исхода для тестов отказа у ACTIVE). Остаток здесь не вычисляется из операций:
 // его ведёт платформа (инвариант 6), тест лишь назначает значение. Порядок отзыва задаёт «Платформа» (ПАО 1.4.0, РП37):
 // поле запроса не берётся, у CART — как у родителя (если родитель здесь есть). Стенд Платформы этого пока не проверяет:
 // стенд v0.5.0 (ПАО 1.4.0; К2а, К1.2 AG-06) мандаты уже отдаёт; переход этих тестов на createStand — STATUS «Открыто».
@@ -38,6 +39,8 @@ export class Consents {
   /** as_of в ответе verify: "now" — часы стенда, null — поле не отдаётся, строка — как есть */
   asOf: "now" | null | string = "now";
   outcome: Verify["outcome"] = "CONFIRMED";
+  /** исход verify отдельного мандата — поверх `outcome` (ворота перед стадией 5 по CART, Р38 п. 3) */
+  readonly outcomeOf = new Map<string, Verify["outcome"]>();
   /** порядок отзыва из соглашения участника — его отдаёт Платформа, не агент (РП37) */
   revocationOrder = "bank:pr_1:revocation:v1";
   /** подмена ответа на создание (проверка сверки ответа с проектом) */
@@ -75,7 +78,7 @@ export class Consents {
         const asOf = this.asOf === "now" ? this.clock().toISOString() : this.asOf;
         return {
           body: {
-            outcome: this.outcome,
+            outcome: this.outcomeOf.get(m.id!) ?? (m.status === "ACTIVE" ? this.outcome : "OUT_OF_SCOPE"),
             amount_left: this.left.get(m.id!) ?? m.amount_limit,
             valid_to: m.valid_to,
             ...(asOf !== null && { as_of: asOf }),

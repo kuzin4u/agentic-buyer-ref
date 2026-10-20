@@ -24,7 +24,7 @@ const coreVectors = (JSON.parse(readFileSync(`${CORE_ROOT}/vectors/vectors.json`
   ed25519_weak_keys: CoreWeakVector[];
 }).ed25519_weak_keys;
 const { isWeakEd25519 } = weakModule;
-// y = p + 3 со знаковым битом — только у агента; в векторах ядра v0.9.0 нет (передать в CO-1, STATUS «Открыто»).
+// y = p + 3 со знаковым битом — только у агента; в векторах ядра v0.11.0 нет (передать в CO-1, STATUS «Открыто»).
 const LOCAL_ONLY = ["f0" + "ff".repeat(31)];
 // Неканоническая запись точки большого порядка (y = 3): её отсекает только проверка y < p; [8]A = O не срабатывает.
 const Y_P_PLUS_3 = ["f0" + "ff".repeat(30) + "7f", ...LOCAL_ONLY];
@@ -34,8 +34,8 @@ const spkiOf = (hex: string): Buffer => Buffer.concat([SPKI_HEADER, Buffer.from(
 const RFC8037_X = Buffer.from("11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo", "base64url");
 
 describe("слабые ключи Ed25519 — функция и векторы ядра (К10, AG-05 К1.3)", () => {
-  it("signer проверяет функцией ядра v0.9.0, своей копии нет", () => {
-    expect(JSON.parse(readFileSync(`${CORE_ROOT}/package.json`, "utf8")).version).toBe("0.9.0");
+  it("signer проверяет функцией ядра v0.11.0, своей копии нет", () => {
+    expect(JSON.parse(readFileSync(`${CORE_ROOT}/package.json`, "utf8")).version).toBe("0.11.0");
     expect(isWeakEd25519).toBe(coreIsWeak);
     expect(Object.keys(weakModule).sort()).toEqual(["assertStrongEd25519", "isWeakEd25519"]);
   });

@@ -3,6 +3,7 @@
 import { Purchase } from "../../src/agent/pipeline/index.js";
 import type { FeedItem, LiveOfferSource, OfferSource, PaymentSteps, ShopPort } from "../../src/agent/ports/index.js";
 import { loadParams } from "../../src/shared/config.js";
+import type { Journal } from "../../src/agent/journal/index.js";
 import type { DiagCode } from "../../src/shared/diag-codes.js";
 import type { MandateDraft } from "../../src/shared/domain.js";
 import { Consents, INTENT, feed } from "./consents.js";
@@ -22,6 +23,8 @@ export interface PurchaseSetup {
   live?: LiveOfferSource;
   shop?: ShopPort;
   payment?: PaymentSteps;
+  /** запись журнала до журнала ядра: бросает — сбой журнала (ревью К5 № 1) */
+  tap?: (entry: Parameters<Journal["record"]>[0]) => void;
   /** стендовые параметры поверх config/params.stand.json (граница порога и т. п.) */
   params?: Partial<ReturnType<typeof loadParams>>;
 }
@@ -48,7 +51,7 @@ export async function purchaseOn(o: PurchaseSetup, track: (s: PaoStand) => void)
     shop,
     payment,
     params: { ...loadParams(), ...o.params },
-    journal: core.journal,
+    journal: { record: (e) => (o.tap?.(e), core.journal.record(e)) },
     admission: () => o.admission ?? null,
     ...(o.region !== null && { region: o.region ?? "77" }),
     now: () => s.clock,

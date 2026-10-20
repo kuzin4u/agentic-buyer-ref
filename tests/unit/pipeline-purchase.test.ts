@@ -151,11 +151,11 @@ describe("стадии 1–2 — INTENT и выдача (Р38 п. 2, п. 5)", ()
     const decisions = r.tail().filter((e) => e.kind.startsWith("offer."));
     expect(decisions.filter((e) => e.kind === "offer.excluded")).toEqual(
       SKUS.map((ref) =>
-        expect.objectContaining({ kind: "offer.excluded", reason: "BAD_INN", ref, mandate: intent.id }),
+        expect.objectContaining({ kind: "offer.excluded", reason: "BAD_INN", ref, mandate: intent.id, merchant: "shop_2" }),
       ),
     );
-    expect(decisions.filter((e) => e.kind === "offer.flagged").map((e) => [e.reason, e.ref])).toEqual(
-      SKUS.map((s) => ["A5_RETURNS_MISMATCH", s]),
+    expect(decisions.filter((e) => e.kind === "offer.flagged").map((e) => [e.reason, e.ref, e.merchant])).toEqual(
+      SKUS.map((s) => ["A5_RETURNS_MISMATCH", s, "shop_3"]),
     );
     expect(zones.contour.every((o) => o.a5.includes("A5_RETURNS_MISMATCH"))).toBe(true);
     expectJournalClean(r.journal.entries, AGENT, r.stand.stub.calls, ["idem-intent-1"]);
@@ -206,6 +206,18 @@ describe("стадии 1–2 — INTENT и выдача (Р38 п. 2, п. 5)", ()
     expect(zones.contour).toHaveLength(3);
     expect(r.tail().filter((e) => e.kind === "offer.excluded")).toEqual([expect.objectContaining({ reason: "REQUIRED" })]);
     expect(r.tail().find((e) => e.kind === "offer.excluded")).not.toHaveProperty("ref");
+  });
+
+  it("решение каталога несёт продавца (Р38 п. 5, поправка К5): записи магазина без товара — тоже; код не по маске — без merchant", async () => {
+    const r = await setup({ shops: [{ ...SHOP, feed: "<yml_catalog>", merchantId: "shop_9" }, { ...SHOP, profile: bakery({ inn: "7705123453" }), merchantId: "продавец 1" }] });
+    await signedIntent(r);
+    await r.purchase.search();
+    const excluded = r.tail().filter((e) => e.kind === "offer.excluded");
+    expect(excluded[0]).toMatchObject({ reason: "XML_SYNTAX", merchant: "shop_9" });
+    expect(excluded.slice(1)).toHaveLength(4);
+    expect(excluded.slice(1).every((e) => !("merchant" in e))).toBe(true);
+    expect(JSON.stringify(r.journal.entries)).not.toContain("продавец");
+    expectJournalClean(r.journal.entries, AGENT, r.stand.stub.calls, ["idem-intent-1"]);
   });
 
   it("sku не по маске — запись без ref (Р38 п. 5, инвариант 5)", async () => {

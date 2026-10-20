@@ -169,9 +169,24 @@ describe("стадия 3 — проект корзины (Р32 п. 2): отка�
     expect(refused).toBeInstanceOf(CartRefused);
     expect(refused).toMatchObject({ code: "A5_NEEDS_HUMAN" });
     expect(r.purchase.state).toBe("OFFERS");
+    // решение политики — в журнал конвейером (Р38 п. 5): код сигнала, решение, sku; без текста фида
+    expect(r.tail().filter((e) => e.kind === "cart.refused")).toEqual([
+      expect.objectContaining({ reason: "A5_RETURNS_MISMATCH", detail: "A5_NEEDS_HUMAN", ref: "tartine", merchant: "shop_1", mandate: r.purchase.intentMandate!.id }),
+    ]);
+    expectJournalClean(r.journal.entries, AGENT, r.stand.stub.calls, ["idem-intent-1"]);
     const decision = { sku: "tartine", accepted: ["A5_RETURNS_MISMATCH" as const] };
     await r.purchase.cart({ ...key(offer), qty: 1, decision, keyTermsShown: true }, { idempotencyKey: "idem-cart-1" });
     expect(r.purchase.state).toBe("CART_PENDING");
+  });
+
+  it("частичное согласие человека — в cart.refused только непринятые сигналы (ревью К5 № 2)", async () => {
+    const feed = SHOP.feed.replace("Цена 450 ₽", "Цена 500 ₽");
+    const r = await setup({ shops: [{ ...SHOP, feed, profile: bakery({ returns: { days: 0, text: "Возврат в течение 14 дней" } }) }] });
+    const offer = await offers(r);
+    expect([...offer.a5].sort()).toEqual(["A5_PRICE_MISMATCH", "A5_RETURNS_MISMATCH"]);
+    const decision = { sku: "tartine", accepted: ["A5_RETURNS_MISMATCH" as const] };
+    await expect(r.purchase.cart({ ...key(offer), qty: 1, decision, keyTermsShown: true }, { idempotencyKey: "idem-cart-1" })).rejects.toMatchObject({ code: "A5_NEEDS_HUMAN" });
+    expect(r.tail().filter((e) => e.kind === "cart.refused").map((e) => e.reason)).toEqual(["A5_PRICE_MISMATCH"]);
   });
 
   it("сигнал A5 при автономном режиме — A5_AUTONOMOUS, решение человека не помогает", async () => {
@@ -183,6 +198,7 @@ describe("стадия 3 — проект корзины (Р32 п. 2): отка�
     expect(refused).toBeInstanceOf(CartRefused);
     expect(refused).toMatchObject({ code: "A5_AUTONOMOUS" });
     expect(r.purchase.state).toBe("OFFERS");
+    expect(r.tail().filter((e) => e.kind === "cart.refused").map((e) => [e.reason, e.detail, e.ref])).toEqual([["A5_RETURNS_MISMATCH", "A5_AUTONOMOUS", offer.sku]]);
   });
 });
 
@@ -200,6 +216,11 @@ describe("стадия 3 — живая проверка перед заказо
       expect(err).toMatchObject({ next, codes });
       expect(r.purchase.state).toBe("OFFERS");
       expect(r.shop.calls).toEqual([]);
+      // заказа нет — запись конвейера на каждый код проверки (Р38 п. 5)
+      expect(r.tail().filter((e) => e.kind === "order.live_refused").map((e) => [e.reason, e.detail, e.ref, e.merchant, e.mandate])).toEqual(
+        codes.map((c) => [c, next, "tartine", "shop_1", r.purchase.intentMandate!.id]),
+      );
+      expectJournalClean(r.journal.entries, AGENT, r.stand.stub.calls, ["idem-intent-1", "idem-cart-1"]);
     });
   }
 
@@ -208,6 +229,7 @@ describe("стадия 3 — живая проверка перед заказо
     const offer = await offers(r);
     await signedCart(r, offer);
     await expect(r.purchase.placeOrder({ idempotencyKey: "idem-order-1" })).rejects.toMatchObject({ next: "TELL_UNCONFIRMED", codes: ["LIVE_UNAVAILABLE"] });
+    expect(r.tail().filter((e) => e.kind === "order.live_refused").map((e) => [e.reason, e.detail])).toEqual([["LIVE_UNAVAILABLE", "TELL_UNCONFIRMED"]]);
     await r.purchase.cart({ ...key(offer), qty: 1, keyTermsShown: true }, { idempotencyKey: "idem-cart-2" });
     expect(stages(r).slice(-3)).toEqual(["CART_ACTIVE", "OFFERS", "CART_PENDING"]);
   });
@@ -402,6 +424,38 @@ describe("ответ порта не той формы или сбой — STOPP
     await settle.purchase.authorize({ idempotencyKey: "idem-pay-1" });
     await expect(settle.purchase.settle()).rejects.toThrow();
     expect(stages(settle).at(-1)).toBe("STOPPED:UNKNOWN");
+  });
+});
+
+describe("сбой журнала — STOPPED UNKNOWN, решение без записи не исполняется (ревью К5 № 1, инвариант 4)", () => {
+  it("журнал не принял order.live_refused — STOPPED, заказа нет, повторный заказ — запрещённый переход", async () => {
+    const boom = new Error("журнал недоступен");
+    const r = await setup({
+      live: liveOffers(SHOP, () => stand!.clock, () => ({ availability: { inStock: false } })),
+      tap: (e) => {
+        if (e.kind === "order.live_refused") throw boom;
+      },
+    });
+    await signedCart(r, await offers(r));
+    await expect(r.purchase.placeOrder({ idempotencyKey: "idem-order-1" })).rejects.toBe(boom);
+    expect(r.purchase.state).toBe("STOPPED");
+    expect(r.purchase.reason).toBe("UNKNOWN");
+    await expect(r.purchase.placeOrder({ idempotencyKey: "idem-order-1" })).rejects.toBeInstanceOf(PurchaseTransitionForbidden);
+    expect(r.shop.calls).toEqual([]);
+  });
+
+  it("журнал не принял cart.refused — STOPPED UNKNOWN, CART не запрошен", async () => {
+    const boom = new Error("журнал недоступен");
+    const r = await setup({
+      shops: [{ ...SHOP, profile: bakery({ returns: { days: 0, text: "Возврат в течение 14 дней" } }) }],
+      tap: (e) => {
+        if (e.kind === "cart.refused") throw boom;
+      },
+    });
+    const offer = await offers(r);
+    await expect(r.purchase.cart({ ...key(offer), qty: 1, keyTermsShown: true }, { idempotencyKey: "idem-cart-1" })).rejects.toBe(boom);
+    expect(r.purchase.reason).toBe("UNKNOWN");
+    expect(r.stand.log().filter((c) => c.op === "POST /pao/v1/mandates")).toHaveLength(1);
   });
 });
 

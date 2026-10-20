@@ -20,11 +20,16 @@ export interface PipelineJournal extends PurchaseJournal {
   record(
     entry:
       | Parameters<PurchaseJournal["record"]>[0]
-      /** ошибка модели каталога — reason; нет доставки в регион — detail REGION без reason; ref — sku по маске */
-      | { at: string; kind: "offer.excluded"; reason: CatalogIssueCode; ref?: string; mandate?: string }
-      | { at: string; kind: "offer.excluded"; detail: "REGION"; ref?: string; mandate?: string }
+      /** ошибка модели каталога — reason; нет доставки в регион — detail REGION без reason; ref — sku, merchant — код
+       *  продавца, оба по маске (у решений каталога ниже — так же) */
+      | { at: string; kind: "offer.excluded"; reason: CatalogIssueCode; ref?: string; mandate?: string; merchant?: string }
+      | { at: string; kind: "offer.excluded"; detail: "REGION"; ref?: string; mandate?: string; merchant?: string }
       /** сигнал A5 — показ с пометкой */
-      | { at: string; kind: "offer.flagged"; reason: A5SignalCode; ref?: string; mandate?: string }
+      | { at: string; kind: "offer.flagged"; reason: A5SignalCode; ref?: string; mandate?: string; merchant?: string }
+      /** проект CART не готовится (Р32 п. 2): reason — код сигнала A5, detail — решение политики */
+      | { at: string; kind: "cart.refused"; reason: A5SignalCode; detail: "A5_NEEDS_HUMAN" | "A5_AUTONOMOUS"; ref?: string; mandate?: string; merchant?: string }
+      /** заказа нет — живая проверка не ok (Р32 п. 3–4): reason — код проверки, detail — следующий шаг */
+      | { at: string; kind: "order.live_refused"; reason: LiveFactCode; detail: OrderNext; ref?: string; mandate?: string; merchant?: string }
       /** ворота: держимый мандат вышел (отзыв, иной статус) — отказ действовать (Р38 п. 3) */
       | { at: string; kind: "agent.refused"; reason: "MANDATE_NOT_ACTIVE"; mandate?: string }
       /** ворота: остатка Платформы по мандату не хватает на итог CART (Р38 п. 3, К4а) */
@@ -227,7 +232,15 @@ export class Purchase {
         this.#halt("OFFER_NOT_IN_CONTOUR");
       }
       const d = mayDraftCart(offer.sku, { kind: "AVAILABLE", a5: [...offer.a5] }, intent.confirmationMode, choice.decision);
-      if (!d.allow) throw new CartRefused(d.code);
+      if (!d.allow) {
+        // EXCLUDED здесь не возникает (в contour только доступные товары): появился — дефект, а не тихий отказ (ревью К5 № 3)
+        if (d.code === "EXCLUDED") this.#halt("UNKNOWN");
+        // решение политики — в журнал конвейером (Р37 п. 5, Р38 п. 5): по каждому сигналу, который человек не принял
+        const accepted = choice.decision?.sku === offer.sku ? choice.decision.accepted : [];
+        const open = d.code === "A5_NEEDS_HUMAN" ? offer.a5.filter((c) => !accepted.includes(c)) : offer.a5;
+        for (const reason of open) this.#record({ kind: "cart.refused", reason, detail: d.code, ...skuRef(offer.sku), ...merchantRef(offer.merchantId) });
+        throw new CartRefused(d.code);
+      }
       this.#held(intent);
       await this.#guard(() => this.o.mandates.requireActive(intent));
       const cart = snapshot(await this.#guard(() => this.o.mandates.request(cartDraft(intent, offer, choice), m, intent)));
@@ -272,6 +285,7 @@ export class Purchase {
       this.#alive();
       const d = mayOrder(live);
       if (!d.allow) {
+        for (const reason of d.codes) this.#record({ kind: "order.live_refused", reason, detail: d.next, ...skuRef(line.sku), ...merchantRef(offer.merchantId) });
         this.#machine.to("OFFERS");
         throw new OrderRefused(d.next, d.codes);
       }
@@ -375,18 +389,19 @@ export class Purchase {
     const zones: OfferZones = { contour: [], market: [] };
     for (const s of shops) {
       const { shop, shopIssues, products, dropped } = s.facts;
+      const m = merchantRef(s.merchantId);
       // фид не разобран — товаров нет, исключён весь магазин: запись на код без sku
       if (shop === null) {
-        for (const reason of shopIssues) this.#record({ kind: "offer.excluded", reason });
+        for (const reason of shopIssues) this.#record({ kind: "offer.excluded", reason, ...m });
         continue;
       }
       // предложения, которые коннектор не перевёл (sku у них нет): запись на код без ref
-      for (const reason of dropped) this.#record({ kind: "offer.excluded", reason });
+      for (const reason of dropped) this.#record({ kind: "offer.excluded", reason, ...m });
       // магазин исключён, а товаров нет — запись на код магазина, как у неразобранного фида
-      if (products.length === 0) for (const reason of shopIssues) this.#record({ kind: "offer.excluded", reason });
+      if (products.length === 0) for (const reason of shopIssues) this.#record({ kind: "offer.excluded", reason, ...m });
       for (const p of products) {
         const v = classifyOffer(p, shop, shopIssues, this.o.region);
-        const ref = skuRef(p.product.sku);
+        const ref = { ...skuRef(p.product.sku), ...m };
         if (v.kind === "EXCLUDED") {
           if (v.reason === "MODEL") for (const reason of v.codes) this.#record({ kind: "offer.excluded", reason, ...ref });
           else this.#record({ kind: "offer.excluded", detail: "REGION", ...ref });
@@ -457,9 +472,19 @@ export class Purchase {
     if (this.#machine.state === "STOPPED") throw new PurchaseStopped(this.#machine.reason ?? "UNKNOWN");
   }
 
-  /** mandate — INTENT покупки, если запись не называет свой (ворота по CART). */
+  /** mandate — INTENT покупки, если запись не называет свой (ворота по CART). Сбой журнала — покупка остановлена
+   *  (UNKNOWN), исходная ошибка наружу: решение без записи не исполняется (инвариант 4, ревью К5 № 1). */
   #record(e: DistributiveOmit<Parameters<PipelineJournal["record"]>[0], "at">): void {
-    this.o.journal.record({ at: this.now().toISOString(), ...this.#machine.mandate, ...e } as Parameters<PipelineJournal["record"]>[0]);
+    try {
+      this.o.journal.record({ at: this.now().toISOString(), ...this.#machine.mandate, ...e } as Parameters<PipelineJournal["record"]>[0]);
+    } catch (err) {
+      try {
+        this.#machine.stop("UNKNOWN");
+      } catch {
+        // журнал недоступен и для purchase.stage: состояние машины уже STOPPED
+      }
+      throw err;
+    }
   }
 }
 
@@ -503,3 +528,5 @@ type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K>
 
 const MANDATE_ID = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/;
 const maskedMandate = (id: string): { mandate?: string } => (MANDATE_ID.test(id) ? { mandate: id } : {});
+/** код продавца из выдачи — данные продавца: в журнале только по маске идентификатора (Р38 п. 5, инвариант 5) */
+const merchantRef = (id: string): { merchant?: string } => (MANDATE_ID.test(id) ? { merchant: id } : {});

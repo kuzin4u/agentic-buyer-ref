@@ -105,6 +105,8 @@ export interface JournalEntry {
   status?: "ok" | "warn" | "fail";
   /** mandate_id мандата, к которому относится запись */
   mandate?: string;
+  /** код продавца из выдачи по маске идентификатора — у решений каталога (Р38 п. 5, поправка К5) */
+  merchant?: string;
   /** ключ операции ПАО по контракту — шаблон пути без подстановок (`POST /pao/v1/mandates/{id}/verify`) */
   method?: string;
   /** итог обращения или решения */
@@ -125,6 +127,7 @@ export const JOURNAL_FIELDS = [
   "check",
   "status",
   "mandate",
+  "merchant",
   "method",
   "result",
   "attempt",

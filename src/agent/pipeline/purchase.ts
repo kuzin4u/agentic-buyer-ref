@@ -8,7 +8,8 @@ import type { DiagCode } from "../../shared/diag-codes.js";
 import { liveCheck, type A5SignalCode, type CatalogIssueCode, type CatalogProduct, type LiveCheckParams, type LiveFactCode } from "../catalog/index.js";
 import { ruleForDeclineReason } from "../declines/index.js";
 import { MandateRefused, type MandateClient } from "../mandates/index.js";
-import { acceptedA5, classifyOffer, mayDraftCart, mayOrder, type HumanA5Decision, type OfferVerdict, type OrderNext } from "../policy/catalog.js";
+import { issuedByShell, spend } from "../policy/a5-issued.js";
+import { acceptedA5, classifyOffer, mayDraftCart, mayOrder, type CartPurchase, type HumanA5Decision, type OfferVerdict, type OrderNext } from "../policy/catalog.js";
 import { confirmThreshold, currencySupported, mandateRefusal, mayAuthorize, needsConfirmation, type PaymentDecision, type Thresholds } from "../policy/payment.js";
 import type { SplitWindow } from "../policy/split.js";
 import type { LiveOfferSource } from "../ports/catalog.js";
@@ -28,8 +29,8 @@ export interface PipelineJournal extends PurchaseJournal {
       | { at: string; kind: "offer.excluded"; detail: "REGION"; ref?: string; mandate?: string; merchant?: string }
       /** сигнал A5 — показ с пометкой */
       | { at: string; kind: "offer.flagged"; reason: A5SignalCode; ref?: string; mandate?: string; merchant?: string }
-      /** проект CART не готовится (Р32 п. 2): reason — код сигнала A5, detail — решение политики */
-      | { at: string; kind: "cart.refused"; reason: A5SignalCode; detail: "A5_NEEDS_HUMAN" | "A5_AUTONOMOUS"; ref?: string; mandate?: string; merchant?: string }
+      /** проект CART не готовится (Р32 п. 2, Р40 п. 4): reason — код сигнала A5, detail — решение политики */
+      | { at: string; kind: "cart.refused"; reason: A5SignalCode; detail: CartRefusal; ref?: string; mandate?: string; merchant?: string }
       /** заказа нет — живая проверка не ok (Р32 п. 3–4): reason — код проверки, detail — следующий шаг */
       | { at: string; kind: "order.live_refused"; reason: LiveFactCode; detail: OrderNext; ref?: string; mandate?: string; merchant?: string }
       /** ворота: держимый мандат вышел (отзыв, иной статус) — отказ действовать (Р38 п. 3) */
@@ -71,9 +72,13 @@ export interface CartChoice {
   keyTermsShown: boolean;
 }
 
+/** Исход политики по сигналам A5, при котором корзина не готовится: решения нет или не все сигналы приняты, автономный
+ *  режим, решение устарело — потрачено, из другой покупки или по другому показу (Р40 п. 3). */
+export type CartRefusal = "A5_NEEDS_HUMAN" | "A5_AUTONOMOUS" | "A5_DECISION_STALE";
+
 /** Проект корзины не готовится (Р32 п. 2): покупка остаётся в OFFERS, обращений не было (Р38 п. 4, поправка К3). */
 export class CartRefused extends Error {
-  constructor(readonly code: "EXCLUDED" | "A5_AUTONOMOUS" | "A5_NEEDS_HUMAN") {
+  constructor(readonly code: "EXCLUDED" | CartRefusal) {
     super(`Корзина не готовится: ${code}`);
     this.name = "CartRefused";
   }
@@ -240,20 +245,18 @@ export class Purchase {
         this.#record({ kind: "agent.refused", reason: "OFFER_NOT_IN_CONTOUR", ...skuRef(String(choice.sku)) });
         this.#halt("OFFER_NOT_IN_CONTOUR");
       }
-      // показ — из своей выдачи: продавец, sku, цена и коды A5, к которым привязано решение человека (Р39 п. 5)
+      // показ — из своей выдачи: продавец, sku, цена и коды A5, к которым привязано решение человека (Р39 п. 5), и
+      // покупка — корневой INTENT (Р40 п. 1)
       const verdict: OfferVerdict = { kind: "AVAILABLE", merchantId: offer.merchantId, sku: offer.sku, price: { ...offer.product.price }, a5: [...offer.a5] };
-      const d = mayDraftCart(verdict, intent.confirmationMode, choice.decision);
-      if (!d.allow) {
-        // EXCLUDED здесь не возникает (в contour только доступные товары): появился — дефект, а не тихий отказ (ревью К5 № 3)
-        if (d.code === "EXCLUDED") this.#halt("UNKNOWN");
-        // решение политики — в журнал конвейером (Р37 п. 5, Р38 п. 5): по каждому сигналу, который человек не принял
-        const accepted = acceptedA5(verdict, choice.decision);
-        const open = d.code === "A5_NEEDS_HUMAN" ? offer.a5.filter((c) => !accepted.includes(c)) : offer.a5;
-        for (const reason of open) this.#record({ kind: "cart.refused", reason, detail: d.code, ...skuRef(offer.sku), ...merchantRef(offer.merchantId) });
-        throw new CartRefused(d.code);
-      }
+      const purchase: CartPurchase = { intentId: intent.id, mode: intent.confirmationMode };
+      this.#draftable(verdict, purchase, choice.decision);
       this.#held(intent);
       await this.#guard(() => this.o.mandates.requireActive(intent));
+      // вторая защита: решение — повторно непосредственно перед тратой, без ожидания между ними (при `#busy` и привязке к
+      // INTENT потратить его на другую корзину во время verify нельзя — недостижимо, нюанс К2 Р40). Тратится только
+      // решение, которое покрыло сигналы этого товара, при любом исходе запроса CART (Р40 п. 2, fail-closed)
+      this.#draftable(verdict, purchase, choice.decision);
+      if (verdict.a5.length > 0 && issuedByShell(choice.decision)) spend(choice.decision);
       const cart = snapshot(await this.#guard(() => this.o.mandates.request(cartDraft(intent, offer, choice), m, intent)));
       this.#offer = offer;
       this.#cart = cart;
@@ -412,6 +415,20 @@ export class Purchase {
     this.#held(intent, cart);
     // без пропуска машина не пустит в AUTHORIZING: запрещённый переход по К2.1, даже если таблица его разрешает
     this.#machine.passGate5();
+  }
+
+  /** Политика по сигналам A5 перед проектом CART (Р32 п. 2, Р40 п. 3–4): отказ — cart.refused по каждому сигналу, который
+   *  человек не принял, и CartRefused; покупка остаётся в OFFERS. */
+  #draftable(verdict: OfferVerdict, purchase: CartPurchase, decision: HumanA5Decision | undefined): void {
+    const d = mayDraftCart(verdict, purchase, decision);
+    if (d.allow) return;
+    // EXCLUDED здесь не возникает (в contour только доступные товары): появился — дефект, а не тихий отказ (ревью К5 № 3)
+    if (d.code === "EXCLUDED" || verdict.kind !== "AVAILABLE") this.#halt("UNKNOWN");
+    // решение политики — в журнал конвейером (Р37 п. 5, Р38 п. 5): по каждому сигналу, который человек не принял
+    const accepted = acceptedA5(verdict, purchase, decision);
+    const open = d.code === "A5_NEEDS_HUMAN" ? verdict.a5.filter((c) => !accepted.includes(c)) : verdict.a5;
+    for (const reason of open) this.#record({ kind: "cart.refused", reason, detail: d.code, ...skuRef(verdict.sku), ...merchantRef(verdict.merchantId) });
+    throw new CartRefused(d.code);
   }
 
   /** Решения каталога — в журнал по каждому товару (Р37 п. 5): исключение — код модели или REGION, A5 — пометка. */

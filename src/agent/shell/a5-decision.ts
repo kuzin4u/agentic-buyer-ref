@@ -1,4 +1,5 @@
-// Решение человека по сигналам A5 (Р32 п. 2, Р39 п. 5): создаёт только оболочка по действию человека в ответ на показ.
+// Решение человека по сигналам A5 (Р32 п. 2, Р39 п. 5, Р40): создаёт только оболочка по действию человека в ответ на показ
+// в этой покупке.
 // Код ядра решение не создаёт (правило графа импортов: из shell/ ядро берёт только типы, отметку реестра политики
 // ставит только эта фабрика) и не подделывает: политика принимает только выданное фабрикой (инвариант 7).
 import type { Money } from "../../shared/domain.js";
@@ -15,10 +16,17 @@ export interface ShownOffer {
   product: { price: Money };
 }
 
-/** Решение привязано к показу: продавец и `sku` (один `sku` бывает у двух магазинов), показанные коды и цена. После
- *  смены цены или набора кодов оно товар не покрывает — решает политика (`mayDraftCart`). */
+/** Покупка, в которой человек видел показ: корневой INTENT (`purchase.intentMandate.id`). */
+export interface ShownIn {
+  intentId: string;
+}
+
+/** Решение привязано к покупке (корневой INTENT, Р40 п. 1) и к показу: продавец и `sku` (один `sku` бывает у двух
+ *  магазинов), показанные коды и цена. После смены цены или набора кодов, в другой покупке и после траты на запрос CART
+ *  (одноразовое, Р40 п. 2) оно товар не покрывает — решает политика (`mayDraftCart`). */
 export interface HumanA5Decision {
   readonly [ISSUED]: true;
+  readonly intentId: string;
   readonly merchantId: string;
   readonly sku: string;
   readonly price: Readonly<Money>;
@@ -28,12 +36,13 @@ export interface HumanA5Decision {
   readonly accepted: readonly A5SignalCode[];
 }
 
-/** Решение человека по показанному товару. Принять можно только показанное; решение заморожено — вызывающий его не
- *  изменит после выдачи. */
-export function humanA5Decision(shown: ShownOffer, accepted: readonly A5SignalCode[]): HumanA5Decision {
+/** Решение человека по товару, показанному в покупке `purchase`. Принять можно только показанное; решение заморожено —
+ *  вызывающий его не изменит после выдачи. */
+export function humanA5Decision(purchase: ShownIn, shown: ShownOffer, accepted: readonly A5SignalCode[]): HumanA5Decision {
   const codes = [...new Set(accepted)];
   if (!codes.every((c) => shown.a5.includes(c))) throw new RangeError("решение A5: принят код, которого не было в показе");
   const d = Object.freeze({
+    intentId: purchase.intentId,
     merchantId: shown.merchantId,
     sku: shown.sku,
     price: Object.freeze({ amount: shown.product.price.amount, currency: shown.product.price.currency }),

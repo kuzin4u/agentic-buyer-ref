@@ -1,4 +1,4 @@
-// Ядро агента и события на стенде v0.5.0 (Р34 п. 2, 4, 8, 10): подписка при старте, push эмулятору получателя стенда →
+// Ядро агента и события на стенде v0.11.0 (Р34 п. 2, 4, 8, 10; Р41 п. 2): подписка при старте, push эмулятору получателя стенда →
 // его тело и x-event-id — в acceptPush ядра → чтение ленты; курсор в каталоге состояния переживает перезапуск.
 // Push на стенде получает эмулятор stand.agentReceiver, а не агент (РП40 п. 8) — тело передаётся вручную.
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
@@ -81,7 +81,7 @@ async function setup() {
   return { s, core, stateDir, calls, replace, host, pushUrl: `https://${host}/pao/events` };
 }
 
-describe("ядро и события на стенде v0.5.0 (Р34)", { timeout: STAND_TIMEOUT_MS }, () => {
+describe("ядро и события на стенде v0.11.0 (Р34)", { timeout: STAND_TIMEOUT_MS }, () => {
   it("подписка при старте, push → лента, курсор в каталоге состояния; перезапуск — без повторной обработки", async () => {
     const { s, core, stateDir, pushUrl, calls } = await setup();
     const a = core(pushUrl);

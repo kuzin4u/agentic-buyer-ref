@@ -1,4 +1,4 @@
-// Лента и подписка адаптера ПАО против стенда Платформы v0.5.0 (Р34 п. 1, 7, 8, 10; РП39, РП40). Курсор — event_id
+// Лента и подписка адаптера ПАО против стенда Платформы v0.11.0 (Р34 п. 1, 7, 8, 10; РП39, РП40; Р41 п. 2). Курсор — event_id
 // последнего события; чужой курсор — 400 REQUEST_INVALID; приостановленному — 403 AGENT_SUSPENDED и остановка.
 // Адрес подписки — хост из event_subscription_allow_hosts стенда, без литерала.
 import { afterEach, describe, expect, it } from "vitest";
@@ -26,7 +26,7 @@ async function started() {
 
 const key = (k: string) => ({ idempotencyKey: `idem-${k}` });
 
-describe("лента событий на стенде v0.5.0 (Р34 п. 1, РП39 п. 7)", { timeout: STAND_TIMEOUT_MS }, () => {
+describe("лента событий на стенде v0.11.0 (Р34 п. 1, РП39 п. 7)", { timeout: STAND_TIMEOUT_MS }, () => {
   it("без курсора — с начала; подпись человека даёт mandate.signed; после курсора — пусто", async () => {
     const { c, stand } = await started();
     expect(await c.platform.listEvents(null)).toEqual([]);
@@ -62,7 +62,7 @@ describe("лента событий на стенде v0.5.0 (Р34 п. 1, РП39
   });
 });
 
-describe("подписка на стенде v0.5.0 (Р34 п. 8, РП40)", { timeout: STAND_TIMEOUT_MS }, () => {
+describe("подписка на стенде v0.11.0 (Р34 п. 8, РП40)", { timeout: STAND_TIMEOUT_MS }, () => {
   it("адрес из списка стенда принят; push доставлен эмулятору получателя с x-event-id", async () => {
     const { c, stand } = await started();
     const host = stand.params.event_subscription_allow_hosts[0];

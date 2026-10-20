@@ -27,6 +27,20 @@ describe("граф импортов src (Р24)", { timeout: 60_000 }, () => {
     expect(allFiles(join(ROOT, "src")).filter((f) => !SOURCE_FILE.test(f))).toEqual([]);
   });
 
+  it("тестовый профиль магазина (tests/support/stand-shop.ts) — только в тестах: src не импортирует tests/, профиль подключает только прогон на стенде (Р38 п. 8, К6)", () => {
+    const rel = (f: string) => f.slice(ROOT.length + 1);
+    const SPEC = /(?:from\s+|import\s*\(\s*|import\s+|require\s*\(\s*|export\s+\*\s+from\s+)["']([^"']+)["']/g;
+    const intoTests = allFiles(join(ROOT, "src")).filter((f) =>
+      [...readFileSync(f, "utf8").matchAll(SPEC)].some(([, spec]) => spec!.startsWith(".") && rel(resolve(join(f, ".."), spec!)).startsWith("tests/")),
+    );
+    expect(intoTests.map(rel)).toEqual([]);
+    expect(allFiles(join(ROOT, "src")).filter((f) => readFileSync(f, "utf8").includes("TEST_PROFILE")).map(rel)).toEqual([]);
+    const users = allFiles(join(ROOT, "tests")).filter(
+      (f) => f.endsWith(".ts") && [...readFileSync(f, "utf8").matchAll(SPEC)].some(([, spec]) => spec!.endsWith("/stand-shop.js")),
+    );
+    expect(users.map(rel)).toEqual(["tests/contract/purchase-stand.test.ts"]);
+  });
+
   it("настоящий src: транзитивных нарушений нет", () => {
     const files = allFiles(join(ROOT, "src"));
     expect(files.length).toBeGreaterThan(20);

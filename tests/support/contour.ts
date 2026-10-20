@@ -37,6 +37,7 @@ import { MemoryJournal } from "../../src/agent/journal/index.js";
 import type { PaymentPlatform } from "../../src/agent/ports/payment-platform.js";
 import { KeyRing, generateKey } from "../../src/agent/signer/index.js";
 import { loadParams, type StandParams } from "../../src/shared/config.js";
+import type { DiagCode } from "../../src/shared/diag-codes.js";
 import type { AgentSelf } from "../../src/shared/domain.js";
 import { AGENT, PaoStand, type StandOptions } from "./pao-stand.js";
 
@@ -91,6 +92,9 @@ export interface Contour {
   readonly platform: PaymentPlatform;
   /** стадия 0 — как AgentCore.start */
   start(): Promise<AgentSelf>;
+  /** допуск для конвейера — как у места сборки (compose.ts): подпись остановлена — её код (CLOSED — UNKNOWN), иначе
+   *  последний start() не дал допуска — NOT_ADMITTED; допуск есть — null (Р38 п. 2, К6) */
+  admission(): DiagCode | null;
   /** только "stand" */
   readonly merchants?: Merchants;
   readonly stand?: Stand;
@@ -140,10 +144,21 @@ function agent(o: { dir: string; baseUrl: string; agentCode: string; params: Sta
   // Часы клиента ПАО — системные, как в tests/support/core.ts: окно времени подписи проверяет сервер по своим часам.
   const pao = { baseUrl: o.baseUrl, agentCode: o.agentCode, params: o.params, sleep: async () => {}, journal: o.journal };
   const platform = new PaoPlatform({ ...pao, signing: ring.port() });
+  let admitted = false;
   return {
     ring,
     platform,
-    start: () => ring.start((signing) => new PaoPlatform({ ...pao, signing }).agentSelf()),
+    start: async () => {
+      admitted = false;
+      const self = await ring.start((signing) => new PaoPlatform({ ...pao, signing }).agentSelf());
+      admitted = true;
+      return self;
+    },
+    admission: (): DiagCode | null => {
+      const stopped = ring.stopReason;
+      if (stopped !== null) return stopped === "CLOSED" ? "UNKNOWN" : stopped;
+      return admitted ? null : "NOT_ADMITTED";
+    },
   };
 }
 
@@ -179,6 +194,7 @@ async function stubContour(opts: StandOptions | undefined): Promise<Contour> {
     journal,
     platform: a.platform,
     start: a.start,
+    admission: a.admission,
     paoStand,
     calls: () =>
       paoStand.stub.calls.map((c) => ({
@@ -277,6 +293,7 @@ async function standContour(): Promise<Contour> {
       journal,
       platform: a.platform,
       start: a.start,
+      admission: a.admission,
       merchants,
       stand,
       calls: () => log.map((c) => ({ ...c })),

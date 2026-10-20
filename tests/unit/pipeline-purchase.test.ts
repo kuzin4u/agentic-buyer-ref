@@ -1,16 +1,15 @@
 // Конвейер стадий 0–6 на PaoStub (Р38 п. 2–5): допуск, INTENT с подписью, выдача в двух зонах с решениями каталога в
 // журнале, ворота держимых мандатов. Ленты у PaoStub нет — элементы ленты задаёт тест (consents.feed).
 import { afterEach, describe, expect, it } from "vitest";
-import { Purchase, PurchaseStopped, PurchaseTransitionForbidden } from "../../src/agent/pipeline/index.js";
+import { PurchaseStopped, PurchaseTransitionForbidden } from "../../src/agent/pipeline/index.js";
 import { MandateRefused } from "../../src/agent/mandates/index.js";
-import type { FeedItem, OfferSource } from "../../src/agent/ports/index.js";
 import { loadParams } from "../../src/shared/config.js";
-import type { DiagCode } from "../../src/shared/diag-codes.js";
-import { Consents, INTENT, event, feed } from "../support/consents.js";
+import { Consents, INTENT, event } from "../support/consents.js";
 import { coreOn } from "../support/core.js";
 import { expectJournalClean } from "../support/journal.js";
 import { AGENT, PaoStand } from "../support/pao-stand.js";
-import { BAKERY_FEED, bakery, feedOffers, type FeedShop } from "../support/shop.js";
+import { SHOP, purchaseOn, signedIntent, stages, type PurchaseSetup } from "../support/purchase.js";
+import { BAKERY_FEED, bakery, feedOffers, liveOffers, payments, shopOrders } from "../support/shop.js";
 
 let stand: PaoStand | undefined;
 afterEach(async () => {
@@ -20,46 +19,12 @@ afterEach(async () => {
   stand = undefined;
 });
 
-const SHOP: FeedShop = { feed: BAKERY_FEED, profile: bakery(), merchantId: "shop_1" };
-
-/** region: null — регион человека неизвестен (в профиле нет). */
-async function setup(o: { shops?: FeedShop[]; admission?: DiagCode | null; region?: string | null; offers?: OfferSource } = {}) {
-  const consents: Consents = new Consents(() => s.clock);
-  const s = new PaoStand({ handlers: consents.handlers() });
-  stand = s;
-  const { core, journal } = await coreOn(s);
-  await core.start();
-  const offers = o.offers ?? feedOffers(...(o.shops ?? [SHOP]));
-  /** лента: тест кладёт элементы до ожидания */
-  let items: FeedItem[] = [];
-  const purchase = new Purchase({
-    mandates: core.mandates,
-    events: () => feed(...items),
-    offers,
-    journal: core.journal,
-    admission: () => o.admission ?? null,
-    ...(o.region !== null && { region: o.region ?? "77" }),
-    now: () => s.clock,
-  });
-  const tail = () => journal.entries.slice(start);
-  const start = journal.entries.length;
-  return { core, journal, consents, stand: s, offers: offers as OfferSource & { calls?: number }, purchase, tail, setFeed: (...x: FeedItem[]) => (items = x) };
-}
-
-/** Покупка до INTENT_ACTIVE: запрос и подпись человека по ленте. */
-async function signedIntent(r: Awaited<ReturnType<typeof setup>>) {
-  const m = await r.purchase.intent(INTENT, { idempotencyKey: "idem-intent-1" });
-  r.setFeed({ kind: "event", event: r.consents.sign(m.id) });
-  return r.purchase.awaitIntent();
-}
+const setup = (o: PurchaseSetup = {}) => purchaseOn(o, (s) => (stand = s));
 
 /** Фид без самовывоза: ни у магазина, ни у товаров (доставка — только по регионам магазина, у tartine-cheese её нет). */
 const NO_PICKUP = BAKERY_FEED.replace(/<pickup-options>[\s\S]*?<\/pickup-options>/, "").replace("<pickup>true</pickup>", "");
 const SKUS = ["tartine", "zavarnoy", "tartine-cheese", "borodinsky"];
 const OPS = { post: "POST /pao/v1/mandates", verify: "GET /pao/v1/mandates/{id}/verify" } as const;
-
-const stages = (r: { tail: () => { kind: string; detail?: string; reason?: string }[] }) =>
-  r.tail().filter((e) => e.kind === "purchase.stage").map((e) => (e.reason ? `${e.detail}:${e.reason}` : e.detail));
 
 describe("стадия 0 — допуск (Р38 п. 2)", () => {
   it("без допуска — STOPPED NOT_ADMITTED, обращений к Платформе нет", async () => {
@@ -67,7 +32,7 @@ describe("стадия 0 — допуск (Р38 п. 2)", () => {
     const before = r.stand.log().length;
     await expect(r.purchase.intent(INTENT, { idempotencyKey: "idem-0" })).rejects.toBeInstanceOf(PurchaseStopped);
     expect(r.purchase.state).toBe("STOPPED");
-    expect(r.purchase.machine.reason).toBe("NOT_ADMITTED");
+    expect(r.purchase.reason).toBe("NOT_ADMITTED");
     expect(r.stand.log().length).toBe(before);
     expect(stages(r)).toEqual(["STOPPED:NOT_ADMITTED"]);
   });
@@ -82,6 +47,8 @@ describe("стадия 0 — допуск (Р38 п. 2)", () => {
 });
 
 describe("стадия 0 через место сборки — core.purchase() (Р38 п. 2, ревью К2.2 № 4, № 9)", () => {
+  const ports = (s: PaoStand) => ({ offers: feedOffers(SHOP), live: liveOffers(SHOP, () => s.clock), shop: shopOrders(SHOP), payment: payments() });
+
   async function bare() {
     const consents: Consents = new Consents(() => s.clock);
     const s = new PaoStand({ handlers: consents.handlers() });
@@ -91,7 +58,7 @@ describe("стадия 0 через место сборки — core.purchase() 
 
   it("start() не вызывался — NOT_ADMITTED, обращений нет", async () => {
     const { s, core } = await bare();
-    const p = core.purchase({ offers: feedOffers(SHOP) });
+    const p = core.purchase(ports(s));
     const before = s.log().length;
     await expect(p.intent(INTENT, { idempotencyKey: "idem-0" })).rejects.toMatchObject({ code: "NOT_ADMITTED" });
     expect(s.log().length).toBe(before);
@@ -101,7 +68,7 @@ describe("стадия 0 через место сборки — core.purchase() 
     const { s, core } = await bare();
     s.exclude([]);
     await core.start().catch(() => undefined);
-    const p = core.purchase({ offers: feedOffers(SHOP) });
+    const p = core.purchase(ports(s));
     const before = s.log().length;
     await expect(p.intent(INTENT, { idempotencyKey: "idem-0" })).rejects.toMatchObject({ code: "AGENT_EXCLUDED" });
     expect(s.log().length).toBe(before);
@@ -111,18 +78,18 @@ describe("стадия 0 через место сборки — core.purchase() 
     const { s, core } = await bare();
     await core.start();
     core.close();
-    const p = core.purchase({ offers: feedOffers(SHOP) });
+    const p = core.purchase(ports(s));
     const before = s.log().length;
     await expect(p.intent(INTENT, { idempotencyKey: "idem-0" })).rejects.toBeInstanceOf(PurchaseStopped);
     expect(p.state).toBe("STOPPED");
-    expect(p.machine.reason).toBe("UNKNOWN");
+    expect(p.reason).toBe("UNKNOWN");
     expect(s.log().length).toBe(before);
   });
 
   it("допуск есть — покупка идёт на клиенте мандатов ядра", async () => {
     const { s, core } = await bare();
     await core.start();
-    const p = core.purchase({ offers: feedOffers(SHOP) });
+    const p = core.purchase(ports(s));
     await p.intent(INTENT, { idempotencyKey: "idem-intent-1" });
     expect(p.state).toBe("INTENT_PENDING");
     expect(s.log().filter((c) => c.op === OPS.post)).toHaveLength(1);
@@ -281,7 +248,7 @@ describe("ворота держимых мандатов перед поиско
       await r.core.mandates.refreshHeld({ kind: "event", event: event("mandate.revoked", m.id) });
     };
     await expect(r.purchase.search()).rejects.toBeInstanceOf(PurchaseStopped);
-    expect(r.purchase.machine.reason).toBe("MANDATE_NOT_ACTIVE");
+    expect(r.purchase.reason).toBe("MANDATE_NOT_ACTIVE");
     expect(r.purchase.offers).toBeNull();
     expect(stages(r).at(-1)).toBe("STOPPED:MANDATE_NOT_ACTIVE");
   });
@@ -291,7 +258,7 @@ describe("ворота держимых мандатов перед поиско
     await signedIntent(r);
     r.consents.outcome = "OUT_OF_SCOPE";
     await expect(r.purchase.search()).rejects.toBeInstanceOf(MandateRefused);
-    expect(r.purchase.machine.reason).toBe("MANDATE_OUT_OF_SCOPE");
+    expect(r.purchase.reason).toBe("MANDATE_OUT_OF_SCOPE");
     expect(r.tail().filter((e) => e.kind === "agent.refused").map((e) => e.reason)).toEqual(["MANDATE_OUT_OF_SCOPE"]);
     expect(r.offers.calls).toBe(0);
   });
@@ -303,7 +270,7 @@ describe("сбой шага — STOPPED с кодом (Р38 п. 4, инвари�
     r.stand.stub.fail(OPS.post, { code: "STATE_UNAVAILABLE" }, loadParams().pao_max_attempts);
     await expect(r.purchase.intent(INTENT, { idempotencyKey: "idem-intent-1" })).rejects.toThrow();
     expect(r.purchase.state).toBe("STOPPED");
-    expect(r.purchase.machine.reason).toBe("STATE_UNAVAILABLE");
+    expect(r.purchase.reason).toBe("STATE_UNAVAILABLE");
     // сбой Платформы — не отказ действовать: agent.refused не пишется (Р38 п. 4)
     expect(r.tail().filter((e) => e.kind === "agent.refused")).toEqual([]);
   });
@@ -313,7 +280,7 @@ describe("сбой шага — STOPPED с кодом (Р38 п. 4, инвари�
     const r = await setup({ offers: { search: () => Promise.reject(boom) } });
     await signedIntent(r);
     await expect(r.purchase.search()).rejects.toBe(boom);
-    expect(r.purchase.machine.reason).toBe("UNKNOWN");
+    expect(r.purchase.reason).toBe("UNKNOWN");
   });
 
   it("выдача не той формы — STOPPED UNKNOWN, а не покупка в прежнем состоянии (ревью К2.2 № 2)", async () => {
@@ -321,7 +288,7 @@ describe("сбой шага — STOPPED с кодом (Р38 п. 4, инвари�
     await signedIntent(r);
     await expect(r.purchase.search()).rejects.toBeInstanceOf(TypeError);
     expect(r.purchase.state).toBe("STOPPED");
-    expect(r.purchase.machine.reason).toBe("UNKNOWN");
+    expect(r.purchase.reason).toBe("UNKNOWN");
   });
 });
 

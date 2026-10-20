@@ -13,7 +13,8 @@ import { MandateClient } from "./mandates/index.js";
 import { EventFeed, EventsStopped, FileCursorStore, acceptPush, type PushReply } from "./events/index.js";
 import { KeyRing, SignerKeyRejected, SignerStopped } from "./signer/index.js";
 import { Purchase } from "./pipeline/index.js";
-import type { OfferSource } from "./ports/shop.js";
+import type { LiveOfferSource } from "./ports/catalog.js";
+import type { OfferSource, PaymentSteps, ShopPort } from "./ports/shop.js";
 import {
   AGENT_DIAG,
   AGENT_STOP_CODES,
@@ -78,6 +79,9 @@ export interface AgentCore {
 /** Порты стадий покупки от вызывающего (Р38 п. 2) и регион человека из профиля (Р32 п. 5). */
 export interface PurchasePorts {
   offers: OfferSource;
+  live: LiveOfferSource;
+  shop: ShopPort;
+  payment: PaymentSteps;
   region?: string;
 }
 
@@ -226,6 +230,10 @@ export function createAgentCore(o: AgentCoreOptions): AgentCore {
         failureCode: startFailureCode,
         now,
         offers: p.offers,
+        live: p.live,
+        shop: p.shop,
+        payment: p.payment,
+        params,
         ...(p.region !== undefined && { region: p.region }),
       }),
     // Ключи загружаются до обращений к Платформе (сбой хранилища — без сети), затем курсор ленты и конфигурация, затем

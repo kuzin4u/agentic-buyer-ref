@@ -127,13 +127,18 @@ export class PurchaseMachine {
   to(next: Exclude<PurchaseState, "STOPPED">): void {
     const from = this.#state;
     // в STOPPED — только stop() с кодом: to("STOPPED") в обход типа — тоже запрещённый переход (ревью К2.1 № 3)
-    if ((next as PurchaseState) === "STOPPED" || !allowed(from, next)) {
-      this.o.journal.record({ at: this.#at(), kind: "agent.refused", reason: "PIPELINE_TRANSITION_FORBIDDEN", detail: `${from}->${next}`, ...this.mandate });
-      if (!isTerminal(from)) this.stop("PIPELINE_TRANSITION_FORBIDDEN");
-      throw new PurchaseTransitionForbidden(from, next);
-    }
+    if ((next as PurchaseState) === "STOPPED" || !allowed(from, next)) this.forbid(next);
     this.#state = next;
     this.o.journal.record({ at: this.#at(), kind: "purchase.stage", detail: next, ...this.mandate });
+  }
+
+  /** Запрещённый переход: таблица разрешает, но условие стадии не выполнено так, что это дефект вызывающего (стадия 4
+   *  без надобности, авторизация без подтверждения, повторный вход в идущую стадию) — тот же отказ, что у таблицы. */
+  forbid(next: PurchaseState): never {
+    const from = this.#state;
+    this.o.journal.record({ at: this.#at(), kind: "agent.refused", reason: "PIPELINE_TRANSITION_FORBIDDEN", detail: `${from}->${next}`, ...this.mandate });
+    if (!isTerminal(from)) this.stop("PIPELINE_TRANSITION_FORBIDDEN");
+    throw new PurchaseTransitionForbidden(from, next);
   }
 
   /** Остановка с кодом реестра; из конечного состояния — без действия (первая причина остаётся). */

@@ -483,14 +483,33 @@ describe("стадии 4–6 — исходы из порта PaymentSteps (ин
   it("авторизация, пока стадия 4 ждёт человека, — запрещённый переход, порт авторизации не вызван (ревью К3 № 4)", async () => {
     let release: (s: "APPROVED") => void = () => {};
     const pending = new Promise<"APPROVED">((res) => (release = res));
+    // порт подтверждения начал ждать человека — после проверки по мандату (Р40 п. 5), уже в CONFIRMING
+    let started: () => void = () => {};
+    const entered = new Promise<void>((res) => (started = res));
     const steps = payments();
-    const r = await setup({ payment: { ...steps, confirm: () => pending } });
+    const r = await setup({ payment: { ...steps, confirm: () => (started(), pending) } });
     await ordered(r, Math.floor(THRESHOLD / TARTINE) + 1);
     const waiting = r.purchase.confirm();
+    await entered;
     await expect(r.purchase.authorize({ idempotencyKey: "idem-pay-1" })).rejects.toBeInstanceOf(PurchaseTransitionForbidden);
+    expect(r.tail().filter((e) => e.reason === "PIPELINE_TRANSITION_FORBIDDEN" && e.kind === "agent.refused").map((e) => e.detail)).toEqual(["CONFIRMING->AUTHORIZING"]);
     release("APPROVED");
     await expect(waiting).rejects.toBeInstanceOf(PurchaseStopped);
     expect(r.purchase.state).toBe("STOPPED");
+    expect(steps.calls).toEqual([]);
+  });
+
+  it("авторизация, пока до стадии 4 идёт verify, — запрещённый переход ORDERED->AUTHORIZING, порты не вызваны (Р40 п. 5)", async () => {
+    const steps = payments();
+    const r = await setup({ payment: steps });
+    await ordered(r, Math.floor(THRESHOLD / TARTINE) + 1);
+    const from = r.stand.stub.calls.length;
+    const checking = r.purchase.confirm();
+    await expect(r.purchase.authorize({ idempotencyKey: "idem-pay-1" })).rejects.toBeInstanceOf(PurchaseTransitionForbidden);
+    await expect(checking).rejects.toBeInstanceOf(PurchaseStopped);
+    expect(r.tail().filter((e) => e.reason === "PIPELINE_TRANSITION_FORBIDDEN" && e.kind === "agent.refused").map((e) => e.detail)).toEqual(["ORDERED->AUTHORIZING"]);
+    // verify INTENT уже ушёл; CART после остановки не проверяется
+    expect(opsFrom(r, from)).toEqual([VERIFY]);
     expect(steps.calls).toEqual([]);
   });
 
@@ -794,6 +813,76 @@ describe("ворота перед стадией 5 (Р38 п. 3, К4): оба м�
     // все попытки — по INTENT, до CART ворота не дошли
     expect(verified(r).slice(before)).toEqual(Array(attempts).fill(r.purchase.intentMandate!.id));
     expect(r.tail().slice(start).filter((e) => e.kind === "agent.refused")).toEqual([]);
+    expect(r.payment.calls).toEqual([]);
+  });
+});
+
+describe("проверка по мандату до стадии 4 (Р40 п. 5, К4а № 3): человека не просят подтвердить покупку, которую ворота отклонят", () => {
+  const ABOVE = Math.floor(THRESHOLD / TARTINE) + 1;
+
+  it("до запроса подтверждения — verify INTENT, затем CART, без иных обращений; в воротах стадии 5 — снова", async () => {
+    const r = await setup();
+    await ordered(r, ABOVE);
+    expect(r.purchase.needsConfirmation).toBe(true);
+    const intentId = r.purchase.intentMandate!.id;
+    const cartId = r.purchase.cartMandate!.id;
+    const from = r.stand.stub.calls.length;
+    const before = verified(r).length;
+    await r.purchase.confirm();
+    expect(opsFrom(r, from)).toEqual([VERIFY, VERIFY]);
+    expect(verified(r).slice(before)).toEqual([intentId, cartId]);
+    expect(r.payment.calls).toEqual(["confirm"]);
+    await r.purchase.authorize({ idempotencyKey: "idem-pay-1" });
+    expect(verified(r).slice(before)).toEqual([intentId, cartId, intentId, cartId]);
+  });
+
+  for (const which of ["INTENT", "CART"] as const) {
+    it(`остаток ${which} меньше итога — STOPPED MANDATE_AMOUNT_LEFT_INSUFFICIENT до запроса подтверждения`, async () => {
+      const r = await setup();
+      await ordered(r, ABOVE);
+      const intentId = r.purchase.intentMandate!.id;
+      const id = which === "INTENT" ? intentId : r.purchase.cartMandate!.id;
+      r.consents.left.set(id, TARTINE * ABOVE - 1);
+      const from = r.stand.stub.calls.length;
+      await expect(r.purchase.confirm()).rejects.toMatchObject({ code: "MANDATE_AMOUNT_LEFT_INSUFFICIENT" });
+      // по INTENT не хватает — CART уже не проверяется
+      expect(opsFrom(r, from)).toEqual(which === "INTENT" ? [VERIFY] : [VERIFY, VERIFY]);
+      expect(r.purchase.state).toBe("STOPPED");
+      expect(r.tail().slice(-2).map((e) => [e.kind, e.reason, e.mandate])).toEqual([
+        ["agent.refused", "MANDATE_AMOUNT_LEFT_INSUFFICIENT", id],
+        ["purchase.stage", "MANDATE_AMOUNT_LEFT_INSUFFICIENT", intentId],
+      ]);
+      // в CONFIRMING не входили, порт подтверждения не вызван
+      expect(stages(r)).not.toContain("CONFIRMING");
+      expect(r.payment.calls).toEqual([]);
+    });
+  }
+
+  for (const which of ["INTENT", "CART"] as const) {
+    it(`verify ${which} не CONFIRMED — agent.refused MANDATE_OUT_OF_SCOPE и STOPPED до запроса подтверждения`, async () => {
+      const r = await setup();
+      await ordered(r, ABOVE);
+      const id = which === "INTENT" ? r.purchase.intentMandate!.id : r.purchase.cartMandate!.id;
+      r.consents.outcomeOf.set(id, "OUT_OF_SCOPE");
+      const from = r.stand.stub.calls.length;
+      await expect(r.purchase.confirm()).rejects.toBeInstanceOf(MandateRefused);
+      expect(r.purchase.reason).toBe("MANDATE_OUT_OF_SCOPE");
+      expect(opsFrom(r, from)).toEqual(which === "INTENT" ? [VERIFY] : [VERIFY, VERIFY]);
+      expect(r.tail().filter((e) => e.kind === "agent.refused").map((e) => [e.reason, e.mandate])).toEqual([["MANDATE_OUT_OF_SCOPE", id]]);
+      expect(stages(r)).not.toContain("CONFIRMING");
+      expect(r.payment.calls).toEqual([]);
+    });
+  }
+
+  it("INTENT отозван после заказа — MANDATE_NOT_ACTIVE до запроса подтверждения, ни verify, ни порта", async () => {
+    const r = await setup();
+    await ordered(r, ABOVE);
+    const id = r.purchase.intentMandate!.id;
+    r.consents.mandates.get(id)!.status = "REVOKED";
+    await r.core.mandates.refreshHeld({ kind: "event", event: event("mandate.revoked", id) });
+    const from = r.stand.stub.calls.length;
+    await expect(r.purchase.confirm()).rejects.toMatchObject({ code: "MANDATE_NOT_ACTIVE" });
+    expect(opsFrom(r, from)).toEqual([]);
     expect(r.payment.calls).toEqual([]);
   });
 });

@@ -334,14 +334,16 @@ export class Purchase {
   }
 
   /** Стадия 4: подтверждение человеком через порт (AG-13): исход — из события Платформы, конвейер его не создаёт
-   *  (инвариант 7). Без надобности — запрещённый переход. Не APPROVED — STOPPED CONFIRMATION_REQUIRED. */
+   *  (инвариант 7). Без надобности — запрещённый переход. До запроса — та же проверка по мандату, что в воротах стадии 5
+   *  (Р40 п. 5): человека не просят подтвердить покупку, которую ворота затем отклонят. Не APPROVED — STOPPED
+   *  CONFIRMATION_REQUIRED. */
   confirm(signal?: AbortSignal): Promise<void> {
     return this.#stage("CONFIRMING", async () => {
       // валюта и доля — до решения о стадии 4: код отказа не зависит от пути вызывающего (ревью К2 В1)
       const c = this.#context();
       this.#prepay(c.intent, c.cart);
       if (!this.needsConfirmation) this.#machine.forbid("CONFIRMING");
-      this.#held(c.intent, c.cart);
+      await this.#scope(c.intent, c.cart);
       this.#machine.to("CONFIRMING");
       const status = await this.#guard(() => this.o.payment.confirm(copy(c), signal));
       this.#held(c.intent, c.cart);
@@ -398,13 +400,20 @@ export class Purchase {
     });
   }
 
-  /** Ворота перед стадией 5 (Р38 п. 3): INTENT и CART оба среди держимых (сигнал, без сети), затем verify каждого и
-   *  решение политики по нему (Р39 п. 1.1–1.3: остаток > 0, в валюте итога и не меньше итога, продавец и валюта в
-   *  пределах; инвариант 6) —
-   *  непосредственно перед запросом реквизита; после verify — держимые ещё раз (отзыв по ленте во время проверки). Отзыв —
-   *  agent.refused MANDATE_NOT_ACTIVE; verify не CONFIRMED — MANDATE_OUT_OF_SCOPE (запись клиента мандатов); отказ
-   *  политики — agent.refused с её кодом; всё — STOPPED до реквизита. */
+  /** Ворота перед стадией 5 (Р38 п. 3): проверка по мандату (`#scope`) непосредственно перед запросом реквизита, затем
+   *  пропуск машины в AUTHORIZING. */
   async #gate(intent: Mandate, cart: Mandate): Promise<void> {
+    await this.#scope(intent, cart);
+    // без пропуска машина не пустит в AUTHORIZING: запрещённый переход по К2.1, даже если таблица его разрешает
+    this.#machine.passGate5();
+  }
+
+  /** Проверка по мандату (Р38 п. 3, Р40 п. 5) — в воротах стадии 5 и до стадии 4: INTENT и CART оба среди держимых
+   *  (сигнал, без сети), затем verify каждого и решение политики по нему (Р39 п. 1.1–1.3: остаток > 0, в валюте итога и
+   *  не меньше итога, продавец и валюта в пределах; инвариант 6); после verify — держимые ещё раз (отзыв по ленте во время
+   *  проверки). Отзыв — agent.refused MANDATE_NOT_ACTIVE; verify не CONFIRMED — MANDATE_OUT_OF_SCOPE (запись клиента
+   *  мандатов); отказ политики — agent.refused с её кодом; всё — STOPPED до запроса подтверждения или реквизита. */
+  async #scope(intent: Mandate, cart: Mandate): Promise<void> {
     const total = this.#total(cart);
     // продавец — из подписанного CART, как его видит Платформа (ревью К2 М3); с выдачей сверен клиентом мандатов
     const merchantId = cart.cart!.merchantId;
@@ -416,8 +425,6 @@ export class Purchase {
     const cartCheck = await this.#guard(() => this.o.mandates.requireActive(cart));
     this.#refuse(mayAuthorize({ intent, cart, merchantId, total }, { intent: intentCheck, cart: cartCheck }));
     this.#held(intent, cart);
-    // без пропуска машина не пустит в AUTHORIZING: запрещённый переход по К2.1, даже если таблица его разрешает
-    this.#machine.passGate5();
   }
 
   /** Политика по сигналам A5 перед проектом CART (Р32 п. 2, Р40 п. 3–4): отказ — cart.refused по каждому сигналу, который

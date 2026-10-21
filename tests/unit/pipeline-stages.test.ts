@@ -369,7 +369,7 @@ describe("стадия 3 — корзина по живой цене перед 
     const offer = await offers(r);
     const from = r.stand.stub.calls.length;
     const cart = await r.purchase.cart({ ...key(offer), qty: 2, keyTermsShown: true }, { idempotencyKey: "idem-cart-1" });
-    // живая проверка — до verify INTENT и запроса CART: одна, по выбору человека
+    // живая проверка — после verify INTENT и до запроса CART: одна, по выбору человека
     expect(r.live.calls).toEqual([{ sku: "tartine", quantity: 2, region: "77" }]);
     expect(opsFrom(r, from)).toEqual([VERIFY, "POST /pao/v1/mandates"]);
     expect(cart).toMatchObject({ kind: "CART", parentId: r.purchase.intentMandate!.id });
@@ -380,18 +380,21 @@ describe("стадия 3 — корзина по живой цене перед 
     ["цена выросла", { price: { amount: TARTINE + 100, currency: "RUB" } }, "NEW_CART_MANDATE", ["LIVE_PRICE_UP"]],
     ["цена снизилась", { price: { amount: TARTINE - 100, currency: "RUB" } }, "NEW_CART_MANDATE", ["LIVE_PRICE_DOWN"]],
     ["нет в наличии", { availability: { inStock: false } }, "TELL_STOCK", ["LIVE_OUT_OF_STOCK"]],
+    ["не хватает количества на 2 шт.", { availability: { inStock: true, quantity: 1 } }, "TELL_STOCK", ["LIVE_QUANTITY"]],
+    ["цена в другой валюте", { price: { amount: TARTINE, currency: "USD" } }, "TELL_UNCONFIRMED", ["LIVE_CURRENCY"]],
   ] as const;
   for (const [name, over, next, codes] of cases) {
     it(`${name} перед CART — CartLiveRefused ${next}, CART не запрошен, покупка в OFFERS (Р43 п. 1, Р32 п. 4)`, async () => {
       const r = await setup({ live: liveOffers(SHOP, () => stand!.clock, () => over) });
       const offer = await offers(r);
       const from = r.stand.stub.calls.length;
-      const err = await r.purchase.cart({ ...key(offer), qty: 1, keyTermsShown: true }, { idempotencyKey: "idem-cart-1" }).catch((e: unknown) => e);
+      const err = await r.purchase.cart({ ...key(offer), qty: 2, keyTermsShown: true }, { idempotencyKey: "idem-cart-1" }).catch((e: unknown) => e);
       expect(err).toBeInstanceOf(CartLiveRefused);
       expect(err).toMatchObject({ next, codes });
       expect(r.purchase.state).toBe("OFFERS");
       expect(r.purchase.cartMandate).toBeNull();
-      expect(opsFrom(r, from)).toEqual([]);
+      // verify INTENT — до живой проверки (П05), CART не запрошен
+      expect(opsFrom(r, from)).toEqual([VERIFY]);
       expect(r.tail().filter((e) => e.kind === "cart.live_refused").map((e) => [e.reason, e.detail, e.ref, e.merchant, e.mandate])).toEqual(
         codes.map((c) => [c, next, "tartine", "shop_1", r.purchase.intentMandate!.id]),
       );
@@ -399,13 +402,64 @@ describe("стадия 3 — корзина по живой цене перед 
     });
   }
 
+  it("INTENT отозван у Платформы, события ещё нет — verify до живой проверки: STOPPED, к витрине ни одного обращения (П05)", async () => {
+    const r = await setup();
+    const offer = await offers(r);
+    r.consents.mandates.get(r.purchase.intentMandate!.id)!.status = "REVOKED";
+    const from = r.stand.stub.calls.length;
+    await expect(r.purchase.cart({ ...key(offer), qty: 1, keyTermsShown: true }, { idempotencyKey: "idem-cart-1" })).rejects.toBeInstanceOf(MandateRefused);
+    expect(r.purchase.state).toBe("STOPPED");
+    expect(r.live.calls).toEqual([]);
+    expect(opsFrom(r, from)).toEqual([VERIFY]);
+  });
+
+  it("отзыв INTENT пришёл по ленте во время живой проверки — STOPPED MANDATE_NOT_ACTIVE, CART не запрошен, решение A5 не потрачено (Р38 п. 3)", async () => {
+    const ok = liveOffers(SHOP, () => stand!.clock);
+    const at: { run?: PurchaseRun } = {};
+    const r = await setup({
+      shops: [{ ...SHOP, profile: bakery({ returns: { days: 0, text: "Возврат в течение 14 дней" } }) }],
+      live: {
+        fetch: async (req, signal) => {
+          const id = at.run!.purchase.intentMandate!.id;
+          at.run!.consents.mandates.get(id)!.status = "REVOKED";
+          await at.run!.core.mandates.refreshHeld({ kind: "event", event: event("mandate.revoked", id) });
+          return ok.fetch(req, signal);
+        },
+      },
+    });
+    at.run = r;
+    const offer = await offers(r);
+    const decision = humanA5Decision(shownIn(r), offer, offer.a5);
+    const before = r.stand.log().filter((c) => c.op === "POST /pao/v1/mandates").length;
+    await expect(r.purchase.cart({ ...key(offer), qty: 1, decision, keyTermsShown: true }, { idempotencyKey: "idem-cart-1" })).rejects.toBeInstanceOf(PurchaseStopped);
+    expect(r.purchase.reason).toBe("MANDATE_NOT_ACTIVE");
+    expect(r.stand.log().filter((c) => c.op === "POST /pao/v1/mandates").length).toBe(before);
+    expect(isSpent(decision)).toBe(false);
+  });
+
+  it("журнал не принял cart.live_refused — STOPPED UNKNOWN, CART не запрошен (инвариант 4)", async () => {
+    const boom = new Error("журнал недоступен");
+    const r = await setup({
+      live: liveOffers(SHOP, () => stand!.clock, () => ({ availability: { inStock: false } })),
+      tap: (e) => {
+        if (e.kind === "cart.live_refused") throw boom;
+      },
+    });
+    const offer = await offers(r);
+    const from = r.stand.stub.calls.length;
+    await expect(r.purchase.cart({ ...key(offer), qty: 1, keyTermsShown: true }, { idempotencyKey: "idem-cart-1" })).rejects.toBe(boom);
+    expect(r.purchase.state).toBe("STOPPED");
+    expect(r.purchase.reason).toBe("UNKNOWN");
+    expect(opsFrom(r, from)).toEqual([VERIFY]);
+  });
+
   it("продавец не ответил перед CART — LIVE_UNAVAILABLE, CART не запрошен; решение A5 не потрачено", async () => {
     const r = await setup({ shops: [{ ...SHOP, profile: bakery({ returns: { days: 0, text: "Возврат в течение 14 дней" } }) }], live: { fetch: () => Promise.reject(new Error("сбой")) } });
     const offer = await offers(r);
     const decision = humanA5Decision(shownIn(r), offer, offer.a5);
     const from = r.stand.stub.calls.length;
     await expect(r.purchase.cart({ ...key(offer), qty: 1, decision, keyTermsShown: true }, { idempotencyKey: "idem-cart-1" })).rejects.toMatchObject({ next: "TELL_UNCONFIRMED", codes: ["LIVE_UNAVAILABLE"] });
-    expect(opsFrom(r, from)).toEqual([]);
+    expect(opsFrom(r, from)).toEqual([VERIFY]);
     expect(isSpent(decision)).toBe(false);
     expect(r.purchase.state).toBe("OFFERS");
   });

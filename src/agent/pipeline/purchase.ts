@@ -300,12 +300,19 @@ export class Purchase {
       const purchase: CartPurchase = { intentId: intent.id, mode: intent.confirmationMode };
       this.#draftable(verdict, purchase, choice.decision);
       this.#held(intent);
+      // verify INTENT — до обращения к витрине: без действующего INTENT ни одного обращения к витринам (П05, как в search();
+      // решение владельца по ревью К1 № 5)
+      await this.#guard(() => this.o.mandates.requireActive(intent));
       // цена позиции — из живой проверки непосредственно перед CART (Р43 п. 1); проверка перед заказом остаётся (Р32 п. 3)
       const price = await this.#liveBeforeCart(offer, choice.qty);
       const total = cartTotal(price, choice.qty);
-      if (total === null) this.#halt("CART_QTY_INVALID");
+      // защита: при ok живая цена равна цене выдачи, а её итог проверен выше — недостижимо, но с записью, как и выше
+      if (total === null) {
+        this.#record({ kind: "agent.refused", reason: "CART_QTY_INVALID", ...skuRef(offer.sku) });
+        this.#halt("CART_QTY_INVALID");
+      }
+      // держимые — повторно после живой проверки: лента могла вывести INTENT во время ожидания (Р38 п. 3)
       this.#held(intent);
-      await this.#guard(() => this.o.mandates.requireActive(intent));
       // вторая защита: решение — повторно непосредственно перед тратой, без ожидания между ними (при `#busy` и привязке к
       // INTENT потратить его на другую корзину во время verify нельзя — недостижимо, нюанс К2 Р40). Тратится только
       // решение, которое покрыло сигналы этого товара, при любом исходе запроса CART (Р40 п. 2, fail-closed)

@@ -6,6 +6,7 @@
 // проверяются.
 import { afterEach, describe, expect, it } from "vitest";
 import { shopBy, type Contour } from "../support/contour.js";
+import { expectJournalClean } from "../support/journal.js";
 import { STAND_TIMEOUT_MS, standPurchase } from "../support/stand-purchase.js";
 
 let c: Contour | undefined;
@@ -34,10 +35,10 @@ describe("П10 — корзина и мандат корзины", { timeout: ST
 
     const before = r.c.calls().length;
     const cart = await r.purchase.cart({ merchantId: offer.merchantId, sku: offer.sku, qty: QTY, keyTermsShown: true }, { idempotencyKey: "idem-cart-p10" });
-    // живая проверка у витрины — непосредственно перед verify INTENT и запросом CART (Р43 п. 1)
+    // verify INTENT, затем живая проверка у витрины — непосредственно перед запросом CART (П05, Р43 п. 1)
     expect(r.c.calls().slice(before).map((x) => `${x.target} ${x.route.replaceAll(intent.id, "{intent}")} ${x.status}`).filter((s) => !s.startsWith("pao GET /pao/v1/events"))).toEqual([
-      `merchants GET /v1/shops/${NORMAL.id}/catalog 200`,
       "pao GET /pao/v1/mandates/{intent}/verify 200",
+      `merchants GET /v1/shops/${NORMAL.id}/catalog 200`,
       "pao POST /pao/v1/mandates 201",
     ]);
     const shown = { amount: QTY * PRICE.amount, currency: PRICE.currency };
@@ -59,5 +60,12 @@ describe("П10 — корзина и мандат корзины", { timeout: ST
       `POST /v1/shops/${NORMAL.id}/orders 201`,
     ]);
     expect(r.payment.calls).toEqual([]);
+    // журнал агента: отказов нет, поля и коды — из набора, ни nonce, ни ключей обращений (ревью К1 № 6)
+    const entries = r.c.journal.entries;
+    expect(entries.filter((e) => e.kind === "agent.refused" || e.kind === "cart.live_refused" || e.kind === "order.live_refused")).toEqual([]);
+    expect(entries.filter((e) => e.kind === "purchase.stage").map((e) => e.detail).slice(-3)).toEqual(["CART_PENDING", "CART_ACTIVE", "ORDERED"]);
+    const secrets = r.c.calls().flatMap((x) => [x.nonce, x.idempotencyKey]).filter((v): v is string => typeof v === "string");
+    // журнал контура собран без compose — кода агента в записях нет (Р37 п. 3)
+    expectJournalClean(entries, null, [], secrets);
   });
 });

@@ -134,7 +134,10 @@ export class MandateClient {
    *  агент располагает: порядок отзыва CART — как у родителя (Р33 п. 4).
    *  После 201 — статус (РП35): PENDING_SIGNATURE — ждать подписи; ACTIVE (повтор тем же ключом позже 24 ч) — статус
    *  только из GET (РП34); прочие — отказ, новый мандат молча не создаётся (новый ключ — после нового поручения человека). */
-  async request(draft: MandateDraft, m: Mutation, parent: Mandate | null = null): Promise<Mandate> {
+  async request(input: MandateDraft, m: Mutation, parent: Mandate | null = null): Promise<Mandate> {
+    // проект — своей копией до первого ожидания: проверенное, отправленное и сверенное с ответом — одно и то же (бюджет
+    // поручения подписывает человек; ревью К1а); бросающий геттер — отказ промиса до обращения
+    const draft: MandateDraft = structuredClone(input);
     const missing = missingTerms(draft, this.now());
     // родитель — только у CART и только тот, на который ссылается проект (ревью К2.2 № 6)
     if (draft.kind === "CART" ? parent?.id !== draft.parentId : parent !== null) missing.push("parent");

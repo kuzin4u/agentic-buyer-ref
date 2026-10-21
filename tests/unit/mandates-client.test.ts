@@ -341,3 +341,26 @@ describe("клиент мандатов на PaoStub", () => {
     expect(after - before).toBe(1);
   });
 });
+
+describe("проект мандата — своей копией до обращения (ревью К1а)", () => {
+  it("геттер предела отдаёт 5 000 ₽, затем 50 000 ₽ — проверен, отправлен и сверен один предел; мандат с ним", async () => {
+    const { core, consents, stand } = await setup();
+    let reads = 0;
+    const draft = { ...INTENT, get amountLimit() { return ++reads === 1 ? RUB(500000) : RUB(5000000); } };
+    const m = await core.mandates.request(draft, { idempotencyKey: "idem_once" });
+    expect(reads).toBe(1);
+    expect(m.amountLimit).toEqual(RUB(500000));
+    // у Платформы (журнал согласий заглушки) — тот же предел, что проверен
+    expect(consents.mandates.get(m.id)).toMatchObject({ amount_limit: 500000 });
+    expect(stand.stub.violations).toEqual([]);
+  });
+
+  it("бросающий геттер проекта — отказ промиса, обращения нет", async () => {
+    const { core, stand } = await setup();
+    const boom = new Error("геттер");
+    const draft = { ...INTENT, get subject(): string { throw boom; } };
+    const before = stand.stub.calls.length;
+    await expect(core.mandates.request(draft, { idempotencyKey: "idem_boom" })).rejects.toBe(boom);
+    expect(stand.stub.calls.length).toBe(before);
+  });
+});

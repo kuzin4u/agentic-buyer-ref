@@ -83,6 +83,8 @@ describe("конвейер на стенде Платформы (Р38 п. 8, К6
       "pao GET /pao/v1/mandates/{intent}/verify 200",
       "merchants GET /v1/shops 200",
       ...search,
+      // живая проверка перед CART — каталог витрины выбора (Р43 п. 1), затем verify INTENT и запрос CART
+      "merchants GET /v1/shops/{shop}/catalog 200",
       "pao GET /pao/v1/mandates/{intent}/verify 200",
       "pao POST /pao/v1/mandates 201",
       "pao GET /pao/v1/mandates/{cart} 200",

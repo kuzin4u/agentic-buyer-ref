@@ -116,3 +116,12 @@ export function mayOrder(live: LiveFact): OrderDecision {
     steps.length === 0 || steps.includes("TELL_UNCONFIRMED") ? "TELL_UNCONFIRMED" : steps.includes("TELL_STOCK") ? "TELL_STOCK" : "NEW_CART_MANDATE";
   return { allow: false, next, codes: [...live.codes], offer: live.offer };
 }
+
+/** Итог корзины из одной позиции — `price × qty` в минимальных единицах по живой цене продавца (Р43 п. 2). Количество —
+ *  целое ≥ 1, цена — целое ≥ 0, итог — безопасное целое; иначе `null` — неверное предложение вызывающего
+ *  (`CART_QTY_INVALID`, Р43 п. 3). Агент только складывает цены продавца: остаток и счётчики — от Платформы (инвариант 6). */
+export function cartTotal(price: Money, qty: number): Money | null {
+  if (!Number.isSafeInteger(qty) || qty < 1 || !Number.isSafeInteger(price.amount) || price.amount < 0) return null;
+  const amount = price.amount * qty;
+  return Number.isSafeInteger(amount) ? { amount, currency: price.currency } : null;
+}

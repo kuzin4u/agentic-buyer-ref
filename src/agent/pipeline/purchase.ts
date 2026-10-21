@@ -9,7 +9,7 @@ import { liveCheck, type A5SignalCode, type CatalogIssueCode, type CatalogProduc
 import { ruleForDeclineReason } from "../declines/index.js";
 import { MandateRefused, type MandateClient } from "../mandates/index.js";
 import { issuedByShell, spend } from "../policy/a5-issued.js";
-import { acceptedA5, classifyOffer, mayDraftCart, mayOrder, type CartPurchase, type HumanA5Decision, type OfferVerdict, type OrderNext } from "../policy/catalog.js";
+import { acceptedA5, cartTotal, classifyOffer, mayDraftCart, mayOrder, type CartPurchase, type HumanA5Decision, type OfferVerdict, type OrderNext } from "../policy/catalog.js";
 import { confirmThreshold, currencySupported, mandateRefusal, mayAuthorize, needsConfirmation, type PaymentDecision, type Thresholds } from "../policy/payment.js";
 import type { SplitWindow } from "../policy/split.js";
 import type { LiveOfferSource } from "../ports/catalog.js";
@@ -33,6 +33,8 @@ export interface PipelineJournal extends PurchaseJournal {
       | { at: string; kind: "cart.refused"; reason: A5SignalCode; detail: CartRefusal; ref?: string; mandate?: string; merchant?: string }
       /** заказа нет — живая проверка не ok (Р32 п. 3–4): reason — код проверки, detail — следующий шаг */
       | { at: string; kind: "order.live_refused"; reason: LiveFactCode; detail: OrderNext; ref?: string; mandate?: string; merchant?: string }
+      /** запроса CART нет — живая проверка перед ним не ok (Р43 п. 1): как order.live_refused */
+      | { at: string; kind: "cart.live_refused"; reason: LiveFactCode; detail: OrderNext; ref?: string; mandate?: string; merchant?: string }
       /** магазин отказал в каталоге (Т4, Р42 п. 4): detail — код витрины, BAD_RESPONSE или NO_RESPONSE; reason — код вне
        *  перечня; merchant — код продавца по маске */
       | ({ at: string; kind: "shop.unavailable"; mandate?: string; merchant?: string } & ShopUnavailableCause)
@@ -47,6 +49,8 @@ export interface PipelineJournal extends PurchaseJournal {
       | { at: string; kind: "agent.refused"; reason: "CURRENCY_NOT_SUPPORTED" | "SPLIT_WINDOW"; mandate?: string }
       /** выбор человека не из контура гарантий выдачи (Р38 п. 2, поправка К3) — отказ действовать; ref — sku по маске */
       | { at: string; kind: "agent.refused"; reason: "OFFER_NOT_IN_CONTOUR"; ref?: string; mandate?: string }
+      /** количество не целое ≥ 1 или итог не безопасное целое (Р43 п. 3) — отказ действовать; ref — sku по маске */
+      | { at: string; kind: "agent.refused"; reason: "CART_QTY_INVALID"; ref?: string; mandate?: string }
       /** решение человека по A5 не выдано оболочкой (Р40 п. 4) — отказ действовать; ref — sku, merchant — код продавца, по
        *  маске; mandate — корневой INTENT из машины */
       | { at: string; kind: "agent.refused"; reason: "A5_DECISION_FORGED"; ref?: string; mandate?: string; merchant?: string },
@@ -103,6 +107,18 @@ export class CartRefused extends Error {
   constructor(readonly code: "EXCLUDED" | CartRefusal) {
     super(`Корзина не готовится: ${code}`);
     this.name = "CartRefused";
+  }
+}
+
+/** Живая проверка перед запросом CART не ok (Р43 п. 1, Р32 п. 4): мандата корзины нет, покупка остаётся в OFFERS; что
+ *  дальше — `next` (ценовые коды — выбор человека по новой цене). */
+export class CartLiveRefused extends Error {
+  constructor(
+    readonly next: OrderNext,
+    readonly codes: LiveFactCode[],
+  ) {
+    super(`Корзина не готовится: ${codes.join(", ")}`);
+    this.name = "CartLiveRefused";
   }
 }
 
@@ -253,10 +269,11 @@ export class Purchase {
     });
   }
 
-  /** Стадия 3: выбор человека → проект CART (Р32 п. 2) → мандат корзины с родителем INTENT. Товар ищется по ключу в своей
-   *  выдаче (зона, A5, цена — из неё, не от вызывающего). Отказ политики — CartRefused, покупка остаётся в OFFERS,
-   *  обращений нет. Перед CART — INTENT держится и подтверждён verify (Р38 п. 3). CART сразу ACTIVE (РП35) —
-   *  CART_PENDING и CART_ACTIVE подряд, `awaitCart` не вызывается. */
+  /** Стадия 3: выбор человека → живая проверка → проект CART (Р32 п. 2) → мандат корзины с родителем INTENT. Товар ищется
+   *  по ключу в своей выдаче (зона, A5 — из неё, не от вызывающего); количество — целое ≥ 1 до обращений (Р43 п. 3). Отказ
+   *  политики — CartRefused, покупка остаётся в OFFERS, обращений нет. Цена позиции — из живой проверки непосредственно
+   *  перед CART (Р43 п. 1), не ok — CartLiveRefused, покупка в OFFERS. Перед CART — INTENT держится и подтверждён verify
+   *  (Р38 п. 3). CART сразу ACTIVE (РП35) — CART_PENDING и CART_ACTIVE подряд, `awaitCart` не вызывается. */
   cart(choice: CartChoice, m: Mutation): Promise<Mandate> {
     return this.#stage("CART_PENDING", async () => {
       const intent = this.#need(this.#intent);
@@ -267,11 +284,21 @@ export class Purchase {
         this.#record({ kind: "agent.refused", reason: "OFFER_NOT_IN_CONTOUR", ...skuRef(String(choice.sku)) });
         this.#halt("OFFER_NOT_IN_CONTOUR");
       }
+      // количество — до обращений: неверное предложение вызывающего, не решение политики (Р43 п. 3, как OFFER_NOT_IN_CONTOUR)
+      if (cartTotal(offer.product.price, choice.qty) === null) {
+        this.#record({ kind: "agent.refused", reason: "CART_QTY_INVALID", ...skuRef(offer.sku) });
+        this.#halt("CART_QTY_INVALID");
+      }
       // показ — из своей выдачи: продавец, sku, цена и коды A5, к которым привязано решение человека (Р39 п. 5), и
       // покупка — корневой INTENT (Р40 п. 1)
       const verdict: OfferVerdict = { kind: "AVAILABLE", merchantId: offer.merchantId, sku: offer.sku, price: { ...offer.product.price }, a5: [...offer.a5] };
       const purchase: CartPurchase = { intentId: intent.id, mode: intent.confirmationMode };
       this.#draftable(verdict, purchase, choice.decision);
+      this.#held(intent);
+      // цена позиции — из живой проверки непосредственно перед CART (Р43 п. 1); проверка перед заказом остаётся (Р32 п. 3)
+      const price = await this.#liveBeforeCart(offer, choice.qty);
+      const total = cartTotal(price, choice.qty);
+      if (total === null) this.#halt("CART_QTY_INVALID");
       this.#held(intent);
       await this.#guard(() => this.o.mandates.requireActive(intent));
       // вторая защита: решение — повторно непосредственно перед тратой, без ожидания между ними (при `#busy` и привязке к
@@ -279,7 +306,7 @@ export class Purchase {
       // решение, которое покрыло сигналы этого товара, при любом исходе запроса CART (Р40 п. 2, fail-closed)
       this.#draftable(verdict, purchase, choice.decision);
       if (verdict.a5.length > 0 && issuedByShell(choice.decision)) spend(choice.decision);
-      const cart = snapshot(await this.#guard(() => this.o.mandates.request(cartDraft(intent, offer, choice), m, intent)));
+      const cart = snapshot(await this.#guard(() => this.o.mandates.request(cartDraft(intent, offer, choice, price, total), m, intent)));
       this.#offer = offer;
       this.#cart = cart;
       this.#approved = false;
@@ -287,6 +314,20 @@ export class Purchase {
       if (cart.status === "ACTIVE") this.#machine.to("CART_ACTIVE");
       return copy(cart);
     });
+  }
+
+  /** Живая проверка перед запросом CART (Р43 п. 1): ok — цена продавца; иначе коды в журнал (cart.live_refused) и
+   *  CartLiveRefused, покупка остаётся в OFFERS (Р32 п. 4: автоматического повтора нет). */
+  async #liveBeforeCart(offer: Offer, qty: number): Promise<Money> {
+    const req = { sku: offer.sku, quantity: qty, ...(this.o.region !== undefined && { region: this.o.region }) };
+    const live = await liveCheck(offer.product, req, this.o.live, this.o.params, () => this.now().getTime());
+    this.#alive();
+    const d = mayOrder(live);
+    if (!d.allow) {
+      for (const reason of d.codes) this.#record({ kind: "cart.live_refused", reason, detail: d.next, ...skuRef(offer.sku), ...merchantRef(offer.merchantId) });
+      throw new CartLiveRefused(d.next, d.codes);
+    }
+    return { ...d.offer.price };
   }
 
   /** Стадия 3: подпись CART человеком по ленте — как `awaitIntent`; держимые — до ожидания и после (Р38 п. 3). */
@@ -605,10 +646,9 @@ export class Purchase {
   }
 }
 
-/** Проект CART: пределы — из INTENT, корзина — одна позиция по цене своей выдачи; живая цена сверяется перед заказом. */
-function cartDraft(intent: Mandate, offer: Offer, c: CartChoice): MandateDraft {
-  const price = { ...offer.product.price };
-  const total = { amount: price.amount * c.qty, currency: price.currency };
+/** Проект CART: пределы — из INTENT, корзина — одна позиция по живой цене продавца перед CART, итог — `cartTotal` (Р43
+ *  п. 1–2); живая цена сверяется ещё раз перед заказом (Р32 п. 3). */
+function cartDraft(intent: Mandate, offer: Offer, c: CartChoice, price: Money, total: Money): MandateDraft {
   return {
     kind: "CART",
     parentId: intent.id,

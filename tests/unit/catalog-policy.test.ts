@@ -3,7 +3,7 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { liveCheck, readFeed, type CatalogShop, type LiveCheckParams, type LiveFactCode, type ProductFacts } from "../../src/agent/catalog/index.js";
-import { acceptedA5, classifyOffer, issuedByShell, mayDraftCart, mayOrder, type CartPurchase, type HumanA5Decision } from "../../src/agent/policy/index.js";
+import { acceptedA5, cartTotal, classifyOffer, issuedByShell, mayDraftCart, mayOrder, type CartPurchase, type HumanA5Decision } from "../../src/agent/policy/index.js";
 import { isSpent, spend } from "../../src/agent/policy/a5-issued.js";
 import { humanA5Decision } from "../../src/agent/shell/index.js";
 import type { LiveOffer, LiveOfferSource } from "../../src/agent/ports/index.js";
@@ -305,5 +305,21 @@ describe("живая проверка перед заказом (Р32 п. 3–4,
   it("live_check_timeout_ms = 20: ответ через 200 мс — продавец не подтвердил (по умолчанию ядра — дождались бы)", async () => {
     const slow = source(() => new Promise((r) => setTimeout(() => r(offer()), 200)));
     expect(await check(slow.s, custom)).toEqual({ ok: false, codes: ["LIVE_UNAVAILABLE"], offer: null });
+  });
+});
+
+describe("итог корзины — cartTotal (Р43 п. 2–3)", () => {
+  const price = { amount: 36900, currency: "RUB" as const };
+  it("целое количество ≥ 1 — price × qty в минимальных единицах, валюта цены", () => {
+    expect(cartTotal(price, 1)).toEqual({ amount: 36900, currency: "RUB" });
+    expect(cartTotal(price, 2)).toEqual({ amount: 73800, currency: "RUB" });
+    expect(cartTotal({ amount: 0, currency: "RUB" }, 3)).toEqual({ amount: 0, currency: "RUB" });
+  });
+  it("количество не целое ≥ 1, цена не целое ≥ 0 или итог не безопасное целое — null (CART_QTY_INVALID)", () => {
+    for (const qty of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1]) expect(cartTotal(price, qty)).toBeNull();
+    expect(cartTotal(price, Math.floor(Number.MAX_SAFE_INTEGER / price.amount) + 1)).toBeNull();
+    expect(cartTotal(price, Math.floor(Number.MAX_SAFE_INTEGER / price.amount))).not.toBeNull();
+    expect(cartTotal({ amount: -1, currency: "RUB" }, 1)).toBeNull();
+    expect(cartTotal({ amount: 0.5, currency: "RUB" }, 2)).toBeNull();
   });
 });

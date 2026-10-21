@@ -410,6 +410,29 @@ describe("стадия 3 — корзина по живой цене перед 
     expect(r.purchase.state).toBe("OFFERS");
   });
 
+  it("количество — снимком выбора: геттер отдаёт 1, затем 5 — в живой проверке и CART одно количество 1 (ревью К1, блокер 1)", async () => {
+    const r = await setup();
+    const offer = await offers(r);
+    let reads = 0;
+    const choice = { ...key(offer), keyTermsShown: true, get qty() { return ++reads === 1 ? 1 : 5; } };
+    const cart = await r.purchase.cart(choice, { idempotencyKey: "idem-cart-1" });
+    expect(reads).toBe(1);
+    expect(r.live.calls).toEqual([{ sku: "tartine", quantity: 1, region: "77" }]);
+    expect(cart.cart).toMatchObject({ lines: [{ qty: 1 }], total: { amount: TARTINE } });
+  });
+
+  it("бросающий геттер выбора — отказ промиса, покупка в OFFERS, обращений нет", async () => {
+    const r = await setup();
+    const offer = await offers(r);
+    const before = r.stand.log().length;
+    const boom = new Error("геттер");
+    const choice = { ...key(offer), keyTermsShown: true, get qty(): number { throw boom; } };
+    await expect(r.purchase.cart(choice, { idempotencyKey: "idem-cart-1" })).rejects.toBe(boom);
+    expect(r.purchase.state).toBe("OFFERS");
+    expect(r.live.calls).toEqual([]);
+    expect(r.stand.log().length).toBe(before);
+  });
+
   it("количество не целое ≥ 1 или итог не безопасное целое — STOPPED CART_QTY_INVALID, agent.refused, ни проверки, ни обращений (Р43 п. 3)", async () => {
     for (const qty of [0, -1, 1.5, Number.NaN, Math.floor(Number.MAX_SAFE_INTEGER / TARTINE) + 1]) {
       const r = await setup();

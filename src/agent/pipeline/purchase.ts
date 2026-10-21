@@ -274,8 +274,13 @@ export class Purchase {
    *  политики — CartRefused, покупка остаётся в OFFERS, обращений нет. Цена позиции — из живой проверки непосредственно
    *  перед CART (Р43 п. 1), не ok — CartLiveRefused, покупка в OFFERS. Перед CART — INTENT держится и подтверждён verify
    *  (Р38 п. 3). CART сразу ACTIVE (РП35) — CART_PENDING и CART_ACTIVE подряд, `awaitCart` не вызывается. */
-  cart(choice: CartChoice, m: Mutation): Promise<Mandate> {
+  cart(input: CartChoice, m: Mutation): Promise<Mandate> {
     return this.#stage("CART_PENDING", async () => {
+      // выбор — снимком, каждое поле прочитано один раз до первого ожидания: геттер или правка вызывающего во время живой
+      // проверки и verify не меняют ни проверенное количество, ни решение A5 (ревью reviewer К1, повторный проход, блокер 1);
+      // бросающий геттер — отказ промиса, покупка в OFFERS, обращений нет
+      const { merchantId, sku, qty, decision, keyTermsShown } = input;
+      const choice: CartChoice = Object.freeze({ merchantId, sku, qty, keyTermsShown, ...(decision !== undefined && { decision }) });
       const intent = this.#need(this.#intent);
       // товар — только из контура гарантий этой выдачи: по зоне вне контура покупки нет (инвариант 10); выбор вне контура —
       // дефект или подмена вызывающего, а не решение политики — остановка (Р38 п. 2, поправка К3, решение владельца 20.10)

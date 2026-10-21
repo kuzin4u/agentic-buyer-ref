@@ -380,7 +380,7 @@ export class Purchase {
       }
       const order = await this.#guard(async () => {
         const reply = snapshot(await this.o.shop.order({ shopId: offer.shopId, items: [{ sku: line.sku, qty: line.qty }], cartMandateId: cart.id }, m));
-        // ПОЛОМКА К2а (через CI, откат — К2б): сверка Order.total с итогом CART убрана
+        if (reply.total.amount !== basket.total.amount || reply.total.currency !== basket.total.currency) this.#halt("ORDER_REPLY_MISMATCH");
         return reply;
       });
       this.#held(intent, cart);

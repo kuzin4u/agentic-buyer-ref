@@ -6,10 +6,11 @@ import type { PaoStubCall } from "@kuzin4u/agentic-core/pao";
 import { DIAG } from "../../src/agent/compose.js";
 import { JOURNAL_FIELDS, type JournalEntry } from "../../src/agent/journal/index.js";
 
-/** calls — журнал обращений заглушки; secrets — прочие значения, которых в журнале быть не должно. */
+/** calls — журнал обращений заглушки; secrets — прочие значения, которых в журнале быть не должно; agent null — журнал
+ *  контура без места сборки (код агента ставит compose, Р37 п. 3): код агента не сверяется. */
 export function expectJournalClean(
   entries: readonly JournalEntry[],
-  agent: string,
+  agent: string | null,
   calls: readonly PaoStubCall[],
   secrets: readonly string[] = [],
 ): void {
@@ -17,7 +18,7 @@ export function expectJournalClean(
   const fields = new Set<string>(JOURNAL_FIELDS);
   for (const e of entries) {
     expect(Object.keys(e).filter((k) => !fields.has(k)), `поля вне набора: ${e.kind}`).toEqual([]);
-    expect(e.agent, `без кода агента: ${e.kind}`).toBe(agent);
+    if (agent !== null) expect(e.agent, `без кода агента: ${e.kind}`).toBe(agent);
     if (e.reason !== undefined) expect(Object.hasOwn(DIAG, e.reason), `код вне реестра: ${e.reason}`).toBe(true);
   }
   const values = [...calls.flatMap((c) => [c.nonce, c.idempotencyKey]), ...secrets].filter((v): v is string => typeof v === "string" && v !== "");

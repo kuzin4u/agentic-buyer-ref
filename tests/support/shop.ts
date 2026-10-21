@@ -59,13 +59,14 @@ export function feedPrice(s: FeedShop, sku: string): Money {
   return p.product.price;
 }
 
-/** Живое предложение продавца: по умолчанию цена — как в фиде, в наличии, время ответа — часы стенда; `over` меняет ответ. */
-export function liveOffers(s: FeedShop, clock: () => Date, over: (req: LiveOfferRequest) => Partial<LiveOffer> = () => ({})): LiveOfferSource & { calls: LiveOfferRequest[] } {
+/** Живое предложение продавца: по умолчанию цена — как в фиде, в наличии, время ответа — часы стенда; `over` меняет ответ,
+ *  `n` — номер вызова с 1 (перед CART и перед заказом — по вызову, Р43 п. 1). */
+export function liveOffers(s: FeedShop, clock: () => Date, over: (req: LiveOfferRequest, n: number) => Partial<LiveOffer> = () => ({})): LiveOfferSource & { calls: LiveOfferRequest[] } {
   const src = {
     calls: [] as LiveOfferRequest[],
     fetch: async (req: LiveOfferRequest): Promise<LiveOffer> => {
       src.calls.push(req);
-      return { sku: req.sku, price: feedPrice(s, req.sku), availability: { inStock: true }, checkedAt: clock().toISOString(), ...over(req) };
+      return { sku: req.sku, price: feedPrice(s, req.sku), availability: { inStock: true }, checkedAt: clock().toISOString(), ...over(req, src.calls.length) };
     },
   };
   return src;

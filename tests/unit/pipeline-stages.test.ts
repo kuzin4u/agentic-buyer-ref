@@ -1,7 +1,7 @@
 // Конвейер, стадии 3–6 на PaoStub (Р38 п. 1–4): выбор человека → CART → живая проверка → заказ со сверкой суммы →
 // подтверждение по порогу (Т7) → авторизация и расчёт через порт PaymentSteps (исход — из события Платформы, AG-11).
 import { afterEach, describe, expect, it } from "vitest";
-import { CartRefused, OrderRefused, PurchaseMachine, PurchaseStopped, PurchaseTransitionForbidden, type Offer } from "../../src/agent/pipeline/index.js";
+import { CartLiveRefused, CartRefused, OrderRefused, PurchaseMachine, PurchaseStopped, PurchaseTransitionForbidden, type Offer } from "../../src/agent/pipeline/index.js";
 import { MandateRefused } from "../../src/agent/mandates/index.js";
 import { isSpent } from "../../src/agent/policy/a5-issued.js";
 import { loadParams } from "../../src/shared/config.js";
@@ -99,8 +99,11 @@ describe("стадии 3–6 — путь покупки (Р38 п. 1–2)", () =
       "GET /pao/v1/mandates/{id}/verify",
       "GET /pao/v1/mandates/{id}/verify",
     ]);
-    // живая проверка — по строке CART
-    expect(r.live.calls).toEqual([{ sku: "tartine", quantity: 1, region: "77" }]);
+    // живая проверка — перед CART по выбору и перед заказом по строке CART (Р43 п. 1, Р32 п. 3)
+    expect(r.live.calls).toEqual([
+      { sku: "tartine", quantity: 1, region: "77" },
+      { sku: "tartine", quantity: 1, region: "77" },
+    ]);
     expectJournalClean(r.journal.entries, AGENT, r.stand.stub.calls, ["idem-intent-1", "idem-cart-1"]);
   });
 
@@ -269,7 +272,8 @@ describe("стадия 3 — проект корзины (Р32 п. 2): отка�
 
   it("решение одноразовое: после CART и возврата в OFFERS то же решение — A5_DECISION_STALE, новое решение по тому же показу — CART (Р40 п. 2)", async () => {
     const profile = bakery({ returns: { days: 0, text: "Возврат в течение 14 дней" } });
-    const r = await setup({ shops: [{ ...SHOP, profile }], live: liveOffers(SHOP, () => stand!.clock, () => ({ availability: { inStock: false } })) });
+    // живая проверка: перед первым CART — ok, перед заказом — нет в наличии; перед вторым CART — ok (Р43 п. 1)
+    const r = await setup({ shops: [{ ...SHOP, profile }], live: liveOffers(SHOP, () => stand!.clock, (_, n) => (n === 2 ? { availability: { inStock: false } } : {})) });
     const offer = await offers(r);
     const decision = humanA5Decision(shownIn(r), offer, offer.a5);
     const cart = await r.purchase.cart({ ...key(offer), qty: 1, decision, keyTermsShown: true }, { idempotencyKey: "idem-cart-1" });
@@ -358,6 +362,150 @@ describe("стадия 3 — отказ витрины на заказе (Р42 �
   }
 });
 
+describe("стадия 3 — корзина по живой цене перед CART, количество до обращений (Р43)", () => {
+  it("CART под действующим INTENT: позиция и итог — по живой цене продавца перед запросом, 2 шт. (П10, Р43 п. 1–2)", async () => {
+    const live = { amount: TARTINE, currency: "RUB" };
+    const r = await setup();
+    const offer = await offers(r);
+    const from = r.stand.stub.calls.length;
+    const cart = await r.purchase.cart({ ...key(offer), qty: 2, keyTermsShown: true }, { idempotencyKey: "idem-cart-1" });
+    // живая проверка — после verify INTENT и до запроса CART: одна, по выбору человека
+    expect(r.live.calls).toEqual([{ sku: "tartine", quantity: 2, region: "77" }]);
+    expect(opsFrom(r, from)).toEqual([VERIFY, "POST /pao/v1/mandates"]);
+    expect(cart).toMatchObject({ kind: "CART", parentId: r.purchase.intentMandate!.id });
+    expect(cart.cart).toEqual({ merchantId: "shop_1", lines: [{ sku: "tartine", qty: 2, price: live }], total: { amount: 2 * TARTINE, currency: "RUB" } });
+  });
+
+  const cases = [
+    ["цена выросла", { price: { amount: TARTINE + 100, currency: "RUB" } }, "NEW_CART_MANDATE", ["LIVE_PRICE_UP"]],
+    ["цена снизилась", { price: { amount: TARTINE - 100, currency: "RUB" } }, "NEW_CART_MANDATE", ["LIVE_PRICE_DOWN"]],
+    ["нет в наличии", { availability: { inStock: false } }, "TELL_STOCK", ["LIVE_OUT_OF_STOCK"]],
+    ["не хватает количества на 2 шт.", { availability: { inStock: true, quantity: 1 } }, "TELL_STOCK", ["LIVE_QUANTITY"]],
+    ["цена в другой валюте", { price: { amount: TARTINE, currency: "USD" } }, "TELL_UNCONFIRMED", ["LIVE_CURRENCY"]],
+  ] as const;
+  for (const [name, over, next, codes] of cases) {
+    it(`${name} перед CART — CartLiveRefused ${next}, CART не запрошен, покупка в OFFERS (Р43 п. 1, Р32 п. 4)`, async () => {
+      const r = await setup({ live: liveOffers(SHOP, () => stand!.clock, () => over) });
+      const offer = await offers(r);
+      const from = r.stand.stub.calls.length;
+      const err = await r.purchase.cart({ ...key(offer), qty: 2, keyTermsShown: true }, { idempotencyKey: "idem-cart-1" }).catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(CartLiveRefused);
+      expect(err).toMatchObject({ next, codes });
+      expect(r.purchase.state).toBe("OFFERS");
+      expect(r.purchase.cartMandate).toBeNull();
+      // verify INTENT — до живой проверки (П05), CART не запрошен
+      expect(opsFrom(r, from)).toEqual([VERIFY]);
+      expect(r.tail().filter((e) => e.kind === "cart.live_refused").map((e) => [e.reason, e.detail, e.ref, e.merchant, e.mandate])).toEqual(
+        codes.map((c) => [c, next, "tartine", "shop_1", r.purchase.intentMandate!.id]),
+      );
+      expectJournalClean(r.journal.entries, AGENT, r.stand.stub.calls, ["idem-intent-1"]);
+    });
+  }
+
+  it("INTENT отозван у Платформы, события ещё нет — verify до живой проверки: STOPPED, к витрине ни одного обращения (П05)", async () => {
+    const r = await setup();
+    const offer = await offers(r);
+    r.consents.mandates.get(r.purchase.intentMandate!.id)!.status = "REVOKED";
+    const from = r.stand.stub.calls.length;
+    await expect(r.purchase.cart({ ...key(offer), qty: 1, keyTermsShown: true }, { idempotencyKey: "idem-cart-1" })).rejects.toBeInstanceOf(MandateRefused);
+    expect(r.purchase.state).toBe("STOPPED");
+    expect(r.live.calls).toEqual([]);
+    expect(opsFrom(r, from)).toEqual([VERIFY]);
+  });
+
+  it("отзыв INTENT пришёл по ленте во время живой проверки — STOPPED MANDATE_NOT_ACTIVE, CART не запрошен, решение A5 не потрачено (Р38 п. 3)", async () => {
+    const ok = liveOffers(SHOP, () => stand!.clock);
+    const at: { run?: PurchaseRun } = {};
+    const r = await setup({
+      shops: [{ ...SHOP, profile: bakery({ returns: { days: 0, text: "Возврат в течение 14 дней" } }) }],
+      live: {
+        fetch: async (req, signal) => {
+          const id = at.run!.purchase.intentMandate!.id;
+          at.run!.consents.mandates.get(id)!.status = "REVOKED";
+          await at.run!.core.mandates.refreshHeld({ kind: "event", event: event("mandate.revoked", id) });
+          return ok.fetch(req, signal);
+        },
+      },
+    });
+    at.run = r;
+    const offer = await offers(r);
+    const decision = humanA5Decision(shownIn(r), offer, offer.a5);
+    const before = r.stand.log().filter((c) => c.op === "POST /pao/v1/mandates").length;
+    await expect(r.purchase.cart({ ...key(offer), qty: 1, decision, keyTermsShown: true }, { idempotencyKey: "idem-cart-1" })).rejects.toBeInstanceOf(PurchaseStopped);
+    expect(r.purchase.reason).toBe("MANDATE_NOT_ACTIVE");
+    expect(r.stand.log().filter((c) => c.op === "POST /pao/v1/mandates").length).toBe(before);
+    expect(isSpent(decision)).toBe(false);
+  });
+
+  it("журнал не принял cart.live_refused — STOPPED UNKNOWN, CART не запрошен (инвариант 4)", async () => {
+    const boom = new Error("журнал недоступен");
+    const r = await setup({
+      live: liveOffers(SHOP, () => stand!.clock, () => ({ availability: { inStock: false } })),
+      tap: (e) => {
+        if (e.kind === "cart.live_refused") throw boom;
+      },
+    });
+    const offer = await offers(r);
+    const from = r.stand.stub.calls.length;
+    await expect(r.purchase.cart({ ...key(offer), qty: 1, keyTermsShown: true }, { idempotencyKey: "idem-cart-1" })).rejects.toBe(boom);
+    expect(r.purchase.state).toBe("STOPPED");
+    expect(r.purchase.reason).toBe("UNKNOWN");
+    expect(opsFrom(r, from)).toEqual([VERIFY]);
+  });
+
+  it("продавец не ответил перед CART — LIVE_UNAVAILABLE, CART не запрошен; решение A5 не потрачено", async () => {
+    const r = await setup({ shops: [{ ...SHOP, profile: bakery({ returns: { days: 0, text: "Возврат в течение 14 дней" } }) }], live: { fetch: () => Promise.reject(new Error("сбой")) } });
+    const offer = await offers(r);
+    const decision = humanA5Decision(shownIn(r), offer, offer.a5);
+    const from = r.stand.stub.calls.length;
+    await expect(r.purchase.cart({ ...key(offer), qty: 1, decision, keyTermsShown: true }, { idempotencyKey: "idem-cart-1" })).rejects.toMatchObject({ next: "TELL_UNCONFIRMED", codes: ["LIVE_UNAVAILABLE"] });
+    expect(opsFrom(r, from)).toEqual([VERIFY]);
+    expect(isSpent(decision)).toBe(false);
+    expect(r.purchase.state).toBe("OFFERS");
+  });
+
+  it("количество — снимком выбора: геттер отдаёт 1, затем 5 — в живой проверке и CART одно количество 1 (ревью К1, блокер 1)", async () => {
+    const r = await setup();
+    const offer = await offers(r);
+    let reads = 0;
+    const choice = { ...key(offer), keyTermsShown: true, get qty() { return ++reads === 1 ? 1 : 5; } };
+    const cart = await r.purchase.cart(choice, { idempotencyKey: "idem-cart-1" });
+    expect(reads).toBe(1);
+    expect(r.live.calls).toEqual([{ sku: "tartine", quantity: 1, region: "77" }]);
+    expect(cart.cart).toMatchObject({ lines: [{ qty: 1 }], total: { amount: TARTINE } });
+  });
+
+  it("бросающий геттер выбора — отказ промиса, покупка в OFFERS, обращений нет", async () => {
+    const r = await setup();
+    const offer = await offers(r);
+    const before = r.stand.log().length;
+    const boom = new Error("геттер");
+    const choice = { ...key(offer), keyTermsShown: true, get qty(): number { throw boom; } };
+    await expect(r.purchase.cart(choice, { idempotencyKey: "idem-cart-1" })).rejects.toBe(boom);
+    expect(r.purchase.state).toBe("OFFERS");
+    expect(r.live.calls).toEqual([]);
+    expect(r.stand.log().length).toBe(before);
+  });
+
+  it("количество не целое ≥ 1 или итог не безопасное целое — STOPPED CART_QTY_INVALID, agent.refused, ни проверки, ни обращений (Р43 п. 3)", async () => {
+    for (const qty of [0, -1, 1.5, Number.NaN, Math.floor(Number.MAX_SAFE_INTEGER / TARTINE) + 1]) {
+      const r = await setup();
+      const offer = await offers(r);
+      const before = r.stand.log().length;
+      await expect(r.purchase.cart({ ...key(offer), qty, keyTermsShown: true }, { idempotencyKey: "idem-cart-1" })).rejects.toBeInstanceOf(PurchaseStopped);
+      expect(r.purchase.reason).toBe("CART_QTY_INVALID");
+      expect(r.tail().slice(-2).map((e) => [e.kind, e.reason, e.ref])).toEqual([
+        ["agent.refused", "CART_QTY_INVALID", "tartine"],
+        ["purchase.stage", "CART_QTY_INVALID", undefined],
+      ]);
+      expect(r.live.calls).toEqual([]);
+      expect(r.stand.log().length).toBe(before);
+      expectJournalClean(r.journal.entries, AGENT, r.stand.stub.calls, ["idem-intent-1"]);
+      await closeStand();
+    }
+  });
+});
+
 describe("стадия 3 — живая проверка перед заказом (Р32 п. 3–4): не ok — CART_ACTIVE → OFFERS, заказа нет", () => {
   const cases = [
     ["цена выросла", { price: { amount: TARTINE + 100, currency: "RUB" } }, "NEW_CART_MANDATE", ["LIVE_PRICE_UP"]],
@@ -365,7 +513,8 @@ describe("стадия 3 — живая проверка перед заказо
   ] as const;
   for (const [name, over, next, codes] of cases) {
     it(`${name} — OrderRefused ${next}`, async () => {
-      const r = await setup({ live: liveOffers(SHOP, () => stand!.clock, () => over) });
+      // перед CART — ok, перед заказом — ответ случая (Р43 п. 1)
+      const r = await setup({ live: liveOffers(SHOP, () => stand!.clock, (_, n) => (n > 1 ? over : {})) });
       await signedCart(r, await offers(r));
       const err = await r.purchase.placeOrder({ idempotencyKey: "idem-order-1" }).catch((e: unknown) => e);
       expect(err).toBeInstanceOf(OrderRefused);
@@ -381,7 +530,9 @@ describe("стадия 3 — живая проверка перед заказо
   }
 
   it("продавец не ответил — LIVE_UNAVAILABLE, «не подтверждено»; новый выбор после отказа — снова CART", async () => {
-    const r = await setup({ live: { fetch: () => Promise.reject(new Error("сбой")) } });
+    // перед CART — ok, перед заказом — сбой, перед новым CART — снова ok (Р43 п. 1)
+    const ok = liveOffers(SHOP, () => stand!.clock);
+    const r = await setup({ live: { fetch: (req, signal) => (ok.calls.length === 1 ? (ok.calls.push(req), Promise.reject(new Error("сбой"))) : ok.fetch(req, signal)) } });
     const offer = await offers(r);
     await signedCart(r, offer);
     await expect(r.purchase.placeOrder({ idempotencyKey: "idem-order-1" })).rejects.toMatchObject({ next: "TELL_UNCONFIRMED", codes: ["LIVE_UNAVAILABLE"] });
@@ -414,7 +565,8 @@ describe("стадия 3 — сверка суммы заказа (Т6)", () => 
     await r.core.mandates.refreshHeld({ kind: "event", event: event("mandate.revoked", cart.id) });
     await expect(r.purchase.placeOrder({ idempotencyKey: "idem-order-1" })).rejects.toBeInstanceOf(PurchaseStopped);
     expect(r.purchase.reason).toBe("MANDATE_NOT_ACTIVE");
-    expect(r.live.calls).toEqual([]);
+    // только проверка перед CART (Р43 п. 1); перед заказом — нет
+    expect(r.live.calls).toHaveLength(1);
     expect(r.shop.calls).toEqual([]);
   });
 });
@@ -606,7 +758,7 @@ describe("сбой журнала — STOPPED UNKNOWN, решение без з�
   it("журнал не принял order.live_refused — STOPPED, заказа нет, повторный заказ — запрещённый переход", async () => {
     const boom = new Error("журнал недоступен");
     const r = await setup({
-      live: liveOffers(SHOP, () => stand!.clock, () => ({ availability: { inStock: false } })),
+      live: liveOffers(SHOP, () => stand!.clock, (_, n) => (n > 1 ? { availability: { inStock: false } } : {})),
       tap: (e) => {
         if (e.kind === "order.live_refused") throw boom;
       },

@@ -83,7 +83,9 @@ describe("конвейер на стенде Платформы (Р38 п. 8, К6
       "pao GET /pao/v1/mandates/{intent}/verify 200",
       "merchants GET /v1/shops 200",
       ...search,
+      // verify INTENT, затем живая проверка перед CART — каталог витрины выбора (Р43 п. 1, П05), затем запрос CART
       "pao GET /pao/v1/mandates/{intent}/verify 200",
+      "merchants GET /v1/shops/{shop}/catalog 200",
       "pao POST /pao/v1/mandates 201",
       "pao GET /pao/v1/mandates/{cart} 200",
       "pao POST /participants/v1/mandates/{cart}/sign 200",
@@ -104,6 +106,22 @@ describe("конвейер на стенде Платформы (Р38 п. 8, К6
     ]);
     // заказ у витрины — подписан тем же ключом агента
     expect(calls.filter((x) => x.target === "merchants" && x.route.endsWith("/orders")).map((x) => x.kid)).toEqual([kid]);
+  });
+
+  it("INTENT отказан (relinquish) на стенде после поиска, события ещё нет — verify OUT_OF_SCOPE, к витринам ни одного обращения (П05, Р43 п. 1)", async () => {
+    const r = await run();
+    const intent = await r.purchase.intent({ ...INTENT, merchantScope: [NORMAL.merchant_id] }, { idempotencyKey: "idem-intent-stand" });
+    await r.signWhileWaiting(intent.id, () => r.purchase.awaitIntent());
+    const zones = await r.purchase.search();
+    const offer = zones.contour.find((o) => o.shopId === NORMAL.id)!;
+    await r.c.platform.relinquishMandate(intent.id, { idempotencyKey: "idem-relinquish-intent" });
+    const start = r.c.calls().length;
+    await expect(r.purchase.cart({ merchantId: offer.merchantId, sku: offer.sku, qty: 1, keyTermsShown: true }, { idempotencyKey: "idem-cart-stand" })).rejects.toBeInstanceOf(MandateRefused);
+    expect(r.purchase.state).toBe("STOPPED");
+    const calls = r.c.calls().slice(start);
+    expect(calls.filter((x) => x.target === "merchants")).toEqual([]);
+    expect(calls.map((x) => shape(x, { intent: intent.id }))).toEqual(["pao GET /pao/v1/mandates/{intent}/verify 200"]);
+    expect(r.payment.calls).toEqual([]);
   });
 
   it("CART отказан (relinquish) на стенде до авторизации — verify CART в воротах OUT_OF_SCOPE, STOPPED, реквизита нет", async () => {

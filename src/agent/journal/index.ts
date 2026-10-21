@@ -86,6 +86,8 @@ export type JournalKind =
   | "cart.refused"
   /** заказа нет: живая проверка не ok (Р32 п. 3–4): reason — код LIVE_*; пишет конвейер */
   | "order.live_refused"
+  /** запроса CART нет: живая проверка перед ним не ok (Р43 п. 1, Р32 п. 4): reason — код LIVE_*; пишет конвейер */
+  | "cart.live_refused"
   /** попытка обращения к витрине (Т15, Р42): method — шаблон пути, attempt > 1 — попытка повтора, ref — id витрины по
    *  маске, mandate — мандат корзины у заказа; detail — код витрины из перечня, BAD_RESPONSE или NO_RESPONSE; код вне
    *  перечня — reason MERCHANT_CODE_UNKNOWN */

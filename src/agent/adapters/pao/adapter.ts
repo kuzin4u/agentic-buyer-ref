@@ -144,11 +144,13 @@ function retryAfterSec(v: string | null): number | undefined {
   return v !== null && /^\d{1,6}$/.test(v.trim()) ? Number(v.trim()) : undefined;
 }
 
+/** Ключ читается у вызывающего один раз: проверенный и отправленный — одно значение (инвариант 9; ревью К1а). */
 function keyOf(m: Mutation): string {
-  if (typeof m.idempotencyKey !== "string" || m.idempotencyKey.trim() === "") {
+  const key = m.idempotencyKey;
+  if (typeof key !== "string" || key.trim() === "") {
     throw new PlatformFailure("UNKNOWN", "never", null, 0, null, "пустой Idempotency-Key, обращение не отправлено");
   }
-  return m.idempotencyKey;
+  return key;
 }
 
 export class PaoPlatform implements PaymentPlatform {

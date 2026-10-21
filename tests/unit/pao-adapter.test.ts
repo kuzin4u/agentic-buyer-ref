@@ -419,6 +419,16 @@ describe("fail-closed без заглушки", () => {
     });
   });
 
+  it("Idempotency-Key читается один раз: геттер отдаёт ключ, затем пустую строку — отправлен проверенный ключ (инвариант 9)", async () => {
+    const { platform, calls } = fake(() => json(201, {}));
+    let reads = 0;
+    const m = { get idempotencyKey() { return ++reads === 1 ? "idem-once" : ""; } };
+    await platform.issueCredential(draft, m).catch(() => undefined);
+    expect(reads).toBe(1);
+    expect(calls).toHaveLength(1);
+    expect(new Headers(calls[0]?.headers).get("idempotency-key")).toBe("idem-once");
+  });
+
   it.each(["", "   "])("пустой Idempotency-Key (%j) — отказ до отправки", async (key) => {
     const { platform, calls } = fake(() => json(201, {}));
     await expect(platform.issueCredential(draft, { idempotencyKey: key })).rejects.toMatchObject({ code: "UNKNOWN" });

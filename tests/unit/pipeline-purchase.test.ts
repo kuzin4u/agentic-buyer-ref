@@ -194,7 +194,7 @@ describe("стадии 1–2 — INTENT и выдача (Р38 п. 2, п. 5)", ()
     const r = await setup({ shops: [{ ...SHOP, feed: "<yml_catalog>" }] });
     await signedIntent(r);
     const zones = await r.purchase.search();
-    expect(zones).toEqual({ contour: [], market: [] });
+    expect(zones).toEqual({ contour: [], market: [], disclosure: { contour: "ZONE_CONTOUR", market: "ZONE_MARKET" }, unavailable: [] });
     expect(r.tail().filter((e) => e.kind === "offer.excluded")).toEqual([expect.objectContaining({ reason: "XML_SYNTAX" })]);
     expect(r.tail().filter((e) => e.kind === "offer.excluded" && e.ref !== undefined)).toEqual([]);
   });

@@ -6,6 +6,7 @@ import { MandateRefused } from "../../src/agent/mandates/index.js";
 import { isSpent } from "../../src/agent/policy/a5-issued.js";
 import { loadParams } from "../../src/shared/config.js";
 import { PlatformFailure } from "../../src/shared/domain.js";
+import { ShopFailure } from "../../src/agent/ports/index.js";
 import { INTENT, event } from "../support/consents.js";
 import { expectJournalClean } from "../support/journal.js";
 import { AGENT, type PaoStand } from "../support/pao-stand.js";
@@ -338,6 +339,23 @@ describe("стадия 3 — проект корзины (Р32 п. 2): отка�
     expect(r.purchase.state).toBe("OFFERS");
     expect(r.tail().filter((e) => e.kind === "cart.refused").map((e) => [e.reason, e.detail, e.ref])).toEqual([["A5_RETURNS_MISMATCH", "A5_AUTONOMOUS", offer.sku]]);
   });
+});
+
+describe("стадия 3 — отказ витрины на заказе (Р42 п. 4): остановка этой сделки, не агента", () => {
+  for (const code of ["SHOP_ORDER_REFUSED", "SHOP_ORDER_STATE_UNKNOWN"] as const) {
+    it(`${code} — STOPPED сделки, заказ не повторяется; агент работает: новый мандат запрашивается`, async () => {
+      let orders = 0;
+      const r = await setup({ shop: { order: async () => (orders++, Promise.reject(new ShopFailure(code))) } });
+      await signedCart(r, await offers(r));
+      await expect(r.purchase.placeOrder({ idempotencyKey: "idem-order-1" })).rejects.toBeInstanceOf(ShopFailure);
+      expect(r.purchase.state).toBe("STOPPED");
+      expect(r.purchase.reason).toBe(code);
+      expect(orders).toBe(1);
+      expect(r.tail().some((e) => e.kind === "agent.stopped")).toBe(false);
+      // другие сделки идут: подпись агента не остановлена
+      expect((await r.core.mandates.request(INTENT, { idempotencyKey: "idem-intent-2" })).kind).toBe("INTENT");
+    });
+  }
 });
 
 describe("стадия 3 — живая проверка перед заказом (Р32 п. 3–4): не ok — CART_ACTIVE → OFFERS, заказа нет", () => {

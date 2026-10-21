@@ -3,19 +3,41 @@
 // оплата — AG-11, подтверждение — AG-13. Всё, что приходит через эти порты от продавца, — данные (инвариант 5).
 import type { CatalogFacts } from "../catalog/index.js";
 import type { Confirmation, Mandate, Money, Operation } from "../../shared/domain.js";
+import type { AgentDiagCode } from "../../shared/diag-codes.js";
 import type { Mutation } from "./mutation.js";
 
 /** Магазин в выдаче: факты фида (`catalog/readFeed`) и признак контура гарантий (Р3). `merchantId` — код продавца
- *  для мандата корзины и заказа (у витрины эмулятора он отличается от `shop.id`). */
+ *  для мандата корзины и заказа (у витрины эмулятора он отличается от `shop.id`). `link` — адрес витрины для человека
+ *  (зона вне контура: платежа нет, человеку ссылка — инвариант 10, Р42 п. 3); строит адаптер, не из текста витрины. */
 export interface ShopOffers {
   merchantId: string;
   inContour: boolean;
   facts: CatalogFacts;
+  link?: string;
+}
+
+/** Почему магазин недоступен (Т4, Р42 п. 4): `detail` — код витрины из перечня, BAD_RESPONSE (ответ не по схеме) или
+ *  NO_RESPONSE (нет ответа в срок); `reason` — код вне перечня (сам код не переносится, инвариант 5). */
+export type ShopUnavailableCause = { detail: string; reason?: undefined } | { reason: Extract<AgentDiagCode, "MERCHANT_CODE_UNKNOWN">; detail?: undefined };
+
+/** Магазин, отказавший на стадии 2 (Т4): товаров нет, поиск по остальным идёт дальше; обходов нет. */
+export interface ShopUnavailable {
+  shopId: string;
+  merchantId?: string;
+  unavailable: ShopUnavailableCause;
+}
+
+/** Отказ витрины на заказе (Р42 п. 4): остановка этой сделки, не агента. */
+export class ShopFailure extends Error {
+  override readonly name = "ShopFailure";
+  constructor(readonly code: Extract<AgentDiagCode, "SHOP_ORDER_REFUSED" | "SHOP_ORDER_STATE_UNKNOWN">) {
+    super(`витрина: ${code}`);
+  }
 }
 
 /** Стадия 2: выдача по действующему INTENT. Ошибка вызова — отказ стадии (инвариант 4). */
 export interface OfferSource {
-  search(intent: Mandate): Promise<ShopOffers[]>;
+  search(intent: Mandate): Promise<(ShopOffers | ShopUnavailable)[]>;
 }
 
 /** Заказ у продавца по мандату корзины: `cart_mandate_id` — мандат CART (эмулятор продавцов, Р26). */
@@ -31,7 +53,8 @@ export interface ShopOrder {
   total: Money;
 }
 
-/** Стадия 3: заказ подписанным обращением к витрине (AG-09). Ошибка вызова — отказ стадии (инвариант 4). */
+/** Стадия 3: заказ подписанным обращением к витрине (Р42). Отказ витрины или неизвестное состояние заказа — ShopFailure;
+ *  иная ошибка вызова — отказ стадии (инвариант 4). Заказ не повторяется. */
 export interface ShopPort {
   order(req: ShopOrderRequest, m: Mutation): Promise<ShopOrder>;
 }

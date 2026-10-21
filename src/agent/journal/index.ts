@@ -85,7 +85,12 @@ export type JournalKind =
   /** проект мандата корзины не готовится (Р32 п. 2): reason — код сигнала A5; пишет конвейер */
   | "cart.refused"
   /** заказа нет: живая проверка не ok (Р32 п. 3–4): reason — код LIVE_*; пишет конвейер */
-  | "order.live_refused";
+  | "order.live_refused"
+  /** попытка обращения к витрине (Т15, Р42): method — шаблон пути, attempt > 1 — попытка повтора, merchant — id витрины
+   *  по маске; detail — код витрины из перечня, BAD_RESPONSE или NO_RESPONSE; код вне перечня — reason MERCHANT_CODE_UNKNOWN */
+  | "shop.call"
+  /** магазин недоступен в выдаче (Т4, Р42 п. 4): detail и reason — как у последней попытки shop.call; пишет конвейер */
+  | "shop.unavailable";
 
 export interface JournalEntry {
   at: string;

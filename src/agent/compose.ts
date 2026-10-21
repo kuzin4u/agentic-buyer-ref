@@ -2,11 +2,13 @@
 // Ядро (pipeline, policy, mandates, declines) получает платформу через порт и не знает, какая она.
 // Подписант создаётся здесь из модуля signer; адаптер получает только порт подписи (инвариант 2).
 import { createHash, randomUUID } from "node:crypto";
+import { signRequest } from "@kuzin4u/agentic-core";
 import { relative, resolve } from "node:path";
 import { ConfigError, loadParams, type StandParams } from "../shared/config.js";
 import { PLATFORM_EVENT_TYPES, PlatformFailure, type AgentSelf } from "../shared/domain.js";
 import type { PaymentPlatform, PlatformCapabilities } from "./ports/payment-platform.js";
 import { PAO_CLIENT_DIAG, PAO_DIAG, PaoPlatform, assertPaoVersion, type PaoPlatformOptions } from "./adapters/pao/index.js";
+import { ShopsAdapter, type ShopsAdapterOptions } from "./adapters/shops/index.js";
 import { CATALOG_DIAG } from "./catalog/index.js";
 import { MemoryJournal, type Journal } from "./journal/index.js";
 import { MandateClient } from "./mandates/index.js";
@@ -53,6 +55,9 @@ export interface AgentCore {
   /** Новая покупка (Р38): конвейер стадий 0–6 на клиенте мандатов, ленте и журнале ядра; порты стадий — от вызывающего.
    *  Стадия 0 — допуск последнего start() и подпись не остановлена; состояние покупки — только в памяти (Р38 п. 6). */
   purchase(o: PurchasePorts): Purchase;
+  /** Адаптер витрин продавцов (Р42): `offers`, `live` и `shop` для `purchase()`; обращения подписаны действующим ключом
+   *  агента, попытки — в журнал ядра (shop.call). Профиль магазина — от вызывающего (до kuzin4u/agentic-ps-platform#45). */
+  shops(o: ShopsOptions): ShopsAdapter;
   /** Самопроверка при старте (Р36 п. 6): отчёт последнего start() (и успешного, и с отказом); до start() — null. */
   selfCheck(): SelfCheckReport | null;
   /** Стадия 0 с самопроверкой (Р36 п. 6, дополнение 2). Порядок: ключи из хранилища и выбор ключа допуска, курсор ленты
@@ -76,6 +81,9 @@ export interface AgentCore {
   /** освободить каталог ключей (один процесс на каталог) */
   close(): void;
 }
+
+/** Витрины для адаптера (Р42): адрес и профиль магазина; подпись, параметры, журнал и часы — от места сборки. */
+export type ShopsOptions = Pick<ShopsAdapterOptions, "baseUrl" | "profile" | "fetch">;
 
 /** Порты стадий покупки от вызывающего (Р38 п. 2) и регион человека из профиля (Р32 п. 5). */
 export interface PurchasePorts {
@@ -239,6 +247,18 @@ export function createAgentCore(o: AgentCoreOptions): AgentCore {
         params,
         split,
         ...(p.region !== undefined && { region: p.region }),
+      }),
+    // Подпись витрин — тем же действующим ключом и профилем, что ПАО; остановленная подпись — исключение, обращения нет.
+    shops: (s) =>
+      new ShopsAdapter({
+        baseUrl: s.baseUrl,
+        profile: s.profile,
+        ...(s.fetch !== undefined && { fetch: s.fetch }),
+        agentCode: o.pao.agentCode,
+        signing: { sign: (req) => signRequest(req, signing.current()) },
+        params,
+        journal,
+        now,
       }),
     // Ключи загружаются до обращений к Платформе (сбой хранилища — без сети), затем курсор ленты и конфигурация, затем
     // GET /pao/v1/agent; курсор и конфигурация — один раз за start, повтор допуска (SIGNATURE_INVALID) их не повторяет.

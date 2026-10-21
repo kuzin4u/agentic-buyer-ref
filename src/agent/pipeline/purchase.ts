@@ -15,7 +15,7 @@ import type { SplitWindow } from "../policy/split.js";
 import type { LiveOfferSource } from "../ports/catalog.js";
 import type { FeedItem } from "../ports/events.js";
 import type { Mutation } from "../ports/mutation.js";
-import type { OfferSource, PaymentContext, PaymentSteps, ShopOffers, ShopOrder, ShopPort } from "../ports/shop.js";
+import { ShopFailure, type OfferSource, type PaymentContext, type PaymentSteps, type ShopOffers, type ShopOrder, type ShopPort, type ShopUnavailable, type ShopUnavailableCause } from "../ports/shop.js";
 import { PurchaseMachine, PurchaseTransitionForbidden, allowed, type PurchaseJournal, type PurchaseState, type StopCause } from "./machine.js";
 
 /** Записи конвейера сверх записей машины (Р38 п. 5, Р37 п. 5). */
@@ -33,6 +33,9 @@ export interface PipelineJournal extends PurchaseJournal {
       | { at: string; kind: "cart.refused"; reason: A5SignalCode; detail: CartRefusal; ref?: string; mandate?: string; merchant?: string }
       /** заказа нет — живая проверка не ok (Р32 п. 3–4): reason — код проверки, detail — следующий шаг */
       | { at: string; kind: "order.live_refused"; reason: LiveFactCode; detail: OrderNext; ref?: string; mandate?: string; merchant?: string }
+      /** магазин отказал в каталоге (Т4, Р42 п. 4): detail — код витрины, BAD_RESPONSE или NO_RESPONSE; reason — код вне
+       *  перечня; merchant — код продавца по маске */
+      | ({ at: string; kind: "shop.unavailable"; mandate?: string; merchant?: string } & ShopUnavailableCause)
       /** ворота: держимый мандат вышел (отзыв, иной статус) — отказ действовать (Р38 п. 3) */
       | { at: string; kind: "agent.refused"; reason: "MANDATE_NOT_ACTIVE"; mandate?: string }
       /** ворота: остатка Платформы по мандату не хватает на итог CART (Р38 п. 3, К4а) */
@@ -50,19 +53,34 @@ export interface PipelineJournal extends PurchaseJournal {
   ): void;
 }
 
-/** Товар выдачи. `a5` непустой — показ с пометкой «сведения продавца противоречивы» (Р32 п. 1). */
+/** Товар выдачи. `a5` непустой — показ с пометкой «сведения продавца противоречивы» (Р32 п. 1). `link` — у зоны вне
+ *  контура: адрес витрины для человека, платежа нет (инвариант 10, Р42 п. 3). */
 export interface Offer {
   shopId: string;
   merchantId: string;
   sku: string;
   product: CatalogProduct;
   a5: A5SignalCode[];
+  link?: string;
 }
 
-/** Две зоны (Р3, Т5): по зоне вне контура гарантий покупки нет — человеку ссылка (инвариант 10). */
+/** Код пояснения различия в защите по зоне (Т5, A6 п. 3.1, Р42 п. 3); тексты для человека — в оболочке (`shell/zones`). */
+export type ZoneCode = "ZONE_CONTOUR" | "ZONE_MARKET";
+
+/** Магазин, недоступный в этой выдаче (Т4, Р42 п. 4): человеку — «продавец недоступен». */
+export interface UnavailableShop {
+  shopId: string;
+  merchantId?: string;
+  cause: ShopUnavailableCause;
+}
+
+/** Две зоны (Р3, Т5): по зоне вне контура гарантий покупки нет — человеку ссылка (инвариант 10). У каждой зоны — код
+ *  пояснения (`disclosure`); `unavailable` — магазины, отказавшие в каталоге (Т4). */
 export interface OfferZones {
   contour: Offer[];
   market: Offer[];
+  disclosure: { contour: "ZONE_CONTOUR"; market: "ZONE_MARKET" };
+  unavailable: UnavailableShop[];
 }
 
 /** Выбор человека на стадии 3 — ключом товара выдачи этой покупки (`merchantId` + `sku`); `decision` — явное решение
@@ -450,9 +468,16 @@ export class Purchase {
   }
 
   /** Решения каталога — в журнал по каждому товару (Р37 п. 5): исключение — код модели или REGION, A5 — пометка. */
-  #classify(shops: ShopOffers[]): OfferZones {
-    const zones: OfferZones = { contour: [], market: [] };
+  #classify(shops: (ShopOffers | ShopUnavailable)[]): OfferZones {
+    const zones: OfferZones = { contour: [], market: [], disclosure: { contour: "ZONE_CONTOUR", market: "ZONE_MARKET" }, unavailable: [] };
     for (const s of shops) {
+      // магазин отказал в каталоге — недоступен, без обходов; поиск по остальным идёт дальше (Т4, Р42 п. 4)
+      if ("unavailable" in s) {
+        const cause: ShopUnavailableCause = s.unavailable.reason !== undefined ? { reason: s.unavailable.reason } : { detail: s.unavailable.detail };
+        this.#record({ kind: "shop.unavailable", ...cause, ...(s.merchantId !== undefined ? merchantRef(s.merchantId) : {}) });
+        zones.unavailable.push({ shopId: s.shopId, ...(s.merchantId !== undefined && { merchantId: s.merchantId }), cause });
+        continue;
+      }
       const { shop, shopIssues, products, dropped } = s.facts;
       const m = merchantRef(s.merchantId);
       // фид не разобран — товаров нет, исключён весь магазин: запись на код без sku
@@ -473,7 +498,9 @@ export class Purchase {
           continue;
         }
         for (const reason of v.a5) this.#record({ kind: "offer.flagged", reason, ...ref });
-        (s.inContour ? zones.contour : zones.market).push({ shopId: shop.id, merchantId: s.merchantId, sku: p.product.sku, product: p.product, a5: v.a5 });
+        const offer: Offer = { shopId: shop.id, merchantId: s.merchantId, sku: p.product.sku, product: p.product, a5: v.a5 };
+        if (s.inContour) zones.contour.push(offer);
+        else zones.market.push({ ...offer, ...(s.link !== undefined && { link: s.link }) });
       }
     }
     return zones;
@@ -546,7 +573,9 @@ export class Purchase {
       result = await step();
     } catch (e) {
       if (e instanceof PurchaseTransitionForbidden || e instanceof PurchaseStopped) throw e;
-      const code = e instanceof MandateRefused ? e.reason : e instanceof PlatformFailure ? e.code : (this.o.failureCode?.(e) ?? "UNKNOWN");
+      // отказ витрины на заказе — остановка этой сделки, не агента (Р42 п. 4)
+      const code =
+        e instanceof MandateRefused ? e.reason : e instanceof PlatformFailure ? e.code : e instanceof ShopFailure ? e.code : (this.o.failureCode?.(e) ?? "UNKNOWN");
       if (!waits.has(code)) this.#machine.stop(code);
       throw e;
     }

@@ -262,8 +262,7 @@ export class Purchase {
       const intent = this.#need(this.#intent);
       // товар — только из контура гарантий этой выдачи: по зоне вне контура покупки нет (инвариант 10); выбор вне контура —
       // дефект или подмена вызывающего, а не решение политики — остановка (Р38 п. 2, поправка К3, решение владельца 20.10)
-      // ПОЛОМКА К3а (через CI, откатывается следующим коммитом): товар корзины — и из зоны рынка
-      const offer = [...(this.#zones?.contour ?? []), ...(this.#zones?.market ?? [])].find((x) => x.merchantId === choice.merchantId && x.sku === choice.sku);
+      const offer = this.#zones?.contour.find((x) => x.merchantId === choice.merchantId && x.sku === choice.sku);
       if (offer === undefined) {
         this.#record({ kind: "agent.refused", reason: "OFFER_NOT_IN_CONTOUR", ...skuRef(String(choice.sku)) });
         this.#halt("OFFER_NOT_IN_CONTOUR");

@@ -259,7 +259,7 @@ export class Purchase {
   }
 
   /** Стадия 2: выдача в двух зонах. Перед поиском — INTENT держится и подтверждён verify (Т2); решения каталога —
-   *  в журнал (Р37 п. 5): `policy/` журнала не получает (инвариант 3). */
+   *  в журнал (Р37 п. 5): `policy/` журнала не получает (инвариант 3). Новая выдача стирает снимок прежнего CART (К2а). */
   search(): Promise<OfferZones> {
     return this.#stage("OFFERS", async () => {
       const intent = this.#need(this.#intent);
@@ -271,6 +271,10 @@ export class Purchase {
       // отзыв мог прийти по ленте, пока шёл поиск (ревью К2.2 № 15)
       this.#held(intent);
       this.#zones = zones;
+      // выдача сменилась — прежний CART наружу как текущий не отдаётся и не исполняется: новый CART — по новому выбору
+      // (общее правило с отказом перед заказом; решение владельца 21.10, К2а)
+      this.#cart = null;
+      this.#lines = null;
       this.#machine.to("OFFERS");
       return copy(zones);
     });

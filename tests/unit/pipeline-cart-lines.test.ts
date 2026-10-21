@@ -299,6 +299,45 @@ describe("Р44 п. 4 — новая цена после согласования
   }
 });
 
+describe("К2а — новая выдача при подписанном CART стирает снимок CART (решение владельца 21.10)", () => {
+  it("новый поиск из CART_ACTIVE: снимок CART стёрт (cartMandate пуст, needsConfirmation — fail-closed); новый выбор — новый CART, заказ — по нему", async () => {
+    const { r } = await onShop();
+    await signedIntent(r);
+    await r.purchase.search();
+    const old = await r.purchase.cart(pick({ sku: "tartine", qty: 1 }), { idempotencyKey: "idem-cart-1" });
+    await sign(r, old.id);
+    expect(r.purchase.state).toBe("CART_ACTIVE");
+    expect(r.purchase.needsConfirmation).toBe(false);
+    const from = r.stand.stub.calls.length;
+    await r.purchase.search();
+    // новый поиск — только verify INTENT; по прежнему CART обращений нет
+    expect(opsFrom(r, from)).toEqual([VERIFY]);
+    expect(r.purchase.state).toBe("OFFERS");
+    expect(r.purchase.cartMandate).toBeNull();
+    expect(r.purchase.needsConfirmation).toBe(true);
+    const fresh = await r.purchase.cart(pick({ sku: "zavarnoy", qty: 1 }), { idempotencyKey: "idem-cart-2" });
+    expect(fresh.id).not.toBe(old.id);
+    expect(r.purchase.cartMandate!.id).toBe(fresh.id);
+    await sign(r, fresh.id);
+    await r.purchase.placeOrder({ idempotencyKey: "idem-order-1" });
+    expect((r.shop.calls as { cartMandateId: string }[]).map((c) => c.cartMandateId)).toEqual([fresh.id]);
+    expectJournalClean(r.journal.entries, AGENT, r.stand.stub.calls, ["idem-intent-1", "idem-cart-1", "idem-cart-2", "idem-order-1"]);
+  });
+
+  it("вторая защита: из OFFERS заказ запрещён машиной — STOPPED PIPELINE_TRANSITION_FORBIDDEN, обращений нет (стирание проверяет тест выше)", async () => {
+    const { r } = await onShop();
+    await signedIntent(r);
+    await r.purchase.search();
+    await sign(r, (await r.purchase.cart(pick({ sku: "tartine", qty: 1 }), { idempotencyKey: "idem-cart-1" })).id);
+    await r.purchase.search();
+    const from = r.stand.stub.calls.length;
+    await expect(r.purchase.placeOrder({ idempotencyKey: "idem-order-1" })).rejects.toThrow();
+    expect(r.purchase.reason).toBe("PIPELINE_TRANSITION_FORBIDDEN");
+    expect(opsFrom(r, from)).toEqual([]);
+    expect(r.shop.calls).toEqual([]);
+  });
+});
+
 describe("Р44 п. 5 — проверка по мандату непосредственно перед заказом (Р-149)", () => {
   /** До CART_ACTIVE: CART на две позиции подписан; остаток задаёт «Платформа» (consents.left). */
   async function signedTwo() {

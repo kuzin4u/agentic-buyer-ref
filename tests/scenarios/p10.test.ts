@@ -98,6 +98,9 @@ describe("П10 — корзина и мандат корзины", { timeout: ST
       "pao GET /pao/v1/mandates/{cart} 200",
       shop,
       shop,
+      // проверка по мандату непосредственно перед заказом (Р44 п. 5)
+      "pao GET /pao/v1/mandates/{intent}/verify 200",
+      "pao GET /pao/v1/mandates/{cart}/verify 200",
       `merchants POST /v1/shops/${NORMAL.id}/orders 201`,
     ]);
     expect(r.payment.calls).toEqual([]);

@@ -24,7 +24,7 @@ export interface ShopProfile {
   item(sku: string): Pick<CatalogProduct, "delivery" | "updatedAt"> | null;
 }
 
-export type ShopsParams = Pick<StandParams, "shop_request_timeout_ms" | "shop_retry_after_max_sec" | "shop_retry_default_ms">;
+export type ShopsParams = Pick<StandParams, "shop_request_timeout_ms" | "shop_retry_after_max_sec" | "shop_retry_default_ms" | "shop_search_deadline_ms">;
 
 export interface ShopsAdapterOptions {
   baseUrl: string;
@@ -96,6 +96,14 @@ function dropCode(raw: unknown, issues: z.core.$ZodIssue[]): CatalogIssueCode {
   return fields.includes("currency") ? "BAD_CURRENCY" : "BAD_TYPE";
 }
 
+/** Общий срок стадии поиска (Р44 п. 6). */
+interface Deadline {
+  signal: AbortSignal;
+  left: () => number;
+}
+
+const DEADLINE: ShopUnavailableCause = { reason: "SHOP_SEARCH_DEADLINE" };
+
 export class ShopsAdapter implements OfferSource, LiveOfferSource, ShopPort {
   private readonly now: () => Date;
   private readonly fetchImpl: typeof fetch;
@@ -111,9 +119,12 @@ export class ShopsAdapter implements OfferSource, LiveOfferSource, ShopPort {
   }
 
   /** Стадия 2. Список витрин не получен или не по схеме — отказ стадии (исключение). Витрина отказала в каталоге —
-   *  магазин недоступен, остальные витрины — дальше. */
+   *  магазин недоступен, остальные витрины — дальше. Общий срок стадии — `shop_search_deadline_ms` с начала поиска (Р44
+   *  п. 6): по истечении к оставшимся витринам не обращаются, идущее обращение прерывается, ожидание повтора не меньше остатка
+   *  не начинается — магазин недоступен с кодом SHOP_SEARCH_DEADLINE. */
   async search(): Promise<(ShopOffers | ShopUnavailable)[]> {
-    const list = await this.#get("GET /v1/shops", "/v1/shops", Shops);
+    const deadline = this.#deadline();
+    const list = await this.#get("GET /v1/shops", "/v1/shops", Shops, undefined, undefined, deadline);
     if (!list.ok) throw new Error("список витрин не получен или не по схеме");
     const out: (ShopOffers | ShopUnavailable)[] = [];
     for (const entry of list.body.shops) {
@@ -124,7 +135,11 @@ export class ShopsAdapter implements OfferSource, LiveOfferSource, ShopPort {
         continue;
       }
       const s = parsed.data;
-      const catalog = await this.#get("GET /v1/shops/{id}/catalog", `/v1/shops/${s.id}/catalog`, Catalog, s.id);
+      if (deadline.left() <= 0) {
+        out.push({ shopId: s.id, merchantId: s.merchant_id, unavailable: DEADLINE });
+        continue;
+      }
+      const catalog = await this.#get("GET /v1/shops/{id}/catalog", `/v1/shops/${s.id}/catalog`, Catalog, s.id, undefined, deadline);
       if (!catalog.ok) {
         out.push({ shopId: s.id, merchantId: s.merchant_id, unavailable: catalog.cause });
         continue;
@@ -216,16 +231,34 @@ export class ShopsAdapter implements OfferSource, LiveOfferSource, ShopPort {
   }
 
   /** GET с одним повтором по повторяемому коду (Р42 п. 4); 200 не по схеме — BAD_RESPONSE без повтора; `shopId` — для
-   *  журнала. */
-  async #get<T>(method: Method, path: string, schema: z.ZodType<T>, shopId?: string, signal?: AbortSignal): Promise<Outcome<T>> {
+   *  журнала. `deadline` — общий срок поиска (Р44 п. 6): обращение прервано им или ожидание повтора не меньше остатка —
+   *  SHOP_SEARCH_DEADLINE без повтора. */
+  async #get<T>(method: Method, path: string, schema: z.ZodType<T>, shopId?: string, signal?: AbortSignal, deadline?: Deadline): Promise<Outcome<T>> {
     let attempt = 1;
     for (;;) {
-      const r = this.#outcome(await this.#send("GET", path, undefined, signal), schema);
+      let reply: Reply;
+      try {
+        reply = await this.#send("GET", path, undefined, deadline ? (signal ? AbortSignal.any([signal, deadline.signal]) : deadline.signal) : signal);
+      } catch (e) {
+        // только прерывание сроком поиска: иное исключение (остановленная подпись, отмена вызывающего) — наружу (инвариант 4)
+        if (deadline === undefined || signal?.aborted || !deadline.signal.aborted || e !== deadline.signal.reason) throw e;
+        this.#log(method, attempt, "unknown", shopId, DEADLINE);
+        return { ok: false, cause: DEADLINE, retry: null };
+      }
+      const r = this.#outcome(reply, schema);
       this.#log(method, attempt, r.ok ? "ok" : r.cause.detail === "NO_RESPONSE" ? "unknown" : "refused", shopId, r.ok ? undefined : r.cause);
       if (r.ok || r.retry === null || attempt > 1) return r;
+      if (deadline !== undefined && r.retry >= deadline.left()) return { ok: false, cause: DEADLINE, retry: null };
       await this.sleep(r.retry, signal);
       attempt++;
     }
+  }
+
+  /** Общий срок стадии поиска с этого момента: сигнал прерывания и остаток в мс (часы — монотонные). */
+  #deadline(): Deadline {
+    const ms = this.o.params.shop_search_deadline_ms;
+    const start = performance.now();
+    return { signal: AbortSignal.timeout(ms), left: () => ms - (performance.now() - start) };
   }
 
   #outcome<T>(reply: Reply, schema: z.ZodType<T>): Outcome<T> {

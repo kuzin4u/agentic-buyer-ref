@@ -264,16 +264,125 @@ describe("Р44 п. 4 — новая цена после согласования
     expect(cart.cart?.total).toEqual({ amount: ZAVARNOY, currency: "RUB" });
   });
 
-  it("отказ по наличию перед заказом — выдача и CART не сброшены ценой: новый выбор из того же показа без поиска", async () => {
+  it("отказ по наличию перед заказом — снимок CART стёрт (наружу не отдаётся), выдача — нет: новый выбор из того же показа без поиска (ревью КТ1 п. 1)", async () => {
     const shop = shopWithPrices();
     const r = await setup({ shops: [shop], live: liveOffers(shop, () => stand!.clock, (_, n) => (n === 2 ? { availability: { inStock: false } } : {})), shop: shopOrders(shop) });
     await signedIntent(r);
     await r.purchase.search();
     await sign(r, (await r.purchase.cart(pick({ sku: "tartine", qty: 1 }), { idempotencyKey: "idem-cart-1" })).id);
     await expect(r.purchase.placeOrder({ idempotencyKey: "idem-order-1" })).rejects.toMatchObject({ next: "TELL_STOCK" });
+    expect(r.purchase.cartMandate).toBeNull();
     expect(r.purchase.offers).not.toBeNull();
     await r.purchase.cart(pick({ sku: "zavarnoy", qty: 1 }), { idempotencyKey: "idem-cart-2" });
     expect(r.purchase.state).toBe("CART_PENDING");
+  });
+
+  for (const [name, over] of [
+    ["нет в наличии", { availability: { inStock: false } }],
+    ["продавец не ответил", { checkedAt: "2000-01-01T00:00:00Z" }],
+  ] as const) {
+    it(`${name} перед заказом — снимок CART стёрт: заказ без нового CART невозможен (STOPPED), к витрине не обращаемся (ревью КТ1 п. 1)`, async () => {
+      const shop = shopWithPrices();
+      const r = await setup({ shops: [shop], live: liveOffers(shop, () => stand!.clock, (_, n) => (n === 2 ? over : {})), shop: shopOrders(shop) });
+      await signedIntent(r);
+      await r.purchase.search();
+      await sign(r, (await r.purchase.cart(pick({ sku: "tartine", qty: 1 }), { idempotencyKey: "idem-cart-1" })).id);
+      await expect(r.purchase.placeOrder({ idempotencyKey: "idem-order-1" })).rejects.toBeInstanceOf(OrderRefused);
+      expect(r.purchase.cartMandate).toBeNull();
+      const from = r.stand.stub.calls.length;
+      await expect(r.purchase.placeOrder({ idempotencyKey: "idem-order-2" })).rejects.toThrow();
+      expect(r.purchase.state).toBe("STOPPED");
+      expect(r.purchase.reason).toBe("PIPELINE_TRANSITION_FORBIDDEN");
+      expect(r.shop.calls).toEqual([]);
+      expect(opsFrom(r, from)).toEqual([]);
+    });
+  }
+});
+
+describe("Р44 п. 5 — проверка по мандату непосредственно перед заказом (Р-149)", () => {
+  /** До CART_ACTIVE: CART на две позиции подписан; остаток задаёт «Платформа» (consents.left). */
+  async function signedTwo() {
+    const { r, payment } = await onShop();
+    await signedIntent(r);
+    await r.purchase.search();
+    const cart = await r.purchase.cart(pick({ sku: "tartine", qty: 2 }, { sku: "zavarnoy", qty: 1 }), { idempotencyKey: "idem-cart-1" });
+    await sign(r, cart.id);
+    return { r, payment, cart };
+  }
+  const TOTAL = 2 * TARTINE + ZAVARNOY;
+
+  it("остаток INTENT иссяк между CART и заказом (другая покупка) — STOPPED до заказа: agent.refused, к витрине POST нет, реквизита нет", async () => {
+    for (const [left, code] of [
+      [TOTAL - 1, "MANDATE_AMOUNT_LEFT_INSUFFICIENT"],
+      [0, "MANDATE_OUT_OF_SCOPE"],
+    ] as const) {
+      const { r, payment } = await signedTwo();
+      const intentId = r.purchase.intentMandate!.id;
+      r.consents.left.set(intentId, left);
+      const from = r.stand.stub.calls.length;
+      await expect(r.purchase.placeOrder({ idempotencyKey: "idem-order-1" })).rejects.toMatchObject({ code });
+      expect(r.purchase.state).toBe("STOPPED");
+      // живые проверки обеих позиций прошли, затем verify INTENT — и стоп: по INTENT вне пределов CART уже не проверяется
+      expect(r.live.calls!.length).toBe(4);
+      expect(opsFrom(r, from)).toEqual([VERIFY]);
+      expect(r.shop.calls).toEqual([]);
+      expect(payment.calls).toEqual([]);
+      expect(r.tail().slice(-2).map((e) => [e.kind, e.reason, e.mandate])).toEqual([
+        ["agent.refused", code, intentId],
+        ["purchase.stage", code, intentId],
+      ]);
+      expect(stand?.stub.violations ?? []).toEqual([]);
+      await stand?.close();
+      stand = undefined;
+    }
+  });
+
+  it("остаток CART меньше итога — STOPPED MANDATE_AMOUNT_LEFT_INSUFFICIENT после verify обоих, заказа нет", async () => {
+    const { r, cart } = await signedTwo();
+    r.consents.left.set(cart.id, TOTAL - 1);
+    const from = r.stand.stub.calls.length;
+    await expect(r.purchase.placeOrder({ idempotencyKey: "idem-order-1" })).rejects.toMatchObject({ code: "MANDATE_AMOUNT_LEFT_INSUFFICIENT" });
+    expect(r.purchase.state).toBe("STOPPED");
+    expect(opsFrom(r, from)).toEqual([VERIFY, VERIFY]);
+    expect(r.shop.calls).toEqual([]);
+    expect(r.tail().slice(-2).map((e) => [e.kind, e.reason, e.mandate])).toEqual([
+      ["agent.refused", "MANDATE_AMOUNT_LEFT_INSUFFICIENT", cart.id],
+      ["purchase.stage", "MANDATE_AMOUNT_LEFT_INSUFFICIENT", r.purchase.intentMandate!.id],
+    ]);
+  });
+
+  it("CART отозван у Платформы, события ещё нет — verify перед заказом: STOPPED, заказа нет", async () => {
+    const { r, cart } = await signedTwo();
+    r.consents.mandates.get(cart.id)!.status = "REVOKED";
+    const from = r.stand.stub.calls.length;
+    await expect(r.purchase.placeOrder({ idempotencyKey: "idem-order-1" })).rejects.toThrow();
+    expect(r.purchase.state).toBe("STOPPED");
+    expect(r.purchase.reason).toBe("MANDATE_OUT_OF_SCOPE");
+    expect(opsFrom(r, from)).toEqual([VERIFY, VERIFY]);
+    expect(r.shop.calls).toEqual([]);
+    expect(r.tail().filter((e) => e.kind === "agent.refused").map((e) => [e.reason, e.mandate])).toEqual([["MANDATE_OUT_OF_SCOPE", cart.id]]);
+  });
+
+  it("остаток в порядке — verify INTENT и CART после живых проверок и непосредственно перед POST заказа, затем заказ", async () => {
+    // витрина записывает, какие обращения к контуру были непосредственно перед заказом
+    // живая проверка записывает, сколько обращений к контуру было к её моменту
+    const at: { r?: PurchaseRun; before?: (string | undefined)[]; live: number[] } = { live: [] };
+    const shop = shopWithPrices();
+    const real = shopOrders(shop);
+    const checks = liveOffers(shop, () => stand!.clock);
+    const live = { fetch: (req: Parameters<typeof checks.fetch>[0], signal: AbortSignal) => (at.live.push(at.r?.stand.stub.calls.length ?? -1), checks.fetch(req, signal)) };
+    const r = await setup({ shops: [shop], live, shop: { order: (req, m) => ((at.before = at.r!.stand.stub.calls.slice(-2).map((c) => c.op)), real.order(req, m)) } });
+    at.r = r;
+    await signedIntent(r);
+    await r.purchase.search();
+    await sign(r, (await r.purchase.cart(pick({ sku: "tartine", qty: 2 }, { sku: "zavarnoy", qty: 1 }), { idempotencyKey: "idem-cart-1" })).id);
+    const from = r.stand.stub.calls.length;
+    await r.purchase.placeOrder({ idempotencyKey: "idem-order-1" });
+    expect(opsFrom(r, from)).toEqual([VERIFY, VERIFY]);
+    expect(at.before).toEqual([VERIFY, VERIFY]);
+    // обе живые проверки перед заказом — до verify: между ними и началом placeOrder обращений к контуру нет
+    expect(at.live.slice(-2)).toEqual([from, from]);
+    expect(r.purchase.state).toBe("ORDERED");
   });
 
   it("перед заказом — до первой позиции не ok: первая не в наличии — вторая не проверяется, коды только первой (Р44 п. 2)", async () => {

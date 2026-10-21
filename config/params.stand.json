@@ -21,5 +21,6 @@
   "event_poll_interval_ms": 1000,
   "shop_request_timeout_ms": 5000,
   "shop_retry_after_max_sec": 30,
-  "shop_retry_default_ms": 1000
+  "shop_retry_default_ms": 1000,
+  "shop_search_deadline_ms": 15000
 }

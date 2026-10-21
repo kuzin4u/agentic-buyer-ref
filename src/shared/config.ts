@@ -44,12 +44,16 @@ export const StandParamsSchema = z
   // × 1000 — пауза таймера: не больше его предела, иначе таймер сработает сразу (ревью К1 № 7)
   shop_retry_after_max_sec: count.max(Math.floor(TIMER_MAX_MS / 1000)),
   shop_retry_default_ms: positive.max(TIMER_MAX_MS),
+  // Общий срок стадии поиска (Р44 п. 6, Р-183): по истечении оставшиеся витрины недоступны (SHOP_SEARCH_DEADLINE).
+  shop_search_deadline_ms: positive.max(TIMER_MAX_MS),
 })
   // Обращения и ожидание повторов укладываются в registry_cache_ttl_sec (инвариант 4, Р20).
   .refine(
     (p) => (p.pao_max_attempts * p.pao_request_timeout_ms) / 1000 + PAO_RETRY_AFTER_MAX_SEC <= p.registry_cache_ttl_sec,
     { message: "pao_max_attempts × pao_request_timeout_ms + 30 с (РП24) больше registry_cache_ttl_sec" },
-  );
+  )
+  // Срок поиска вмещает хотя бы одно обращение к витрине (Р44 п. 6).
+  .refine((p) => p.shop_search_deadline_ms >= p.shop_request_timeout_ms, { message: "shop_search_deadline_ms меньше shop_request_timeout_ms" });
 
 export type StandParams = z.infer<typeof StandParamsSchema>;
 

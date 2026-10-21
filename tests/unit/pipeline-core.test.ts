@@ -36,7 +36,7 @@ describe("core.purchase() — путь 0–6 на PaoStub (Р38 п. 8, К6)", ()
     await p.settle();
     expect(p.state).toBe("DONE");
     // полный журнал обращений к PaoStub: допуск, INTENT (сразу ACTIVE — GET), verify перед поиском и перед CART, CART,
-    // ворота — verify INTENT и CART; лишнее обращение видно (ревью К6 № 4)
+    // перед заказом и в воротах — verify INTENT и CART (Р44 п. 5); лишнее обращение видно (ревью К6 № 4)
     expect(s.stub.calls.map((c) => c.op)).toEqual([
       "GET /.well-known/pao-configuration",
       "GET /pao/v1/agent",
@@ -46,6 +46,8 @@ describe("core.purchase() — путь 0–6 на PaoStub (Р38 п. 8, К6)", ()
       "GET /pao/v1/mandates/{id}/verify",
       "POST /pao/v1/mandates",
       "GET /pao/v1/mandates/{id}",
+      "GET /pao/v1/mandates/{id}/verify",
+      "GET /pao/v1/mandates/{id}/verify",
       "GET /pao/v1/mandates/{id}/verify",
       "GET /pao/v1/mandates/{id}/verify",
     ]);

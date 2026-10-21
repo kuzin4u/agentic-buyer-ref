@@ -384,10 +384,11 @@ export class Purchase {
     });
   }
 
-  /** Стадия 3: живая проверка каждой позиции непосредственно перед заказом (Р32 п. 3, Р44 п. 2) → заказ у продавца →
-   *  сверка суммы (Т6). Позиции заказа и проверки — из подписанного CART, товары и магазин — из своей выдачи. Проверка не ok
-   *  — OrderRefused, CART_ACTIVE → OFFERS (Р38 п. 1); ценовой отказ сбрасывает выдачу и снимок CART: новый CART — только
-   *  после нового поиска (Т6, Р44 п. 4). Сумма или валюта заказа ≠ CART — STOPPED ORDER_REPLY_MISMATCH. */
+  /** Стадия 3: живая проверка каждой позиции непосредственно перед заказом (Р32 п. 3, Р44 п. 2) → проверка по мандату
+   *  (Р44 п. 5) → заказ у продавца → сверка суммы (Т6). Позиции заказа и проверки — из подписанного CART, товары и магазин —
+   *  из своей выдачи. Проверка не ok — OrderRefused, CART_ACTIVE → OFFERS (Р38 п. 1), снимок CART стёрт; ценовой отказ
+   *  сбрасывает и выдачу: новый CART — только после нового поиска (Т6, Р44 п. 4). Отказ по мандату — STOPPED до заказа.
+   *  Сумма или валюта заказа ≠ CART — STOPPED ORDER_REPLY_MISMATCH. */
   placeOrder(m: Mutation): Promise<ShopOrder> {
     return this.#stage("ORDERED", async () => {
       const intent = this.#need(this.#intent);
@@ -407,15 +408,17 @@ export class Purchase {
         const d = mayOrder(live);
         if (d.allow) continue;
         for (const reason of d.codes) this.#record({ kind: "order.live_refused", reason, detail: d.next, ...skuRef(line.sku), ...merchantRef(offer.merchantId) });
-        // новая цена — прежний CART больше не используется ничем: ни заказ, ни реквизит, ни оплата (Т6, Р44 п. 4, выбор 4а)
-        if (d.next === "NEW_CART_MANDATE") {
-          this.#zones = null;
-          this.#cart = null;
-          this.#lines = null;
-        }
+        // прежний CART больше не используется ничем и наружу как текущий не отдаётся — после любого отказа (Р44 п. 4,
+        // выбор 4а; решение владельца по ревью КТ1 п. 1); новая цена — и выдача: новый CART только после нового поиска (Т6)
+        this.#cart = null;
+        this.#lines = null;
+        if (d.next === "NEW_CART_MANDATE") this.#zones = null;
         this.#machine.to("OFFERS");
         throw new OrderRefused(d.next, d.codes);
       }
+      // проверка по мандату непосредственно перед заказом (Р44 п. 5, Р-149): остаток не меньше итога CART, продавец и
+      // валюта в пределах — иначе STOPPED до заказа, у продавца не остаётся неоплаченного заказа; ворота стадии 5 остаются
+      await this.#scope(intent, cart);
       const shopId = offers[0]!.shopId;
       const order = await this.#guard(async () => {
         const reply = snapshot(await this.o.shop.order({ shopId, items: basket.lines.map((l) => ({ sku: l.sku, qty: l.qty })), cartMandateId: cart.id }, m));
@@ -519,7 +522,7 @@ export class Purchase {
     this.#machine.passGate5();
   }
 
-  /** Проверка по мандату (Р38 п. 3, Р40 п. 5) — в воротах стадии 5 и до стадии 4: INTENT и CART оба среди держимых
+  /** Проверка по мандату (Р38 п. 3, Р40 п. 5, Р44 п. 5) — перед заказом, до стадии 4 и в воротах стадии 5: INTENT и CART оба среди держимых
    *  (сигнал, без сети), затем verify каждого и решение политики по нему (Р39 п. 1.1–1.3: остаток > 0, в валюте итога и
    *  не меньше итога, продавец и валюта в пределах; инвариант 6); после verify — держимые ещё раз (отзыв по ленте во время
    *  проверки). Отзыв — agent.refused MANDATE_NOT_ACTIVE; verify не CONFIRMED — MANDATE_OUT_OF_SCOPE (запись клиента

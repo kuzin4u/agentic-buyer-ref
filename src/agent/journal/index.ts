@@ -90,10 +90,12 @@ export type JournalKind =
   | "cart.live_refused"
   /** попытка обращения к витрине (Т15, Р42): method — шаблон пути, attempt > 1 — попытка повтора, ref — id витрины по
    *  маске, mandate — мандат корзины у заказа; detail — код витрины из перечня, BAD_RESPONSE или NO_RESPONSE; код вне
-   *  перечня — reason MERCHANT_CODE_UNKNOWN */
+   *  перечня — reason MERCHANT_CODE_UNKNOWN; обращение прервано общим сроком поиска — reason SHOP_SEARCH_DEADLINE (Р44 п. 6) */
   | "shop.call"
   /** магазин недоступен в выдаче (Т4, Р42 п. 4): detail и reason — как у последней попытки shop.call, merchant — код
-   *  продавца; пишет конвейер */
+   *  продавца; пишет конвейер. Исключения по сроку поиска (Р44 п. 6) — reason SHOP_SEARCH_DEADLINE: срок истёк до
+   *  обращения (shop.call нет) или повтор не начат, потому что Retry-After не меньше остатка (у shop.call — detail кода
+   *  витрины) */
   | "shop.unavailable";
 
 export interface JournalEntry {

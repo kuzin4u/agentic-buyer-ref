@@ -87,7 +87,7 @@ describe("стадии 3–6 — путь покупки (Р38 п. 1–2)", () =
     expect(r.payment.calls).toEqual(["authorize", "settle"]);
     expect(stages(r)).toEqual(["INTENT_PENDING", "INTENT_ACTIVE", "OFFERS", "CART_PENDING", "CART_ACTIVE", "ORDERED", "AUTHORIZING", "SETTLING", "DONE"]);
     // после допуска: INTENT (POST, GET по подписи), verify перед поиском и перед CART (Р38 п. 3), CART (POST, GET),
-    // ворота перед стадией 5 — verify INTENT и CART (К4)
+    // перед заказом — verify INTENT и CART (Р44 п. 5), ворота перед стадией 5 — verify INTENT и CART (К4)
     const log = r.stand.log().map((c) => c.op);
     expect(log.slice(log.indexOf("POST /pao/v1/mandates"))).toEqual([
       "POST /pao/v1/mandates",
@@ -96,6 +96,8 @@ describe("стадии 3–6 — путь покупки (Р38 п. 1–2)", () =
       "GET /pao/v1/mandates/{id}/verify",
       "POST /pao/v1/mandates",
       "GET /pao/v1/mandates/{id}",
+      "GET /pao/v1/mandates/{id}/verify",
+      "GET /pao/v1/mandates/{id}/verify",
       "GET /pao/v1/mandates/{id}/verify",
       "GET /pao/v1/mandates/{id}/verify",
     ]);
@@ -1078,17 +1080,17 @@ describe("политика до стадий 4–5 (Р39): отказ — agent.
     });
   }
 
-  it("продавец заказа вне merchantScope INTENT — STOPPED MANDATE_OUT_OF_SCOPE после verify обоих, реквизита нет (Р39 п. 1.3)", async () => {
+  it("продавец CART вне merchantScope INTENT — STOPPED MANDATE_OUT_OF_SCOPE после verify обоих уже перед заказом: заказа и реквизита нет (Р39 п. 1.3, Р44 п. 5)", async () => {
     const r = await setup();
     await signedIntent(r, { ...INTENT, merchantScope: ["shop_2"] });
     const zones = await r.purchase.search();
     await signedCart(r, zones.contour.find((o) => o.sku === "tartine")!);
-    await r.purchase.placeOrder({ idempotencyKey: "idem-order-1" });
     const intentId = r.purchase.intentMandate!.id;
     const cartId = r.purchase.cartMandate!.id;
     const before = verified(r).length;
     const from = r.stand.stub.calls.length;
-    await expect(r.purchase.authorize({ idempotencyKey: "idem-pay-1" })).rejects.toMatchObject({ code: "MANDATE_OUT_OF_SCOPE" });
+    await expect(r.purchase.placeOrder({ idempotencyKey: "idem-order-1" })).rejects.toMatchObject({ code: "MANDATE_OUT_OF_SCOPE" });
+    expect(r.shop.calls).toEqual([]);
     expect(verified(r).slice(before)).toEqual([intentId, cartId]);
     expect(opsFrom(r, from)).toEqual([VERIFY, VERIFY]);
     expect(r.tail().slice(-2).map((e) => [e.kind, e.reason, e.mandate])).toEqual([

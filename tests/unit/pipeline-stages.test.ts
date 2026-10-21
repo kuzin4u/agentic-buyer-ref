@@ -10,7 +10,7 @@ import { ShopFailure } from "../../src/agent/ports/index.js";
 import { INTENT, event } from "../support/consents.js";
 import { expectJournalClean } from "../support/journal.js";
 import { AGENT, type PaoStand } from "../support/pao-stand.js";
-import { SHOP, purchaseOn, signedIntent, stages, type PurchaseRun, type PurchaseSetup } from "../support/purchase.js";
+import { SHOP, one, purchaseOn, signedIntent, stages, type PurchaseRun, type PurchaseSetup } from "../support/purchase.js";
 import { bakery, feedPrice, liveOffers, payments, shopOrders } from "../support/shop.js";
 import { humanA5Decision } from "../../src/agent/shell/index.js";
 
@@ -59,7 +59,7 @@ async function offers(r: PurchaseRun, sku = "tartine"): Promise<Offer> {
 
 /** До CART_ACTIVE: CART запрошен и подписан человеком по ленте. */
 async function signedCart(r: PurchaseRun, offer: Offer, qty = 1) {
-  const cart = await r.purchase.cart({ ...key(offer), qty, keyTermsShown: true }, { idempotencyKey: "idem-cart-1" });
+  const cart = await r.purchase.cart(one(offer, qty), { idempotencyKey: "idem-cart-1" });
   r.setFeed({ kind: "event", event: r.consents.sign(cart.id) });
   return r.purchase.awaitCart();
 }
@@ -87,7 +87,7 @@ describe("стадии 3–6 — путь покупки (Р38 п. 1–2)", () =
     expect(r.payment.calls).toEqual(["authorize", "settle"]);
     expect(stages(r)).toEqual(["INTENT_PENDING", "INTENT_ACTIVE", "OFFERS", "CART_PENDING", "CART_ACTIVE", "ORDERED", "AUTHORIZING", "SETTLING", "DONE"]);
     // после допуска: INTENT (POST, GET по подписи), verify перед поиском и перед CART (Р38 п. 3), CART (POST, GET),
-    // ворота перед стадией 5 — verify INTENT и CART (К4)
+    // перед заказом — verify INTENT и CART (Р44 п. 5), ворота перед стадией 5 — verify INTENT и CART (К4)
     const log = r.stand.log().map((c) => c.op);
     expect(log.slice(log.indexOf("POST /pao/v1/mandates"))).toEqual([
       "POST /pao/v1/mandates",
@@ -96,6 +96,8 @@ describe("стадии 3–6 — путь покупки (Р38 п. 1–2)", () =
       "GET /pao/v1/mandates/{id}/verify",
       "POST /pao/v1/mandates",
       "GET /pao/v1/mandates/{id}",
+      "GET /pao/v1/mandates/{id}/verify",
+      "GET /pao/v1/mandates/{id}/verify",
       "GET /pao/v1/mandates/{id}/verify",
       "GET /pao/v1/mandates/{id}/verify",
     ]);
@@ -123,7 +125,7 @@ describe("стадии 3–6 — путь покупки (Р38 п. 1–2)", () =
     const r = await setup();
     const offer = await offers(r);
     r.consents.tamper = (m) => (m.parent_id ? Object.assign(m, { status: "ACTIVE" }) : m);
-    await r.purchase.cart({ ...key(offer), qty: 1, keyTermsShown: true }, { idempotencyKey: "idem-cart-1" });
+    await r.purchase.cart(one(offer, 1), { idempotencyKey: "idem-cart-1" });
     expect(r.purchase.state).toBe("CART_ACTIVE");
     await r.purchase.placeOrder({ idempotencyKey: "idem-order-1" });
     expect(stages(r).slice(-3)).toEqual(["CART_PENDING", "CART_ACTIVE", "ORDERED"]);
@@ -131,7 +133,7 @@ describe("стадии 3–6 — путь покупки (Р38 п. 1–2)", () =
 
   it("подписи CART нет — ждать человека: MANDATE_SIGNATURE_PENDING наружу, покупка в CART_PENDING", async () => {
     const r = await setup();
-    await r.purchase.cart({ ...key(await offers(r)), qty: 1, keyTermsShown: true }, { idempotencyKey: "idem-cart-1" });
+    await r.purchase.cart(one(await offers(r), 1), { idempotencyKey: "idem-cart-1" });
     r.setFeed();
     await expect(r.purchase.awaitCart()).rejects.toMatchObject({ reason: "MANDATE_SIGNATURE_PENDING" });
     expect(r.purchase.state).toBe("CART_PENDING");
@@ -146,7 +148,7 @@ describe("стадия 3 — проект корзины (Р32 п. 2): отка�
       const zones = await r.purchase.search();
       const before = r.stand.log().length;
       const choice = pick === "market" ? key(zones.market[0]!) : { merchantId: "shop_1", sku: "нет такого" };
-      await expect(r.purchase.cart({ ...choice, qty: 1, keyTermsShown: true }, { idempotencyKey: "idem-cart-1" })).rejects.toBeInstanceOf(PurchaseStopped);
+      await expect(r.purchase.cart(one(choice, 1), { idempotencyKey: "idem-cart-1" })).rejects.toBeInstanceOf(PurchaseStopped);
       expect(r.purchase.reason).toBe("OFFER_NOT_IN_CONTOUR");
       expect(r.tail().slice(-2).map((e) => [e.kind, e.reason, e.ref])).toEqual([
         ["agent.refused", "OFFER_NOT_IN_CONTOUR", pick === "market" ? "tartine" : undefined],
@@ -165,10 +167,10 @@ describe("стадия 3 — проект корзины (Р32 п. 2): отка�
     zones.contour[0]!.a5 = [];
     zones.contour[0]!.product.price.amount = 1;
     r.purchase.offers!.contour[0]!.a5 = [];
-    await expect(r.purchase.cart({ ...key(zones.contour[0]!), qty: 1, keyTermsShown: true }, { idempotencyKey: "idem-cart-1" })).rejects.toMatchObject({ code: "A5_NEEDS_HUMAN" });
+    await expect(r.purchase.cart(one(zones.contour[0]!, 1), { idempotencyKey: "idem-cart-1" })).rejects.toMatchObject({ code: "A5_NEEDS_HUMAN" });
     expect(r.purchase.state).toBe("OFFERS");
     const decision = humanA5Decision(shownIn(r), r.purchase.offers!.contour[0]!, ["A5_RETURNS_MISMATCH"]);
-    const cart = await r.purchase.cart({ ...key(zones.contour[0]!), qty: 1, decision, keyTermsShown: true }, { idempotencyKey: "idem-cart-1" });
+    const cart = await r.purchase.cart(one(zones.contour[0]!, 1, decision), { idempotencyKey: "idem-cart-1" });
     expect(cart.cart!.total.amount).toBe(TARTINE);
   });
 
@@ -178,7 +180,7 @@ describe("стадия 3 — проект корзины (Р32 п. 2): отка�
     const zones = await r.purchase.search();
     zones.contour.push(zones.market[0]!);
     r.purchase.offers!.contour.push(zones.market[0]!);
-    await expect(r.purchase.cart({ ...key(zones.market[0]!), qty: 1, keyTermsShown: true }, { idempotencyKey: "idem-cart-1" })).rejects.toBeInstanceOf(PurchaseStopped);
+    await expect(r.purchase.cart(one(zones.market[0]!, 1), { idempotencyKey: "idem-cart-1" })).rejects.toBeInstanceOf(PurchaseStopped);
     expect(r.purchase.reason).toBe("OFFER_NOT_IN_CONTOUR");
   });
 
@@ -186,7 +188,7 @@ describe("стадия 3 — проект корзины (Р32 п. 2): отка�
     const r = await setup({ shops: [{ ...SHOP, profile: bakery({ returns: { days: 0, text: "Возврат в течение 14 дней" } }) }] });
     const offer = await offers(r);
     expect(offer.a5).toEqual(["A5_RETURNS_MISMATCH"]);
-    const refused = await r.purchase.cart({ ...key(offer), qty: 1, keyTermsShown: true }, { idempotencyKey: "idem-cart-1" }).catch((e: unknown) => e);
+    const refused = await r.purchase.cart(one(offer, 1), { idempotencyKey: "idem-cart-1" }).catch((e: unknown) => e);
     expect(refused).toBeInstanceOf(CartRefused);
     expect(refused).toMatchObject({ code: "A5_NEEDS_HUMAN" });
     expect(r.purchase.state).toBe("OFFERS");
@@ -196,7 +198,7 @@ describe("стадия 3 — проект корзины (Р32 п. 2): отка�
     ]);
     expectJournalClean(r.journal.entries, AGENT, r.stand.stub.calls, ["idem-intent-1"]);
     const decision = humanA5Decision(shownIn(r), offer, ["A5_RETURNS_MISMATCH"]);
-    await r.purchase.cart({ ...key(offer), qty: 1, decision, keyTermsShown: true }, { idempotencyKey: "idem-cart-1" });
+    await r.purchase.cart(one(offer, 1, decision), { idempotencyKey: "idem-cart-1" });
     expect(r.purchase.state).toBe("CART_PENDING");
   });
 
@@ -208,7 +210,7 @@ describe("стадия 3 — проект корзины (Р32 п. 2): отка�
     const [a, b] = ["shop_1", "shop_2"].map((m) => zones.contour.find((o) => o.merchantId === m && o.sku === "tartine")!);
     const decision = humanA5Decision(shownIn(r), a!, a!.a5);
     const from = r.stand.stub.calls.length;
-    await expect(r.purchase.cart({ ...key(b!), qty: 1, decision, keyTermsShown: true }, { idempotencyKey: "idem-cart-1" })).rejects.toMatchObject({ code: "A5_DECISION_STALE" });
+    await expect(r.purchase.cart(one(b!, 1, decision), { idempotencyKey: "idem-cart-1" })).rejects.toMatchObject({ code: "A5_DECISION_STALE" });
     expect(r.tail().filter((e) => e.kind === "cart.refused").map((e) => [e.reason, e.detail, e.merchant])).toEqual([["A5_RETURNS_MISMATCH", "A5_DECISION_STALE", "shop_2"]]);
     expect(r.stand.stub.calls.slice(from)).toEqual([]);
     expect(r.purchase.state).toBe("OFFERS");
@@ -221,7 +223,7 @@ describe("стадия 3 — проект корзины (Р32 п. 2): отка�
     const tampered = { ...offer, product: { ...offer.product, price: { ...offer.product.price, amount: 1 } } };
     const decision = humanA5Decision(shownIn(r), tampered, tampered.a5);
     const from = r.stand.stub.calls.length;
-    await expect(r.purchase.cart({ ...key(offer), qty: 1, decision, keyTermsShown: true }, { idempotencyKey: "idem-cart-1" })).rejects.toMatchObject({ code: "A5_DECISION_STALE" });
+    await expect(r.purchase.cart(one(offer, 1, decision), { idempotencyKey: "idem-cart-1" })).rejects.toMatchObject({ code: "A5_DECISION_STALE" });
     expect(r.tail().filter((e) => e.kind === "cart.refused").map((e) => [e.reason, e.detail])).toEqual([["A5_RETURNS_MISMATCH", "A5_DECISION_STALE"]]);
     expect(r.stand.stub.calls.slice(from)).toEqual([]);
     expect(r.purchase.state).toBe("OFFERS");
@@ -245,7 +247,7 @@ describe("стадия 3 — проект корзины (Р32 п. 2): отка�
             : ({ intentId: real.intentId, merchantId: real.merchantId, sku: real.sku, price: real.price, shown: real.shown, accepted: real.accepted } as unknown as typeof real);
         const from = r.stand.stub.calls.length;
         const start = r.tail().length;
-        await expect(r.purchase.cart({ ...key(offer), qty: 1, decision, keyTermsShown: true }, { idempotencyKey: "idem-cart-1" })).rejects.toBeInstanceOf(PurchaseStopped);
+        await expect(r.purchase.cart(one(offer, 1, decision), { idempotencyKey: "idem-cart-1" })).rejects.toBeInstanceOf(PurchaseStopped);
         expect(r.purchase.reason).toBe("A5_DECISION_FORGED");
         const root = r.purchase.intentMandate!.id;
         expect(r.tail().slice(start).map((e) => [e.kind, e.reason, e.ref, e.merchant, e.mandate])).toEqual([
@@ -264,7 +266,7 @@ describe("стадия 3 — проект корзины (Р32 п. 2): отка�
     const offer = await offers(r);
     const decision = humanA5Decision({ intentId: "mnd_other_purchase" }, offer, offer.a5);
     const from = r.stand.stub.calls.length;
-    await expect(r.purchase.cart({ ...key(offer), qty: 1, decision, keyTermsShown: true }, { idempotencyKey: "idem-cart-1" })).rejects.toMatchObject({ code: "A5_DECISION_STALE" });
+    await expect(r.purchase.cart(one(offer, 1, decision), { idempotencyKey: "idem-cart-1" })).rejects.toMatchObject({ code: "A5_DECISION_STALE" });
     expect(r.tail().filter((e) => e.kind === "cart.refused").map((e) => [e.reason, e.detail])).toEqual([["A5_RETURNS_MISMATCH", "A5_DECISION_STALE"]]);
     expect(r.stand.stub.calls.slice(from)).toEqual([]);
     expect(r.purchase.state).toBe("OFFERS");
@@ -276,7 +278,7 @@ describe("стадия 3 — проект корзины (Р32 п. 2): отка�
     const r = await setup({ shops: [{ ...SHOP, profile }], live: liveOffers(SHOP, () => stand!.clock, (_, n) => (n === 2 ? { availability: { inStock: false } } : {})) });
     const offer = await offers(r);
     const decision = humanA5Decision(shownIn(r), offer, offer.a5);
-    const cart = await r.purchase.cart({ ...key(offer), qty: 1, decision, keyTermsShown: true }, { idempotencyKey: "idem-cart-1" });
+    const cart = await r.purchase.cart(one(offer, 1, decision), { idempotencyKey: "idem-cart-1" });
     r.setFeed({ kind: "event", event: r.consents.sign(cart.id) });
     await r.purchase.awaitCart();
     await expect(r.purchase.placeOrder({ idempotencyKey: "idem-order-1" })).rejects.toBeInstanceOf(OrderRefused);
@@ -284,11 +286,11 @@ describe("стадия 3 — проект корзины (Р32 п. 2): отка�
     // показ тот же (выдача не менялась), покупка та же — решение потрачено на первый CART
     const from = r.stand.stub.calls.length;
     const start = r.tail().length;
-    await expect(r.purchase.cart({ ...key(offer), qty: 1, decision, keyTermsShown: true }, { idempotencyKey: "idem-cart-2" })).rejects.toMatchObject({ code: "A5_DECISION_STALE" });
+    await expect(r.purchase.cart(one(offer, 1, decision), { idempotencyKey: "idem-cart-2" })).rejects.toMatchObject({ code: "A5_DECISION_STALE" });
     expect(r.tail().slice(start).filter((e) => e.kind === "cart.refused").map((e) => [e.reason, e.detail])).toEqual([["A5_RETURNS_MISMATCH", "A5_DECISION_STALE"]]);
     expect(r.stand.stub.calls.slice(from)).toEqual([]);
     expect(r.purchase.state).toBe("OFFERS");
-    await r.purchase.cart({ ...key(offer), qty: 1, decision: humanA5Decision(shownIn(r), offer, offer.a5), keyTermsShown: true }, { idempotencyKey: "idem-cart-2" });
+    await r.purchase.cart(one(offer, 1, humanA5Decision(shownIn(r), offer, offer.a5)), { idempotencyKey: "idem-cart-2" });
     expect(r.purchase.state).toBe("CART_PENDING");
   });
 
@@ -302,7 +304,7 @@ describe("стадия 3 — проект корзины (Р32 п. 2): отка�
       const decision = humanA5Decision(shownIn(r), offer, offer.a5);
       const before = r.stand.log().filter((c) => c.op === "POST /pao/v1/mandates").length;
       r.stand.stub.fail("POST /pao/v1/mandates", { code }, attempts);
-      await expect(r.purchase.cart({ ...key(offer), qty: 1, decision, keyTermsShown: true }, { idempotencyKey: "idem-cart-1" })).rejects.toBeInstanceOf(PlatformFailure);
+      await expect(r.purchase.cart(one(offer, 1, decision), { idempotencyKey: "idem-cart-1" })).rejects.toBeInstanceOf(PlatformFailure);
       expect(r.purchase.reason).toBe(code);
       // запрос CART ушёл — решение потрачено при любом исходе
       expect(r.stand.log().filter((c) => c.op === "POST /pao/v1/mandates").length).toBe(before + attempts);
@@ -315,7 +317,7 @@ describe("стадия 3 — проект корзины (Р32 п. 2): отка�
     const offer = await offers(r);
     expect(offer.a5).toEqual([]);
     const decision = humanA5Decision(shownIn(r), offer, []);
-    await r.purchase.cart({ ...key(offer), qty: 1, decision, keyTermsShown: true }, { idempotencyKey: "idem-cart-1" });
+    await r.purchase.cart(one(offer, 1, decision), { idempotencyKey: "idem-cart-1" });
     expect(r.purchase.state).toBe("CART_PENDING");
     expect(isSpent(decision)).toBe(false);
   });
@@ -326,7 +328,7 @@ describe("стадия 3 — проект корзины (Р32 п. 2): отка�
     const offer = await offers(r);
     expect([...offer.a5].sort()).toEqual(["A5_PRICE_MISMATCH", "A5_RETURNS_MISMATCH"]);
     const decision = humanA5Decision(shownIn(r), offer, ["A5_RETURNS_MISMATCH"]);
-    await expect(r.purchase.cart({ ...key(offer), qty: 1, decision, keyTermsShown: true }, { idempotencyKey: "idem-cart-1" })).rejects.toMatchObject({ code: "A5_NEEDS_HUMAN" });
+    await expect(r.purchase.cart(one(offer, 1, decision), { idempotencyKey: "idem-cart-1" })).rejects.toMatchObject({ code: "A5_NEEDS_HUMAN" });
     expect(r.tail().filter((e) => e.kind === "cart.refused").map((e) => e.reason)).toEqual(["A5_PRICE_MISMATCH"]);
     // отказ политики до запроса CART — решение не потрачено (Р40 п. 2)
     expect(isSpent(decision)).toBe(false);
@@ -337,7 +339,7 @@ describe("стадия 3 — проект корзины (Р32 п. 2): отка�
     await signedIntent(r, { ...INTENT, confirmationMode: "AUTONOMOUS" });
     const offer = (await r.purchase.search()).contour[0]!;
     const decision = humanA5Decision(shownIn(r), offer, offer.a5);
-    const refused = await r.purchase.cart({ ...key(offer), qty: 1, decision, keyTermsShown: true }, { idempotencyKey: "idem-cart-1" }).catch((e: unknown) => e);
+    const refused = await r.purchase.cart(one(offer, 1, decision), { idempotencyKey: "idem-cart-1" }).catch((e: unknown) => e);
     expect(refused).toBeInstanceOf(CartRefused);
     expect(refused).toMatchObject({ code: "A5_AUTONOMOUS" });
     expect(r.purchase.state).toBe("OFFERS");
@@ -368,7 +370,7 @@ describe("стадия 3 — корзина по живой цене перед 
     const r = await setup();
     const offer = await offers(r);
     const from = r.stand.stub.calls.length;
-    const cart = await r.purchase.cart({ ...key(offer), qty: 2, keyTermsShown: true }, { idempotencyKey: "idem-cart-1" });
+    const cart = await r.purchase.cart(one(offer, 2), { idempotencyKey: "idem-cart-1" });
     // живая проверка — после verify INTENT и до запроса CART: одна, по выбору человека
     expect(r.live.calls).toEqual([{ sku: "tartine", quantity: 2, region: "77" }]);
     expect(opsFrom(r, from)).toEqual([VERIFY, "POST /pao/v1/mandates"]);
@@ -388,7 +390,7 @@ describe("стадия 3 — корзина по живой цене перед 
       const r = await setup({ live: liveOffers(SHOP, () => stand!.clock, () => over) });
       const offer = await offers(r);
       const from = r.stand.stub.calls.length;
-      const err = await r.purchase.cart({ ...key(offer), qty: 2, keyTermsShown: true }, { idempotencyKey: "idem-cart-1" }).catch((e: unknown) => e);
+      const err = await r.purchase.cart(one(offer, 2), { idempotencyKey: "idem-cart-1" }).catch((e: unknown) => e);
       expect(err).toBeInstanceOf(CartLiveRefused);
       expect(err).toMatchObject({ next, codes });
       expect(r.purchase.state).toBe("OFFERS");
@@ -407,7 +409,7 @@ describe("стадия 3 — корзина по живой цене перед 
     const offer = await offers(r);
     r.consents.mandates.get(r.purchase.intentMandate!.id)!.status = "REVOKED";
     const from = r.stand.stub.calls.length;
-    await expect(r.purchase.cart({ ...key(offer), qty: 1, keyTermsShown: true }, { idempotencyKey: "idem-cart-1" })).rejects.toBeInstanceOf(MandateRefused);
+    await expect(r.purchase.cart(one(offer, 1), { idempotencyKey: "idem-cart-1" })).rejects.toBeInstanceOf(MandateRefused);
     expect(r.purchase.state).toBe("STOPPED");
     expect(r.live.calls).toEqual([]);
     expect(opsFrom(r, from)).toEqual([VERIFY]);
@@ -431,7 +433,7 @@ describe("стадия 3 — корзина по живой цене перед 
     const offer = await offers(r);
     const decision = humanA5Decision(shownIn(r), offer, offer.a5);
     const before = r.stand.log().filter((c) => c.op === "POST /pao/v1/mandates").length;
-    await expect(r.purchase.cart({ ...key(offer), qty: 1, decision, keyTermsShown: true }, { idempotencyKey: "idem-cart-1" })).rejects.toBeInstanceOf(PurchaseStopped);
+    await expect(r.purchase.cart(one(offer, 1, decision), { idempotencyKey: "idem-cart-1" })).rejects.toBeInstanceOf(PurchaseStopped);
     expect(r.purchase.reason).toBe("MANDATE_NOT_ACTIVE");
     expect(r.stand.log().filter((c) => c.op === "POST /pao/v1/mandates").length).toBe(before);
     expect(isSpent(decision)).toBe(false);
@@ -447,7 +449,7 @@ describe("стадия 3 — корзина по живой цене перед 
     });
     const offer = await offers(r);
     const from = r.stand.stub.calls.length;
-    await expect(r.purchase.cart({ ...key(offer), qty: 1, keyTermsShown: true }, { idempotencyKey: "idem-cart-1" })).rejects.toBe(boom);
+    await expect(r.purchase.cart(one(offer, 1), { idempotencyKey: "idem-cart-1" })).rejects.toBe(boom);
     expect(r.purchase.state).toBe("STOPPED");
     expect(r.purchase.reason).toBe("UNKNOWN");
     expect(opsFrom(r, from)).toEqual([VERIFY]);
@@ -458,7 +460,7 @@ describe("стадия 3 — корзина по живой цене перед 
     const offer = await offers(r);
     const decision = humanA5Decision(shownIn(r), offer, offer.a5);
     const from = r.stand.stub.calls.length;
-    await expect(r.purchase.cart({ ...key(offer), qty: 1, decision, keyTermsShown: true }, { idempotencyKey: "idem-cart-1" })).rejects.toMatchObject({ next: "TELL_UNCONFIRMED", codes: ["LIVE_UNAVAILABLE"] });
+    await expect(r.purchase.cart(one(offer, 1, decision), { idempotencyKey: "idem-cart-1" })).rejects.toMatchObject({ next: "TELL_UNCONFIRMED", codes: ["LIVE_UNAVAILABLE"] });
     expect(opsFrom(r, from)).toEqual([VERIFY]);
     expect(isSpent(decision)).toBe(false);
     expect(r.purchase.state).toBe("OFFERS");
@@ -468,7 +470,7 @@ describe("стадия 3 — корзина по живой цене перед 
     const r = await setup();
     const offer = await offers(r);
     let reads = 0;
-    const choice = { ...key(offer), keyTermsShown: true, get qty() { return ++reads === 1 ? 1 : 5; } };
+    const choice = { merchantId: offer.merchantId, keyTermsShown: true, lines: [{ sku: offer.sku, get qty() { return ++reads === 1 ? 1 : 5; } }] };
     const cart = await r.purchase.cart(choice, { idempotencyKey: "idem-cart-1" });
     expect(reads).toBe(1);
     expect(r.live.calls).toEqual([{ sku: "tartine", quantity: 1, region: "77" }]);
@@ -480,7 +482,7 @@ describe("стадия 3 — корзина по живой цене перед 
     const offer = await offers(r);
     const before = r.stand.log().length;
     const boom = new Error("геттер");
-    const choice = { ...key(offer), keyTermsShown: true, get qty(): number { throw boom; } };
+    const choice = { merchantId: offer.merchantId, keyTermsShown: true, lines: [{ sku: offer.sku, get qty(): number { throw boom; } }] };
     await expect(r.purchase.cart(choice, { idempotencyKey: "idem-cart-1" })).rejects.toBe(boom);
     expect(r.purchase.state).toBe("OFFERS");
     expect(r.live.calls).toEqual([]);
@@ -492,7 +494,7 @@ describe("стадия 3 — корзина по живой цене перед 
       const r = await setup();
       const offer = await offers(r);
       const before = r.stand.log().length;
-      await expect(r.purchase.cart({ ...key(offer), qty, keyTermsShown: true }, { idempotencyKey: "idem-cart-1" })).rejects.toBeInstanceOf(PurchaseStopped);
+      await expect(r.purchase.cart(one(offer, qty), { idempotencyKey: "idem-cart-1" })).rejects.toBeInstanceOf(PurchaseStopped);
       expect(r.purchase.reason).toBe("CART_QTY_INVALID");
       expect(r.tail().slice(-2).map((e) => [e.kind, e.reason, e.ref])).toEqual([
         ["agent.refused", "CART_QTY_INVALID", "tartine"],
@@ -537,7 +539,7 @@ describe("стадия 3 — живая проверка перед заказо
     await signedCart(r, offer);
     await expect(r.purchase.placeOrder({ idempotencyKey: "idem-order-1" })).rejects.toMatchObject({ next: "TELL_UNCONFIRMED", codes: ["LIVE_UNAVAILABLE"] });
     expect(r.tail().filter((e) => e.kind === "order.live_refused").map((e) => [e.reason, e.detail])).toEqual([["LIVE_UNAVAILABLE", "TELL_UNCONFIRMED"]]);
-    await r.purchase.cart({ ...key(offer), qty: 1, keyTermsShown: true }, { idempotencyKey: "idem-cart-2" });
+    await r.purchase.cart(one(offer, 1), { idempotencyKey: "idem-cart-2" });
     expect(stages(r).slice(-3)).toEqual(["CART_ACTIVE", "OFFERS", "CART_PENDING"]);
   });
 });
@@ -622,7 +624,7 @@ describe("стадии 4–6 — исходы из порта PaymentSteps (ин
       if (immediate) {
         const offer = await offers(r);
         r.consents.tamper = (m) => (m.parent_id ? Object.assign(m, { status: "ACTIVE" }) : m);
-        await r.purchase.cart({ ...key(offer), qty, keyTermsShown: true }, { idempotencyKey: "idem-cart-1" });
+        await r.purchase.cart(one(offer, qty), { idempotencyKey: "idem-cart-1" });
       } else await signedCart(r, await offers(r), qty);
       const held = r.core.mandates.held().find((m) => m.kind === "CART")!;
       (held.cart!.total as { amount: number }).amount = 1;
@@ -686,8 +688,8 @@ describe("стадии 4–6 — исходы из порта PaymentSteps (ин
   it("повторный вход в идущую стадию — запрещённый переход (два cart() подряд)", async () => {
     const r = await setup();
     const offer = await offers(r);
-    const first = r.purchase.cart({ ...key(offer), qty: 1, keyTermsShown: true }, { idempotencyKey: "idem-cart-1" });
-    await expect(r.purchase.cart({ ...key(offer), qty: 1, keyTermsShown: true }, { idempotencyKey: "idem-cart-2" })).rejects.toBeInstanceOf(PurchaseTransitionForbidden);
+    const first = r.purchase.cart(one(offer, 1), { idempotencyKey: "idem-cart-1" });
+    await expect(r.purchase.cart(one(offer, 1), { idempotencyKey: "idem-cart-2" })).rejects.toBeInstanceOf(PurchaseTransitionForbidden);
     await expect(first).rejects.toBeInstanceOf(PurchaseStopped);
     expect(r.stand.log().filter((c) => c.op === "POST /pao/v1/mandates")).toHaveLength(1);
   });
@@ -780,7 +782,7 @@ describe("сбой журнала — STOPPED UNKNOWN, решение без з�
       },
     });
     const offer = await offers(r);
-    await expect(r.purchase.cart({ ...key(offer), qty: 1, keyTermsShown: true }, { idempotencyKey: "idem-cart-1" })).rejects.toBe(boom);
+    await expect(r.purchase.cart(one(offer, 1), { idempotencyKey: "idem-cart-1" })).rejects.toBe(boom);
     expect(r.purchase.reason).toBe("UNKNOWN");
     expect(r.stand.log().filter((c) => c.op === "POST /pao/v1/mandates")).toHaveLength(1);
   });
@@ -791,7 +793,7 @@ describe("держимые после ожиданий (Р38 п. 3, ревью �
     const r = await setup();
     const intent = await signedIntent(r);
     const offer = (await r.purchase.search()).contour[0]!;
-    const cart = await r.purchase.cart({ ...key(offer), qty: 1, keyTermsShown: true }, { idempotencyKey: "idem-cart-1" });
+    const cart = await r.purchase.cart(one(offer, 1), { idempotencyKey: "idem-cart-1" });
     r.setStream(async function* () {
       r.consents.mandates.get(intent.id)!.status = "REVOKED";
       await r.core.mandates.refreshHeld({ kind: "event", event: event("mandate.revoked", intent.id) });
@@ -1078,17 +1080,17 @@ describe("политика до стадий 4–5 (Р39): отказ — agent.
     });
   }
 
-  it("продавец заказа вне merchantScope INTENT — STOPPED MANDATE_OUT_OF_SCOPE после verify обоих, реквизита нет (Р39 п. 1.3)", async () => {
+  it("продавец CART вне merchantScope INTENT — STOPPED MANDATE_OUT_OF_SCOPE после verify обоих уже перед заказом: заказа и реквизита нет (Р39 п. 1.3, Р44 п. 5)", async () => {
     const r = await setup();
     await signedIntent(r, { ...INTENT, merchantScope: ["shop_2"] });
     const zones = await r.purchase.search();
     await signedCart(r, zones.contour.find((o) => o.sku === "tartine")!);
-    await r.purchase.placeOrder({ idempotencyKey: "idem-order-1" });
     const intentId = r.purchase.intentMandate!.id;
     const cartId = r.purchase.cartMandate!.id;
     const before = verified(r).length;
     const from = r.stand.stub.calls.length;
-    await expect(r.purchase.authorize({ idempotencyKey: "idem-pay-1" })).rejects.toMatchObject({ code: "MANDATE_OUT_OF_SCOPE" });
+    await expect(r.purchase.placeOrder({ idempotencyKey: "idem-order-1" })).rejects.toMatchObject({ code: "MANDATE_OUT_OF_SCOPE" });
+    expect(r.shop.calls).toEqual([]);
     expect(verified(r).slice(before)).toEqual([intentId, cartId]);
     expect(opsFrom(r, from)).toEqual([VERIFY, VERIFY]);
     expect(r.tail().slice(-2).map((e) => [e.kind, e.reason, e.mandate])).toEqual([
@@ -1214,7 +1216,7 @@ describe("стадии 3–6 — запрещённые переходы до р
     const offer = await offers(r);
     const decision = humanA5Decision(shownIn(r), offer, offer.a5);
     r.consents.outcome = "OUT_OF_SCOPE";
-    await expect(r.purchase.cart({ ...key(offer), qty: 1, decision, keyTermsShown: true }, { idempotencyKey: "idem-cart-1" })).rejects.toBeInstanceOf(MandateRefused);
+    await expect(r.purchase.cart(one(offer, 1, decision), { idempotencyKey: "idem-cart-1" })).rejects.toBeInstanceOf(MandateRefused);
     expect(r.purchase.reason).toBe("MANDATE_OUT_OF_SCOPE");
     expect(r.stand.log().filter((c) => c.op === "POST /pao/v1/mandates")).toHaveLength(1);
     expect(isSpent(decision)).toBe(false);

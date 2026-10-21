@@ -10,6 +10,7 @@ import { PurchaseStopped } from "../../src/agent/pipeline/index.js";
 import { ZONE_TEXT } from "../../src/agent/shell/index.js";
 import { shopBy, type Contour } from "../support/contour.js";
 import { STAND_TIMEOUT_MS, standPurchase } from "../support/stand-purchase.js";
+import { one } from "../support/purchase.js";
 
 let c: Contour | undefined;
 afterEach(async () => {
@@ -62,7 +63,7 @@ describe("П07 — поиск по обеим зонам каталога", { ti
     // выбор человека из зоны рынка — сделка остановлена до любого обращения: ни CART у Платформы, ни заказа у витрины
     const market = zones.market[0]!;
     const before = r.c.calls().length;
-    await expect(r.purchase.cart({ merchantId: market.merchantId, sku: market.sku, qty: 1, keyTermsShown: true }, { idempotencyKey: "idem-cart-market" })).rejects.toBeInstanceOf(PurchaseStopped);
+    await expect(r.purchase.cart(one(market, 1), { idempotencyKey: "idem-cart-market" })).rejects.toBeInstanceOf(PurchaseStopped);
     expect(r.purchase.state).toBe("STOPPED");
     expect(r.purchase.reason).toBe("OFFER_NOT_IN_CONTOUR");
     expect(r.c.calls().slice(before)).toEqual([]);

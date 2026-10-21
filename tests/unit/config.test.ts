@@ -50,17 +50,22 @@ describe("стендовые параметры", () => {
     expect(() => parseParams({ ...stand, live_check_clock_skew_sec: maxSec + 1 })).toThrow(ConfigError);
   });
 
-  it("витрины (Р42): три параметра обязательны; таймауты — 1…2^31 − 1 мс, предел Retry-After — не больше ⌊(2^31 − 1) / 1000⌋ с", () => {
-    for (const k of ["shop_request_timeout_ms", "shop_retry_after_max_sec", "shop_retry_default_ms"]) {
+  it("витрины (Р42, Р44 п. 6): четыре параметра обязательны; таймауты — 1…2^31 − 1 мс, предел Retry-After — не больше ⌊(2^31 − 1) / 1000⌋ с", () => {
+    for (const k of ["shop_request_timeout_ms", "shop_retry_after_max_sec", "shop_retry_default_ms", "shop_search_deadline_ms"]) {
       const rest = { ...stand };
       delete rest[k];
       expect(() => parseParams(rest), k).toThrow(ConfigError);
     }
-    for (const k of ["shop_request_timeout_ms", "shop_retry_default_ms"]) {
-      expect(() => parseParams({ ...stand, [k]: 0 }), k).toThrow(ConfigError);
-      expect(() => parseParams({ ...stand, [k]: 2_147_483_648 }), k).toThrow(ConfigError);
-      expect(() => parseParams({ ...stand, [k]: 2_147_483_647 }), k).not.toThrow();
+    for (const k of ["shop_request_timeout_ms", "shop_retry_default_ms", "shop_search_deadline_ms"]) {
+      // срок поиска — не меньше тайм-аута обращения (Р44 п. 6): граница таймера проверяется при наибольшем сроке
+      const base = { ...stand, shop_search_deadline_ms: 2_147_483_647 };
+      expect(() => parseParams({ ...base, [k]: 0 }), k).toThrow(ConfigError);
+      expect(() => parseParams({ ...base, [k]: 2_147_483_648 }), k).toThrow(ConfigError);
+      expect(() => parseParams({ ...base, [k]: 2_147_483_647 }), k).not.toThrow();
     }
+    // срок поиска меньше тайм-аута обращения — отказ; равен — допустимо (Р44 п. 6)
+    expect(() => parseParams({ ...stand, shop_search_deadline_ms: stand.shop_request_timeout_ms - 1 })).toThrow(ConfigError);
+    expect(() => parseParams({ ...stand, shop_search_deadline_ms: stand.shop_request_timeout_ms })).not.toThrow();
     // пауза повтора — × 1000 в таймер Node: больше предела таймер сработал бы сразу (ревью К1 № 7)
     const maxSec = Math.floor(2_147_483_647 / 1000);
     expect(() => parseParams({ ...stand, shop_retry_after_max_sec: maxSec })).not.toThrow();

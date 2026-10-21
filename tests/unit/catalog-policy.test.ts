@@ -308,18 +308,27 @@ describe("живая проверка перед заказом (Р32 п. 3–4,
   });
 });
 
-describe("итог корзины — cartTotal (Р43 п. 2–3)", () => {
+describe("итог корзины — cartTotal (Р43 п. 2–3, Р44 п. 3)", () => {
   const price = { amount: 36900, currency: "RUB" as const };
   it("целое количество ≥ 1 — price × qty в минимальных единицах, валюта цены", () => {
-    expect(cartTotal(price, 1)).toEqual({ amount: 36900, currency: "RUB" });
-    expect(cartTotal(price, 2)).toEqual({ amount: 73800, currency: "RUB" });
-    expect(cartTotal({ amount: 0, currency: "RUB" }, 3)).toEqual({ amount: 0, currency: "RUB" });
+    expect(cartTotal([{ price, qty: 1 }])).toEqual({ amount: 36900, currency: "RUB" });
+    expect(cartTotal([{ price, qty: 2 }])).toEqual({ amount: 73800, currency: "RUB" });
+    expect(cartTotal([{ price: { amount: 0, currency: "RUB" }, qty: 3 }])).toEqual({ amount: 0, currency: "RUB" });
   });
   it("количество не целое ≥ 1, цена не целое ≥ 0 или итог не безопасное целое — null (CART_QTY_INVALID)", () => {
-    for (const qty of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1]) expect(cartTotal(price, qty)).toBeNull();
-    expect(cartTotal(price, Math.floor(Number.MAX_SAFE_INTEGER / price.amount) + 1)).toBeNull();
-    expect(cartTotal(price, Math.floor(Number.MAX_SAFE_INTEGER / price.amount))).not.toBeNull();
-    expect(cartTotal({ amount: -1, currency: "RUB" }, 1)).toBeNull();
-    expect(cartTotal({ amount: 0.5, currency: "RUB" }, 2)).toBeNull();
+    for (const qty of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1]) expect(cartTotal([{ price, qty }])).toBeNull();
+    expect(cartTotal([{ price, qty: Math.floor(Number.MAX_SAFE_INTEGER / price.amount) + 1 }])).toBeNull();
+    expect(cartTotal([{ price, qty: Math.floor(Number.MAX_SAFE_INTEGER / price.amount) }])).not.toBeNull();
+    expect(cartTotal([{ price: { amount: -1, currency: "RUB" }, qty: 1 }])).toBeNull();
+    expect(cartTotal([{ price: { amount: 0.5, currency: "RUB" }, qty: 2 }])).toBeNull();
+  });
+  it("несколько позиций — Σ price × qty; пусто, разные валюты или сумма не безопасное целое — null", () => {
+    const bread = { amount: 39000, currency: "RUB" as const };
+    expect(cartTotal([{ price, qty: 2 }, { price: bread, qty: 1 }])).toEqual({ amount: 2 * 36900 + 39000, currency: "RUB" });
+    expect(cartTotal([])).toBeNull();
+    expect(cartTotal([{ price, qty: 1 }, { price: { amount: 100, currency: "USD" }, qty: 1 }])).toBeNull();
+    expect(cartTotal([{ price, qty: 1 }, { price: bread, qty: 0 }])).toBeNull();
+    const half = Math.floor(Number.MAX_SAFE_INTEGER / 2);
+    expect(cartTotal([{ price: { amount: half, currency: "RUB" }, qty: 1 }, { price: { amount: half + 2, currency: "RUB" }, qty: 1 }])).toBeNull();
   });
 });

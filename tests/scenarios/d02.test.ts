@@ -9,6 +9,7 @@ import { PurchaseStopped } from "../../src/agent/pipeline/index.js";
 import { shopBy, type Contour } from "../support/contour.js";
 import { expectJournalClean } from "../support/journal.js";
 import { STAND_TIMEOUT_MS, standPurchase } from "../support/stand-purchase.js";
+import { one } from "../support/purchase.js";
 
 let c: Contour | undefined;
 afterEach(async () => {
@@ -33,7 +34,7 @@ describe("Д02 — агенту цена ниже, чем человеку (ча
     expect(offer.product.price.amount).toBe(AGENT_ITEM.price);
 
     const start = r.c.calls().length;
-    const cart = await r.purchase.cart({ merchantId: offer.merchantId, sku: offer.sku, qty: 1, keyTermsShown: true }, { idempotencyKey: "idem-cart-d02" });
+    const cart = await r.purchase.cart(one(offer, 1), { idempotencyKey: "idem-cart-d02" });
     // в CART — итог по живой цене продавца из своей выдачи (Р43 п. 1–2), не подставленный
     expect(cart.cart!.total).toEqual({ amount: AGENT_ITEM.price, currency: AGENT_ITEM.currency });
     await r.signWhileWaiting(cart.id, () => r.purchase.awaitCart());
@@ -43,16 +44,20 @@ describe("Д02 — агенту цена ниже, чем человеку (ча
     expect(r.purchase.state).toBe("STOPPED");
     expect(r.purchase.reason).toBe("ORDER_REPLY_MISMATCH");
     expect(r.purchase.order).toBeNull();
-    // продавец заказ создал по цене для всех; после ответа — ни одного обращения: ни verify, ни реквизита, ни оплаты
+    // перед заказом — живая проверка и verify INTENT и CART (Р44 п. 5); продавец заказ создал по цене для всех; после
+    // ответа — ни одного обращения: ни verify, ни реквизита, ни оплаты
     const after = r.c.calls().slice(before).filter((x) => !(x.target === "pao" && x.route.startsWith("GET /pao/v1/events")));
     expect(after.map((x) => `${x.target} ${x.route} ${x.status}`)).toEqual([
       `merchants GET /v1/shops/${DUAL.id}/catalog 200`,
+      // проверка по мандату непосредственно перед заказом (Р44 п. 5)
+      `pao GET /pao/v1/mandates/${intent.id}/verify 200`,
+      `pao GET /pao/v1/mandates/${cart.id}/verify 200`,
       `merchants POST /v1/shops/${DUAL.id}/orders 201`,
     ]);
     expect(r.c.calls().some((x) => x.route.includes("/credentials"))).toBe(false);
     expect(r.payment.calls).toEqual([]);
     expect(r.c.journal.entries.filter((e) => e.kind === "purchase.stage").at(-1)).toMatchObject({ detail: "STOPPED", reason: "ORDER_REPLY_MISMATCH", mandate: intent.id });
-    // полный журнал обращений стадии 3 (без чтений ленты): verify, живая проверка, CART, подпись, живая проверка, заказ
+    // полный журнал обращений стадии 3 (без чтений ленты): verify, живая проверка, CART, подпись, живая проверка, verify, заказ
     const shape = (x: { target: string; route: string; status: number | null }) => `${x.target} ${x.route.replaceAll(intent.id, "{intent}").replaceAll(cart.id, "{cart}")} ${x.status}`;
     expect(r.c.calls().slice(start).filter((x) => !x.route.startsWith("GET /pao/v1/events")).map(shape)).toEqual([
       "pao GET /pao/v1/mandates/{intent}/verify 200",
@@ -62,6 +67,9 @@ describe("Д02 — агенту цена ниже, чем человеку (ча
       "pao POST /participants/v1/mandates/{cart}/sign 200",
       "pao GET /pao/v1/mandates/{cart} 200",
       `merchants GET /v1/shops/${DUAL.id}/catalog 200`,
+      // проверка по мандату непосредственно перед заказом (Р44 п. 5)
+      "pao GET /pao/v1/mandates/{intent}/verify 200",
+      "pao GET /pao/v1/mandates/{cart}/verify 200",
       `merchants POST /v1/shops/${DUAL.id}/orders 201`,
     ]);
     // журнал агента: поля и коды из набора, ни nonce, ни ключей обращений; журнал контура без compose — кода агента нет

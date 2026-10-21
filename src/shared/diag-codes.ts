@@ -58,6 +58,8 @@ export const AGENT_DIAG_CODES = [
   "SHOP_ORDER_REFUSED",
   "SHOP_ORDER_STATE_UNKNOWN",
   "MERCHANT_CODE_UNKNOWN",
+  // общий срок стадии поиска истёк (Р44 п. 6): оставшиеся витрины недоступны в этой выдаче
+  "SHOP_SEARCH_DEADLINE",
   // причины operation.declined (SPEC §7б): в PAO_DIAG ядра их нет
   "AOI_MISSING",
   "AOI_MISMATCH",

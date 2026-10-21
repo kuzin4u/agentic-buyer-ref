@@ -17,6 +17,7 @@ import { createContour, shopBy, type Contour, type ContourCall } from "../suppor
 import { payments } from "../support/shop.js";
 import { standShops } from "../support/stand-shop.js";
 import { STAND_TIMEOUT_MS, feedOf, standPurchase } from "../support/stand-purchase.js";
+import { one } from "../support/purchase.js";
 
 let c: Contour | undefined;
 afterEach(async () => {
@@ -42,7 +43,7 @@ async function ordered(r: Awaited<ReturnType<typeof run>>) {
   await r.signWhileWaiting(intent.id, () => r.purchase.awaitIntent());
   const zones = await r.purchase.search();
   const offer = zones.contour.find((o) => o.shopId === NORMAL.id)!;
-  const cart = await r.purchase.cart({ merchantId: offer.merchantId, sku: offer.sku, qty: 1, keyTermsShown: true }, { idempotencyKey: "idem-cart-stand" });
+  const cart = await r.purchase.cart(one(offer, 1), { idempotencyKey: "idem-cart-stand" });
   await r.signWhileWaiting(cart.id, () => r.purchase.awaitCart());
   const order = await r.purchase.placeOrder({ idempotencyKey: "idem-order-stand" });
   return { intent, cart, offer, zones, order };
@@ -91,6 +92,9 @@ describe("конвейер на стенде Платформы (Р38 п. 8, К6
       "pao POST /participants/v1/mandates/{cart}/sign 200",
       "pao GET /pao/v1/mandates/{cart} 200",
       "merchants GET /v1/shops/{shop}/catalog 200",
+      // проверка по мандату непосредственно перед заказом (Р44 п. 5)
+      "pao GET /pao/v1/mandates/{intent}/verify 200",
+      "pao GET /pao/v1/mandates/{cart}/verify 200",
       "merchants POST /v1/shops/{shop}/orders 201",
       "pao GET /pao/v1/mandates/{intent}/verify 200",
       "pao GET /pao/v1/mandates/{cart}/verify 200",
@@ -116,7 +120,7 @@ describe("конвейер на стенде Платформы (Р38 п. 8, К6
     const offer = zones.contour.find((o) => o.shopId === NORMAL.id)!;
     await r.c.platform.relinquishMandate(intent.id, { idempotencyKey: "idem-relinquish-intent" });
     const start = r.c.calls().length;
-    await expect(r.purchase.cart({ merchantId: offer.merchantId, sku: offer.sku, qty: 1, keyTermsShown: true }, { idempotencyKey: "idem-cart-stand" })).rejects.toBeInstanceOf(MandateRefused);
+    await expect(r.purchase.cart(one(offer, 1), { idempotencyKey: "idem-cart-stand" })).rejects.toBeInstanceOf(MandateRefused);
     expect(r.purchase.state).toBe("STOPPED");
     const calls = r.c.calls().slice(start);
     expect(calls.filter((x) => x.target === "merchants")).toEqual([]);

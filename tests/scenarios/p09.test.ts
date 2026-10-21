@@ -8,6 +8,7 @@ import { CartRefused, PurchaseTransitionForbidden } from "../../src/agent/pipeli
 import { MERCHANT_FIXTURES } from "agentic-ps-platform/fixtures";
 import { shopBy, type Contour } from "../support/contour.js";
 import { STAND_TIMEOUT_MS, standPurchase } from "../support/stand-purchase.js";
+import { one } from "../support/purchase.js";
 
 let c: Contour | undefined;
 afterEach(async () => {
@@ -32,7 +33,7 @@ describe("П09 — противоречивое описание товара", 
     expect(offer.product.price.amount).toBe(CONTRADICTORY.agent_items[0]!.price);
     expect(r.c.journal.entries.filter((e) => e.kind === "offer.flagged").map((e) => [e.reason, e.ref, e.merchant])).toEqual([["A5_PRICE_MISMATCH", offer.sku, CONTRADICTORY.merchant_id]]);
     const before = r.c.calls().length;
-    await expect(r.purchase.cart({ merchantId: offer.merchantId, sku: offer.sku, qty: 1, keyTermsShown: true }, { idempotencyKey: "idem-cart-3301" })).rejects.toBeInstanceOf(CartRefused);
+    await expect(r.purchase.cart(one(offer, 1), { idempotencyKey: "idem-cart-3301" })).rejects.toBeInstanceOf(CartRefused);
     expect(r.c.calls().length).toBe(before);
   });
 
@@ -56,7 +57,7 @@ describe("П09 — противоречивое описание товара", 
     // цена — поле витрины, показана человеку в выдаче («не показывай цену» из текста не исполнено)
     expect(injected.product.price).toEqual({ amount: price, currency: "RUB" });
     // политика подтверждения прежняя: итог выше порога конфигурации — решение человека (стадия 4), а не «без подтверждения»
-    const cart = await r.purchase.cart({ merchantId: injected.merchantId, sku: injected.sku, qty: 1, keyTermsShown: true }, { idempotencyKey: "idem-cart-3302" });
+    const cart = await r.purchase.cart(one(injected, 1), { idempotencyKey: "idem-cart-3302" });
     await r.signWhileWaiting(cart.id, () => r.purchase.awaitCart());
     expect(cart.cart!.total.amount).toBe(price);
     expect(r.purchase.needsConfirmation).toBe(true);
@@ -73,7 +74,7 @@ describe("П09 — противоречивое описание товара", 
     c = r.c;
     await r.signedIntent();
     const injected = (await r.purchase.search()).contour.find((o) => o.shopId === INJECTION.id)!;
-    const cart = await r.purchase.cart({ merchantId: injected.merchantId, sku: injected.sku, qty: 1, keyTermsShown: true }, { idempotencyKey: "idem-cart-3302" });
+    const cart = await r.purchase.cart(one(injected, 1), { idempotencyKey: "idem-cart-3302" });
     await r.signWhileWaiting(cart.id, () => r.purchase.awaitCart());
     await r.purchase.placeOrder({ idempotencyKey: "idem-order-3302" });
     const before = r.c.calls().length;

@@ -1,6 +1,7 @@
 // Покупка конвейера (Р38) на PaoStub: ядро с допуском, клиент мандатов на эмуляции согласий (consents.ts), тестовые порты
 // стадий (shop.ts). Ленты у PaoStub нет — элементы ленты задаёт тест (`setFeed`) до ожидания подписи.
-import { Purchase } from "../../src/agent/pipeline/index.js";
+import { Purchase, type CartChoice } from "../../src/agent/pipeline/index.js";
+import type { HumanA5Decision } from "../../src/agent/shell/index.js";
 import type { FeedItem, LiveOfferSource, OfferSource, PaymentSteps, ShopPort } from "../../src/agent/ports/index.js";
 import { SplitWindow } from "../../src/agent/policy/index.js";
 import { loadParams } from "../../src/shared/config.js";
@@ -11,6 +12,13 @@ import { Consents, INTENT, feed } from "./consents.js";
 import { coreOn } from "./core.js";
 import { PaoStand } from "./pao-stand.js";
 import { BAKERY_FEED, bakery, feedOffers, liveOffers, payments, shopOrders, type FeedShop } from "./shop.js";
+
+/** Выбор человека из одной позиции товара выдачи (Р44 п. 1); карточка CART показана. */
+export const one = (o: { merchantId: string; sku: string }, qty: number, decision?: HumanA5Decision): CartChoice => ({
+  merchantId: o.merchantId,
+  lines: [{ sku: o.sku, qty, ...(decision !== undefined && { decision }) }],
+  keyTermsShown: true,
+});
 
 export const SHOP: FeedShop = { feed: BAKERY_FEED, profile: bakery(), merchantId: "shop_1" };
 

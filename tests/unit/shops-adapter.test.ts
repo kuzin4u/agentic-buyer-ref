@@ -131,7 +131,8 @@ describe("адаптер витрин (Р42)", () => {
   it("429: Retry-After не больше предела — ждать его; больше предела или не секунды — без повтора", async () => {
     const limited = (after: string): Answer => ({ status: 429, body: { code: "RATE_LIMITED" }, headers: { "retry-after": after } });
     const max = params.shop_retry_after_max_sec;
-    const within = adapter({ ...LIST(shop("S1")), ...catalog("S1", limited(String(max)), ok(ITEM)) });
+    // срок поиска больше ожидания — иначе повтора нет (Р44 п. 6, тест ниже)
+    const within = adapter({ ...LIST(shop("S1")), ...catalog("S1", limited(String(max)), ok(ITEM)) }, { params: { ...params, shop_search_deadline_ms: (max + 10) * 1000 } });
     await within.a.search();
     expect(within.sleeps).toEqual([max * 1000]);
     for (const after of [String(max + 1), "Wed, 21 Oct 2026 07:28:00 GMT", "-1"]) {
@@ -165,6 +166,54 @@ describe("адаптер витрин (Р42)", () => {
     const { a } = adapter({ ...LIST(shop("S1")), ...catalog("S1", "hang") }, { params: { ...params, shop_request_timeout_ms: 20 } });
     const [s] = await a.search();
     expect(s).toEqual({ shopId: "S1", merchantId: "MER-S1", unavailable: { detail: "NO_RESPONSE" } });
+  });
+
+  it("общий срок поиска истёк во время обращения — оно прервано, следующей витрине не обращаются: обе SHOP_SEARCH_DEADLINE (Р44 п. 6)", async () => {
+    const { a, seen, journal } = adapter({ ...LIST(shop("S1"), shop("S2")), ...catalog("S1", "hang"), ...catalog("S2", ok(ITEM)) }, { params: { ...params, shop_search_deadline_ms: 300 } });
+    const out = await a.search();
+    expect(out).toEqual([
+      { shopId: "S1", merchantId: "MER-S1", unavailable: { reason: "SHOP_SEARCH_DEADLINE" } },
+      { shopId: "S2", merchantId: "MER-S2", unavailable: { reason: "SHOP_SEARCH_DEADLINE" } },
+    ]);
+    expect(seen.map((s) => s.path)).toEqual(["/v1/shops", "/v1/shops/S1/catalog"]);
+    expect(calls(journal)).toEqual([
+      ["GET /v1/shops", 1, "ok", undefined],
+      ["GET /v1/shops/{id}/catalog", 1, "unknown", "SHOP_SEARCH_DEADLINE"],
+    ]);
+  });
+
+  it("ожидание Retry-After не меньше остатка срока поиска — без ожидания и повтора, SHOP_SEARCH_DEADLINE (Р44 п. 6)", async () => {
+    const after = Math.ceil(params.shop_search_deadline_ms / 1000);
+    expect(after).toBeLessThanOrEqual(params.shop_retry_after_max_sec);
+    const limited: Answer = { status: 429, body: { code: "RATE_LIMITED" }, headers: { "retry-after": String(after) } };
+    const { a, sleeps, seen, journal } = adapter({ ...LIST(shop("S1")), ...catalog("S1", limited, ok(ITEM)) });
+    const [s] = await a.search();
+    expect(s).toEqual({ shopId: "S1", merchantId: "MER-S1", unavailable: { reason: "SHOP_SEARCH_DEADLINE" } });
+    expect(sleeps).toEqual([]);
+    // попытка — с кодом витрины, недоступность — по сроку (описание shop.unavailable)
+    expect(calls(journal)).toEqual([
+      ["GET /v1/shops", 1, "ok", undefined],
+      ["GET /v1/shops/{id}/catalog", 1, "refused", "RATE_LIMITED"],
+    ]);
+    expect(seen.filter((x) => x.path === "/v1/shops/S1/catalog")).toHaveLength(1);
+  });
+
+  it("срок поиска истёк, а подпись остановлена — исключение подписи наружу, не SHOP_SEARCH_DEADLINE (инвариант 4)", async () => {
+    const stopped = new Error("подпись остановлена");
+    let n = 0;
+    const { a } = adapter({ ...LIST(shop("S1")), ...catalog("S1", { status: 429, body: { code: "RATE_LIMITED" } }, ok(ITEM)) }, {
+      // повтор без Retry-After через 1 мс — меньше остатка; пауза повтора съедает срок: к повтору срок истёк, подпись остановлена
+      params: { ...params, shop_search_deadline_ms: 300, shop_retry_default_ms: 1 },
+      signing: { sign: (req) => { if (++n > 2) throw stopped; return { ...req, headers: { ...req.headers, signature: "sig", "signature-input": "sig=()" } }; } },
+      sleep: async () => new Promise((r) => setTimeout(r, 400)),
+    });
+    await expect(a.search()).rejects.toBe(stopped);
+  });
+
+  it("срок поиска истёк до ответа списка витрин — исключение (отказ стадии), к каталогам не обращаются (Р44 п. 6)", async () => {
+    const { a, seen } = adapter({ "GET /v1/shops": ["hang"] }, { params: { ...params, shop_search_deadline_ms: 300 } });
+    await expect(a.search()).rejects.toThrow();
+    expect(seen.map((s) => s.path)).toEqual(["/v1/shops"]);
   });
 
   it("списка витрин нет целиком — исключение (отказ стадии); запись списка не по схеме — только эта витрина (ревью КТ1 п. 1)", async () => {

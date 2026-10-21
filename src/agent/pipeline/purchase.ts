@@ -3,7 +3,7 @@
 // «выполнены ли условия сейчас». Ход покупки задаёт вызывающий: каждое действие человека — типизированный вход метода
 // (инвариант 3). Состояние — только в памяти (Р38 п. 6).
 import type { StandParams } from "../../shared/config.js";
-import { PlatformFailure, type Mandate, type MandateDraft, type Money, type Operation } from "../../shared/domain.js";
+import { PlatformFailure, type CartLine, type Mandate, type MandateDraft, type Money, type Operation } from "../../shared/domain.js";
 import type { DiagCode } from "../../shared/diag-codes.js";
 import { liveCheck, type A5SignalCode, type CatalogIssueCode, type CatalogProduct, type LiveCheckParams, type LiveFactCode } from "../catalog/index.js";
 import { ruleForDeclineReason } from "../declines/index.js";
@@ -88,13 +88,19 @@ export interface OfferZones {
   unavailable: UnavailableShop[];
 }
 
-/** Выбор человека на стадии 3 — ключом товара выдачи этой покупки (`merchantId` + `sku`); `decision` — явное решение
- *  человека по сигналам A5 из оболочки (Р32 п. 2); `keyTermsShown` — карточка CART показана (Т3а). */
-export interface CartChoice {
-  merchantId: string;
+/** Позиция выбора: товар выдачи этой покупки у продавца выбора (`sku`), количество; `decision` — явное решение человека
+ *  по сигналам A5 этой позиции из оболочки (Р32 п. 2, Р44 п. 1). */
+export interface CartChoiceLine {
   sku: string;
   qty: number;
   decision?: HumanA5Decision;
+}
+
+/** Выбор человека на стадии 3: одна или несколько позиций одного продавца (Р44 п. 1) — продавец один на корзину по
+ *  построению; `keyTermsShown` — карточка CART показана (Т3а). */
+export interface CartChoice {
+  merchantId: string;
+  lines: CartChoiceLine[];
   keyTermsShown: boolean;
 }
 
@@ -181,7 +187,8 @@ export class Purchase {
   // советчик) не может подменить выдачу, мандат корзины или заказ после проверки (ревью К3 № 1–3, инвариант 3).
   #intent: Mandate | null = null;
   #zones: OfferZones | null = null;
-  #offer: Offer | null = null;
+  /** товары выдачи по позициям подписанного CART, в его порядке */
+  #lines: readonly Offer[] | null = null;
   #cart: Mandate | null = null;
   #order: ShopOrder | null = null;
   #operation: Operation | null = null;
@@ -252,7 +259,7 @@ export class Purchase {
   }
 
   /** Стадия 2: выдача в двух зонах. Перед поиском — INTENT держится и подтверждён verify (Т2); решения каталога —
-   *  в журнал (Р37 п. 5): `policy/` журнала не получает (инвариант 3). */
+   *  в журнал (Р37 п. 5): `policy/` журнала не получает (инвариант 3). Новая выдача стирает снимок прежнего CART (К2а). */
   search(): Promise<OfferZones> {
     return this.#stage("OFFERS", async () => {
       const intent = this.#need(this.#intent);
@@ -264,62 +271,77 @@ export class Purchase {
       // отзыв мог прийти по ленте, пока шёл поиск (ревью К2.2 № 15)
       this.#held(intent);
       this.#zones = zones;
+      // выдача сменилась — прежний CART наружу как текущий не отдаётся и не исполняется: новый CART — по новому выбору
+      // (общее правило с отказом перед заказом; решение владельца 21.10, К2а)
+      this.#cart = null;
+      this.#lines = null;
       this.#machine.to("OFFERS");
       return copy(zones);
     });
   }
 
-  /** Стадия 3: выбор человека → живая проверка → проект CART (Р32 п. 2) → мандат корзины с родителем INTENT. Товар ищется
-   *  по ключу в своей выдаче (зона, A5 — из неё, не от вызывающего); количество — целое ≥ 1 до обращений (Р43 п. 3). Отказ
-   *  политики — CartRefused, покупка остаётся в OFFERS, обращений нет. Цена позиции — из живой проверки непосредственно
-   *  перед CART (Р43 п. 1), не ok — CartLiveRefused, покупка в OFFERS. Перед CART — INTENT держится и подтверждён verify
-   *  (Р38 п. 3). CART сразу ACTIVE (РП35) — CART_PENDING и CART_ACTIVE подряд, `awaitCart` не вызывается. */
+  /** Стадия 3: выбор человека → живая проверка → проект CART (Р32 п. 2) → мандат корзины с родителем INTENT. Каждая
+   *  позиция ищется по ключу в своей выдаче (зона, A5 — из неё, не от вызывающего), все — у одной витрины; количество и
+   *  итог — до обращений (Р43 п. 3, Р44 п. 1). Отказ политики по любой позиции — CartRefused, покупка остаётся в OFFERS,
+   *  обращений нет. Цены позиций — из живой проверки каждой непосредственно перед CART (Р43 п. 1, Р44 п. 2), до первой
+   *  не ok — CartLiveRefused, покупка в OFFERS; ценовой отказ сбрасывает выдачу (Р44 п. 4). Выдачи нет (сброшена или не
+   *  было поиска) — запрещённый переход. Перед CART — INTENT держится и подтверждён verify (Р38 п. 3). CART сразу ACTIVE
+   *  (РП35) — CART_PENDING и CART_ACTIVE подряд, `awaitCart` не вызывается. */
   cart(input: CartChoice, m: Mutation): Promise<Mandate> {
     return this.#stage("CART_PENDING", async () => {
       // выбор — снимком, каждое поле прочитано один раз до первого ожидания: геттер или правка вызывающего во время живой
-      // проверки и verify не меняют ни проверенное количество, ни решение A5 (ревью reviewer К1, повторный проход, блокер 1);
-      // бросающий геттер — отказ промиса, покупка в OFFERS, обращений нет
-      const { merchantId, sku, qty, decision, keyTermsShown } = input;
-      const choice: CartChoice = Object.freeze({ merchantId, sku, qty, keyTermsShown, ...(decision !== undefined && { decision }) });
+      // проверки и verify не меняют ни проверенное количество, ни решение A5 (ревью reviewer К1, повторный проход, блокер 1;
+      // Р-205); бросающий геттер — отказ промиса, покупка в OFFERS, обращений нет
+      const choice = pick(input);
       const intent = this.#need(this.#intent);
-      // товар — только из контура гарантий этой выдачи: по зоне вне контура покупки нет (инвариант 10); выбор вне контура —
-      // дефект или подмена вызывающего, а не решение политики — остановка (Р38 п. 2, поправка К3, решение владельца 20.10)
-      const offer = this.#zones?.contour.find((x) => x.merchantId === choice.merchantId && x.sku === choice.sku);
-      if (offer === undefined) {
-        this.#record({ kind: "agent.refused", reason: "OFFER_NOT_IN_CONTOUR", ...skuRef(String(choice.sku)) });
-        this.#halt("OFFER_NOT_IN_CONTOUR");
-      }
-      // количество — до обращений: неверное предложение вызывающего, не решение политики (Р43 п. 3, как OFFER_NOT_IN_CONTOUR)
-      if (cartTotal(offer.product.price, choice.qty) === null) {
-        this.#record({ kind: "agent.refused", reason: "CART_QTY_INVALID", ...skuRef(offer.sku) });
-        this.#halt("CART_QTY_INVALID");
-      }
+      const zones = this.#need(this.#zones);
+      // пустой выбор или повтор sku — неверное предложение вызывающего (Р44 п. 1, как количество)
+      if (choice.lines.length === 0 || new Set(choice.lines.map((l) => l.sku)).size !== choice.lines.length) this.#invalidQty();
+      // товар — только из контура гарантий этой выдачи и одной витрины: по зоне вне контура покупки нет (инвариант 10); выбор
+      // вне контура — дефект или подмена вызывающего, а не решение политики — остановка (Р38 п. 2, поправка К3, решение
+      // владельца 20.10)
+      let shopId: string | undefined;
+      const offers = choice.lines.map((l) => {
+        const offer = zones.contour.find((x) => x.merchantId === choice.merchantId && x.sku === l.sku);
+        shopId ??= offer?.shopId;
+        if (offer === undefined || offer.shopId !== shopId) {
+          this.#record({ kind: "agent.refused", reason: "OFFER_NOT_IN_CONTOUR", ...skuRef(String(l.sku)) });
+          this.#halt("OFFER_NOT_IN_CONTOUR");
+        }
+        return offer;
+      });
+      // количество и итог — до обращений: неверное предложение вызывающего, не решение политики (Р43 п. 3)
+      if (cartTotal(offers.map((o, i) => ({ price: o.product.price, qty: choice.lines[i]!.qty }))) === null) this.#invalidQty(offers, choice);
       // показ — из своей выдачи: продавец, sku, цена и коды A5, к которым привязано решение человека (Р39 п. 5), и
       // покупка — корневой INTENT (Р40 п. 1)
-      const verdict: OfferVerdict = { kind: "AVAILABLE", merchantId: offer.merchantId, sku: offer.sku, price: { ...offer.product.price }, a5: [...offer.a5] };
+      const verdicts = offers.map((o): Extract<OfferVerdict, { kind: "AVAILABLE" }> => ({ kind: "AVAILABLE", merchantId: o.merchantId, sku: o.sku, price: { ...o.product.price }, a5: [...o.a5] }));
       const purchase: CartPurchase = { intentId: intent.id, mode: intent.confirmationMode };
-      this.#draftable(verdict, purchase, choice.decision);
+      verdicts.forEach((v, i) => this.#draftable(v, purchase, choice.lines[i]!.decision));
       this.#held(intent);
       // verify INTENT — до обращения к витрине: без действующего INTENT ни одного обращения к витринам (П05, как в search();
       // решение владельца по ревью К1 № 5)
       await this.#guard(() => this.o.mandates.requireActive(intent));
-      // цена позиции — из живой проверки непосредственно перед CART (Р43 п. 1); проверка перед заказом остаётся (Р32 п. 3)
-      const price = await this.#liveBeforeCart(offer, choice.qty);
-      const total = cartTotal(price, choice.qty);
-      // защита: при ok живая цена равна цене выдачи, а её итог проверен выше — недостижимо, но с записью, как и выше
-      if (total === null) {
-        this.#record({ kind: "agent.refused", reason: "CART_QTY_INVALID", ...skuRef(offer.sku) });
-        this.#halt("CART_QTY_INVALID");
+      // цены позиций — из живой проверки непосредственно перед CART (Р43 п. 1, Р44 п. 2); проверка перед заказом остаётся
+      const lines: CartLine[] = [];
+      for (const [i, offer] of offers.entries()) {
+        const { qty } = choice.lines[i]!;
+        lines.push({ sku: offer.sku, qty, price: await this.#liveBeforeCart(offer, qty) });
       }
+      const total = cartTotal(lines);
+      // защита: при ok живая цена равна цене выдачи, а её итог проверен выше — недостижимо, но с записью, как и выше
+      if (total === null) this.#invalidQty();
       // держимые — повторно после живой проверки: лента могла вывести INTENT во время ожидания (Р38 п. 3)
       this.#held(intent);
-      // вторая защита: решение — повторно непосредственно перед тратой, без ожидания между ними (при `#busy` и привязке к
-      // INTENT потратить его на другую корзину во время verify нельзя — недостижимо, нюанс К2 Р40). Тратится только
-      // решение, которое покрыло сигналы этого товара, при любом исходе запроса CART (Р40 п. 2, fail-closed)
-      this.#draftable(verdict, purchase, choice.decision);
-      if (verdict.a5.length > 0 && issuedByShell(choice.decision)) spend(choice.decision);
-      const cart = snapshot(await this.#guard(() => this.o.mandates.request(cartDraft(intent, offer, choice, price, total), m, intent)));
-      this.#offer = offer;
+      // вторая защита: решения — повторно непосредственно перед тратой, без ожидания между ними (при `#busy` и привязке к
+      // INTENT потратить их на другую корзину во время verify нельзя — недостижимо, нюанс К2 Р40). Тратятся только решения,
+      // которые покрыли сигналы своей позиции, при любом исходе запроса CART (Р40 п. 2, fail-closed)
+      verdicts.forEach((v, i) => this.#draftable(v, purchase, choice.lines[i]!.decision));
+      for (const [i, v] of verdicts.entries()) {
+        const { decision } = choice.lines[i]!;
+        if (v.a5.length > 0 && issuedByShell(decision)) spend(decision);
+      }
+      const cart = snapshot(await this.#guard(() => this.o.mandates.request(cartDraft(intent, choice, keyLines(lines), total), m, intent)));
+      this.#lines = Object.freeze(offers);
       this.#cart = cart;
       this.#approved = false;
       this.#machine.to("CART_PENDING");
@@ -328,8 +350,17 @@ export class Purchase {
     });
   }
 
-  /** Живая проверка перед запросом CART (Р43 п. 1): ok — цена продавца; иначе коды в журнал (cart.live_refused) и
-   *  CartLiveRefused, покупка остаётся в OFFERS (Р32 п. 4: автоматического повтора нет). */
+  /** Количество, итог или состав выбора не годятся (Р43 п. 3, Р44 п. 1) — agent.refused и STOPPED до обращений; ref — sku
+   *  первой позиции с неверным количеством, иначе без ref. */
+  #invalidQty(offers?: readonly Offer[], choice?: CartChoice): never {
+    const bad = offers?.find((o, i) => cartTotal([{ price: o.product.price, qty: choice!.lines[i]!.qty }]) === null);
+    this.#record({ kind: "agent.refused", reason: "CART_QTY_INVALID", ...(bad !== undefined && skuRef(bad.sku)) });
+    this.#halt("CART_QTY_INVALID");
+  }
+
+  /** Живая проверка позиции перед запросом CART (Р43 п. 1): ok — цена продавца; иначе коды в журнал (cart.live_refused),
+   *  ценовой отказ сбрасывает выдачу (Р44 п. 4) и CartLiveRefused, покупка остаётся в OFFERS (Р32 п. 4: автоматического
+   *  повтора нет). */
   async #liveBeforeCart(offer: Offer, qty: number): Promise<Money> {
     const req = { sku: offer.sku, quantity: qty, ...(this.o.region !== undefined && { region: this.o.region }) };
     const live = await liveCheck(offer.product, req, this.o.live, this.o.params, () => this.now().getTime());
@@ -337,6 +368,7 @@ export class Purchase {
     const d = mayOrder(live);
     if (!d.allow) {
       for (const reason of d.codes) this.#record({ kind: "cart.live_refused", reason, detail: d.next, ...skuRef(offer.sku), ...merchantRef(offer.merchantId) });
+      if (d.next === "NEW_CART_MANDATE") this.#zones = null;
       throw new CartLiveRefused(d.next, d.codes);
     }
     return { ...d.offer.price };
@@ -356,30 +388,44 @@ export class Purchase {
     });
   }
 
-  /** Стадия 3: живая проверка непосредственно перед заказом (Р32 п. 3) → заказ у продавца → сверка суммы (Т6). Позиции
-   *  заказа и проверки — из подписанного CART, магазин — из своей выдачи. Проверка не ok — OrderRefused,
-   *  CART_ACTIVE → OFFERS (Р38 п. 1); сумма или валюта заказа ≠ CART — STOPPED ORDER_REPLY_MISMATCH. */
+  /** Стадия 3: живая проверка каждой позиции непосредственно перед заказом (Р32 п. 3, Р44 п. 2) → проверка по мандату
+   *  (Р44 п. 5) → заказ у продавца → сверка суммы (Т6). Позиции заказа и проверки — из подписанного CART, товары и магазин —
+   *  из своей выдачи. Проверка не ok — OrderRefused, CART_ACTIVE → OFFERS (Р38 п. 1), снимок CART стёрт; ценовой отказ
+   *  сбрасывает и выдачу: новый CART — только после нового поиска (Т6, Р44 п. 4). Отказ по мандату — STOPPED до заказа.
+   *  Сумма или валюта заказа ≠ CART — STOPPED ORDER_REPLY_MISMATCH. */
   placeOrder(m: Mutation): Promise<ShopOrder> {
     return this.#stage("ORDERED", async () => {
       const intent = this.#need(this.#intent);
       const cart = this.#need(this.#cart);
-      const offer = this.#need(this.#offer);
+      const offers = this.#need(this.#lines);
       const basket = cart.cart;
-      const line = basket?.lines.length === 1 ? basket.lines[0] : undefined;
-      // CART без корзины или не с одной позицией — ответ не той формы (инвариант 4); состав сверил клиент мандатов (sameTerms)
-      if (basket === null || basket === undefined || line === undefined) this.#halt("MANDATE_REPLY_MISMATCH");
+      // CART без корзины или не с позициями выбора — ответ не той формы (инвариант 4); состав сверил клиент мандатов (sameTerms)
+      if (basket === null || basket === undefined || basket.lines.length !== offers.length || basket.lines.some((l, i) => l.sku !== offers[i]!.sku)) {
+        this.#halt("MANDATE_REPLY_MISMATCH");
+      }
       this.#held(intent, cart);
-      const req = { sku: line.sku, quantity: line.qty, ...(this.o.region !== undefined && { region: this.o.region }) };
-      const live = await liveCheck(offer.product, req, this.o.live, this.o.params, () => this.now().getTime());
-      this.#alive();
-      const d = mayOrder(live);
-      if (!d.allow) {
+      for (const [i, line] of basket.lines.entries()) {
+        const offer = offers[i]!;
+        const req = { sku: line.sku, quantity: line.qty, ...(this.o.region !== undefined && { region: this.o.region }) };
+        const live = await liveCheck(offer.product, req, this.o.live, this.o.params, () => this.now().getTime());
+        this.#alive();
+        const d = mayOrder(live);
+        if (d.allow) continue;
         for (const reason of d.codes) this.#record({ kind: "order.live_refused", reason, detail: d.next, ...skuRef(line.sku), ...merchantRef(offer.merchantId) });
+        // прежний CART больше не используется ничем и наружу как текущий не отдаётся — после любого отказа (Р44 п. 4,
+        // выбор 4а; решение владельца по ревью КТ1 п. 1); новая цена — и выдача: новый CART только после нового поиска (Т6)
+        this.#cart = null;
+        this.#lines = null;
+        if (d.next === "NEW_CART_MANDATE") this.#zones = null;
         this.#machine.to("OFFERS");
         throw new OrderRefused(d.next, d.codes);
       }
+      // проверка по мандату непосредственно перед заказом (Р44 п. 5, Р-149): остаток не меньше итога CART, продавец и
+      // валюта в пределах — иначе STOPPED до заказа, у продавца не остаётся неоплаченного заказа; ворота стадии 5 остаются
+      await this.#scope(intent, cart);
+      const shopId = offers[0]!.shopId;
       const order = await this.#guard(async () => {
-        const reply = snapshot(await this.o.shop.order({ shopId: offer.shopId, items: [{ sku: line.sku, qty: line.qty }], cartMandateId: cart.id }, m));
+        const reply = snapshot(await this.o.shop.order({ shopId, items: basket.lines.map((l) => ({ sku: l.sku, qty: l.qty })), cartMandateId: cart.id }, m));
         if (reply.total.amount !== basket.total.amount || reply.total.currency !== basket.total.currency) this.#halt("ORDER_REPLY_MISMATCH");
         return reply;
       });
@@ -480,7 +526,7 @@ export class Purchase {
     this.#machine.passGate5();
   }
 
-  /** Проверка по мандату (Р38 п. 3, Р40 п. 5) — в воротах стадии 5 и до стадии 4: INTENT и CART оба среди держимых
+  /** Проверка по мандату (Р38 п. 3, Р40 п. 5, Р44 п. 5) — перед заказом, до стадии 4 и в воротах стадии 5: INTENT и CART оба среди держимых
    *  (сигнал, без сети), затем verify каждого и решение политики по нему (Р39 п. 1.1–1.3: остаток > 0, в валюте итога и
    *  не меньше итога, продавец и валюта в пределах; инвариант 6); после verify — держимые ещё раз (отзыв по ленте во время
    *  проверки). Отзыв — agent.refused MANDATE_NOT_ACTIVE; verify не CONFIRMED — MANDATE_OUT_OF_SCOPE (запись клиента
@@ -561,7 +607,8 @@ export class Purchase {
   }
 
   #context(): PaymentContext {
-    const offer = this.#need(this.#offer);
+    const [offer] = this.#need(this.#lines);
+    if (offer === undefined) this.#halt("PIPELINE_TRANSITION_FORBIDDEN");
     return { intent: this.#need(this.#intent), cart: this.#need(this.#cart), shopId: offer.shopId, merchantId: offer.merchantId, order: this.#need(this.#order) };
   }
 
@@ -658,20 +705,34 @@ export class Purchase {
   }
 }
 
-/** Проект CART: пределы — из INTENT, корзина — одна позиция по живой цене продавца перед CART, итог — `cartTotal` (Р43
- *  п. 1–2); живая цена сверяется ещё раз перед заказом (Р32 п. 3). */
-function cartDraft(intent: Mandate, offer: Offer, c: CartChoice, price: Money, total: Money): MandateDraft {
+/** Выбор — снимком: каждое поле и каждая позиция прочитаны один раз (Р-205); не массив позиций — пустой выбор. */
+function pick(input: CartChoice): CartChoice {
+  const { merchantId, lines, keyTermsShown } = input;
+  const raw: unknown[] = Array.isArray(lines) ? Array.prototype.slice.call(lines) : [];
+  const picked = raw.map((x) => {
+    const { sku, qty, decision } = x as CartChoiceLine;
+    return Object.freeze({ sku, qty, ...(decision !== undefined && { decision }) });
+  });
+  return Object.freeze({ merchantId, lines: Object.freeze(picked) as CartChoiceLine[], keyTermsShown });
+}
+
+/** Позиции корзины — свои копии (цена — из живой проверки). */
+const keyLines = (lines: readonly CartLine[]): CartLine[] => lines.map((l) => ({ sku: l.sku, qty: l.qty, price: { ...l.price } }));
+
+/** Проект CART: пределы — из INTENT, корзина — позиции по живым ценам продавца перед CART, итог — `cartTotal` (Р43 п.
+ *  1–2, Р44 п. 3); живые цены сверяются ещё раз перед заказом (Р32 п. 3). */
+function cartDraft(intent: Mandate, c: CartChoice, lines: CartLine[], total: Money): MandateDraft {
   return {
     kind: "CART",
     parentId: intent.id,
     subject: intent.subject,
     amountLimit: total,
     validTo: intent.validTo,
-    merchantScope: [offer.merchantId],
+    merchantScope: [c.merchantId],
     principalRef: intent.principalRef,
     confirmationMode: intent.confirmationMode,
     keyTermsShown: c.keyTermsShown,
-    cart: { merchantId: offer.merchantId, lines: [{ sku: offer.sku, qty: c.qty, price }], total },
+    cart: { merchantId: c.merchantId, lines, total },
   };
 }
 

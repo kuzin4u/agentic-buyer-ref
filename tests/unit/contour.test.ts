@@ -1,12 +1,11 @@
 // Тестовый контур AG-04 (Р26 агента): поднимается в обоих режимах, журнал обращений полный и без тел,
 // запросы к витринам подписывает порт подписи агента, контуры изолированы (ревью #23 п. 2–5).
-import { MERCHANT_HTTP } from "../../src/agent/adapters/shops/index.js";
-import { MERCHANT_DIAG } from "../../src/agent/declines/index.js";
 import { spawnSync } from "node:child_process";
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { MERCHANT_ERROR_CODES } from "agentic-ps-platform/fixtures";
 import { SignerStopped, listKeys } from "../../src/agent/signer/index.js";
 import { createContour, shopBy, type Contour, type ContourCall } from "../support/contour.js";
 
@@ -81,10 +80,10 @@ describe("режим stand — стенд Платформы и эмулятор
       signed: false,
       body: { cart_mandate_id: CART, items: [{ sku: NORMAL.items[0]!.sku, qty: 1 }] },
     });
-    // код и статус — из реестра кодов витрин (Р42 п. 7, ревью #23 п. 7), не литералом
-    const { code } = MERCHANT_DIAG.AGENT_UNIDENTIFIED;
-    expect(r).toEqual({ status: MERCHANT_HTTP.AGENT_UNIDENTIFIED, body: { code } });
-    expect(c.calls()).toEqual([{ target: "merchants", route: `POST /v1/shops/${NORMAL.id}/orders`, status: MERCHANT_HTTP.AGENT_UNIDENTIFIED, code }]);
+    // код и статус — из перечня эмулятора (MERCHANT_ERROR_CODES, Р26 п. 5, ревью #23 п. 7; ревью К2 № 6), не литералом агента
+    const { code, http } = MERCHANT_ERROR_CODES.find((x) => x.code === "AGENT_UNIDENTIFIED")!;
+    expect(r).toEqual({ status: http, body: { code } });
+    expect(c.calls()).toEqual([{ target: "merchants", route: `POST /v1/shops/${NORMAL.id}/orders`, status: http, code }]);
   });
 });
 

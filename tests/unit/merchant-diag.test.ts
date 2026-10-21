@@ -27,7 +27,15 @@ describe("реестр кодов витрин MERCHANT_DIAG (Р42 п. 7)", () =
     expect([...MERCHANT_RETRYABLE].map((c) => MERCHANT_HTTP[c]).sort()).toEqual([429, 503]);
   });
 
-  it("в полный реестр DIAG не слит: записи витрин в нём не появляются (коды пересекаются по имени)", () => {
-    for (const [code, entry] of Object.entries(MERCHANT_DIAG)) expect(DIAG[code]).not.toBe(entry);
+  it("в полный реестр DIAG не слит: коды только витрин в DIAG отсутствуют, у пересекающихся — запись ПАО или агента, не витрины", () => {
+    for (const [code, entry] of Object.entries(MERCHANT_DIAG)) {
+      const own = DIAG[code];
+      if (own === undefined) continue;
+      expect(own, code).not.toBe(entry);
+      expect(own.source, code).not.toContain("merchant");
+    }
+    // хотя бы часть кодов витрин — только витрин: копия реестра в DIAG их бы добавила
+    const only = MERCHANT_CODES.filter((c) => DIAG[c] === undefined);
+    expect(only).toEqual(expect.arrayContaining(["SHOP_NOT_FOUND", "ITEM_INCOMPLETE", "ORDER_NOT_PAYABLE"]));
   });
 });

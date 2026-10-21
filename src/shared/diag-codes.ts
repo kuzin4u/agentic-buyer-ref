@@ -51,6 +51,11 @@ export const AGENT_DIAG_CODES = [
   "ORDER_REPLY_MISMATCH",
   // каталог: ошибка вызова живой проверки (рядом с LIVE_* ядра, Р32 п. 4)
   "LIVE_CALL_ERROR",
+  // витрины продавцов (Р42 п. 4): отказ витрины на заказе и неизвестное состояние заказа — остановка сделки, не агента;
+  // код витрины вне перечня — магазин недоступен
+  "SHOP_ORDER_REFUSED",
+  "SHOP_ORDER_STATE_UNKNOWN",
+  "MERCHANT_CODE_UNKNOWN",
   // причины operation.declined (SPEC §7б): в PAO_DIAG ядра их нет
   "AOI_MISSING",
   "AOI_MISMATCH",

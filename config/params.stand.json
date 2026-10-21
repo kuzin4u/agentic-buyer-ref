@@ -18,5 +18,8 @@
   "live_check_timeout_ms": 5000,
   "live_check_max_age_sec": 60,
   "live_check_clock_skew_sec": 30,
-  "event_poll_interval_ms": 1000
+  "event_poll_interval_ms": 1000,
+  "shop_request_timeout_ms": 5000,
+  "shop_retry_after_max_sec": 30,
+  "shop_retry_default_ms": 1000
 }

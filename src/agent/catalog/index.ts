@@ -54,17 +54,27 @@ const codes = <C extends string>(xs: { code: C }[]): C[] => [...new Set(xs.map((
 export function readFeed(input: string | Uint8Array, profile: CatalogShop, opts: FeedOptions): CatalogFacts {
   const r = parseYml(input, profile, opts);
   if (r.shop === null) return { shop: null, shopIssues: codes(r.issues), products: [], dropped: [] };
-  const shop = r.shop;
   const offerIssues = r.issues.filter((i) => i.path.startsWith(OFFER_PATH));
-  const shopIssues = codes([...r.issues.filter((i) => !i.path.startsWith(OFFER_PATH)), ...validateShop(shop)]);
+  return check(r.shop, r.products, codes(r.issues.filter((i) => !i.path.startsWith(OFFER_PATH))), codes(offerIssues), opts.exponent);
+}
+
+/** Магазин и товары витрины, уже переведённые адаптером в модель (Р42 п. 2) → те же проверки, что у фида. `dropped` —
+ *  код на каждую карточку, которую адаптер не перевёл (не по схеме: в `products` её нет), без схлопывания: запись в
+ *  журнал — на каждую карточку (Р42 п. 6; у фида коды схлопываются, как у коннектора ядра). */
+export function readShop(shop: CatalogShop, products: CatalogProduct[], dropped: CatalogIssueCode[], exponent: number): CatalogFacts {
+  return check(shop, products, [], [...dropped], exponent);
+}
+
+function check(shop: CatalogShop, list: CatalogProduct[], parseIssues: CatalogIssueCode[], dropped: CatalogIssueCode[], exponent: number): CatalogFacts {
+  const shopIssues = [...new Set([...parseIssues, ...codes(validateShop(shop))])];
   const shopSignals = shopIssues.length === 0 ? codes(checkShopA5(shop)) : [];
-  const products = r.products.map((product): ProductFacts => {
+  const products = list.map((product): ProductFacts => {
     const issues = codes(validateProduct(product, shop));
     // A5 — только по товару, прошедшему модель: ядро считает данные уже проверенными
-    const signals = issues.length === 0 ? [...new Set([...shopSignals, ...codes(checkProductA5(product, opts.exponent))])] : [];
+    const signals = issues.length === 0 ? [...new Set([...shopSignals, ...codes(checkProductA5(product, exponent))])] : [];
     return { product, issues, signals };
   });
-  return { shop, shopIssues, products, dropped: codes(offerIssues) };
+  return { shop, shopIssues, products, dropped };
 }
 
 /** Параметры живой проверки — из конфигурации, все три явно (Р32 п. 7; ревью К1.2а № 3): умолчаний ядра нет. */

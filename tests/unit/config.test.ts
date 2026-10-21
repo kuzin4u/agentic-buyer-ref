@@ -50,6 +50,28 @@ describe("стендовые параметры", () => {
     expect(() => parseParams({ ...stand, live_check_clock_skew_sec: maxSec + 1 })).toThrow(ConfigError);
   });
 
+  it("витрины (Р42): три параметра обязательны; таймауты — 1…2^31 − 1 мс, предел Retry-After — не больше ⌊(2^31 − 1) / 1000⌋ с", () => {
+    for (const k of ["shop_request_timeout_ms", "shop_retry_after_max_sec", "shop_retry_default_ms"]) {
+      const rest = { ...stand };
+      delete rest[k];
+      expect(() => parseParams(rest), k).toThrow(ConfigError);
+    }
+    for (const k of ["shop_request_timeout_ms", "shop_retry_default_ms"]) {
+      expect(() => parseParams({ ...stand, [k]: 0 }), k).toThrow(ConfigError);
+      expect(() => parseParams({ ...stand, [k]: 2_147_483_648 }), k).toThrow(ConfigError);
+      expect(() => parseParams({ ...stand, [k]: 2_147_483_647 }), k).not.toThrow();
+    }
+    // пауза повтора — × 1000 в таймер Node: больше предела таймер сработал бы сразу (ревью К1 № 7)
+    const maxSec = Math.floor(2_147_483_647 / 1000);
+    expect(() => parseParams({ ...stand, shop_retry_after_max_sec: maxSec })).not.toThrow();
+    expect(() => parseParams({ ...stand, shop_retry_after_max_sec: maxSec + 1 })).toThrow(ConfigError);
+    expect(() => parseParams({ ...stand, shop_retry_after_max_sec: 0 })).not.toThrow();
+    expect(() => parseParams({ ...stand, shop_retry_after_max_sec: -1 })).toThrow(ConfigError);
+    expect(() => parseParams({ ...stand, shop_retry_after_max_sec: 1.5 })).toThrow(ConfigError);
+    expect(() => parseParams({ ...stand, shop_request_timeout_ms: 1.5 })).toThrow(ConfigError);
+    expect(() => parseParams({ ...stand, shop_retry_default_ms: 1.5 })).toThrow(ConfigError);
+  });
+
   it("отказ при отсутствии файла", () => {
     expect(() => loadParams("config/missing.json")).toThrow(ConfigError);
   });

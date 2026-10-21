@@ -1,8 +1,8 @@
 // Прогон конвейера на стенде Платформы v0.11.0 (Р41 п. 2) и эмуляторе продавцов (Р38 п. 8, К6; решение владельца 20.10.2026,
 // вариант А). По-настоящему: допуск (итог start() контура), INTENT и CART на стенде — подпись эмулятором банка во время
 // ожидания, решение — по событию mandate.signed ленты стенда и GET после него; заказ у витрины подписанным обращением по
-// cart_mandate_id; ворота перед стадией 5 — держимые, verify и остаток обоих мандатов на стенде. Выдача — по витринам
-// эмулятора с ТЕСТОВЫМ ПРОФИЛЕМ магазина (tests/support/stand-shop.ts): решения каталога здесь доказательством не
+// cart_mandate_id; ворота перед стадией 5 — держимые, verify и остаток обоих мандатов на стенде. Выдача — адаптер витрин (Р42)
+// с ТЕСТОВЫМ ПРОФИЛЕМ магазина (tests/support/stand-shop.ts): решения каталога здесь доказательством не
 // считаются. Стадии 4–6 — тестовый порт PaymentSteps (стенд без /credentials).
 // Конвейер собран поверх адаптера контура — повтор места сборки до AG-09 (шапка tests/support/contour.ts); отличия от
 // compose: лента — чтение listEvents с курсором (не EventFeed с файловым курсором), failureCode не задан (UNKNOWN), часы —
@@ -11,15 +11,13 @@ import { afterEach, describe, expect, it } from "vitest";
 import { MandateClient, MandateRefused } from "../../src/agent/mandates/index.js";
 import { SplitWindow } from "../../src/agent/policy/index.js";
 import { Purchase } from "../../src/agent/pipeline/index.js";
-import type { FeedItem, PaymentPlatform } from "../../src/agent/ports/index.js";
 import { MERCHANT_FIXTURES } from "agentic-ps-platform/fixtures";
 import { INTENT } from "../support/consents.js";
 import { createContour, shopBy, type Contour, type ContourCall } from "../support/contour.js";
 import { payments } from "../support/shop.js";
-import { standLive, standOffers, standShop } from "../support/stand-shop.js";
+import { standShops } from "../support/stand-shop.js";
+import { STAND_TIMEOUT_MS, feedOf, standPurchase } from "../support/stand-purchase.js";
 
-/** Стенд в процессе теста под параллельной нагрузкой прогона бывает медленнее 5 с (нюанс К2.3). */
-const STAND_TIMEOUT_MS = 30_000;
 let c: Contour | undefined;
 afterEach(async () => {
   expect(c?.violations() ?? []).toEqual([]);
@@ -30,61 +28,11 @@ afterEach(async () => {
 /** витрины — из фикстур Платформы, не литералами (contour-fixtures.test.ts) */
 const NORMAL = shopBy("NORMAL");
 const OUTSIDE = shopBy("READ_ONLY");
-const pause = (ms: number) => new Promise((r) => setTimeout(r, ms));
-
-/** Лента стенда с курсором: читает, пока ожидание не завершится; пустой ответ — пауза и снова (не больше `polls` раз). */
-function feedOf(platform: PaymentPlatform, polls = 100) {
-  return async function* events(signal?: AbortSignal): AsyncIterable<FeedItem> {
-    let cursor: string | null = null;
-    for (let i = 0; i < polls && !signal?.aborted; i++) {
-      const items = await platform.listEvents(cursor);
-      if (items.length === 0) await pause(50);
-      for (const item of items) {
-        cursor = item.kind === "event" ? item.event.eventId : item.eventId;
-        yield item;
-      }
-    }
-  };
-}
 
 async function run() {
-  c = await createContour({ pao: "stand" });
-  const self = await c.start();
-  const contour = c;
-  const { stand, merchants } = contour;
-  if (!stand || !merchants) throw new Error("контур без стенда или витрин");
-  const mandates = new MandateClient({ port: contour.platform, params: contour.params, journal: contour.journal });
-  const offers = standOffers(merchants);
-  const live = standLive(merchants, offers.shopOf);
-  const shop = standShop(merchants);
-  const payment = payments();
-  const purchase = new Purchase({
-    mandates,
-    events: feedOf(contour.platform),
-    offers,
-    live,
-    shop,
-    payment,
-    params: contour.params,
-    split: new SplitWindow(contour.params, () => new Date()),
-    journal: contour.journal,
-    admission: () => contour.admission(),
-    region: "77",
-  });
-  /** обращений к ПАО за мандатом id — GET мандата */
-  const gets = (id: string) => contour.calls().filter((x) => x.target === "pao" && x.route === `GET /pao/v1/mandates/${id}`).length;
-  /** Подпись человека во время ожидания: после первого GET ожидания — эмулятор банка подписывает, решение — по событию. */
-  async function signWhileWaiting(id: string, wait: () => Promise<unknown>) {
-    const before = gets(id);
-    const waiting = wait();
-    for (let i = 0; gets(id) === before && i < 200; i++) await pause(10);
-    expect(gets(id)).toBe(before + 1);
-    expect((await stand!.issuer.sign(id)).statusCode).toBe(200);
-    await waiting;
-    // GET до ожидания и GET по событию mandate.signed: решение принято по событию ленты (Р29 п. 5, Р34 п. 5)
-    expect(gets(id)).toBe(before + 2);
-  }
-  return { c: contour, self, stand, purchase, live, shop, payment, signWhileWaiting };
+  const r = await standPurchase();
+  c = r.c;
+  return r;
 }
 
 /** До ORDERED на стенде: INTENT и CART подписаны эмулятором банка во время ожидания, заказ у витрины. */
@@ -111,9 +59,8 @@ describe("конвейер на стенде Платформы (Р38 п. 8, К6
     const { intent, cart, offer, zones, order } = await ordered(r);
     expect(OUTSIDE.zone).toBe("OUTSIDE");
     expect(zones.market.some((o) => o.shopId === OUTSIDE.id)).toBe(true);
-    expect(r.shop.calls).toEqual([{ shopId: NORMAL.id, items: [{ sku: offer.sku, qty: 1 }], cartMandateId: cart.id }]);
     expect(order.total).toEqual(cart.cart!.total);
-    expect(r.live.calls).toEqual([{ sku: offer.sku, quantity: 1, region: "77" }]);
+    expect(cart.cart!.lines).toMatchObject([{ sku: offer.sku, qty: 1 }]);
     await r.purchase.authorize({ idempotencyKey: "idem-pay-stand" });
     await r.purchase.settle();
     expect(r.purchase.state).toBe("DONE");
@@ -182,9 +129,8 @@ describe("конвейер на стенде Платформы (Р38 п. 8, К6
     const contour = c;
     expect(contour.admission()).toBe("NOT_ADMITTED");
     const mandates = new MandateClient({ port: contour.platform, params: contour.params, journal: contour.journal });
-    const merchants = contour.merchants!;
-    const offers = standOffers(merchants);
-    const p = new Purchase({ mandates, events: feedOf(contour.platform), offers, live: standLive(merchants, offers.shopOf), shop: standShop(merchants), payment: payments(), params: contour.params, split: new SplitWindow(contour.params, () => new Date()), journal: contour.journal, admission: () => contour.admission() });
+    const shops = standShops(contour);
+    const p = new Purchase({ mandates, events: feedOf(contour.platform), offers: shops, live: shops, shop: shops, payment: payments(), params: contour.params, split: new SplitWindow(contour.params, () => new Date()), journal: contour.journal, admission: () => contour.admission() });
     const before = contour.calls().length;
     await expect(p.intent({ ...INTENT, merchantScope: [NORMAL.merchant_id] }, { idempotencyKey: "idem-intent-stand" })).rejects.toMatchObject({ code: "NOT_ADMITTED" });
     expect(contour.calls().length).toBe(before);

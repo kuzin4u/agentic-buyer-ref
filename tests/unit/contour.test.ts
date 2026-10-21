@@ -5,6 +5,7 @@ import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { MERCHANT_ERROR_CODES } from "agentic-ps-platform/fixtures";
 import { SignerStopped, listKeys } from "../../src/agent/signer/index.js";
 import { createContour, shopBy, type Contour, type ContourCall } from "../support/contour.js";
 
@@ -79,10 +80,10 @@ describe("режим stand — стенд Платформы и эмулятор
       signed: false,
       body: { cart_mandate_id: CART, items: [{ sku: NORMAL.items[0]!.sku, qty: 1 }] },
     });
-    expect(r).toEqual({ status: 403, body: { code: "AGENT_UNIDENTIFIED" } });
-    expect(c.calls()).toEqual([
-      { target: "merchants", route: `POST /v1/shops/${NORMAL.id}/orders`, status: 403, code: "AGENT_UNIDENTIFIED" },
-    ]);
+    // код и статус — из перечня эмулятора (MERCHANT_ERROR_CODES, Р26 п. 5, ревью #23 п. 7; ревью К2 № 6), не литералом агента
+    const { code, http } = MERCHANT_ERROR_CODES.find((x) => x.code === "AGENT_UNIDENTIFIED")!;
+    expect(r).toEqual({ status: http, body: { code } });
+    expect(c.calls()).toEqual([{ target: "merchants", route: `POST /v1/shops/${NORMAL.id}/orders`, status: http, code }]);
   });
 });
 

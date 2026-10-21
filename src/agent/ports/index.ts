@@ -2,6 +2,7 @@
 export type { PaymentPlatform, PlatformCapabilities, Mutation } from "./payment-platform.js";
 export type { MandatePort } from "./mandates.js";
 export type { EventsPort, FeedItem } from "./events.js";
-export type { RequestSigning } from "./request-signing.js";
+export type { HttpRequestSigning, RequestSigning } from "./request-signing.js";
 export type { LiveAvailability, LiveOffer, LiveOfferRequest, LiveOfferSource } from "./catalog.js";
-export type { OfferSource, PaymentContext, PaymentSteps, ShopOffers, ShopOrder, ShopOrderRequest, ShopPort } from "./shop.js";
+export type { OfferSource, PaymentContext, PaymentSteps, ShopOffers, ShopOrder, ShopOrderRequest, ShopPort, ShopUnavailable, ShopUnavailableCause } from "./shop.js";
+export { ShopFailure } from "./shop.js";

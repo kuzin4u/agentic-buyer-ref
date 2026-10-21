@@ -7,7 +7,7 @@ const catalog = JSON.parse(readFileSync("tests/scenarios/scenarios.json", "utf8"
 const md = readFileSync("docs/core/SCENARIOS.md", "utf8");
 
 // Р26: источники кодов — x-pao-errors копии ПАО (SPEC §7а) и причины operation.declined (SPEC §7б).
-// openapi.yaml заморожен и кодов не даёт; коды витрин — после экспорта перечня эмулятором Платформы.
+// openapi.yaml заморожен и кодов не даёт; коды витрин — реестр MERCHANT_DIAG (Р42 п. 7, тест merchant-diag).
 function paoErrorCodes(yaml: string): string[] {
   // Раздел — до следующего ключа верхнего уровня (paths:, components: …).
   const tail = (yaml.split(/^x-pao-errors:$/m)[1] ?? "").split(/^\S/m)[0]!;

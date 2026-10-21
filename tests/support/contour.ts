@@ -36,6 +36,7 @@ import { createMerchants, createStand, type MerchantsStand, type Stand } from "a
 import { PaoPlatform } from "../../src/agent/adapters/pao/index.js";
 import { MemoryJournal } from "../../src/agent/journal/index.js";
 import type { PaymentPlatform } from "../../src/agent/ports/payment-platform.js";
+import type { HttpRequestSigning } from "../../src/agent/ports/request-signing.js";
 import { KeyRing, generateKey } from "../../src/agent/signer/index.js";
 import { loadParams, type StandParams } from "../../src/shared/config.js";
 import type { DiagCode } from "../../src/shared/diag-codes.js";
@@ -98,6 +99,8 @@ export interface Contour {
   admission(): DiagCode | null;
   /** только "stand" */
   readonly merchants?: Merchants;
+  /** только "stand": подпись обращений к витринам действующим ключом агента — как у места сборки (compose.shops, Р42) */
+  readonly shopSigning?: HttpRequestSigning;
   readonly stand?: Stand;
   /** только "stub" */
   readonly paoStand?: PaoStand;
@@ -296,6 +299,7 @@ async function standContour(): Promise<Contour> {
       start: a.start,
       admission: a.admission,
       merchants,
+      shopSigning: { sign: (req) => signRequest(req, signing.current()) },
       stand,
       calls: () => log.map((c) => ({ ...c })),
       violations: () => [],

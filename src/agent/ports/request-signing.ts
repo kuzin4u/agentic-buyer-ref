@@ -1,6 +1,6 @@
 // Порт «подпись обращений»: адаптер платформы берёт подписанта отсюда и сообщает об отказах по ключу и допуску.
 // Реализация — связка ключей в src/agent/signer; закрытый ключ через порт не проходит (инвариант 2).
-import type { Signer } from "@kuzin4u/agentic-core";
+import type { HttpLike, Signer } from "@kuzin4u/agentic-core";
 import type { DiagCode } from "../../shared/diag-codes.js";
 
 export interface RequestSigning {
@@ -17,4 +17,11 @@ export interface RequestSigning {
   /** Ответ реестра не по схеме после допуска (Р27): подпись приостановлена до успешной повторной сверки; до допуска —
    *  без действия (допуск и так не состоялся). */
   suspend(reason: DiagCode): void;
+}
+
+/** Подпись обращения не к ПАО (витрины продавцов, Р42 п. 1): действующим ключом порта `RequestSigning`, тот же профиль
+ *  подписи. Собирает место сборки; закрытый ключ через порт не проходит (инвариант 2). Подпись остановлена или
+ *  приостановлена — SignerStopped или SignerSuspended, обращения нет. */
+export interface HttpRequestSigning {
+  sign(req: HttpLike): HttpLike;
 }

@@ -38,6 +38,12 @@ export const StandParamsSchema = z
   live_check_clock_skew_sec: secToMs,
   // Лента событий (Р34 п. 9): наименьший промежуток между чтениями и пауза опроса без push.
   event_poll_interval_ms: positive.max(TIMER_MAX_MS),
+  // Витрины продавцов (Р42 п. 1, 4): тайм-аут обращения; повтор 429 и 503 на GET — после Retry-After не больше предела,
+  // без Retry-After — через shop_retry_default_ms.
+  shop_request_timeout_ms: positive.max(TIMER_MAX_MS),
+  // × 1000 — пауза таймера: не больше его предела, иначе таймер сработает сразу (ревью К1 № 7)
+  shop_retry_after_max_sec: count.max(Math.floor(TIMER_MAX_MS / 1000)),
+  shop_retry_default_ms: positive.max(TIMER_MAX_MS),
 })
   // Обращения и ожидание повторов укладываются в registry_cache_ttl_sec (инвариант 4, Р20).
   .refine(

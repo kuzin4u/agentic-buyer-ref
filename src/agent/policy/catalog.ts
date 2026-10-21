@@ -117,11 +117,18 @@ export function mayOrder(live: LiveFact): OrderDecision {
   return { allow: false, next, codes: [...live.codes], offer: live.offer };
 }
 
-/** Итог корзины из одной позиции — `price × qty` в минимальных единицах по живой цене продавца (Р43 п. 2). Количество —
- *  целое ≥ 1, цена — целое ≥ 0, итог — безопасное целое; иначе `null` — неверное предложение вызывающего
- *  (`CART_QTY_INVALID`, Р43 п. 3). Агент только складывает цены продавца: остаток и счётчики — от Платформы (инвариант 6). */
-export function cartTotal(price: Money, qty: number): Money | null {
-  if (!Number.isSafeInteger(qty) || qty < 1 || !Number.isSafeInteger(price.amount) || price.amount < 0) return null;
-  const amount = price.amount * qty;
-  return Number.isSafeInteger(amount) ? { amount, currency: price.currency } : null;
+/** Итог корзины — `Σ price × qty` по позициям в минимальных единицах по живым ценам продавца (Р43 п. 2, Р44 п. 3).
+ *  Позиции есть, количество каждой — целое ≥ 1, цена — целое ≥ 0, валюта одна, итог — безопасное целое; иначе `null` —
+ *  неверное предложение вызывающего (`CART_QTY_INVALID`, Р43 п. 3). Агент только складывает цены продавца: остаток и
+ *  счётчики — от Платформы (инвариант 6). */
+export function cartTotal(lines: readonly { price: Money; qty: number }[]): Money | null {
+  const currency = lines[0]?.price.currency;
+  if (currency === undefined) return null;
+  let amount = 0;
+  for (const { price, qty } of lines) {
+    if (!Number.isSafeInteger(qty) || qty < 1 || !Number.isSafeInteger(price.amount) || price.amount < 0 || price.currency !== currency) return null;
+    amount += price.amount * qty;
+    if (!Number.isSafeInteger(amount)) return null;
+  }
+  return { amount, currency };
 }

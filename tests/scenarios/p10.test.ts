@@ -8,6 +8,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { shopBy, type Contour } from "../support/contour.js";
 import { expectJournalClean } from "../support/journal.js";
 import { STAND_TIMEOUT_MS, standPurchase } from "../support/stand-purchase.js";
+import { one } from "../support/purchase.js";
 
 let c: Contour | undefined;
 afterEach(async () => {
@@ -34,7 +35,7 @@ describe("П10 — корзина и мандат корзины", { timeout: ST
     expect(offer.product.price).toEqual(PRICE);
 
     const before = r.c.calls().length;
-    const cart = await r.purchase.cart({ merchantId: offer.merchantId, sku: offer.sku, qty: QTY, keyTermsShown: true }, { idempotencyKey: "idem-cart-p10" });
+    const cart = await r.purchase.cart(one(offer, QTY), { idempotencyKey: "idem-cart-p10" });
     // verify INTENT, затем живая проверка у витрины — непосредственно перед запросом CART (П05, Р43 п. 1)
     expect(r.c.calls().slice(before).map((x) => `${x.target} ${x.route.replaceAll(intent.id, "{intent}")} ${x.status}`).filter((s) => !s.startsWith("pao GET /pao/v1/events"))).toEqual([
       "pao GET /pao/v1/mandates/{intent}/verify 200",
@@ -66,6 +67,43 @@ describe("П10 — корзина и мандат корзины", { timeout: ST
     expect(entries.filter((e) => e.kind === "purchase.stage").map((e) => e.detail).slice(-3)).toEqual(["CART_PENDING", "CART_ACTIVE", "ORDERED"]);
     const secrets = r.c.calls().flatMap((x) => [x.nonce, x.idempotencyKey]).filter((v): v is string => typeof v === "string");
     // журнал контура собран без compose — кода агента в записях нет (Р37 п. 3)
+    expectJournalClean(entries, null, [], secrets);
+  });
+
+  it("две позиции одной витрины: живая проверка каждой перед CART и перед заказом, итог — Σ; заказ — обе позиции, Order.total = итогу CART (Р44 п. 1–3)", async () => {
+    const r = await standPurchase();
+    c = r.c;
+    const intent = await r.signedIntent();
+    await r.purchase.search();
+    const items = NORMAL.agent_items.slice(0, 2);
+    expect(items).toHaveLength(2);
+    const lines = items.map((i, n) => ({ sku: i.sku, qty: n + 1 }));
+    const total = { amount: items.reduce((sum, i, n) => sum + i.price! * (n + 1), 0), currency: "RUB" };
+    const before = r.c.calls().length;
+    const cart = await r.purchase.cart({ merchantId: NORMAL.merchant_id, lines, keyTermsShown: true }, { idempotencyKey: "idem-cart-p10-2" });
+    expect(cart.cart).toEqual({ merchantId: NORMAL.merchant_id, lines: items.map((i, n) => ({ sku: i.sku, qty: n + 1, price: { amount: i.price!, currency: i.currency! } })), total });
+    await r.signWhileWaiting(cart.id, () => r.purchase.awaitCart());
+    const order = await r.purchase.placeOrder({ idempotencyKey: "idem-order-p10-2" });
+    expect(order.total).toEqual(total);
+    // полный журнал обращений (без ленты): verify INTENT, живые проверки обеих позиций, CART, подпись, снова обе, заказ
+    const shop = `merchants GET /v1/shops/${NORMAL.id}/catalog 200`;
+    const ids = (x: string) => x.replaceAll(intent.id, "{intent}").replaceAll(cart.id, "{cart}");
+    expect(r.c.calls().slice(before).filter((x) => !x.route.startsWith("GET /pao/v1/events")).map((x) => ids(`${x.target} ${x.route} ${x.status}`))).toEqual([
+      "pao GET /pao/v1/mandates/{intent}/verify 200",
+      shop,
+      shop,
+      "pao POST /pao/v1/mandates 201",
+      "pao GET /pao/v1/mandates/{cart} 200",
+      "pao POST /participants/v1/mandates/{cart}/sign 200",
+      "pao GET /pao/v1/mandates/{cart} 200",
+      shop,
+      shop,
+      `merchants POST /v1/shops/${NORMAL.id}/orders 201`,
+    ]);
+    expect(r.payment.calls).toEqual([]);
+    const entries = r.c.journal.entries;
+    expect(entries.filter((e) => e.kind === "agent.refused" || e.kind === "cart.live_refused" || e.kind === "order.live_refused")).toEqual([]);
+    const secrets = r.c.calls().flatMap((x) => [x.nonce, x.idempotencyKey]).filter((v): v is string => typeof v === "string");
     expectJournalClean(entries, null, [], secrets);
   });
 });

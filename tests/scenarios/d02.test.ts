@@ -9,6 +9,7 @@ import { PurchaseStopped } from "../../src/agent/pipeline/index.js";
 import { shopBy, type Contour } from "../support/contour.js";
 import { expectJournalClean } from "../support/journal.js";
 import { STAND_TIMEOUT_MS, standPurchase } from "../support/stand-purchase.js";
+import { one } from "../support/purchase.js";
 
 let c: Contour | undefined;
 afterEach(async () => {
@@ -33,7 +34,7 @@ describe("Д02 — агенту цена ниже, чем человеку (ча
     expect(offer.product.price.amount).toBe(AGENT_ITEM.price);
 
     const start = r.c.calls().length;
-    const cart = await r.purchase.cart({ merchantId: offer.merchantId, sku: offer.sku, qty: 1, keyTermsShown: true }, { idempotencyKey: "idem-cart-d02" });
+    const cart = await r.purchase.cart(one(offer, 1), { idempotencyKey: "idem-cart-d02" });
     // в CART — итог по живой цене продавца из своей выдачи (Р43 п. 1–2), не подставленный
     expect(cart.cart!.total).toEqual({ amount: AGENT_ITEM.price, currency: AGENT_ITEM.currency });
     await r.signWhileWaiting(cart.id, () => r.purchase.awaitCart());

@@ -72,22 +72,23 @@ export function liveOffers(s: FeedShop, clock: () => Date, over: (req: LiveOffer
   return src;
 }
 
-/** Витрина: сумму заказа считает «продавец» по цене фида; `total` — подмена суммы (дефект продавца). */
+/** Витрина: сумму заказа считает «продавец» по цене фида — Σ по позициям; `total` — подмена суммы (дефект продавца). */
 export function shopOrders(s: FeedShop, total?: (req: ShopOrderRequest) => Money): ShopPort & { calls: ShopOrderRequest[] } {
   const port = {
     calls: [] as ShopOrderRequest[],
     order: async (req: ShopOrderRequest): Promise<ShopOrder> => {
       port.calls.push(req);
-      const line = req.items[0]!;
-      const price = feedPrice(s, line.sku);
-      return { orderId: `ord_${port.calls.length}`, total: total ? total(req) : { amount: price.amount * line.qty, currency: price.currency } };
+      const sum = req.items.reduce((acc, l) => acc + feedPrice(s, l.sku).amount * l.qty, 0);
+      return { orderId: `ord_${port.calls.length}`, total: total ? total(req) : { amount: sum, currency: feedPrice(s, req.items[0]!.sku).currency } };
     },
   };
   return port;
 }
 
-/** Шаги оплаты (стадии 4–6) до AG-11 и AG-13: исходы задаёт тест; `calls` — какие шаги вызваны. */
-export function payments(o: { confirm?: Confirmation["status"]; authorize?: Partial<Operation>; settle?: Operation["status"] } = {}): PaymentSteps & { calls: string[] } {
+/** Шаги оплаты (стадии 4–6) до AG-11 и AG-13: исходы задаёт тест; `calls` — какие шаги вызваны, `carts` — id CART и
+ *  сумма заказа в контексте каждого `confirm` и `authorize` (Р44 п. 4: оплата только по CART, итог которого = заказу). */
+export function payments(o: { confirm?: Confirmation["status"]; authorize?: Partial<Operation>; settle?: Operation["status"] } = {}): PaymentSteps & { calls: string[]; carts: { cart: string; total: Money | undefined; order: Money }[] } {
+  const seen = (c: PaymentContext) => steps.carts.push({ cart: c.cart.id, total: c.cart.cart?.total, order: c.order.total });
   const op = (c: PaymentContext, over: Partial<Operation>): Operation => ({
     opRef: "op_1",
     orderRef: c.order.orderId,
@@ -101,8 +102,9 @@ export function payments(o: { confirm?: Confirmation["status"]; authorize?: Part
   });
   const steps = {
     calls: [] as string[],
-    confirm: async (): Promise<Confirmation["status"]> => (steps.calls.push("confirm"), o.confirm ?? "APPROVED"),
-    authorize: async (c: PaymentContext): Promise<Operation> => (steps.calls.push("authorize"), op(c, o.authorize ?? {})),
+    carts: [] as { cart: string; total: Money | undefined; order: Money }[],
+    confirm: async (c: PaymentContext): Promise<Confirmation["status"]> => (steps.calls.push("confirm"), seen(c), o.confirm ?? "APPROVED"),
+    authorize: async (c: PaymentContext): Promise<Operation> => (steps.calls.push("authorize"), seen(c), op(c, o.authorize ?? {})),
     settle: async (x: Operation): Promise<Operation> => (steps.calls.push("settle"), { ...x, status: o.settle ?? "SETTLED" }),
   };
   return steps;

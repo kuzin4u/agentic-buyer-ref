@@ -6,7 +6,7 @@ import { Consents, INTENT } from "../support/consents.js";
 import { coreOn } from "../support/core.js";
 import { expectJournalClean } from "../support/journal.js";
 import { AGENT, PaoStand } from "../support/pao-stand.js";
-import { SHOP } from "../support/purchase.js";
+import { SHOP, one } from "../support/purchase.js";
 import { feedOffers, liveOffers, payments, shopOrders } from "../support/shop.js";
 
 let stand: PaoStand | undefined;
@@ -29,7 +29,7 @@ describe("core.purchase() — путь 0–6 на PaoStub (Р38 п. 8, К6)", ()
     const p = core.purchase({ offers: feedOffers(SHOP), live: liveOffers(SHOP, () => s.clock), shop, payment, region: "77" });
     const intent = await p.intent(INTENT, { idempotencyKey: "idem-intent-1" });
     const offer = (await p.search()).contour[0]!;
-    const cart = await p.cart({ merchantId: offer.merchantId, sku: offer.sku, qty: 1, keyTermsShown: true }, { idempotencyKey: "idem-cart-1" });
+    const cart = await p.cart(one(offer, 1), { idempotencyKey: "idem-cart-1" });
     await p.placeOrder({ idempotencyKey: "idem-order-1" });
     expect(p.needsConfirmation).toBe(false);
     await p.authorize({ idempotencyKey: "idem-pay-1" });

@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { PurchaseStopped } from "../../src/agent/pipeline/index.js";
 import { expectJournalClean } from "../support/journal.js";
 import { AGENT, type PaoStand } from "../support/pao-stand.js";
-import { purchaseOn, signedIntent } from "../support/purchase.js";
+import { one, purchaseOn, signedIntent } from "../support/purchase.js";
 
 vi.mock("../../src/agent/policy/catalog.js", async (importOriginal) => {
   const original = await importOriginal<typeof import("../../src/agent/policy/catalog.js")>();
@@ -27,7 +27,7 @@ describe("EXCLUDED на стадии 3 — STOPPED:CART_POLICY_EXCLUDED (Р40 п
     const from = r.stand.stub.calls.length;
     const start = r.tail().length;
     await expect(
-      r.purchase.cart({ merchantId: offer.merchantId, sku: offer.sku, qty: 1, keyTermsShown: true }, { idempotencyKey: "idem-cart-1" }),
+      r.purchase.cart(one(offer, 1), { idempotencyKey: "idem-cart-1" }),
     ).rejects.toBeInstanceOf(PurchaseStopped);
     expect(r.purchase.reason).toBe("UNKNOWN");
     expect(r.tail().slice(start).map((e) => [e.kind, e.detail, e.reason, e.mandate])).toEqual([

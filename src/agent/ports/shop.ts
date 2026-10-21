@@ -22,7 +22,8 @@ export type ShopUnavailableCause = { detail: string; reason?: undefined } | { re
 
 /** Магазин, отказавший на стадии 2 (Т4): товаров нет, поиск по остальным идёт дальше; обходов нет. */
 export interface ShopUnavailable {
-  shopId: string;
+  /** нет — запись списка без id по маске (обратиться к витрине нельзя) */
+  shopId?: string;
   merchantId?: string;
   unavailable: ShopUnavailableCause;
 }

@@ -69,7 +69,8 @@ export type ZoneCode = "ZONE_CONTOUR" | "ZONE_MARKET";
 
 /** Магазин, недоступный в этой выдаче (Т4, Р42 п. 4): человеку — «продавец недоступен». */
 export interface UnavailableShop {
-  shopId: string;
+  /** нет — запись списка витрин без id по маске */
+  shopId?: string;
   merchantId?: string;
   cause: ShopUnavailableCause;
 }
@@ -475,7 +476,7 @@ export class Purchase {
       if ("unavailable" in s) {
         const cause: ShopUnavailableCause = s.unavailable.reason !== undefined ? { reason: s.unavailable.reason } : { detail: s.unavailable.detail };
         this.#record({ kind: "shop.unavailable", ...cause, ...(s.merchantId !== undefined ? merchantRef(s.merchantId) : {}) });
-        zones.unavailable.push({ shopId: s.shopId, ...(s.merchantId !== undefined && { merchantId: s.merchantId }), cause });
+        zones.unavailable.push({ ...(s.shopId !== undefined && { shopId: s.shopId }), ...(s.merchantId !== undefined && { merchantId: s.merchantId }), cause });
         continue;
       }
       const { shop, shopIssues, products, dropped } = s.facts;

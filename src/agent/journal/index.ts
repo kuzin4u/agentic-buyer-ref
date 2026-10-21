@@ -86,10 +86,12 @@ export type JournalKind =
   | "cart.refused"
   /** заказа нет: живая проверка не ok (Р32 п. 3–4): reason — код LIVE_*; пишет конвейер */
   | "order.live_refused"
-  /** попытка обращения к витрине (Т15, Р42): method — шаблон пути, attempt > 1 — попытка повтора, merchant — id витрины
-   *  по маске; detail — код витрины из перечня, BAD_RESPONSE или NO_RESPONSE; код вне перечня — reason MERCHANT_CODE_UNKNOWN */
+  /** попытка обращения к витрине (Т15, Р42): method — шаблон пути, attempt > 1 — попытка повтора, ref — id витрины по
+   *  маске, mandate — мандат корзины у заказа; detail — код витрины из перечня, BAD_RESPONSE или NO_RESPONSE; код вне
+   *  перечня — reason MERCHANT_CODE_UNKNOWN */
   | "shop.call"
-  /** магазин недоступен в выдаче (Т4, Р42 п. 4): detail и reason — как у последней попытки shop.call; пишет конвейер */
+  /** магазин недоступен в выдаче (Т4, Р42 п. 4): detail и reason — как у последней попытки shop.call, merchant — код
+   *  продавца; пишет конвейер */
   | "shop.unavailable";
 
 export interface JournalEntry {
@@ -102,9 +104,11 @@ export interface JournalEntry {
   reason?: JournalCode;
   /** уточнение — только значение закрытого перечня: ПАО (класс из реестра при AGENT_CLASS_MISMATCH, Р27), агента
    *  (NO_VERSION, REGION) или состояние машины покупки и запрошенный переход «откуда->куда» (Р38 п. 5); у остановки
-   *  покупки с уточнением — «STOPPED:CART_POLICY_EXCLUDED» (Р40 п. 6) */
+   *  покупки с уточнением — «STOPPED:CART_POLICY_EXCLUDED» (Р40 п. 6); у shop.call и shop.unavailable — код витрины из
+   *  перечня, BAD_RESPONSE или NO_RESPONSE (Р42) */
   detail?: string;
-  /** идентификатор объекта Платформы по маске адаптера — event_id события ленты (Р34 п. 11) */
+  /** идентификатор объекта по маске адаптера — event_id события ленты (Р34 п. 11), sku у решений каталога, id витрины у
+   *  shop.call (Р42) */
   ref?: string;
   /** имя проверки самопроверки (agent.selfcheck, Р36 п. 6) */
   check?: string;

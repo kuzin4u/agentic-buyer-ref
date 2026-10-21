@@ -41,7 +41,8 @@ export const StandParamsSchema = z
   // Витрины продавцов (Р42 п. 1, 4): тайм-аут обращения; повтор 429 и 503 на GET — после Retry-After не больше предела,
   // без Retry-After — через shop_retry_default_ms.
   shop_request_timeout_ms: positive.max(TIMER_MAX_MS),
-  shop_retry_after_max_sec: secToMs,
+  // × 1000 — пауза таймера: не больше его предела, иначе таймер сработает сразу (ревью К1 № 7)
+  shop_retry_after_max_sec: count.max(Math.floor(TIMER_MAX_MS / 1000)),
   shop_retry_default_ms: positive.max(TIMER_MAX_MS),
 })
   // Обращения и ожидание повторов укладываются в registry_cache_ttl_sec (инвариант 4, Р20).

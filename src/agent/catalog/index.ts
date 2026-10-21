@@ -59,9 +59,10 @@ export function readFeed(input: string | Uint8Array, profile: CatalogShop, opts:
 }
 
 /** Магазин и товары витрины, уже переведённые адаптером в модель (Р42 п. 2) → те же проверки, что у фида. `dropped` —
- *  коды карточек, которые адаптер не перевёл (не по схеме: в `products` их нет). */
+ *  код на каждую карточку, которую адаптер не перевёл (не по схеме: в `products` её нет), без схлопывания: запись в
+ *  журнал — на каждую карточку (Р42 п. 6; у фида коды схлопываются, как у коннектора ядра). */
 export function readShop(shop: CatalogShop, products: CatalogProduct[], dropped: CatalogIssueCode[], exponent: number): CatalogFacts {
-  return check(shop, products, [], [...new Set(dropped)], exponent);
+  return check(shop, products, [], [...dropped], exponent);
 }
 
 function check(shop: CatalogShop, list: CatalogProduct[], parseIssues: CatalogIssueCode[], dropped: CatalogIssueCode[], exponent: number): CatalogFacts {

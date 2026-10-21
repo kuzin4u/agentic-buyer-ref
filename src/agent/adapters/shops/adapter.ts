@@ -43,10 +43,16 @@ export interface ShopsAdapterOptions {
 /** Идентификатор от витрины — в путь и в журнал только по маске (как sku у конвейера, Р38 п. 5). */
 const ID = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$/;
 const Id = z.string().regex(ID);
+/** mandate_id в журнале — по той же маске, что у клиента мандатов (Р37 п. 3). */
+const MANDATE_ID = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/;
 /** Знаков после запятой у валюты цены: таблицы в ядре нет (К9); витрина эмулятора — только RUB (ISO 4217). */
 const EXPONENT = { RUB: 2 } as const;
 
-const Shops = z.object({ shops: z.array(z.object({ id: Id, merchant_id: Id, zone: z.string(), readiness_mark: z.boolean() })) });
+/** Список витрин — массив; каждая запись разбирается отдельно (ревью КТ1 п. 1): зона и знак не по схеме — зона рынка,
+ *  id или код продавца не по маске — витрина недоступна; отказ стадии — только если списка нет целиком. */
+const Shops = z.object({ shops: z.array(z.unknown()) });
+const ShopEntry = z.object({ id: Id, merchant_id: Id });
+const Zone = z.object({ zone: z.literal("CONTOUR"), readiness_mark: z.literal(true) });
 const Catalog = z.object({ items: z.array(z.unknown()) });
 const Item = z.object({
   sku: Id,
@@ -110,7 +116,14 @@ export class ShopsAdapter implements OfferSource, LiveOfferSource, ShopPort {
     const list = await this.#get("GET /v1/shops", "/v1/shops", Shops);
     if (!list.ok) throw new Error("список витрин не получен или не по схеме");
     const out: (ShopOffers | ShopUnavailable)[] = [];
-    for (const s of list.body.shops) {
+    for (const entry of list.body.shops) {
+      const parsed = ShopEntry.safeParse(entry);
+      if (!parsed.success) {
+        // идентификатора по маске нет — обратиться к витрине нельзя; в журнал — без id (инвариант 5)
+        out.push({ unavailable: { detail: "BAD_RESPONSE" } });
+        continue;
+      }
+      const s = parsed.data;
       const catalog = await this.#get("GET /v1/shops/{id}/catalog", `/v1/shops/${s.id}/catalog`, Catalog, s.id);
       if (!catalog.ok) {
         out.push({ shopId: s.id, merchantId: s.merchant_id, unavailable: catalog.cause });
@@ -125,8 +138,9 @@ export class ShopsAdapter implements OfferSource, LiveOfferSource, ShopPort {
       }
       // запись не стирается: sku, найденный у другой витрины в любой выдаче, становится неоднозначным навсегда
       for (const i of items) this.#shopOf.set(i.sku, this.#shopOf.has(i.sku) && this.#shopOf.get(i.sku) !== s.id ? null : s.id);
-      // зона контура — только при зоне CONTOUR и знаке готовности (РП22 п. 7 платформы); иначе — рынок (Р42 п. 3)
-      const inContour = s.zone === "CONTOUR" && s.readiness_mark;
+      // зона контура — только при зоне CONTOUR и знаке готовности true (РП22 п. 7 платформы); нет полей, иное значение или
+      // тип — рынок (Р42 п. 3)
+      const inContour = Zone.safeParse(entry).success;
       out.push({
         merchantId: s.merchant_id,
         inContour,
@@ -159,19 +173,19 @@ export class ShopsAdapter implements OfferSource, LiveOfferSource, ShopPort {
     if (!ID.test(req.shopId)) throw new Error("id витрины не по маске");
     const reply = await this.#send("POST", `/v1/shops/${req.shopId}/orders`, JSON.stringify({ items: req.items, cart_mandate_id: req.cartMandateId }));
     if (reply === null) {
-      this.#log(method, 1, "unknown", req.shopId, { detail: "NO_RESPONSE" });
+      this.#log(method, 1, "unknown", req.shopId, { detail: "NO_RESPONSE" }, req.cartMandateId);
       throw new ShopFailure("SHOP_ORDER_STATE_UNKNOWN");
     }
     if (reply.status >= 400) {
-      this.#log(method, 1, "refused", req.shopId, this.#cause(reply.body));
+      this.#log(method, 1, "refused", req.shopId, this.#cause(reply.body), req.cartMandateId);
       throw new ShopFailure("SHOP_ORDER_REFUSED");
     }
     const b = reply.status === 201 ? Order.safeParse(reply.body) : null;
     if (!b?.success) {
-      this.#log(method, 1, "unknown", req.shopId, { detail: "BAD_RESPONSE" });
+      this.#log(method, 1, "unknown", req.shopId, { detail: "BAD_RESPONSE" }, req.cartMandateId);
       throw new ShopFailure("SHOP_ORDER_STATE_UNKNOWN");
     }
-    this.#log(method, 1, "ok", req.shopId);
+    this.#log(method, 1, "ok", req.shopId, undefined, req.cartMandateId);
     return { orderId: b.data.id, total: { amount: b.data.total, currency: b.data.currency } };
   }
 
@@ -274,15 +288,17 @@ export class ShopsAdapter implements OfferSource, LiveOfferSource, ShopPort {
     }
   }
 
-  /** shop.call (Т15): тела, заголовков и x-nonce нет; merchant — id витрины по маске. */
-  #log(method: Method, attempt: number, result: JournalResult, shopId?: string, cause?: ShopUnavailableCause): void {
+  /** shop.call (Т15): тела, заголовков и x-nonce нет; ref — id витрины по маске (код продавца — поле merchant — у записей
+   *  конвейера: у заказа адаптер его не знает); mandate — мандат корзины заказа по маске (ревью К1 № 4–5). */
+  #log(method: Method, attempt: number, result: JournalResult, shopId?: string, cause?: ShopUnavailableCause, mandate?: string): void {
     this.o.journal.record({
       at: this.now().toISOString(),
       kind: "shop.call",
       method,
       attempt,
       result,
-      ...(shopId !== undefined && ID.test(shopId) && { merchant: shopId }),
+      ...(shopId !== undefined && ID.test(shopId) && { ref: shopId }),
+      ...(mandate !== undefined && MANDATE_ID.test(mandate) && { mandate }),
       ...(cause?.detail !== undefined && { detail: cause.detail }),
       ...(cause?.reason !== undefined && { reason: cause.reason }),
     });

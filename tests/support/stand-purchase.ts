@@ -8,6 +8,7 @@ import { MandateClient } from "../../src/agent/mandates/index.js";
 import { Purchase } from "../../src/agent/pipeline/index.js";
 import { SplitWindow } from "../../src/agent/policy/index.js";
 import type { FeedItem, HttpRequestSigning, PaymentPlatform } from "../../src/agent/ports/index.js";
+import { parseParams, type StandParams } from "../../src/shared/config.js";
 import type { Mandate } from "../../src/shared/domain.js";
 import { INTENT } from "./consents.js";
 import { createContour, type Contour } from "./contour.js";
@@ -40,6 +41,9 @@ export interface StandPurchaseOptions {
   fetch?: typeof fetch;
   /** подпись обращений к витринам не ключом агента контура */
   signing?: HttpRequestSigning;
+  /** стендовые параметры покупки поверх config/params.stand.json (граница порога подтверждения и т. п.): проходят схему
+   *  запуска (`parseParams`); клиент мандатов работает на параметрах контура — порог ему не нужен */
+  params?: Partial<StandParams>;
 }
 
 /** Контур со стендом и витринами после start(), покупка на адаптере витрин. Закрыть — `c.close()` у вызывающего. */
@@ -51,6 +55,7 @@ export async function standPurchase(o: StandPurchaseOptions = {}) {
   const mandates = new MandateClient({ port: c.platform, params: c.params, journal: c.journal });
   const shops: ShopsAdapter = standShops(c, o);
   const payment = payments();
+  const params = parseParams({ ...c.params, ...o.params });
   const purchase = new Purchase({
     mandates,
     events: feedOf(c.platform),
@@ -58,8 +63,8 @@ export async function standPurchase(o: StandPurchaseOptions = {}) {
     live: shops,
     shop: shops,
     payment,
-    params: c.params,
-    split: new SplitWindow(c.params, () => new Date()),
+    params,
+    split: new SplitWindow(params, () => new Date()),
     journal: c.journal,
     admission: () => c.admission(),
     region: "77",

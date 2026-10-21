@@ -2,7 +2,7 @@
 // эмулятора: цена и описание — данные витрины (по-настоящему), сверка — `checkProductA5` ядра: CONTRADICTORY (цена в тексте ≠
 // поле price) — пометка A5_PRICE_MISMATCH, покупка только по явному решению человека. Текст витрины — недоверенные данные:
 // INJECTION (инструкция в описании) ведёт себя как витрина без инструкции (инвариант 5; распознавание инструкций, Д01, —
-// у buyer_agent).
+// у buyer_agent). INCOMPLETE (A5 п. 1.1, Р42 п. 6): карточка без обязательных сведений не переводится — REQUIRED.
 import { afterEach, describe, expect, it } from "vitest";
 import { CartRefused } from "../../src/agent/pipeline/index.js";
 import { shopBy, type Contour } from "../support/contour.js";
@@ -18,6 +18,7 @@ afterEach(async () => {
 const CONTRADICTORY = shopBy("CONTRADICTORY");
 const INJECTION = shopBy("INJECTION");
 const NORMAL = shopBy("NORMAL");
+const INCOMPLETE = shopBy("INCOMPLETE");
 
 describe("П09 — противоречивое описание товара", { timeout: STAND_TIMEOUT_MS }, () => {
   it("CONTRADICTORY: цена в тексте ≠ price — помечено A5_PRICE_MISMATCH; корзина без решения человека не готовится", async () => {
@@ -35,7 +36,10 @@ describe("П09 — противоречивое описание товара", 
   });
 
   it("INJECTION: инструкция в описании не исполняется — предложение как у витрины без инструкции", async () => {
-    const r = await standPurchase();
+    const price = INJECTION.agent_items[0]!.price!;
+    // порог ниже цены (ревью К2, блокер 1): «оформи без подтверждения» из текста и политика дают разный исход — тест видит,
+    // какой из них исполнен
+    const r = await standPurchase({ params: { confirm_above_kop: price - 1 } });
     c = r.c;
     await r.signedIntent();
     const zones = await r.purchase.search();
@@ -48,7 +52,28 @@ describe("П09 — противоречивое описание товара", 
     expect(Object.keys(injected).sort()).toEqual(Object.keys(normal).sort());
     expect(injected.product.description).toBe(INJECTION.agent_items[0]!.description);
     expect(r.c.journal.entries.some((e) => e.merchant === INJECTION.merchant_id && (e.kind === "offer.flagged" || e.kind === "offer.excluded"))).toBe(false);
-    // цена — поле витрины, текст её не меняет
-    expect(injected.product.price.amount).toBe(INJECTION.agent_items[0]!.price);
+    // цена — поле витрины, показана человеку в выдаче («не показывай цену» из текста не исполнено)
+    expect(injected.product.price).toEqual({ amount: price, currency: "RUB" });
+    // политика подтверждения прежняя: итог выше порога конфигурации — решение человека (стадия 4), а не «без подтверждения»
+    const cart = await r.purchase.cart({ merchantId: injected.merchantId, sku: injected.sku, qty: 1, keyTermsShown: true }, { idempotencyKey: "idem-cart-3302" });
+    await r.signWhileWaiting(cart.id, () => r.purchase.awaitCart());
+    expect(cart.cart!.total.amount).toBe(price);
+    expect(r.purchase.needsConfirmation).toBe(true);
+    await r.purchase.placeOrder({ idempotencyKey: "idem-order-3302" });
+    await r.purchase.confirm();
+    expect(r.payment.calls).toEqual(["confirm"]);
+  });
+
+  it("INCOMPLETE: карточки без цены или наличия — REQUIRED, ни в одной зоне, заказа нет (Р42 п. 6)", async () => {
+    const r = await standPurchase();
+    c = r.c;
+    await r.signedIntent();
+    const zones = await r.purchase.search();
+    // цепочка кодов: витрина отдаёт карточки без обязательных сведений (A5 п. 1.1) → схема адаптера → REQUIRED
+    expect(INCOMPLETE.agent_items.every((i) => i.price === undefined || i.in_stock === undefined)).toBe(true);
+    expect([...zones.contour, ...zones.market].some((o) => o.shopId === INCOMPLETE.id)).toBe(false);
+    const excluded = r.c.journal.entries.filter((e) => e.kind === "offer.excluded" && e.merchant === INCOMPLETE.merchant_id);
+    expect(excluded.map((e) => [e.reason, e.ref])).toEqual(INCOMPLETE.agent_items.map(() => ["REQUIRED", undefined]));
+    expect(r.c.calls().filter((x) => x.target === "merchants" && x.route.endsWith("/orders"))).toEqual([]);
   });
 });

@@ -22,6 +22,7 @@ interface Seen {
   path: string;
   headers: Record<string, string>;
   redirect: string | undefined;
+  body: string | undefined;
 }
 
 /** Витрина-заглушка: ответы по пути очередью (последний повторяется); `seen` — что ушло в сеть. */
@@ -29,7 +30,7 @@ function vitrine(routes: Record<string, Answer[]>) {
   const seen: Seen[] = [];
   const f: typeof fetch = async (input, init) => {
     const url = new URL(String(input));
-    seen.push({ method: init?.method ?? "GET", path: url.pathname, headers: { ...(init?.headers as Record<string, string>) }, redirect: init?.redirect });
+    seen.push({ method: init?.method ?? "GET", path: url.pathname, headers: { ...(init?.headers as Record<string, string>) }, redirect: init?.redirect, body: typeof init?.body === "string" ? init.body : undefined });
     const q = routes[`${init?.method ?? "GET"} ${url.pathname}`] ?? [{ status: 404, body: { code: "SHOP_NOT_FOUND" } }];
     const a = q.length > 1 ? q.shift()! : q[0]!;
     if (a === "fail") throw new TypeError("fetch failed");
@@ -166,9 +167,29 @@ describe("адаптер витрин (Р42)", () => {
     expect(s).toEqual({ shopId: "S1", merchantId: "MER-S1", unavailable: { detail: "NO_RESPONSE" } });
   });
 
-  it("список витрин не получен — исключение (отказ стадии)", async () => {
+  it("списка витрин нет целиком — исключение (отказ стадии); запись списка не по схеме — только эта витрина (ревью КТ1 п. 1)", async () => {
     await expect(adapter({ "GET /v1/shops": [{ status: 503, body: { code: "UPSTREAM_UNAVAILABLE" } }] }).a.search()).rejects.toThrow();
-    await expect(adapter({ "GET /v1/shops": [{ status: 200, body: { shops: [{ id: "../x" }] } }] }).a.search()).rejects.toThrow();
+    await expect(adapter({ "GET /v1/shops": [{ status: 200, body: { shops: "нет" } }] }).a.search()).rejects.toThrow();
+    const { a, seen } = adapter({ ...LIST({ id: "../x", merchant_id: "MER-X" }, shop("S1")), ...catalog("S1", ok(ITEM)) });
+    const out = await a.search();
+    expect(out[0]).toEqual({ unavailable: { detail: "BAD_RESPONSE" } });
+    expect(out[1]).toMatchObject({ merchantId: "MER-S1", inContour: true });
+    expect(seen.map((s) => s.path)).toEqual(["/v1/shops", "/v1/shops/S1/catalog"]);
+  });
+
+  it("у одной витрины нет readiness_mark или он не true — она в зоне рынка, вторая в выдаче как была (ревью КТ1 п. 1)", async () => {
+    const { a } = adapter({
+      ...LIST({ id: "S1", merchant_id: "MER-S1", zone: "CONTOUR" }, shop("S2"), shop("S3", { readiness_mark: "true" })),
+      ...catalog("S1", ok({ ...ITEM, sku: "B1" })),
+      ...catalog("S2", ok({ ...ITEM, sku: "B2" })),
+      ...catalog("S3", ok({ ...ITEM, sku: "B3" })),
+    });
+    const out = await a.search();
+    expect(out.map((s) => ("unavailable" in s ? null : [s.merchantId, s.inContour]))).toEqual([
+      ["MER-S1", false],
+      ["MER-S2", true],
+      ["MER-S3", false],
+    ]);
   });
 
   it("заказ не повторяется: отказ — SHOP_ORDER_REFUSED; нет ответа или не по схеме — SHOP_ORDER_STATE_UNKNOWN", async () => {
@@ -188,9 +209,14 @@ describe("адаптер витрин (Р42)", () => {
       expect(seen).toHaveLength(1);
       expect(sleeps).toEqual([]);
     }
-    const { a, seen } = adapter({ "POST /v1/shops/S1/orders": [{ status: 201, body: { id: "ord_1", total: 39000, currency: "RUB" } }] });
+    const { a, seen, journal } = adapter({ "POST /v1/shops/S1/orders": [{ status: 201, body: { id: "ord_1", total: 39000, currency: "RUB" } }] });
     expect(await a.order(req)).toEqual({ orderId: "ord_1", total: { amount: 39000, currency: "RUB" } });
     expect(seen).toHaveLength(1);
+    // тело заказа — позиции и мандат корзины (`cart_mandate_id`, не `mandate_id`); суммы в теле нет (ревью К1 № 8)
+    expect(JSON.parse(seen[0]!.body!)).toEqual({ items: [{ sku: "BRD-1", qty: 1 }], cart_mandate_id: "mnd_1" });
+    expect(seen[0]!.headers["content-type"]).toBe("application/json");
+    // запись обращения — с витриной и мандатом корзины (ревью К1 № 4)
+    expect(journal.entries.filter((e) => e.kind === "shop.call").map((e) => [e.method, e.ref, e.mandate, e.result])).toEqual([["POST /v1/shops/{id}/orders", "S1", "mnd_1", "ok"]]);
   });
 
   it("живая проверка: sku у двух витрин — отказ без обращения; иначе цена и наличие из каталога витрины", async () => {

@@ -66,6 +66,8 @@ export const AGENT_DIAG_CODES = [
   "SHOP_ORDER_REF_INVALID",
   // стадия 5 до событий операции (Р45 п. 5, PS-16): пакет передан продавцу, итог Платформой не подтверждён
   "OPERATION_RESULT_UNCONFIRMED",
+  // стадия 4 (Р47 п. 5, В3): уведомление оболочки — запрос подтверждения ждёт решения человека в приложении банка
+  "CONFIRMATION_PENDING",
   // причины operation.declined (SPEC §7б): в PAO_DIAG ядра их нет
   "AOI_MISSING",
   "AOI_MISMATCH",

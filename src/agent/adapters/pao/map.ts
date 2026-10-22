@@ -4,7 +4,7 @@
 // валюта мандата ссылки. Множество валют платформы — только допустимое: вне его — отказ (исходящие) или UNKNOWN (входящие).
 import { money, type CurrencyCode, type Money } from "@kuzin4u/agentic-core";
 import type * as Pao from "@kuzin4u/agentic-core/pao";
-import { SAFE_ID } from "../../../shared/ids.js";
+import { CONFIRMATION_ID, SAFE_ID } from "../../../shared/ids.js";
 import {
   PlatformFailure,
   type AgentIndicator,
@@ -355,6 +355,8 @@ export function feedItemFromPao(raw: unknown): FeedItem {
   const d = data as Record<string, unknown>;
   const ref = requiredRef(type);
   if (ref !== null && id(d[ref]) === null) return { kind: "ignored", eventId, detail: "INVALID_DATA", type };
+  // запрос подтверждения — только по форме Платформы `cnf_` + UUID (Р47 п. 3): иначе пропуск, обращения нет
+  if (ref === "confirmation_id" && !CONFIRMATION_ID.test(d[ref] as string)) return { kind: "ignored", eventId, detail: "INVALID_DATA", type };
   return {
     kind: "event",
     event: {

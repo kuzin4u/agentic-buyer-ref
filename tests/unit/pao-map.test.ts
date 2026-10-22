@@ -200,6 +200,14 @@ describe("перевод ПАО ↔ ядро", () => {
     expect(bad("mandate.signed", ["m_1"])).toMatchObject({ detail: "INVALID_DATA" });
     expect(bad("operation.settled", { mandate_id: "m_1" })).toMatchObject({ detail: "INVALID_DATA", type: "operation.settled" });
     expect(bad("confirmation.required", { confirmation_id: 7 })).toMatchObject({ detail: "INVALID_DATA" });
+    // confirmation_id — только `cnf_` + UUID v4 строчными, как у Платформы (Р47 п. 3): иначе пропуск, без GET
+    for (const v of ["cnf_1", "c_11111111-1111-4111-8111-111111111111", "cnf_11111111-1111-4111-8111-11111111111A", "cnf_11111111-1111-1111-8111-111111111111"]) {
+      expect(bad("confirmation.approved", { confirmation_id: v }), v).toMatchObject({ detail: "INVALID_DATA", type: "confirmation.approved" });
+    }
+    expect(bad("confirmation.approved", { confirmation_id: "cnf_11111111-1111-4111-8111-111111111111" })).toMatchObject({
+      kind: "event",
+      event: { confirmationId: "cnf_11111111-1111-4111-8111-111111111111" },
+    });
     // agent.* и dispute.updated обязательной ссылки не имеют
     expect(bad("agent.key_revoked", {})).toMatchObject({ kind: "event" });
     // причина отказа — только вид кода, свободный текст не переносится (инвариант 5)

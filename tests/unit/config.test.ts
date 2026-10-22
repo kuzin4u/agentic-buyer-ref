@@ -77,6 +77,17 @@ describe("стендовые параметры", () => {
     expect(() => parseParams({ ...stand, shop_retry_default_ms: 1.5 })).toThrow(ConfigError);
   });
 
+  it("ожидание запроса подтверждения (Р47 п. 4): обязательно, целое 1…2^31 − 1 мс и не больше registry_cache_ttl_sec × 1000", () => {
+    const rest = { ...stand };
+    delete rest.confirmation_wait_ms;
+    expect(() => parseParams(rest)).toThrow(ConfigError);
+    expect(stand.confirmation_wait_ms).toBe(30_000);
+    expect(() => parseParams({ ...stand, confirmation_wait_ms: 0 })).toThrow(ConfigError);
+    expect(() => parseParams({ ...stand, confirmation_wait_ms: 1.5 })).toThrow(ConfigError);
+    expect(() => parseParams({ ...stand, confirmation_wait_ms: stand.registry_cache_ttl_sec * 1000 })).not.toThrow();
+    expect(() => parseParams({ ...stand, confirmation_wait_ms: stand.registry_cache_ttl_sec * 1000 + 1 })).toThrow(ConfigError);
+  });
+
   it("отказ при отсутствии файла", () => {
     expect(() => loadParams("config/missing.json")).toThrow(ConfigError);
   });

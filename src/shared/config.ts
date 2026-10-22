@@ -6,7 +6,7 @@ import { z } from "zod";
 const count = z.number().int().nonnegative();
 const positive = z.number().int().positive();
 /** Предел таймера Node: больше 2^31 − 1 мс таймер срабатывает через 1 мс (agentic-core `checkLiveOffer`). */
-const TIMER_MAX_MS = 2_147_483_647;
+export const TIMER_MAX_MS = 2_147_483_647;
 /** Секунды, которые переводятся в мс для ядра: после × 1000 значение остаётся safe integer — отказ при запуске, а не при проверке. */
 const secToMs = count.max(Math.floor(Number.MAX_SAFE_INTEGER / 1000));
 
@@ -52,6 +52,8 @@ export const StandParamsSchema = z
   shop_retry_default_ms: positive.max(TIMER_MAX_MS),
   // Общий срок стадии поиска (Р44 п. 6, Р-183): по истечении оставшиеся витрины недоступны (SHOP_SEARCH_DEADLINE).
   shop_search_deadline_ms: positive.max(TIMER_MAX_MS),
+  // Ожидание запроса подтверждения после ответа продавца DECLINED (Р47 п. 4): не пришёл — OPERATION_RESULT_UNCONFIRMED.
+  confirmation_wait_ms: positive.max(TIMER_MAX_MS),
 })
   // Обращения и ожидание повторов укладываются в registry_cache_ttl_sec (инвариант 4, Р20).
   .refine(
@@ -65,6 +67,8 @@ export const StandParamsSchema = z
   })
   .refine((p) => p.pao_credentials_timeout_ms >= p.pao_request_timeout_ms, { message: "pao_credentials_timeout_ms меньше pao_request_timeout_ms" })
   .refine((p) => p.pao_credentials_timeout_ms <= p.registry_cache_ttl_sec * 1000, { message: "pao_credentials_timeout_ms больше registry_cache_ttl_sec" })
+  // Ожидание запроса подтверждения — в пределах registry_cache_ttl_sec (Р47 п. 4, инвариант 4).
+  .refine((p) => p.confirmation_wait_ms <= p.registry_cache_ttl_sec * 1000, { message: "confirmation_wait_ms больше registry_cache_ttl_sec" })
   // Срок поиска вмещает хотя бы одно обращение к витрине (Р44 п. 6).
   .refine((p) => p.shop_search_deadline_ms >= p.shop_request_timeout_ms, { message: "shop_search_deadline_ms меньше shop_request_timeout_ms" });
 

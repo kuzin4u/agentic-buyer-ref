@@ -1,10 +1,12 @@
 // Покупка конвейера на стенде Платформы и эмуляторе продавцов (Р38 п. 8, Р42): клиент мандатов на стенде, лента стенда с
 // курсором, адаптер витрин (stand-shop.ts, ТЕСТОВЫЙ ПРОФИЛЬ магазина), стадии 4–6 — тестовый порт PaymentSteps или шаги
-// профиля contour (`contourPayment`, Р45): реквизит по ПАО стенда и пакет агентской оплаты витрине эмулятора.
+// профиля contour (`contourPayment`, Р45): реквизит по ПАО стенда и пакет агентской оплаты витрине эмулятора; ожидание
+// подтверждения — модуль подтверждений ядра на ленте стенда (Р47).
 // Подпись INTENT и CART — эмулятором банка во время ожидания, решение — по событию mandate.signed (Р29 п. 5, Р34 п. 5).
 import { expect } from "vitest";
 import { MERCHANT_FIXTURES } from "agentic-ps-platform/fixtures";
 import type { ShopsAdapter, ShopProfile } from "../../src/agent/adapters/shops/index.js";
+import { Confirmations } from "../../src/agent/confirmations/index.js";
 import { MandateClient } from "../../src/agent/mandates/index.js";
 import { ContourPayment } from "../../src/agent/payment-package/index.js";
 import { Purchase } from "../../src/agent/pipeline/index.js";
@@ -50,6 +52,8 @@ export interface StandPurchaseOptions {
   contourPayment?: boolean;
   /** выдача реквизита поверх настоящей платформы контура — действие теста посреди стадии 5 (параллельный вызов, Р45 Б2в) */
   issue?: (real: PaymentPlatform["issuePaymentPackage"]) => PaymentPlatform["issuePaymentPackage"];
+  /** уведомление оболочки (Р47 п. 5, В3) */
+  notify?: (code: "CONFIRMATION_PENDING") => void | Promise<void>;
 }
 
 /** Контур со стендом и витринами после start(), покупка на адаптере витрин. Закрыть — `c.close()` у вызывающего. */
@@ -64,8 +68,23 @@ export async function standPurchase(o: StandPurchaseOptions = {}) {
   const payment = payments();
   const real: PaymentPlatform["issuePaymentPackage"] = (d, m) => c.platform.issuePaymentPackage(d, m);
   const platform = { issuePaymentPackage: o.issue ? o.issue(real) : real };
-  const steps = o.contourPayment ? new ContourPayment({ platform, shop: shops, journal: c.journal }) : payment;
   const params = parseParams({ ...c.params, ...o.params });
+  // модуль подтверждений на ленте стенда, как у места сборки (compose): wake — одно чтение ленты со своим курсором
+  let cursor: string | null = null;
+  const confirmations: Confirmations = new Confirmations({
+    port: c.platform,
+    journal: c.journal,
+    params,
+    wake: async () => {
+      const items = await c.platform.listEvents(cursor);
+      if (items.length === 0) await pause(20);
+      for (const item of items) {
+        cursor = item.kind === "event" ? item.event.eventId : item.eventId;
+        await confirmations.listener(item);
+      }
+    },
+  });
+  const steps = o.contourPayment ? new ContourPayment({ platform, shop: shops, journal: c.journal, confirmations }) : payment;
   const split = new SplitWindow(params, () => new Date());
   const purchase = new Purchase({
     mandates,
@@ -79,6 +98,7 @@ export async function standPurchase(o: StandPurchaseOptions = {}) {
     journal: c.journal,
     admission: () => c.admission(),
     region: "77",
+    ...(o.notify !== undefined && { notify: o.notify }),
   });
   /** обращений к ПАО за мандатом id — GET мандата */
   const gets = (id: string) => c.calls().filter((x) => x.target === "pao" && x.route === `GET /pao/v1/mandates/${id}`).length;
@@ -99,5 +119,5 @@ export async function standPurchase(o: StandPurchaseOptions = {}) {
     await signWhileWaiting(intent.id, () => purchase.awaitIntent());
     return intent;
   }
-  return { c, self, stand, purchase, payment, split, params, signWhileWaiting, signedIntent };
+  return { c, self, stand, purchase, payment, split, params, confirmations, signWhileWaiting, signedIntent };
 }

@@ -19,6 +19,7 @@ import { SplitWindow } from "./policy/index.js";
 import type { LiveOfferSource } from "./ports/catalog.js";
 import type { OfferSource, PaymentSteps, ShopPaymentPort, ShopPort } from "./ports/shop.js";
 import { ContourPayment } from "./payment-package/index.js";
+import { Confirmations } from "./confirmations/index.js";
 import {
   AGENT_DIAG,
   AGENT_STOP_CODES,
@@ -59,8 +60,9 @@ export interface AgentCore {
   /** Адаптер витрин продавцов (Р42): `offers`, `live` и `shop` для `purchase()`; обращения подписаны действующим ключом
    *  агента, попытки — в журнал ядра (shop.call). Профиль магазина — от вызывающего (до kuzin4u/agentic-ps-platform#45). */
   shops(o: ShopsOptions): ShopsAdapter;
-  /** Шаги стадий 4–6 профиля contour (Р45 п. 6): реквизит по ПАО этой платформы и пакет агентской оплаты продавцу через
-   *  `shop` (адаптер витрин); до событий операции итог не подтверждается (OPERATION_RESULT_UNCONFIRMED). */
+  /** Шаги стадий 4–6 профиля contour (Р45 п. 6, Р47): реквизит по ПАО этой платформы и пакет агентской оплаты продавцу
+   *  через `shop` (адаптер витрин); до событий операции итог не подтверждается (OPERATION_RESULT_UNCONFIRMED); ответ
+   *  продавца DECLINED — ожидание запроса подтверждения и решения человека (модуль подтверждений ядра). */
   payment(shop: ShopPaymentPort): PaymentSteps;
   /** Самопроверка при старте (Р36 п. 6): отчёт последнего start() (и успешного, и с отказом); до start() — null. */
   selfCheck(): SelfCheckReport | null;
@@ -96,6 +98,8 @@ export interface PurchasePorts {
   shop: ShopPort;
   payment: PaymentSteps;
   region?: string;
+  /** уведомление оболочки (Р47 п. 5, В3): CONFIRMATION_PENDING — нужно подтверждение в приложении банка */
+  notify?: (code: "CONFIRMATION_PENDING") => void | Promise<void>;
 }
 
 export interface AgentCoreOptions {
@@ -218,6 +222,10 @@ export function createAgentCore(o: AgentCoreOptions): AgentCore {
   // сбой GET — слушатель падает, курсор на месте (Р34 п. 3): лента стоит для всех, и ожидание подписи другого мандата
   // (awaitSigned) получает тот же отказ — fail-closed, нюанс Р37 (ревью К2.3 № 6). awaitSigned читает ленту само.
   events.listen((item) => mandates.refreshHeld(item));
+  // подтверждение человеком (Р47 п. 3–4): confirmation.* — сигнал, статус по GET; один модуль на ядро — привязка запроса
+  // к покупке считает все ожидающие покупки агента; пока покупка ждёт, лента читается
+  const confirmations = new Confirmations({ port: platform, journal, params, wake: () => events.signal(), now });
+  events.listen(confirmations.listener);
   // окно дробления — одно на ядро: доли разных покупок под одним INTENT видят друг друга (Р39 п. 4)
   const split = new SplitWindow(params, now);
   return {
@@ -251,6 +259,7 @@ export function createAgentCore(o: AgentCoreOptions): AgentCore {
         params,
         split,
         ...(p.region !== undefined && { region: p.region }),
+        ...(p.notify !== undefined && { notify: p.notify }),
       }),
     // Подпись витрин — тем же действующим ключом и профилем, что ПАО; остановленная подпись — исключение, обращения нет.
     shops: (s) =>
@@ -264,7 +273,7 @@ export function createAgentCore(o: AgentCoreOptions): AgentCore {
         journal,
         now,
       }),
-    payment: (shop) => new ContourPayment({ platform, shop, journal, now }),
+    payment: (shop) => new ContourPayment({ platform, shop, journal, confirmations, now }),
     // Ключи загружаются до обращений к Платформе (сбой хранилища — без сети), затем курсор ленты и конфигурация, затем
     // GET /pao/v1/agent; курсор и конфигурация — один раз за start, повтор допуска (SIGNATURE_INVALID) их не повторяет.
     start: async () => {

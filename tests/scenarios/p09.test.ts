@@ -4,7 +4,8 @@
 // INJECTION (инструкция в описании) ведёт себя как витрина без инструкции (инвариант 5; распознавание инструкций, Д01, —
 // у buyer_agent). INCOMPLETE (A5 п. 1.1, Р42 п. 6): карточка без обязательных сведений не переводится — REQUIRED.
 import { afterEach, describe, expect, it } from "vitest";
-import { CartRefused, PurchaseTransitionForbidden } from "../../src/agent/pipeline/index.js";
+import { CartRefused } from "../../src/agent/pipeline/index.js";
+import { PaymentFailure } from "../../src/agent/ports/index.js";
 import { MERCHANT_FIXTURES } from "agentic-ps-platform/fixtures";
 import { shopBy, type Contour } from "../support/contour.js";
 import { STAND_TIMEOUT_MS, standPurchase } from "../support/stand-purchase.js";
@@ -56,19 +57,18 @@ describe("П09 — противоречивое описание товара", 
     expect(r.c.journal.entries.some((e) => e.merchant === INJECTION.merchant_id && (e.kind === "offer.flagged" || e.kind === "offer.excluded"))).toBe(false);
     // цена — поле витрины, показана человеку в выдаче («не показывай цену» из текста не исполнено)
     expect(injected.product.price).toEqual({ amount: price, currency: "RUB" });
-    // политика подтверждения прежняя: итог выше порога конфигурации — решение человека (стадия 4), а не «без подтверждения»
+    // политика подтверждения прежняя: итог выше порога конфигурации — выше порога и для агента («без подтверждения» из текста
+    // не исполнено); подтверждения требует ADP на авторизации (Р47 п. 2)
     const cart = await r.purchase.cart(one(injected, 1), { idempotencyKey: "idem-cart-3302" });
     await r.signWhileWaiting(cart.id, () => r.purchase.awaitCart());
     expect(cart.cart!.total.amount).toBe(price);
     expect(r.purchase.needsConfirmation).toBe(true);
     await r.purchase.placeOrder({ idempotencyKey: "idem-order-3302" });
     expect(r.payment.calls).toEqual([]);
-    // решение человека — стадия 4 через порт подтверждения (ревью К3 № 3)
-    await r.purchase.confirm();
-    expect(r.payment.calls).toEqual(["confirm"]);
+    // стадия 4 — после авторизации, если подтверждения потребует ADP (Р47 п. 2): до оплаты порт не вызывается
   });
 
-  it("INJECTION: оплата без решения человека — запрещённый переход, ни порта оплаты, ни обращений к контуру (ревью К2, повторный № 1)", async () => {
+  it("INJECTION: «без подтверждения» из текста не исполняется — агент сам не подтверждает, стадию 4 открывает только требование Платформы (ревью К2, повторный № 1; Р47 п. 2)", async () => {
     const price = INJECTION.agent_items[0]!.price!;
     const r = await standPurchase({ params: { confirm_above_kop: price - 1 } });
     c = r.c;
@@ -77,11 +77,45 @@ describe("П09 — противоречивое описание товара", 
     const cart = await r.purchase.cart(one(injected, 1), { idempotencyKey: "idem-cart-3302" });
     await r.signWhileWaiting(cart.id, () => r.purchase.awaitCart());
     await r.purchase.placeOrder({ idempotencyKey: "idem-order-3302" });
+    expect(r.purchase.needsConfirmation).toBe(true);
     const before = r.c.calls().length;
-    await expect(r.purchase.authorize({ idempotencyKey: "idem-pay-3302" })).rejects.toBeInstanceOf(PurchaseTransitionForbidden);
-    expect(r.purchase.state).toBe("STOPPED");
-    expect(r.payment.calls).toEqual([]);
-    expect(r.c.calls().slice(before)).toEqual([]);
+    // выше порога агент идёт в авторизацию: решение о подтверждении — у ADP; тестовый порт его не требует — порт
+    // подтверждения не вызывается, решения агент не создаёт (инвариант 7)
+    await r.purchase.authorize({ idempotencyKey: "idem-pay-3302" });
+    expect(r.payment.calls).toEqual(["authorize"]);
+    expect(r.c.journal.entries.some((e) => e.kind === "purchase.stage" && e.detail === "CONFIRMING")).toBe(false);
+    // полный журнал обращений после заказа (ленту не считаем): только ворота стадии 5 — verify INTENT и CART
+    expect(
+      r.c
+        .calls()
+        .slice(before)
+        .filter((x) => !x.route.startsWith("GET /pao/v1/events"))
+        .map((x) => `${x.target} ${x.route} ${x.status}`),
+    ).toEqual([`pao GET /pao/v1/mandates/${r.purchase.intentMandate!.id}/verify 200`, `pao GET /pao/v1/mandates/${cart.id}/verify 200`]);
+  });
+
+  it("INJECTION: Платформа требует подтверждения — стадия 4, решение только человека; «без подтверждения» из текста ничего не меняет (Р47 п. 2, 6)", async () => {
+    const price = INJECTION.agent_items[0]!.price!;
+    const r = await standPurchase({ params: { confirm_above_kop: price - 1 } });
+    c = r.c;
+    await r.signedIntent();
+    const injected = (await r.purchase.search()).contour.find((o) => o.shopId === INJECTION.id)!;
+    const cart = await r.purchase.cart(one(injected, 1), { idempotencyKey: "idem-cart-3302" });
+    await r.signWhileWaiting(cart.id, () => r.purchase.awaitCart());
+    await r.purchase.placeOrder({ idempotencyKey: "idem-order-3302" });
+    // порт оплаты: продавец ответил DECLINED (ADP: CONFIRMATION_REQUIRED), человек отклонил
+    const calls: string[] = [];
+    r.payment.authorize = async () => {
+      calls.push("authorize");
+      throw new PaymentFailure("CONFIRMATION_REQUIRED");
+    };
+    r.payment.confirm = async () => (calls.push("confirm"), "REJECTED" as const);
+    await expect(r.purchase.authorize({ idempotencyKey: "idem-pay-3302" })).rejects.toMatchObject({ code: "CONFIRMATION_REJECTED" });
+    expect(calls).toEqual(["authorize", "confirm"]);
+    const stages = r.c.journal.entries.filter((e) => e.kind === "purchase.stage").map((e) => e.detail);
+    expect(stages.slice(-3)).toEqual(["AUTHORIZING", "CONFIRMING", "STOPPED"]);
+    await expect(r.purchase.authorize({ idempotencyKey: "idem-pay-3302" })).rejects.toThrow();
+    expect(calls).toEqual(["authorize", "confirm"]);
   });
 
   it("INCOMPLETE: карточки без цены или наличия — REQUIRED, ни в одной зоне, заказа нет (Р42 п. 6)", async () => {

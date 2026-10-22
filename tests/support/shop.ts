@@ -3,8 +3,9 @@
 // факты `catalog/readFeed` и исходы, которые задаёт тест.
 import { readFileSync } from "node:fs";
 import { readFeed, type CatalogShop } from "../../src/agent/catalog/index.js";
-import type { Confirmation, Money, Operation } from "../../src/shared/domain.js";
+import type { Money, Operation } from "../../src/shared/domain.js";
 import type {
+  ConfirmationOutcome,
   LiveOffer,
   LiveOfferRequest,
   LiveOfferSource,
@@ -87,7 +88,7 @@ export function shopOrders(s: FeedShop, total?: (req: ShopOrderRequest) => Money
 
 /** Шаги оплаты (стадии 4–6) до AG-11 и AG-13: исходы задаёт тест; `calls` — какие шаги вызваны, `carts` — id CART и
  *  сумма заказа в контексте каждого `confirm` и `authorize` (Р44 п. 4: оплата только по CART, итог которого = заказу). */
-export function payments(o: { confirm?: Confirmation["status"]; authorize?: Partial<Operation>; settle?: Operation["status"] } = {}): PaymentSteps & { calls: string[]; carts: { cart: string; total: Money | undefined; order: Money }[] } {
+export function payments(o: { confirm?: ConfirmationOutcome; authorize?: Partial<Operation>; settle?: Operation["status"] } = {}): PaymentSteps & { calls: string[]; carts: { cart: string; total: Money | undefined; order: Money }[] } {
   const seen = (c: PaymentContext) => steps.carts.push({ cart: c.cart.id, total: c.cart.cart?.total, order: c.order.total });
   const op = (c: PaymentContext, over: Partial<Operation>): Operation => ({
     opRef: "op_1",
@@ -103,7 +104,14 @@ export function payments(o: { confirm?: Confirmation["status"]; authorize?: Part
   const steps = {
     calls: [] as string[],
     carts: [] as { cart: string; total: Money | undefined; order: Money }[],
-    confirm: async (c: PaymentContext): Promise<Confirmation["status"]> => (steps.calls.push("confirm"), seen(c), o.confirm ?? "APPROVED"),
+    // уведомление — как у модуля ядра: только когда запрос привязан и был PENDING (не NONE и не UNBOUND, В3)
+    confirm: async (c: PaymentContext, notify: () => void): Promise<ConfirmationOutcome> => {
+      steps.calls.push("confirm");
+      seen(c);
+      const outcome = o.confirm ?? "APPROVED";
+      if (outcome !== "NONE" && outcome !== "UNBOUND") notify();
+      return outcome;
+    },
     authorize: async (c: PaymentContext): Promise<Operation> => (steps.calls.push("authorize"), seen(c), op(c, o.authorize ?? {})),
     settle: async (x: Operation): Promise<Operation> => (steps.calls.push("settle"), { ...x, status: o.settle ?? "SETTLED" }),
   };

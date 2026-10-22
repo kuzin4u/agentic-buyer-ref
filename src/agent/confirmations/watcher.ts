@@ -4,6 +4,7 @@
 // ровно одна покупка (4а): ошибка привязки денег не стоит — ADP сверяет ссылку с мандатом, продавцом, суммой и order_ref.
 // link и confirmation_ref дальше разбора ответа не идут: ни в журнал, ни в исход, ни человеку (инвариант 1, Р47 п. 5).
 import type { FeedItem } from "../ports/events.js";
+import type { ConfirmationOutcome } from "../ports/shop.js";
 import { PlatformFailure, type Confirmation } from "../../shared/domain.js";
 import { TIMER_MAX_MS } from "../../shared/config.js";
 import { CONFIRMATION_ID } from "../../shared/ids.js";
@@ -24,9 +25,8 @@ export interface ConfirmationsJournal {
   ): void;
 }
 
-/** Исход ожидания: решение по GET; UNBOUND — привязка неоднозначна (4а); NONE — запроса нет за confirmation_wait_ms;
- *  UNKNOWN — статус не подтверждён (сбой GET, ответ не по схеме, PENDING после срока) — fail-closed. */
-export type ConfirmationOutcome = "APPROVED" | "REJECTED" | "EXPIRED" | "UNBOUND" | "NONE" | "UNKNOWN";
+/** Исход ожидания — тип порта шагов оплаты (UNKNOWN — сбой GET, ответ не по схеме, PENDING после срока). */
+export type { ConfirmationOutcome };
 
 export interface ConfirmationsOptions {
   port: ConfirmationsPort;

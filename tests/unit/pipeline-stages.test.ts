@@ -1,12 +1,12 @@
 // Конвейер, стадии 3–6 на PaoStub (Р38 п. 1–4): выбор человека → CART → живая проверка → заказ со сверкой суммы →
 // подтверждение по порогу (Т7) → авторизация и расчёт через порт PaymentSteps (исход — из события Платформы, AG-11).
 import { afterEach, describe, expect, it } from "vitest";
-import { CartLiveRefused, CartRefused, OrderRefused, PurchaseMachine, PurchaseStopped, PurchaseTransitionForbidden, type Offer } from "../../src/agent/pipeline/index.js";
+import { CartLiveRefused, CartRefused, OrderRefused, Purchase, PurchaseMachine, PurchaseStopped, PurchaseTransitionForbidden, type Offer } from "../../src/agent/pipeline/index.js";
 import { MandateRefused } from "../../src/agent/mandates/index.js";
 import { isSpent } from "../../src/agent/policy/a5-issued.js";
 import { loadParams } from "../../src/shared/config.js";
 import { PlatformFailure } from "../../src/shared/domain.js";
-import { ShopFailure } from "../../src/agent/ports/index.js";
+import { PaymentFailure, ShopFailure, type ConfirmationOutcome } from "../../src/agent/ports/index.js";
 import { INTENT, event } from "../support/consents.js";
 import { expectJournalClean } from "../support/journal.js";
 import { AGENT, type PaoStand } from "../support/pao-stand.js";
@@ -69,6 +69,18 @@ async function ordered(r: PurchaseRun, qty = 1) {
   return r.purchase.placeOrder({ idempotencyKey: "idem-order-1" });
 }
 
+/** Порт оплаты: авторизация — «нужно подтверждение» (как DECLINED продавца в профиле contour), стадия 4 — исход `outcome`. */
+const confirming = (outcome: ConfirmationOutcome) => {
+  const steps = payments({ confirm: outcome });
+  return {
+    ...steps,
+    authorize: async () => {
+      steps.calls.push("authorize");
+      throw new PaymentFailure("CONFIRMATION_REQUIRED");
+    },
+  };
+};
+
 describe("стадии 3–6 — путь покупки (Р38 п. 1–2)", () => {
   it("сумма не выше порога: CART → заказ → авторизация → расчёт без стадии 4, purchase.stage на каждый переход", async () => {
     const r = await setup();
@@ -109,16 +121,15 @@ describe("стадии 3–6 — путь покупки (Р38 п. 1–2)", () =
     expectJournalClean(r.journal.entries, AGENT, r.stand.stub.calls, ["idem-intent-1", "idem-cart-1"]);
   });
 
-  it("сумма выше порога (Т7): ORDERED → CONFIRMING → AUTHORIZING, решение — из порта", async () => {
+  it("сумма выше порога (Т7, Р47 п. 2а): авторизация без предварительного подтверждения — его требует ADP; не потребовала — ORDERED → AUTHORIZING → SETTLING", async () => {
     const r = await setup();
     const qty = Math.floor(THRESHOLD / TARTINE) + 1;
     await ordered(r, qty);
     expect(r.purchase.needsConfirmation).toBe(true);
-    await r.purchase.confirm();
     await r.purchase.authorize({ idempotencyKey: "idem-pay-1" });
     await r.purchase.settle();
-    expect(r.payment.calls).toEqual(["confirm", "authorize", "settle"]);
-    expect(stages(r).slice(-5)).toEqual(["ORDERED", "CONFIRMING", "AUTHORIZING", "SETTLING", "DONE"]);
+    expect(r.payment.calls).toEqual(["authorize", "settle"]);
+    expect(stages(r).slice(-4)).toEqual(["ORDERED", "AUTHORIZING", "SETTLING", "DONE"]);
   });
 
   it("CART сразу ACTIVE (РП35): CART_PENDING и CART_ACTIVE подряд, без ожидания подписи", async () => {
@@ -574,32 +585,69 @@ describe("стадия 3 — сверка суммы заказа (Т6)", () => 
 });
 
 describe("стадии 4–6 — исходы из порта PaymentSteps (инварианты 7, 8)", () => {
-  it("человек не подтвердил — STOPPED CONFIRMATION_REQUIRED, авторизации нет", async () => {
-    const r = await setup({ payment: payments({ confirm: "REJECTED" }) });
-    await ordered(r, Math.floor(THRESHOLD / TARTINE) + 1);
-    await expect(r.purchase.confirm()).rejects.toMatchObject({ code: "CONFIRMATION_REQUIRED" });
-    expect(r.payment.calls).toEqual(["confirm"]);
-    expect(stages(r).at(-1)).toBe("STOPPED:CONFIRMATION_REQUIRED");
+  it("стадия 4 после стадии 5 (Р47 п. 2, 6): AUTHORIZING → CONFIRMING → STOPPED с кодом исхода; CONFIRMING → AUTHORIZING не проходит ни один исход", async () => {
+    for (const [outcome, code] of [
+      ["APPROVED", "CONFIRMATION_NOT_DELIVERED"],
+      ["REJECTED", "CONFIRMATION_REJECTED"],
+      ["EXPIRED", "CONFIRMATION_EXPIRED"],
+      ["UNBOUND", "CONFIRMATION_UNBOUND"],
+      ["NONE", "OPERATION_RESULT_UNCONFIRMED"],
+      ["UNKNOWN", "UNKNOWN"],
+    ] as const) {
+      const steps = confirming(outcome);
+      const notified: string[] = [];
+      const r = await setup({ payment: steps, notify: (c) => void notified.push(c) });
+      await ordered(r, Math.floor(THRESHOLD / TARTINE) + 1);
+      await expect(r.purchase.authorize({ idempotencyKey: "idem-pay-1" }), outcome).rejects.toMatchObject({ code });
+      expect(steps.calls).toEqual(["authorize", "confirm"]);
+      expect(stages(r).slice(-3), outcome).toEqual(["AUTHORIZING", "CONFIRMING", `STOPPED:${code}`]);
+      // уведомление — только по привязанному PENDING (В3): без запроса (NONE) и без привязки (UNBOUND) — нет
+      expect(notified).toEqual(outcome === "NONE" || outcome === "UNBOUND" ? [] : ["CONFIRMATION_PENDING"]);
+      // в ч. 1 из CONFIRMING — только в STOPPED: повтора авторизации нет (Р47 п. 6, ч. 2)
+      expect(r.tail().some((e) => e.kind === "agent.refused" && e.detail === "CONFIRMING->AUTHORIZING")).toBe(false);
+      expect(stages(r).filter((x) => x === "AUTHORIZING")).toHaveLength(1);
+      await expect(r.purchase.authorize({ idempotencyKey: "idem-pay-1" })).rejects.toBeInstanceOf(PurchaseTransitionForbidden);
+      expect(steps.calls).toEqual(["authorize", "confirm"]);
+      await closeStand();
+    }
   });
 
-  it("выше порога авторизация без подтверждения — запрещённый переход (agent.refused «откуда->куда»), порт не вызван", async () => {
-    const r = await setup();
-    await ordered(r, Math.floor(THRESHOLD / TARTINE) + 1);
-    await expect(r.purchase.authorize({ idempotencyKey: "idem-pay-1" })).rejects.toBeInstanceOf(PurchaseTransitionForbidden);
-    expect(r.purchase.reason).toBe("PIPELINE_TRANSITION_FORBIDDEN");
-    expect(r.tail().filter((e) => e.kind === "agent.refused").map((e) => e.detail)).toEqual(["ORDERED->AUTHORIZING"]);
-    expect(r.payment.calls).toEqual([]);
-  });
-
-  it("не выше порога подтверждение не запрашивается — confirm() запрещён", async () => {
-    const r = await setup();
+  it("стадия 4 и ниже порога: требование подтверждения от Платформы (порог банка ниже, Р-142) — тот же путь", async () => {
+    const steps = confirming("REJECTED");
+    const r = await setup({ payment: steps });
     await ordered(r);
-    await expect(r.purchase.confirm()).rejects.toBeInstanceOf(PurchaseTransitionForbidden);
-    expect(r.tail().filter((e) => e.kind === "agent.refused").map((e) => e.detail)).toEqual(["ORDERED->CONFIRMING"]);
-    expect(r.payment.calls).toEqual([]);
+    expect(r.purchase.needsConfirmation).toBe(false);
+    await expect(r.purchase.authorize({ idempotencyKey: "idem-pay-1" })).rejects.toMatchObject({ code: "CONFIRMATION_REJECTED" });
+    expect(stages(r).slice(-2)).toEqual(["CONFIRMING", "STOPPED:CONFIRMATION_REJECTED"]);
   });
 
-  it("граница порога (Т7): итог ровно confirm_above_kop — без стадии 4, на копейку выше — со стадией 4", async () => {
+  it("уведомление оболочки (В3): исключение и отказ обещания — notify.failed, исход прежний; висящее — не ждётся", async () => {
+    const cases: [string, () => void | Promise<void>, string[]][] = [
+      [
+        "исключение",
+        () => {
+          throw new Error("оболочка упала");
+        },
+        ["CONFIRMATION_PENDING"],
+      ],
+      ["отказ обещания", () => Promise.reject(new Error("оболочка отказала")), ["CONFIRMATION_PENDING"]],
+      ["висящее обещание", () => new Promise<void>(() => undefined), []],
+    ];
+    for (const [name, notify, failed] of cases) {
+      const r = await setup({ payment: confirming("REJECTED"), notify });
+      await ordered(r);
+      await expect(r.purchase.authorize({ idempotencyKey: "idem-pay-1" }), name).rejects.toMatchObject({ code: "CONFIRMATION_REJECTED" });
+      await new Promise((res) => setImmediate(res));
+      expect(r.tail().filter((e) => e.kind === "notify.failed").map((e) => e.reason), name).toEqual(failed);
+      await closeStand();
+    }
+  });
+
+  it("нет перехода ORDERED → CONFIRMING и публичного confirm() (Р47 п. 2, В3 п. 4)", () => {
+    expect("confirm" in Purchase.prototype).toBe(false);
+  });
+
+  it("граница порога (Т7): итог ровно confirm_above_kop — сведения «не выше порога», на копейку выше — «выше» (воротами не служат, Р47 п. 2)", async () => {
     for (const [limit, needs] of [[2 * TARTINE, false], [2 * TARTINE - 1, true]] as const) {
       const r = await setup({ params: { confirm_above_kop: limit } });
       await ordered(r, 2);
@@ -608,16 +656,15 @@ describe("стадии 4–6 — исходы из порта PaymentSteps (ин
     }
   });
 
-  it("мандат корзины, отданный наружу, — копия: подмена итога не снимает стадию 4 (ревью К3 № 3)", async () => {
+  it("мандат корзины, отданный наружу, — копия: подмена итога не меняет сведения о пороге (ревью К3 № 3)", async () => {
     const r = await setup();
     await ordered(r, Math.floor(THRESHOLD / TARTINE) + 1);
     const cart = r.purchase.cartMandate!;
     cart.cart!.total.amount = 1;
     expect(r.purchase.needsConfirmation).toBe(true);
-    await expect(r.purchase.authorize({ idempotencyKey: "idem-pay-1" })).rejects.toBeInstanceOf(PurchaseTransitionForbidden);
   });
 
-  it("снимок CART свой (после подписи и сразу ACTIVE): изменение объекта в держимых клиента мандатов не снимает стадию 4", async () => {
+  it("снимок CART свой (после подписи и сразу ACTIVE): изменение объекта в держимых клиента мандатов не меняет сведения о пороге", async () => {
     for (const immediate of [false, true]) {
       const r = await setup();
       const qty = Math.floor(THRESHOLD / TARTINE) + 1;
@@ -637,11 +684,13 @@ describe("стадии 4–6 — исходы из порта PaymentSteps (ин
     for (const step of ["confirm", "authorize"] as const) {
       const steps = payments();
       const refuse = () => Promise.reject(new MandateRefused("MANDATE_SIGNATURE_PENDING", "ждём человека"));
-      const r = await setup({ payment: { ...steps, [step]: refuse } });
-      await ordered(r, step === "confirm" ? Math.floor(THRESHOLD / TARTINE) + 1 : 1);
-      await expect(step === "confirm" ? r.purchase.confirm() : r.purchase.authorize({ idempotencyKey: "idem-pay-1" })).rejects.toBeInstanceOf(MandateRefused);
+      const needConfirm = () => (steps.calls.push("authorize"), Promise.reject(new PaymentFailure("CONFIRMATION_REQUIRED")));
+      const r = await setup({ payment: { ...steps, ...(step === "confirm" ? { authorize: needConfirm, confirm: refuse } : { authorize: refuse }) } });
+      await ordered(r, 1);
+      await expect(r.purchase.authorize({ idempotencyKey: "idem-pay-1" })).rejects.toBeInstanceOf(MandateRefused);
       expect(stages(r).at(-1)).toBe("STOPPED:MANDATE_SIGNATURE_PENDING");
-      expect(steps.calls).toEqual([]);
+      expect(steps.calls).toEqual(step === "confirm" ? ["authorize"] : []);
+      if (step === "confirm") expect(stages(r)).toContain("CONFIRMING");
       await closeStand();
     }
   });
@@ -652,37 +701,27 @@ describe("стадии 4–6 — исходы из порта PaymentSteps (ин
     expect(Object.values(r.purchase).some((v) => v instanceof PurchaseMachine)).toBe(false);
   });
 
-  it("авторизация, пока стадия 4 ждёт человека, — запрещённый переход, порт авторизации не вызван (ревью К3 № 4)", async () => {
-    let release: (s: "APPROVED") => void = () => {};
-    const pending = new Promise<"APPROVED">((res) => (release = res));
-    // порт подтверждения начал ждать человека — после проверки по мандату (Р40 п. 5), уже в CONFIRMING
+  it("авторизация, пока стадия 4 ждёт человека, — запрещённый переход; ожидание прервано остановкой (ревью К3 № 4)", async () => {
+    // порт подтверждения начал ждать человека — уже в CONFIRMING; ждёт, пока покупку не остановят
     let started: () => void = () => {};
     const entered = new Promise<void>((res) => (started = res));
     const steps = payments();
-    const r = await setup({ payment: { ...steps, confirm: () => (started(), pending) } });
+    const confirm = (_c: unknown, _n: unknown, signal: AbortSignal) =>
+      new Promise<ConfirmationOutcome>((_res, rej) => (started(), signal.addEventListener("abort", () => rej(signal.reason), { once: true })));
+    let authorized = 0;
+    const r = await setup({ payment: { ...steps, authorize: () => (authorized++, Promise.reject(new PaymentFailure("CONFIRMATION_REQUIRED"))), confirm } });
     await ordered(r, Math.floor(THRESHOLD / TARTINE) + 1);
-    const waiting = r.purchase.confirm();
+    const waiting = r.purchase.authorize({ idempotencyKey: "idem-pay-1" });
     await entered;
-    await expect(r.purchase.authorize({ idempotencyKey: "idem-pay-1" })).rejects.toBeInstanceOf(PurchaseTransitionForbidden);
+    const from = r.stand.stub.calls.length;
+    await expect(r.purchase.authorize({ idempotencyKey: "idem-pay-2" })).rejects.toBeInstanceOf(PurchaseTransitionForbidden);
+    // параллельный вызов не дошёл ни до порта, ни до контура
+    expect(authorized).toBe(1);
+    expect(r.stand.stub.calls.slice(from)).toEqual([]);
     expect(r.tail().filter((e) => e.reason === "PIPELINE_TRANSITION_FORBIDDEN" && e.kind === "agent.refused").map((e) => e.detail)).toEqual(["CONFIRMING->AUTHORIZING"]);
-    release("APPROVED");
     await expect(waiting).rejects.toBeInstanceOf(PurchaseStopped);
     expect(r.purchase.state).toBe("STOPPED");
-    expect(steps.calls).toEqual([]);
-  });
-
-  it("авторизация, пока до стадии 4 идёт verify, — запрещённый переход ORDERED->AUTHORIZING, порты не вызваны (Р40 п. 5)", async () => {
-    const steps = payments();
-    const r = await setup({ payment: steps });
-    await ordered(r, Math.floor(THRESHOLD / TARTINE) + 1);
-    const from = r.stand.stub.calls.length;
-    const checking = r.purchase.confirm();
-    await expect(r.purchase.authorize({ idempotencyKey: "idem-pay-1" })).rejects.toBeInstanceOf(PurchaseTransitionForbidden);
-    await expect(checking).rejects.toBeInstanceOf(PurchaseStopped);
-    expect(r.tail().filter((e) => e.reason === "PIPELINE_TRANSITION_FORBIDDEN" && e.kind === "agent.refused").map((e) => e.detail)).toEqual(["ORDERED->AUTHORIZING"]);
-    // verify INTENT уже ушёл; CART после остановки не проверяется
-    expect(opsFrom(r, from)).toEqual([VERIFY]);
-    expect(steps.calls).toEqual([]);
+    expect(r.purchase.reason).toBe("PIPELINE_TRANSITION_FORBIDDEN");
   });
 
   it("повторный вход в идущую стадию — запрещённый переход (два cart() подряд)", async () => {
@@ -694,12 +733,12 @@ describe("стадии 4–6 — исходы из порта PaymentSteps (ин
     expect(r.stand.log().filter((c) => c.op === "POST /pao/v1/mandates")).toHaveLength(1);
   });
 
-  it("Платформа требует подтверждения на стадии 5 — STOPPED CONFIRMATION_REQUIRED, без повтора", async () => {
+  it("ответ порта со статусом CONFIRMATION_REQUIRED — стадия 4 (Р47 п. 2); одобрение до канала к продавцу — CONFIRMATION_NOT_DELIVERED, без повтора", async () => {
     const r = await setup({ payment: payments({ authorize: { status: "CONFIRMATION_REQUIRED" } }) });
     await ordered(r);
-    await expect(r.purchase.authorize({ idempotencyKey: "idem-pay-1" })).rejects.toMatchObject({ code: "CONFIRMATION_REQUIRED" });
-    expect(r.payment.calls).toEqual(["authorize"]);
-    expect(stages(r).slice(-2)).toEqual(["AUTHORIZING", "STOPPED:CONFIRMATION_REQUIRED"]);
+    await expect(r.purchase.authorize({ idempotencyKey: "idem-pay-1" })).rejects.toMatchObject({ code: "CONFIRMATION_NOT_DELIVERED" });
+    expect(r.payment.calls).toEqual(["authorize", "confirm"]);
+    expect(stages(r).slice(-3)).toEqual(["AUTHORIZING", "CONFIRMING", "STOPPED:CONFIRMATION_NOT_DELIVERED"]);
     await expect(r.purchase.settle()).rejects.toBeInstanceOf(PurchaseTransitionForbidden);
   });
 
@@ -842,21 +881,28 @@ describe("держимые после ожиданий (Р38 п. 3, ревью �
     expect(stages(r).slice(-2)).toEqual(["CART_PENDING", "STOPPED:MANDATE_NOT_ACTIVE"]);
   });
 
-  it("CART отозван, пока человек подтверждал, — STOPPED MANDATE_NOT_ACTIVE, авторизации нет", async () => {
-    const steps = payments();
+  it("CART отозван, пока человек подтверждал, — STOPPED MANDATE_NOT_ACTIVE, повтора нет", async () => {
+    const calls: string[] = [];
+    const steps = {
+      ...payments(),
+      authorize: () => (calls.push("authorize"), Promise.reject(new PaymentFailure("CONFIRMATION_REQUIRED"))),
+    };
     const run: { r?: PurchaseRun } = {};
     const confirm = async () => {
       const r = run.r!;
       const id = r.purchase.cartMandate!.id;
       r.consents.mandates.get(id)!.status = "REVOKED";
       await r.core.mandates.refreshHeld({ kind: "event", event: event("mandate.revoked", id) });
+      calls.push("confirm");
       return "APPROVED" as const;
     };
     const r = (run.r = await setup({ payment: { ...steps, confirm } }));
     await ordered(r, Math.floor(THRESHOLD / TARTINE) + 1);
-    await expect(r.purchase.confirm()).rejects.toMatchObject({ code: "MANDATE_NOT_ACTIVE" });
+    await expect(r.purchase.authorize({ idempotencyKey: "idem-pay-1" })).rejects.toMatchObject({ code: "MANDATE_NOT_ACTIVE" });
+    expect(stages(r).slice(-3)).toEqual(["AUTHORIZING", "CONFIRMING", "STOPPED:MANDATE_NOT_ACTIVE"]);
+    expect(r.tail().filter((e) => e.kind === "agent.refused").map((e) => e.reason)).toEqual(["MANDATE_NOT_ACTIVE"]);
     await expect(r.purchase.authorize({ idempotencyKey: "idem-pay-1" })).rejects.toBeInstanceOf(PurchaseTransitionForbidden);
-    expect(steps.calls).toEqual([]);
+    expect(calls).toEqual(["authorize", "confirm"]);
   });
 
   it("CART отозван, пока продавец отвечал на заказ, — STOPPED MANDATE_NOT_ACTIVE, ORDERED не записан", async () => {
@@ -889,11 +935,10 @@ describe("держимые после ожиданий (Р38 п. 3, ревью �
 describe("ворота перед стадией 5 (Р38 п. 3, К4): оба мандата держатся и подтверждены verify — иначе STOPPED до реквизита", () => {
   /** verify обращения к контуру по порядку: id мандата из пути */
 
-  it("ворота — verify INTENT, затем CART, непосредственно перед портом авторизации; и после стадии 4 тоже", async () => {
+  it("ворота — verify INTENT, затем CART, непосредственно перед портом авторизации; и выше порога тоже (Р47 п. 2)", async () => {
     for (const qty of [1, Math.floor(THRESHOLD / TARTINE) + 1]) {
       const r = await setup();
       await ordered(r, qty);
-      if (r.purchase.needsConfirmation) await r.purchase.confirm();
       const before = verified(r).length;
       const log = r.stand.log().length;
       await r.purchase.authorize({ idempotencyKey: "idem-pay-1" });
@@ -1028,10 +1073,10 @@ describe("ворота перед стадией 5 (Р38 п. 3, К4): оба м�
   });
 });
 
-describe("проверка по мандату до стадии 4 (Р40 п. 5, К4а № 3): человека не просят подтвердить покупку, которую ворота отклонят", () => {
+describe("проверка по мандату до стадии 4 (Р40 п. 5, К4а № 3; после Р47 п. 2 — ворота стадии 5): человека не просят подтвердить покупку, которую ворота отклонят", () => {
   const ABOVE = Math.floor(THRESHOLD / TARTINE) + 1;
 
-  it("до запроса подтверждения — verify INTENT, затем CART, без иных обращений; в воротах стадии 5 — снова", async () => {
+  it("выше порога — verify INTENT, затем CART, один раз в воротах стадии 5, без иных обращений до порта", async () => {
     const r = await setup();
     await ordered(r, ABOVE);
     expect(r.purchase.needsConfirmation).toBe(true);
@@ -1039,12 +1084,10 @@ describe("проверка по мандату до стадии 4 (Р40 п. 5, 
     const cartId = r.purchase.cartMandate!.id;
     const from = r.stand.stub.calls.length;
     const before = verified(r).length;
-    await r.purchase.confirm();
+    await r.purchase.authorize({ idempotencyKey: "idem-pay-1" });
     expect(opsFrom(r, from)).toEqual([VERIFY, VERIFY]);
     expect(verified(r).slice(before)).toEqual([intentId, cartId]);
-    expect(r.payment.calls).toEqual(["confirm"]);
-    await r.purchase.authorize({ idempotencyKey: "idem-pay-1" });
-    expect(verified(r).slice(before)).toEqual([intentId, cartId, intentId, cartId]);
+    expect(r.payment.calls).toEqual(["authorize"]);
   });
 
   for (const which of ["INTENT", "CART"] as const) {
@@ -1055,7 +1098,7 @@ describe("проверка по мандату до стадии 4 (Р40 п. 5, 
       const id = which === "INTENT" ? intentId : r.purchase.cartMandate!.id;
       r.consents.left.set(id, TARTINE * ABOVE - 1);
       const from = r.stand.stub.calls.length;
-      await expect(r.purchase.confirm()).rejects.toMatchObject({ code: "MANDATE_AMOUNT_LEFT_INSUFFICIENT" });
+      await expect(r.purchase.authorize({ idempotencyKey: "idem-pay-1" })).rejects.toMatchObject({ code: "MANDATE_AMOUNT_LEFT_INSUFFICIENT" });
       // по INTENT не хватает — CART уже не проверяется
       expect(opsFrom(r, from)).toEqual(which === "INTENT" ? [VERIFY] : [VERIFY, VERIFY]);
       expect(r.purchase.state).toBe("STOPPED");
@@ -1076,7 +1119,7 @@ describe("проверка по мандату до стадии 4 (Р40 п. 5, 
       const id = which === "INTENT" ? r.purchase.intentMandate!.id : r.purchase.cartMandate!.id;
       r.consents.outcomeOf.set(id, "OUT_OF_SCOPE");
       const from = r.stand.stub.calls.length;
-      await expect(r.purchase.confirm()).rejects.toBeInstanceOf(MandateRefused);
+      await expect(r.purchase.authorize({ idempotencyKey: "idem-pay-1" })).rejects.toBeInstanceOf(MandateRefused);
       expect(r.purchase.reason).toBe("MANDATE_OUT_OF_SCOPE");
       expect(opsFrom(r, from)).toEqual(which === "INTENT" ? [VERIFY] : [VERIFY, VERIFY]);
       expect(r.tail().filter((e) => e.kind === "agent.refused").map((e) => [e.reason, e.mandate])).toEqual([["MANDATE_OUT_OF_SCOPE", id]]);
@@ -1092,7 +1135,7 @@ describe("проверка по мандату до стадии 4 (Р40 п. 5, 
     r.consents.mandates.get(id)!.status = "REVOKED";
     await r.core.mandates.refreshHeld({ kind: "event", event: event("mandate.revoked", id) });
     const from = r.stand.stub.calls.length;
-    await expect(r.purchase.confirm()).rejects.toMatchObject({ code: "MANDATE_NOT_ACTIVE" });
+    await expect(r.purchase.authorize({ idempotencyKey: "idem-pay-1" })).rejects.toMatchObject({ code: "MANDATE_NOT_ACTIVE" });
     expect(opsFrom(r, from)).toEqual([]);
     expect(r.payment.calls).toEqual([]);
   });
@@ -1218,10 +1261,22 @@ describe("политика до стадий 4–5 (Р39): отказ — agent.
       await ordered(r);
       const intentId = r.purchase.intentMandate!.id;
       await r.purchase.authorize({ idempotencyKey: "idem-pay-1" }).catch(() => undefined);
-      expect(r.payment.calls).toEqual(["authorize"]);
+      // ответ CONFIRMATION_REQUIRED ведёт в стадию 4 (Р47 п. 2): место в окне — как до Р47 (Р39 п. 4)
+      expect(r.payment.calls).toEqual(reply.status === "CONFIRMATION_REQUIRED" ? ["authorize", "confirm"] : ["authorize"]);
       expect(isShareAfter(r, intentId)).toBe(counts);
     });
   }
+
+  it("порт бросил CONFIRMATION_REQUIRED (профиль contour: пакет передан, продавец DECLINED) — место в окне занято при любом исходе стадии 4 (Р47 п. 6)", async () => {
+    for (const outcome of ["APPROVED", "REJECTED", "NONE"] as const) {
+      const r = await setup({ payment: confirming(outcome) });
+      await ordered(r);
+      const intentId = r.purchase.intentMandate!.id;
+      await r.purchase.authorize({ idempotencyKey: "idem-pay-1" }).catch(() => undefined);
+      expect(isShareAfter(r, intentId), outcome).toBe(true);
+      await closeStand();
+    }
+  });
 
   it("сбой порта на стадии 5 — операция остаётся в окне (fail-closed, Р39 п. 4)", async () => {
     const payment = payments();

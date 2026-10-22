@@ -83,15 +83,15 @@ describe("П11 — цена изменилась после согласован
     await r.signWhileWaiting(fresh.id, () => r.purchase.awaitCart());
     const order = await r.purchase.placeOrder({ idempotencyKey: "idem-order-p11-2" });
     expect(order.total).toEqual(RUB(newTotal));
-    // итог выше порога подтверждения (порог — из конфигурации) — стадия 4 через тестовый порт (Т7), затем оплата
+    // итог выше порога подтверждения (порог — из конфигурации): авторизация без предварительного подтверждения — его
+    // требует ADP (Р47 п. 2); тестовый порт его не требует
     expect(newTotal).toBeGreaterThan(THRESHOLD);
     expect(r.purchase.needsConfirmation).toBe(true);
-    await r.purchase.confirm();
     await r.purchase.authorize({ idempotencyKey: "idem-auth-p11" });
     // заказ у витрины — один, по новому CART; оплата — по CART, итог которого равен заказу
     const paid = { cart: fresh.id, total: RUB(newTotal), order: RUB(newTotal) };
-    expect(r.payment.calls).toEqual(["confirm", "authorize"]);
-    expect(r.payment.carts).toEqual([paid, paid]);
+    expect(r.payment.calls).toEqual(["authorize"]);
+    expect(r.payment.carts).toEqual([paid]);
     // полный журнал обращений от первого заказа (ленту не считаем): по прежнему CART после отказа — ни verify, ни заказа,
     // ни отзыва, ни повторного запроса; единственное чтение прежнего CART — проверка теста (выбор 4а)
     const ids = (x: string) => x.replaceAll(intent.id, "{intent}").replaceAll(old.id, "{old}").replaceAll(fresh.id, "{fresh}");
@@ -117,9 +117,7 @@ describe("П11 — цена изменилась после согласован
       "pao GET /pao/v1/mandates/{intent}/verify 200",
       "pao GET /pao/v1/mandates/{fresh}/verify 200",
       `merchants POST /v1/shops/${NORMAL.id}/orders 201`,
-      // стадия 4 и ворота стадии 5 — verify INTENT и нового CART
-      "pao GET /pao/v1/mandates/{intent}/verify 200",
-      "pao GET /pao/v1/mandates/{fresh}/verify 200",
+      // ворота стадии 5 — verify INTENT и нового CART (стадия 4 — после авторизации, по требованию ADP, Р47 п. 2)
       "pao GET /pao/v1/mandates/{intent}/verify 200",
       "pao GET /pao/v1/mandates/{fresh}/verify 200",
     ]);

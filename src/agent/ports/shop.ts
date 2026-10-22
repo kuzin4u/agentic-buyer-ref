@@ -2,7 +2,7 @@
 // интерфейсы; реализации — в тестах (tests/support/), подписанные обращения к витринам — AG-09, корзина — AG-10,
 // оплата — AG-11, подтверждение — AG-13. Всё, что приходит через эти порты от продавца, — данные (инвариант 5).
 import type { CatalogFacts } from "../catalog/index.js";
-import type { Confirmation, Mandate, Money, Operation } from "../../shared/domain.js";
+import type { Mandate, Money, Operation } from "../../shared/domain.js";
 import type { AgentDiagCode, DiagCode } from "../../shared/diag-codes.js";
 import type { Mutation } from "./mutation.js";
 import type { SealedPackage } from "../payment-package/package.js";
@@ -102,11 +102,19 @@ export interface PaymentContext {
   sending(): void;
 }
 
+/** Исход стадии 4 (Р47 п. 3–4): решение по GET; UNBOUND — привязка неоднозначна; NONE — запроса нет за
+ *  confirmation_wait_ms; UNKNOWN — статус не подтверждён (fail-closed). */
+export type ConfirmationOutcome = "APPROVED" | "REJECTED" | "EXPIRED" | "UNBOUND" | "NONE" | "UNKNOWN";
+
 /** Стадии 4–6. Исход каждого шага — из подписанного события Платформы, не со слов продавца (инвариант 8, Р14). */
 export interface PaymentSteps {
-  /** Стадия 4: запрос подтверждения и решение человека (AG-13); конвейер решения не создаёт (инвариант 7). */
-  confirm(c: PaymentContext, signal?: AbortSignal): Promise<Confirmation["status"]>;
-  /** Стадия 5: реквизит (`POST /pao/v1/credentials`), пакет агентской оплаты продавцу и итог авторизации (AG-11). */
+  /** Стадия 4 (Р47 п. 2): после отказа авторизации с требованием подтверждения — ожидание запроса ADP и решения человека
+   *  (AG-13); конвейер решения не создаёт (инвариант 7). `notify` — уведомление оболочки, один раз на запрос, без link;
+   *  `signal` — покупка остановлена. */
+  confirm(c: PaymentContext, notify: () => void, signal: AbortSignal): Promise<ConfirmationOutcome>;
+  /** Стадия 5: реквизит (`POST /pao/v1/credentials`), пакет агентской оплаты продавцу и итог авторизации (AG-11). Платформа
+   *  требует подтверждения — PaymentFailure CONFIRMATION_REQUIRED (профиль contour — ответ продавца DECLINED, Р47 п. 4)
+   *  или ответ со статусом CONFIRMATION_REQUIRED: дальше стадия 4. */
   authorize(c: PaymentContext, m: Mutation): Promise<Operation>;
   /** Стадия 6: итог расчёта по операции (AG-11). */
   settle(op: Operation, signal?: AbortSignal): Promise<Operation>;

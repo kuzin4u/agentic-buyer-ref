@@ -68,6 +68,11 @@ export const AGENT_DIAG_CODES = [
   "OPERATION_RESULT_UNCONFIRMED",
   // стадия 4 (Р47 п. 5, В3): уведомление оболочки — запрос подтверждения ждёт решения человека в приложении банка
   "CONFIRMATION_PENDING",
+  // исходы стадии 4 (Р47 п. 4, 6): отклонено, истекло, одобрено без канала к продавцу (до AG-13 ч. 2), привязка неоднозначна
+  "CONFIRMATION_REJECTED",
+  "CONFIRMATION_EXPIRED",
+  "CONFIRMATION_NOT_DELIVERED",
+  "CONFIRMATION_UNBOUND",
   // причины operation.declined (SPEC §7б): в PAO_DIAG ядра их нет
   "AOI_MISSING",
   "AOI_MISMATCH",

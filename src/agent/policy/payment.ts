@@ -33,7 +33,8 @@ export function currencySupported(total: Money): boolean {
   return total.currency === "RUB";
 }
 
-/** Т7: итог строго выше порога — стадия 4. Иная валюта сюда не доходит (`currencySupported`). */
+/** Т7: итог строго выше порога — сведения для оболочки; стадию 4 открывает требование ADP (Р47 п. 2). Иная валюта сюда не
+ *  доходит (`currencySupported`). */
 export function needsConfirmation(total: Money, t: Thresholds): boolean {
   return total.amount > confirmThreshold(t);
 }

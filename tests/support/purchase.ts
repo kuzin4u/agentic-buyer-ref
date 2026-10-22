@@ -38,6 +38,8 @@ export interface PurchaseSetup {
   params?: Partial<ReturnType<typeof loadParams>>;
   /** окно дробления, общее с другой покупкой (как одно на ядро у места сборки); нет — своё */
   split?: SplitWindow;
+  /** уведомление оболочки (Р47 п. 5, В3) */
+  notify?: (code: "CONFIRMATION_PENDING") => void | Promise<void>;
 }
 
 /** `track` получает стенд до первого обращения — тест закрывает его и проверяет нарушения схемы в afterEach. */
@@ -67,6 +69,7 @@ export async function purchaseOn(o: PurchaseSetup, track: (s: PaoStand) => void)
     journal: { record: (e) => (o.tap?.(e), core.journal.record(e)) },
     admission: () => o.admission ?? null,
     ...(o.region !== null && { region: o.region ?? "77" }),
+    ...(o.notify !== undefined && { notify: o.notify }),
     now: () => s.clock,
   });
   const start = journal.entries.length;

@@ -135,14 +135,14 @@ export class ShopsAdapter implements OfferSource, LiveOfferSource, ShopPort, Sho
     this.sleep = o.sleep ?? pause;
   }
 
-  /** Стадия 2. Список витрин не получен или не по схеме — отказ стадии (исключение). Витрина отказала в каталоге —
-   *  магазин недоступен, остальные витрины — дальше. Общий срок стадии — `shop_search_deadline_ms` с начала поиска (Р44
+  /** Стадия 2. Список витрин не получен или не по схеме — ShopFailure SHOP_LIST_UNAVAILABLE (Р46 п. 2), остановка сделки.
+   *  Витрина отказала в каталоге — магазин недоступен, остальные витрины — дальше. Общий срок стадии — `shop_search_deadline_ms` с начала поиска (Р44
    *  п. 6): по истечении к оставшимся витринам не обращаются, идущее обращение прерывается, ожидание повтора не меньше остатка
    *  не начинается — магазин недоступен с кодом SHOP_SEARCH_DEADLINE. */
   async search(): Promise<(ShopOffers | ShopUnavailable)[]> {
     const deadline = this.#deadline();
     const list = await this.#get("GET /v1/shops", "/v1/shops", Shops, undefined, undefined, deadline);
-    if (!list.ok) throw new Error("список витрин не получен или не по схеме");
+    if (!list.ok) throw new ShopFailure("SHOP_LIST_UNAVAILABLE");
     const out: (ShopOffers | ShopUnavailable)[] = [];
     for (const entry of list.body.shops) {
       const parsed = ShopEntry.safeParse(entry);

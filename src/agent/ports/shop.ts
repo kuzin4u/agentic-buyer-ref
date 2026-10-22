@@ -30,10 +30,10 @@ export interface ShopUnavailable {
   unavailable: ShopUnavailableCause;
 }
 
-/** Отказ витрины на заказе (Р42 п. 4): остановка этой сделки, не агента. */
+/** Отказ витрины на заказе (Р42 п. 4) и сбой списка витрин (Р46 п. 2): остановка этой сделки, не агента. */
 export class ShopFailure extends Error {
   override readonly name = "ShopFailure";
-  constructor(readonly code: Extract<AgentDiagCode, "SHOP_ORDER_REFUSED" | "SHOP_ORDER_STATE_UNKNOWN">) {
+  constructor(readonly code: Extract<AgentDiagCode, "SHOP_ORDER_REFUSED" | "SHOP_ORDER_STATE_UNKNOWN" | "SHOP_LIST_UNAVAILABLE">) {
     super(`витрина: ${code}`);
   }
 }

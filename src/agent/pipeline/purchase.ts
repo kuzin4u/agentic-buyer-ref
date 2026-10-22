@@ -700,7 +700,7 @@ export class Purchase {
       result = await step();
     } catch (e) {
       if (e instanceof PurchaseTransitionForbidden || e instanceof PurchaseStopped) throw e;
-      // отказ витрины на заказе и шага оплаты — остановка этой сделки, не агента (Р42 п. 4, Р45)
+      // отказ витрины на заказе, сбой списка витрин и шага оплаты — остановка этой сделки, не агента (Р42 п. 4, Р45, Р46 п. 2)
       const code =
         e instanceof MandateRefused
           ? e.reason

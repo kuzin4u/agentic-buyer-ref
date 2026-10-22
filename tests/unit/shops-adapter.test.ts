@@ -211,15 +211,15 @@ describe("адаптер витрин (Р42)", () => {
     await expect(a.search()).rejects.toBe(stopped);
   });
 
-  it("срок поиска истёк до ответа списка витрин — исключение (отказ стадии), к каталогам не обращаются (Р44 п. 6)", async () => {
+  it("срок поиска истёк до ответа списка витрин — SHOP_LIST_UNAVAILABLE (Р46 п. 2), к каталогам не обращаются (Р44 п. 6)", async () => {
     const { a, seen } = adapter({ "GET /v1/shops": ["hang"] }, { params: { ...params, shop_search_deadline_ms: 300 } });
-    await expect(a.search()).rejects.toThrow();
+    await expect(a.search()).rejects.toMatchObject({ name: "ShopFailure", code: "SHOP_LIST_UNAVAILABLE" });
     expect(seen.map((s) => s.path)).toEqual(["/v1/shops"]);
   });
 
-  it("списка витрин нет целиком — исключение (отказ стадии); запись списка не по схеме — только эта витрина (ревью КТ1 п. 1)", async () => {
-    await expect(adapter({ "GET /v1/shops": [{ status: 503, body: { code: "UPSTREAM_UNAVAILABLE" } }] }).a.search()).rejects.toThrow();
-    await expect(adapter({ "GET /v1/shops": [{ status: 200, body: { shops: "нет" } }] }).a.search()).rejects.toThrow();
+  it("списка витрин нет целиком — ShopFailure SHOP_LIST_UNAVAILABLE (Р46 п. 2); запись списка не по схеме — только эта витрина (ревью КТ1 п. 1)", async () => {
+    await expect(adapter({ "GET /v1/shops": [{ status: 503, body: { code: "UPSTREAM_UNAVAILABLE" } }] }).a.search()).rejects.toMatchObject({ name: "ShopFailure", code: "SHOP_LIST_UNAVAILABLE" });
+    await expect(adapter({ "GET /v1/shops": [{ status: 200, body: { shops: "нет" } }] }).a.search()).rejects.toMatchObject({ name: "ShopFailure", code: "SHOP_LIST_UNAVAILABLE" });
     const { a, seen } = adapter({ ...LIST({ id: "../x", merchant_id: "MER-X" }, shop("S1")), ...catalog("S1", ok(ITEM)) });
     const out = await a.search();
     expect(out[0]).toEqual({ unavailable: { detail: "BAD_RESPONSE" } });

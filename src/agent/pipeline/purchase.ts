@@ -509,8 +509,9 @@ export class Purchase {
           if (e instanceof PaymentFailure && e.code === "CONFIRMATION_REQUIRED") return null;
           throw e;
         }
-        // отказ и CONFIRMATION_REQUIRED окно не занимают; сбой и неизвестный исход — занимают (fail-closed)
-        if (reply.status === "DECLINED" || reply.status === "CONFIRMATION_REQUIRED") slot.settle("REFUSED");
+        // отказ окно не занимает; сбой, неизвестный исход и CONFIRMATION_REQUIRED (дальше стадия 4, исход не известен —
+        // Р47 п. 6, решение владельца по ревью К3 № 4) — занимают (fail-closed)
+        if (reply.status === "DECLINED") slot.settle("REFUSED");
         else if (reply.status === "AUTHORIZED") slot.settle("APPROVED");
         else slot.settle("UNKNOWN");
         if (reply.status === "DECLINED") this.#halt(ruleForDeclineReason(reply.declineReason).code);

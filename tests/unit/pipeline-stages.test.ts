@@ -1252,7 +1252,8 @@ describe("политика до стадий 4–5 (Р39): отказ — agent.
   for (const [reply, counts] of [
     [{ status: "AUTHORIZED" }, true],
     [{ status: "DECLINED", declineReason: "LIMIT_EXCEEDED" }, false],
-    [{ status: "CONFIRMATION_REQUIRED" }, false],
+    // дальше стадия 4 — место занято, как после исключения порта (Р47 п. 6, решение владельца по ревью К3 № 4)
+    [{ status: "CONFIRMATION_REQUIRED" }, true],
     // ответ не той формы для стадии 5 — неизвестный исход (STOPPED UNKNOWN), окно занято
     [{ status: "SETTLED" }, true],
   ] as const) {
@@ -1261,7 +1262,7 @@ describe("политика до стадий 4–5 (Р39): отказ — agent.
       await ordered(r);
       const intentId = r.purchase.intentMandate!.id;
       await r.purchase.authorize({ idempotencyKey: "idem-pay-1" }).catch(() => undefined);
-      // ответ CONFIRMATION_REQUIRED ведёт в стадию 4 (Р47 п. 2): место в окне — как до Р47 (Р39 п. 4)
+      // ответ CONFIRMATION_REQUIRED ведёт в стадию 4 (Р47 п. 2)
       expect(r.payment.calls).toEqual(reply.status === "CONFIRMATION_REQUIRED" ? ["authorize", "confirm"] : ["authorize"]);
       expect(isShareAfter(r, intentId)).toBe(counts);
     });

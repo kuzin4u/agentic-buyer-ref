@@ -1,6 +1,6 @@
 // Адаптер витрин (Р42) на подменённом fetch: подпись до сети, схема ответа, зона, повтор только 429 и 503 на GET (один
 // раз, новой подписью, Retry-After не больше предела), заказ без повтора, неизвестный код витрины, живая проверка.
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { ShopsAdapter, type ShopProfile, type ShopsAdapterOptions } from "../../src/agent/adapters/shops/index.js";
 import { MemoryJournal } from "../../src/agent/journal/index.js";
 import { ShopFailure } from "../../src/agent/ports/index.js";
@@ -181,6 +181,19 @@ describe("адаптер витрин (Р42)", () => {
       ["GET /v1/shops", 1, "ok", undefined],
       ["GET /v1/shops/{id}/catalog", 1, "unknown", "SHOP_SEARCH_DEADLINE"],
     ]);
+  });
+
+  it("таймер срока сработал, а часы срок ещё не отсчитали — остаток ноль: к следующей витрине не обращаются (Р46, К2а; ревью reviewer К2 № 1)", async () => {
+    // часы стоят: по ним срок не истёк никогда; прерывает только таймер срока — как при его раннем срабатывании в Node
+    const now = vi.spyOn(performance, "now").mockReturnValue(1000);
+    try {
+      const { a, seen } = adapter({ ...LIST(shop("S1"), shop("S2")), ...catalog("S1", "hang"), ...catalog("S2", ok(ITEM)) }, { params: { ...params, shop_search_deadline_ms: 300 } });
+      const out = await a.search();
+      expect(out.map((x) => ("unavailable" in x ? x.unavailable : null))).toEqual([{ reason: "SHOP_SEARCH_DEADLINE" }, { reason: "SHOP_SEARCH_DEADLINE" }]);
+      expect(seen.map((s) => s.path)).toEqual(["/v1/shops", "/v1/shops/S1/catalog"]);
+    } finally {
+      now.mockRestore();
+    }
   });
 
   it("ожидание Retry-After не меньше остатка срока поиска — без ожидания и повтора, SHOP_SEARCH_DEADLINE (Р44 п. 6)", async () => {

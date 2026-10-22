@@ -296,11 +296,14 @@ export class ShopsAdapter implements OfferSource, LiveOfferSource, ShopPort, Sho
     }
   }
 
-  /** Общий срок стадии поиска с этого момента: сигнал прерывания и остаток в мс (часы — монотонные). */
+  /** Общий срок стадии поиска с этого момента: сигнал прерывания и остаток в мс (часы — монотонные). Таймер срока
+   *  срабатывает раньше, чем часы отсчитают полный срок: сработал — остаток ноль, иначе после прерванного сроком обращения
+   *  была бы ещё попытка (Р46, К2а; уточняет Р44 п. 6). */
   #deadline(): Deadline {
     const ms = this.o.params.shop_search_deadline_ms;
     const start = performance.now();
-    return { signal: AbortSignal.timeout(ms), left: () => ms - (performance.now() - start) };
+    const signal = AbortSignal.timeout(ms);
+    return { signal, left: () => (signal.aborted ? 0 : ms - (performance.now() - start)) };
   }
 
   #outcome<T>(reply: Reply, schema: z.ZodType<T>): Outcome<T> {

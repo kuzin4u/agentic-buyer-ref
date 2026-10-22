@@ -1,9 +1,7 @@
 // Приём push-событий Платформы (Р34 п. 2): до ПАО 1.5.0 тело не подписано (РП39 п. 6) и в обработку не идёт — push только
 // будит чтение ленты. Проверяется форма: JSON-объект Event (тип — любая строка), x-event-id равен event_id. Ответ — сразу,
 // до чтения ленты (в пределах event_delivery_timeout_ms Платформы). HTTP-сервера здесь нет: он у оболочки или buyer_agent.
-
-/** Маска event_id — та же, что у идентификаторов ленты в адаптере. */
-const EVENT_ID = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/;
+import { SAFE_ID } from "../../shared/ids.js";
 
 export type PushRejection = "NOT_JSON" | "NOT_EVENT" | "EVENT_ID_MISMATCH";
 
@@ -42,7 +40,7 @@ export function acceptPush(o: PushOptions, body: string, headers: Readonly<Recor
   if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return reject("NOT_EVENT");
   const e = raw as { event_id?: unknown; type?: unknown; at?: unknown; data?: unknown };
   const dataOk = typeof e.data === "object" && e.data !== null && !Array.isArray(e.data);
-  if (typeof e.event_id !== "string" || !EVENT_ID.test(e.event_id) || typeof e.type !== "string" || e.type === "" || typeof e.at !== "string" || !dataOk) {
+  if (typeof e.event_id !== "string" || !SAFE_ID.test(e.event_id) || typeof e.type !== "string" || e.type === "" || typeof e.at !== "string" || !dataOk) {
     return reject("NOT_EVENT");
   }
   if (headers["x-event-id"] !== e.event_id) return reject("EVENT_ID_MISMATCH");

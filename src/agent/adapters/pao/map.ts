@@ -4,6 +4,7 @@
 // валюта мандата ссылки. Множество валют платформы — только допустимое: вне его — отказ (исходящие) или UNKNOWN (входящие).
 import { money, type CurrencyCode, type Money } from "@kuzin4u/agentic-core";
 import type * as Pao from "@kuzin4u/agentic-core/pao";
+import { SAFE_ID } from "../../../shared/ids.js";
 import {
   PlatformFailure,
   type AgentIndicator,
@@ -320,8 +321,7 @@ const reasonCode = (v: unknown): string | null => (typeof v === "string" && /^[A
 
 /** Идентификатор из ленты (event_id, mandate_id, op_ref, confirmation_id): данные, не инструкция (инвариант 5) — уходит
  *  в журнал, курсор и путь GET, поэтому только безопасные знаки и ограниченная длина. */
-const ID = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/;
-const id = (v: unknown): string | null => (typeof v === "string" && ID.test(v) ? v : null);
+const id = (v: unknown): string | null => (typeof v === "string" && SAFE_ID.test(v) ? v : null);
 /** Та же маска — для mandate_id в журнале обращений (Р37 п. 3). */
 export const safeId = id;
 

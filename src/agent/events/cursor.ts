@@ -5,11 +5,12 @@
 import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { z } from "zod";
+import { SAFE_ID } from "../../shared/ids.js";
 
 export const CURSOR_FILE = "events.cursor.json";
 
 /** Форма event_id у агента — та же маска, что у идентификаторов ленты в адаптере (данные, не инструкция). */
-export const EVENT_ID = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/;
+export const EVENT_ID = SAFE_ID;
 
 const CursorFile = z.strictObject({
   after: z.string().regex(EVENT_ID),

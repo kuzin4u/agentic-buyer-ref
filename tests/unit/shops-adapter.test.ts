@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest";
 import { ShopsAdapter, type ShopProfile, type ShopsAdapterOptions } from "../../src/agent/adapters/shops/index.js";
 import { MemoryJournal } from "../../src/agent/journal/index.js";
 import { ShopFailure } from "../../src/agent/ports/index.js";
+import { sealPackage } from "../../src/agent/payment-package/index.js";
 import { SignerStopped } from "../../src/agent/signer/index.js";
 import { loadParams } from "../../src/shared/config.js";
 
@@ -266,6 +267,34 @@ describe("адаптер витрин (Р42)", () => {
     expect(seen[0]!.headers["content-type"]).toBe("application/json");
     // запись обращения — с витриной и мандатом корзины (ревью К1 № 4)
     expect(journal.entries.filter((e) => e.kind === "shop.call").map((e) => [e.method, e.ref, e.mandate, e.result])).toEqual([["POST /v1/shops/{id}/orders", "S1", "mnd_1", "ok"]]);
+  });
+
+  it("номер заказа — по маске ссылки агента, 128 знаков, как у Платформы (Р46 п. 1, выбор 1а): 65 и 128 — заказ, 129 — SHOP_ORDER_STATE_UNKNOWN", async () => {
+    const req = { shopId: "S1", items: [{ sku: "BRD-1", qty: 1 }], cartMandateId: "mnd_1" };
+    for (const len of [65, 128]) {
+      const id = "o".repeat(len);
+      const { a } = adapter({ "POST /v1/shops/S1/orders": [{ status: 201, body: { id, total: 39000, currency: "RUB" } }] });
+      expect((await a.order(req)).orderId).toBe(id);
+    }
+    const { a } = adapter({ "POST /v1/shops/S1/orders": [{ status: 201, body: { id: "o".repeat(129), total: 39000, currency: "RUB" } }] });
+    const err = await a.order(req).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ShopFailure);
+    expect((err as ShopFailure).code).toBe("SHOP_ORDER_STATE_UNKNOWN");
+  });
+
+  it("оплата: номер заказа 65 и 128 знаков — в путь и ответ по той же маске; 129 — исключение до обращения (Р46 п. 1, выбор 1а; ревью reviewer К1 № 2)", async () => {
+    const pkg = (orderRef: string) =>
+      sealPackage({ credential_ref: "CRD-1", kind: "CARD", payload: { token_ref: "tok_test", cryptogram: "c", valid_to: "2026-10-22T10:00:00Z" }, aoi: { indicator: true, agent_code: "nspk:agent:test:v1", mandate_id: "mnd_1" }, cart_mandate_id: "mnd_1", order_ref: orderRef });
+    for (const len of [65, 128]) {
+      const id = "o".repeat(len);
+      const { a, seen } = adapter({ [`POST /v1/shops/S1/orders/${id}/payment`]: [{ status: 200, body: { id, status: "PAID" } }] });
+      expect(await a.pay({ shopId: "S1", orderId: id, cartMandateId: "mnd_1", package: pkg(id) })).toEqual({ status: "PAID" });
+      expect(seen.map((x) => x.path)).toEqual([`/v1/shops/S1/orders/${id}/payment`]);
+    }
+    const id = "o".repeat(129);
+    const { a, seen } = adapter({});
+    await expect(a.pay({ shopId: "S1", orderId: id, cartMandateId: "mnd_1", package: pkg(id) })).rejects.toThrow();
+    expect(seen).toEqual([]);
   });
 
   it("живая проверка: sku у двух витрин — отказ без обращения; иначе цена и наличие из каталога витрины", async () => {

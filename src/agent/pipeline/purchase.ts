@@ -5,6 +5,7 @@
 import type { StandParams } from "../../shared/config.js";
 import { PlatformFailure, type CartLine, type Mandate, type MandateDraft, type Money, type Operation } from "../../shared/domain.js";
 import type { DiagCode } from "../../shared/diag-codes.js";
+import { SAFE_ID, SHOP_ID } from "../../shared/ids.js";
 import { liveCheck, type A5SignalCode, type CatalogIssueCode, type CatalogProduct, type LiveCheckParams, type LiveFactCode } from "../catalog/index.js";
 import { ruleForDeclineReason } from "../declines/index.js";
 import { MandateRefused, type MandateClient } from "../mandates/index.js";
@@ -174,8 +175,7 @@ export interface PurchaseOptions {
 }
 
 /** sku из фида — в журнале только по маске идентификатора (Р38 п. 5, инвариант 5). */
-const SKU = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$/;
-const skuRef = (sku: string): { ref?: string } => (SKU.test(sku) ? { ref: sku } : {});
+const skuRef = (sku: string): { ref?: string } => (SHOP_ID.test(sku) ? { ref: sku } : {});
 
 /** Отказ подписи — ждать человека, а не останавливать покупку (SPEC §7а PRINCIPAL_SIGNATURE_PENDING); только у ожидания
  *  подписи мандата: тот же код из порта витрины или оплаты — остановка (ревью К3 повторное Н1, инвариант 4). */
@@ -788,7 +788,7 @@ function copy<T>(x: T): T {
 
 type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K> : never;
 
-const MANDATE_ID = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/;
-const maskedMandate = (id: string): { mandate?: string } => (MANDATE_ID.test(id) ? { mandate: id } : {});
+// mandate_id и код продавца в журнале — по маске (Р37 п. 3, Р46 п. 1)
+const maskedMandate = (id: string): { mandate?: string } => (SAFE_ID.test(id) ? { mandate: id } : {});
 /** код продавца из выдачи — данные продавца: в журнале только по маске идентификатора (Р38 п. 5, инвариант 5) */
-const merchantRef = (id: string): { merchant?: string } => (MANDATE_ID.test(id) ? { merchant: id } : {});
+const merchantRef = (id: string): { merchant?: string } => (SAFE_ID.test(id) ? { merchant: id } : {});

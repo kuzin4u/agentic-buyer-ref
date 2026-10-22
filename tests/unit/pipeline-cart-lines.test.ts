@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { CartLiveRefused, CartRefused, OrderRefused, PurchaseStopped, type CartChoice, type CartChoiceLine } from "../../src/agent/pipeline/index.js";
 import { isSpent } from "../../src/agent/policy/a5-issued.js";
 import { humanA5Decision } from "../../src/agent/shell/index.js";
+import type { JournalEntry } from "../../src/agent/journal/index.js";
 import { expectJournalClean } from "../support/journal.js";
 import { AGENT, type PaoStand } from "../support/pao-stand.js";
 import { SHOP, purchaseOn, signedIntent, stages, type PurchaseRun, type PurchaseSetup } from "../support/purchase.js";
@@ -52,6 +53,10 @@ async function sign(r: PurchaseRun, id: string) {
   r.setFeed({ kind: "event", event: r.consents.sign(id) });
   return r.purchase.awaitCart();
 }
+
+/** Записи об оставленном CART (Р46 п. 3): только причина и id CART — сумм, позиций и продавца нет. */
+const abandoned = (r: { tail: () => JournalEntry[] }) =>
+  r.tail().filter((e) => e.kind === "cart.abandoned").map((e) => ({ ...e, at: undefined, agent: undefined }));
 
 describe("Р44 п. 1–3 — корзина из нескольких позиций одного продавца", () => {
   it("две позиции: живая проверка каждой перед CART и перед заказом, итог — Σ, заказ — все позиции, Order.total = итогу CART", async () => {
@@ -206,9 +211,14 @@ describe("Р44 п. 4 — новая цена после согласования
     expect(r.purchase.cartMandate).toBeNull();
     expect(r.purchase.offers).toBeNull();
     expect(r.consents.mandates.get(old.id)!.status).toBe("ACTIVE");
+    // оставленный CART — в журнале (Р46 п. 3)
+    const left = [{ kind: "cart.abandoned", detail: "REFUSED_BEFORE_ORDER", mandate: old.id, at: undefined, agent: undefined }];
+    expect(abandoned(r)).toEqual(left);
 
     // новый показ — новая цена; CART по ней, заказ и оплата — только по новому CART
     const zones = await r.purchase.search();
+    // поиск из OFFERS — CART не было, новой записи нет
+    expect(abandoned(r)).toEqual(left);
     expect(zones.contour.find((o) => o.sku === "zavarnoy")!.product.price).toEqual({ amount: 41000, currency: "RUB" });
     const fresh = await r.purchase.cart(pick({ sku: "tartine", qty: 2 }, { sku: "zavarnoy", qty: 1 }), { idempotencyKey: "idem-cart-2" });
     const total = { amount: 2 * TARTINE + 41000, currency: "RUB" };
@@ -309,9 +319,12 @@ describe("К2а — новая выдача при подписанном CART �
     expect(r.purchase.state).toBe("CART_ACTIVE");
     expect(r.purchase.needsConfirmation).toBe(false);
     const from = r.stand.stub.calls.length;
+    expect(abandoned(r)).toEqual([]);
     await r.purchase.search();
     // новый поиск — только verify INTENT; по прежнему CART обращений нет
     expect(opsFrom(r, from)).toEqual([VERIFY]);
+    // оставленный CART — в журнале до того, как снимок стёрт (Р46 п. 3)
+    expect(abandoned(r)).toEqual([{ kind: "cart.abandoned", detail: "NEW_SEARCH", mandate: old.id, at: undefined, agent: undefined }]);
     expect(r.purchase.state).toBe("OFFERS");
     expect(r.purchase.cartMandate).toBeNull();
     expect(r.purchase.needsConfirmation).toBe(true);

@@ -88,6 +88,9 @@ export type JournalKind =
   | "order.live_refused"
   /** запроса CART нет: живая проверка перед ним не ok (Р43 п. 1, Р32 п. 4): reason — код LIVE_*; пишет конвейер */
   | "cart.live_refused"
+  /** прежний CART больше не используется (Т15, Р46 п. 3): mandate — id CART, detail — NEW_SEARCH или
+   *  REFUSED_BEFORE_ORDER; сумм, позиций и продавца нет; пишет конвейер */
+  | "cart.abandoned"
   /** попытка обращения к витрине (Т15, Р42): method — шаблон пути, attempt > 1 — попытка повтора, ref — id витрины по
    *  маске, mandate — мандат корзины у заказа; detail — код витрины из перечня, BAD_RESPONSE или NO_RESPONSE; код вне
    *  перечня — reason MERCHANT_CODE_UNKNOWN; обращение прервано общим сроком поиска — reason SHOP_SEARCH_DEADLINE (Р44 п. 6);
@@ -110,7 +113,7 @@ export interface JournalEntry {
   /** уточнение — только значение закрытого перечня: ПАО (класс из реестра при AGENT_CLASS_MISMATCH, Р27), агента
    *  (NO_VERSION, REGION) или состояние машины покупки и запрошенный переход «откуда->куда» (Р38 п. 5); у остановки
    *  покупки с уточнением — «STOPPED:CART_POLICY_EXCLUDED» (Р40 п. 6); у shop.call и shop.unavailable — код витрины из
-   *  перечня, BAD_RESPONSE или NO_RESPONSE (Р42) */
+   *  перечня, BAD_RESPONSE или NO_RESPONSE (Р42); у cart.abandoned — NEW_SEARCH или REFUSED_BEFORE_ORDER (Р46 п. 3) */
   detail?: string;
   /** идентификатор объекта по маске адаптера — event_id события ленты (Р34 п. 11), sku у решений каталога, id витрины у
    *  shop.call (Р42) */

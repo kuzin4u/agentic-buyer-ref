@@ -20,6 +20,9 @@ import { orderRefIssue, type OrderRefIssue } from "../payment-package/order-ref.
 import { PaymentFailure, ShopFailure, type OfferSource, type PaymentContext, type PaymentSteps, type ShopOffers, type ShopOrder, type ShopPort, type ShopUnavailable, type ShopUnavailableCause } from "../ports/shop.js";
 import { PurchaseMachine, PurchaseTransitionForbidden, allowed, type PurchaseJournal, type PurchaseState, type StopCause } from "./machine.js";
 
+/** Почему оставлен CART (Р46 п. 3): новый поиск из CART_ACTIVE или отказ живой проверки перед заказом. */
+export type CartAbandoned = "NEW_SEARCH" | "REFUSED_BEFORE_ORDER";
+
 /** Записи конвейера сверх записей машины (Р38 п. 5, Р37 п. 5). */
 export interface PipelineJournal extends PurchaseJournal {
   record(
@@ -40,6 +43,9 @@ export interface PipelineJournal extends PurchaseJournal {
       /** магазин отказал в каталоге (Т4, Р42 п. 4): detail — код витрины, BAD_RESPONSE или NO_RESPONSE; reason — код вне
        *  перечня; merchant — код продавца по маске */
       | ({ at: string; kind: "shop.unavailable"; mandate?: string; merchant?: string } & ShopUnavailableCause)
+      /** прежний CART больше не используется (Т15, Р46 п. 3): mandate — id CART по маске, detail — причина закрытым
+       *  перечнем; сумм, позиций и продавца нет. У Платформы CART остаётся ACTIVE (риск 4а) */
+      | { at: string; kind: "cart.abandoned"; detail: CartAbandoned; mandate?: string }
       /** ворота: держимый мандат вышел (отзыв, иной статус) — отказ действовать (Р38 п. 3) */
       | { at: string; kind: "agent.refused"; reason: "MANDATE_NOT_ACTIVE"; mandate?: string }
       /** ворота: остатка Платформы по мандату не хватает на итог CART (Р38 п. 3, К4а) */
@@ -262,7 +268,8 @@ export class Purchase {
   }
 
   /** Стадия 2: выдача в двух зонах. Перед поиском — INTENT держится и подтверждён verify (Т2); решения каталога —
-   *  в журнал (Р37 п. 5): `policy/` журнала не получает (инвариант 3). Новая выдача стирает снимок прежнего CART (К2а). */
+   *  в журнал (Р37 п. 5): `policy/` журнала не получает (инвариант 3). Новая выдача стирает снимок прежнего CART (К2а),
+   *  запись cart.abandoned — Р46 п. 3. */
   search(): Promise<OfferZones> {
     return this.#stage("OFFERS", async () => {
       const intent = this.#need(this.#intent);
@@ -273,6 +280,9 @@ export class Purchase {
       const zones = snapshot(await this.#guard(async () => this.#classify(shops)));
       // отзыв мог прийти по ленте, пока шёл поиск (ревью К2.2 № 15)
       this.#held(intent);
+      // оставленный CART — в журнал до смены выдачи и снимка: сбой записи — STOPPED с прежними выдачей и CART (Р46 п. 3,
+      // инвариант 4; ревью reviewer К3 № 1)
+      this.#abandon("NEW_SEARCH");
       this.#zones = zones;
       // выдача сменилась — прежний CART наружу как текущий не отдаётся и не исполняется: новый CART — по новому выбору
       // (общее правило с отказом перед заказом; решение владельца 21.10, К2а)
@@ -417,6 +427,7 @@ export class Purchase {
         for (const reason of d.codes) this.#record({ kind: "order.live_refused", reason, detail: d.next, ...skuRef(line.sku), ...merchantRef(offer.merchantId) });
         // прежний CART больше не используется ничем и наружу как текущий не отдаётся — после любого отказа (Р44 п. 4,
         // выбор 4а; решение владельца по ревью КТ1 п. 1); новая цена — и выдача: новый CART только после нового поиска (Т6)
+        this.#abandon("REFUSED_BEFORE_ORDER");
         this.#cart = null;
         this.#lines = null;
         if (d.next === "NEW_CART_MANDATE") this.#zones = null;
@@ -687,6 +698,12 @@ export class Purchase {
     this.#halt(d.code);
   }
 
+  /** Оставленный CART — запись до того, как снимок стёрт (Р46 п. 3); CART не было — записи нет. Мандат — только CART:
+   *  id не по маске — запись без mandate, а не с id INTENT (ревью reviewer К3 № 2). */
+  #abandon(detail: CartAbandoned): void {
+    if (this.#cart !== null) this.#record({ kind: "cart.abandoned", detail, ...maskedMandate(this.#cart.id) }, false);
+  }
+
   #halt(code: DiagCode, cause?: StopCause): never {
     this.#machine.stop(code, cause);
     throw new PurchaseStopped(code);
@@ -723,9 +740,9 @@ export class Purchase {
 
   /** mandate — INTENT покупки, если запись не называет свой (ворота по CART). Сбой журнала — покупка остановлена
    *  (UNKNOWN), исходная ошибка наружу: решение без записи не исполняется (инвариант 4, ревью К5 № 1). */
-  #record(e: DistributiveOmit<Parameters<PipelineJournal["record"]>[0], "at">): void {
+  #record(e: DistributiveOmit<Parameters<PipelineJournal["record"]>[0], "at">, purchaseMandate = true): void {
     try {
-      this.o.journal.record({ at: this.now().toISOString(), ...this.#machine.mandate, ...e } as Parameters<PipelineJournal["record"]>[0]);
+      this.o.journal.record({ at: this.now().toISOString(), ...(purchaseMandate && this.#machine.mandate), ...e } as Parameters<PipelineJournal["record"]>[0]);
     } catch (err) {
       try {
         this.#machine.stop("UNKNOWN");

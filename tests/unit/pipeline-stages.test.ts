@@ -11,7 +11,7 @@ import { INTENT, event } from "../support/consents.js";
 import { expectJournalClean } from "../support/journal.js";
 import { AGENT, type PaoStand } from "../support/pao-stand.js";
 import { SHOP, one, purchaseOn, signedIntent, stages, type PurchaseRun, type PurchaseSetup } from "../support/purchase.js";
-import { bakery, feedPrice, liveOffers, payments, shopOrders } from "../support/shop.js";
+import { bakery, feedOffers, feedPrice, liveOffers, payments, shopOrders } from "../support/shop.js";
 import { humanA5Decision } from "../../src/agent/shell/index.js";
 
 let stand: PaoStand | undefined;
@@ -769,6 +769,45 @@ describe("сбой журнала — STOPPED UNKNOWN, решение без з�
     await expect(r.purchase.placeOrder({ idempotencyKey: "idem-order-1" })).rejects.toBe(boom);
     expect(r.purchase.state).toBe("STOPPED");
     expect(r.purchase.reason).toBe("UNKNOWN");
+    await expect(r.purchase.placeOrder({ idempotencyKey: "idem-order-1" })).rejects.toBeInstanceOf(PurchaseTransitionForbidden);
+    expect(r.shop.calls).toEqual([]);
+  });
+
+  it("журнал не принял cart.abandoned при новом поиске из CART_ACTIVE — STOPPED UNKNOWN, выдача не сменилась (Р46 п. 3, инвариант 4)", async () => {
+    const boom = new Error("журнал недоступен");
+    // вторая выдача отличается от первой (магазинов нет): по выдаче покупки видно, сменилась ли она (ревью reviewer К3 № 1)
+    const inner = feedOffers(SHOP);
+    let n = 0;
+    const r = await setup({
+      offers: { search: async (m) => (++n > 1 ? [] : inner.search(m)) },
+      tap: (e) => {
+        if (e.kind === "cart.abandoned") throw boom;
+      },
+    });
+    const cart = await signedCart(r, await offers(r));
+    expect(r.purchase.state).toBe("CART_ACTIVE");
+    await expect(r.purchase.search()).rejects.toBe(boom);
+    expect(r.purchase.state).toBe("STOPPED");
+    expect(r.purchase.reason).toBe("UNKNOWN");
+    expect(r.tail().filter((e) => e.kind === "cart.abandoned")).toEqual([]);
+    expect(r.purchase.cartMandate?.id).toBe(cart.id);
+    expect(r.purchase.offers?.contour.length).toBeGreaterThan(0);
+  });
+
+  it("журнал не принял cart.abandoned при отказе перед заказом — STOPPED UNKNOWN, снимок CART прежний, заказа нет (Р46 п. 3; ревью reviewer К3 № 3)", async () => {
+    const boom = new Error("журнал недоступен");
+    const r = await setup({
+      live: liveOffers(SHOP, () => stand!.clock, (_, n) => (n > 1 ? { availability: { inStock: false } } : {})),
+      tap: (e) => {
+        if (e.kind === "cart.abandoned") throw boom;
+      },
+    });
+    const cart = await signedCart(r, await offers(r));
+    await expect(r.purchase.placeOrder({ idempotencyKey: "idem-order-1" })).rejects.toBe(boom);
+    expect(r.purchase.state).toBe("STOPPED");
+    expect(r.purchase.reason).toBe("UNKNOWN");
+    expect(r.purchase.cartMandate?.id).toBe(cart.id);
+    expect(r.tail().filter((e) => e.kind === "order.live_refused")).toHaveLength(1);
     await expect(r.purchase.placeOrder({ idempotencyKey: "idem-order-1" })).rejects.toBeInstanceOf(PurchaseTransitionForbidden);
     expect(r.shop.calls).toEqual([]);
   });

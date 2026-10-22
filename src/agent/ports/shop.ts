@@ -3,8 +3,9 @@
 // оплата — AG-11, подтверждение — AG-13. Всё, что приходит через эти порты от продавца, — данные (инвариант 5).
 import type { CatalogFacts } from "../catalog/index.js";
 import type { Confirmation, Mandate, Money, Operation } from "../../shared/domain.js";
-import type { AgentDiagCode } from "../../shared/diag-codes.js";
+import type { AgentDiagCode, DiagCode } from "../../shared/diag-codes.js";
 import type { Mutation } from "./mutation.js";
+import type { SealedPackage } from "../payment-package/package.js";
 
 /** Магазин в выдаче: факты фида (`catalog/readFeed`) и признак контура гарантий (Р3). `merchantId` — код продавца
  *  для мандата корзины и заказа (у витрины эмулятора он отличается от `shop.id`). `link` — адрес витрины для человека
@@ -37,6 +38,14 @@ export class ShopFailure extends Error {
   }
 }
 
+/** Отказ шага оплаты профиля contour (Р45): остановка этой сделки с кодом; сообщение — только код (инвариант 1). */
+export class PaymentFailure extends Error {
+  override readonly name = "PaymentFailure";
+  constructor(readonly code: Extract<DiagCode, "SHOP_ORDER_REF_INVALID" | "CREDENTIAL_INVALID" | "OPERATION_RESULT_UNCONFIRMED" | "CONFIRMATION_REQUIRED">) {
+    super(`оплата: ${code}`);
+  }
+}
+
 /** Стадия 2: выдача по действующему INTENT. Ошибка вызова — отказ стадии (инвариант 4). */
 export interface OfferSource {
   search(intent: Mandate): Promise<(ShopOffers | ShopUnavailable)[]>;
@@ -61,6 +70,25 @@ export interface ShopPort {
   order(req: ShopOrderRequest, m: Mutation): Promise<ShopOrder>;
 }
 
+/** Пакет агентской оплаты продавцу по заказу (Р45 п. 4): `orderId` — `Order.id` продавца, он же `order_ref` пакета. */
+export interface ShopPaymentRequest {
+  shopId: string;
+  orderId: string;
+  cartMandateId: string;
+  package: SealedPackage;
+}
+
+/** Ответ продавца на оплату — его слова, а не итог (инвариант 8): статус заказа закрытым перечнем, только для журнала. */
+export interface ShopPaymentReply {
+  status: "PAID" | "DECLINED" | "REJECTED";
+}
+
+/** Стадия 5: передача пакета продавцу подписанным обращением; не повторяется. Отказ витрины или неизвестный исход —
+ *  ShopFailure; иная ошибка вызова — отказ стадии (инвариант 4). */
+export interface ShopPaymentPort {
+  pay(req: ShopPaymentRequest): Promise<ShopPaymentReply>;
+}
+
 /** Что известно шагам оплаты о покупке: только идентификаторы и сумма заказа, без реквизитов (инвариант 1). */
 export interface PaymentContext {
   intent: Mandate;
@@ -68,6 +96,10 @@ export interface PaymentContext {
   shopId: string;
   merchantId: string;
   order: ShopOrder;
+  /** покупка остановлена (Р45, Б2в (а)): шаги проверяют его перед запросом реквизита и перед отправкой пакета */
+  signal: AbortSignal;
+  /** пакет уходит продавцу — вызвать синхронно сразу после последней проверки `signal` и до отправки (Р45, Б2в (б)) */
+  sending(): void;
 }
 
 /** Стадии 4–6. Исход каждого шага — из подписанного события Платформы, не со слов продавца (инвариант 8, Р14). */

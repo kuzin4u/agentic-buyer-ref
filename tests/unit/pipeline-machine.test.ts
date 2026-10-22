@@ -230,3 +230,45 @@ describe("ворота перед стадией 5 (Р38 п. 3, К4): без п�
     expect(m.state).toBe("AUTHORIZING");
   });
 });
+
+// Р45, решение владельца Б2в (ревью reviewer К2, повторный проход № 1): окно «пакет отправлен → исход стадии 5 записан».
+describe("окно отправки пакета (Р45, Б2в)", () => {
+  const stops = (journal: MemoryJournal) => journal.entries.filter((e) => e.kind === "purchase.stage" && e.detail === "STOPPED").map((e) => e.reason);
+
+  it("в окне запрещённый переход — agent.refused без остановки; исход стадии 5 — одна запись STOPPED, сигнал остановки взведён", () => {
+    const { m, journal } = at("AUTHORIZING");
+    m.sending();
+    expect(() => m.to("OFFERS")).toThrow(PurchaseTransitionForbidden);
+    expect(m.state).toBe("AUTHORIZING");
+    expect(m.stopped.aborted).toBe(false);
+    m.stop("OPERATION_RESULT_UNCONFIRMED");
+    expect(m.reason).toBe("OPERATION_RESULT_UNCONFIRMED");
+    expect(m.stopped.aborted).toBe(true);
+    expect(stops(journal)).toEqual(["OPERATION_RESULT_UNCONFIRMED"]);
+  });
+
+  it.each(["ORDERED", "CONFIRMING", "OFFERS"] as const)("вне AUTHORIZING (%s) окно не открывается: STOPPED PIPELINE_TRANSITION_FORBIDDEN", (s) => {
+    const { m, journal } = at(s);
+    expect(() => m.sending()).toThrow(PurchaseTransitionForbidden);
+    expect(m.reason).toBe("PIPELINE_TRANSITION_FORBIDDEN");
+    expect(m.stopped.aborted).toBe(true);
+    expect(stops(journal)).toEqual(["PIPELINE_TRANSITION_FORBIDDEN"]);
+  });
+
+  it("после STOPPED окно не открывается, код не меняется", () => {
+    const { m, journal } = at("AUTHORIZING");
+    m.stop("UNKNOWN");
+    expect(() => m.sending()).toThrow(PurchaseTransitionForbidden);
+    expect(m.reason).toBe("UNKNOWN");
+    expect(stops(journal)).toEqual(["UNKNOWN"]);
+  });
+
+  it("после перехода из AUTHORIZING окно закрыто: запрещённый переход снова останавливает покупку", () => {
+    const { m, journal } = at("AUTHORIZING");
+    m.sending();
+    m.to("SETTLING");
+    expect(() => m.to("OFFERS")).toThrow(PurchaseTransitionForbidden);
+    expect(m.reason).toBe("PIPELINE_TRANSITION_FORBIDDEN");
+    expect(stops(journal)).toEqual(["PIPELINE_TRANSITION_FORBIDDEN"]);
+  });
+});

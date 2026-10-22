@@ -1,5 +1,6 @@
 // Адаптер витрин продавцов (Р42): порты стадий 2–3 `OfferSource`, `LiveOfferSource`, `ShopPort` по API витрин эмулятора
-// (К6, Р26): `GET /v1/shops`, `GET /v1/shops/{id}/catalog`, `POST /v1/shops/{id}/orders`.
+// (К6, Р26): `GET /v1/shops`, `GET /v1/shops/{id}/catalog`, `POST /v1/shops/{id}/orders`; пакет агентской оплаты —
+// `POST /v1/shops/{id}/orders/{order_id}/payment` (Р45 п. 4).
 // Каждое обращение подписано портом подписи места сборки (A2 п. 5.1, Т4); подпись остановлена — исключение порта, обращения
 // нет (инвариант 4). Ответ витрины — данные: берутся только поля схемы, текст описания — только в `description` для
 // сверки с ценой (инвариант 5, Т5а). Отказ витрины — без обходов: ни без подписи, ни другим ключом; повтор — только
@@ -13,7 +14,20 @@ import { readShop, type CatalogFacts, type CatalogIssueCode, type CatalogProduct
 import type { Journal, JournalResult } from "../../journal/index.js";
 import type { LiveOffer, LiveOfferRequest, LiveOfferSource } from "../../ports/catalog.js";
 import type { HttpRequestSigning } from "../../ports/request-signing.js";
-import { ShopFailure, type OfferSource, type ShopOffers, type ShopOrder, type ShopOrderRequest, type ShopPort, type ShopUnavailable, type ShopUnavailableCause } from "../../ports/shop.js";
+import {
+  ShopFailure,
+  type OfferSource,
+  type ShopOffers,
+  type ShopOrder,
+  type ShopOrderRequest,
+  type ShopPaymentPort,
+  type ShopPaymentReply,
+  type ShopPaymentRequest,
+  type ShopPort,
+  type ShopUnavailable,
+  type ShopUnavailableCause,
+} from "../../ports/shop.js";
+import { openPackage } from "../../payment-package/package.js";
 import type { StandParams } from "../../../shared/config.js";
 import { MERCHANT_RETRYABLE, isMerchantCode } from "./codes.js";
 
@@ -65,8 +79,10 @@ const Item = z.object({
 });
 type ShopItem = z.infer<typeof Item>;
 const Order = z.object({ id: Id, total: z.number().int().nonnegative(), currency: z.enum(Object.keys(EXPONENT) as [keyof typeof EXPONENT]) });
+/** Ответ на оплату — заказ продавца: статус после авторизации у эквайрера (слова продавца, не итог — инвариант 8). */
+const Paid = z.object({ id: Id, status: z.enum(["PAID", "DECLINED", "REJECTED"]) });
 
-type Method = "GET /v1/shops" | "GET /v1/shops/{id}/catalog" | "POST /v1/shops/{id}/orders";
+type Method = "GET /v1/shops" | "GET /v1/shops/{id}/catalog" | "POST /v1/shops/{id}/orders" | "POST /v1/shops/{id}/orders/{order_id}/payment";
 
 /** Итог обращения: ответ с телом (JSON или нет) либо нет ответа в срок. */
 type Reply = { status: number; body: unknown; retryAfter: string | null } | null;
@@ -104,7 +120,7 @@ interface Deadline {
 
 const DEADLINE: ShopUnavailableCause = { reason: "SHOP_SEARCH_DEADLINE" };
 
-export class ShopsAdapter implements OfferSource, LiveOfferSource, ShopPort {
+export class ShopsAdapter implements OfferSource, LiveOfferSource, ShopPort, ShopPaymentPort {
   private readonly now: () => Date;
   private readonly fetchImpl: typeof fetch;
   private readonly sleep: (ms: number, signal?: AbortSignal) => Promise<void>;
@@ -202,6 +218,31 @@ export class ShopsAdapter implements OfferSource, LiveOfferSource, ShopPort {
     }
     this.#log(method, 1, "ok", req.shopId, undefined, req.cartMandateId);
     return { orderId: b.data.id, total: { amount: b.data.total, currency: b.data.currency } };
+  }
+
+  /** Стадия 5: пакет агентской оплаты продавцу (Р45 п. 4) — подписанным обращением, `content-digest` покрывает тело
+   *  (подпись пакета, ПАО §4); не повторяется (как заказ). Тело — только в запросе: в журнал, исключения и сообщения оно не
+   *  попадает. Отказ витрины — SHOP_ORDER_REFUSED; нет ответа в срок или ответ не по схеме — SHOP_ORDER_STATE_UNKNOWN. Статус
+   *  заказа из ответа — detail записи shop.call: это слова продавца, а не итог операции (инвариант 8). */
+  async pay(req: ShopPaymentRequest): Promise<ShopPaymentReply> {
+    const method: Method = "POST /v1/shops/{id}/orders/{order_id}/payment";
+    if (!ID.test(req.shopId) || !ID.test(req.orderId)) throw new Error("id витрины или заказа не по маске");
+    const reply = await this.#send("POST", `/v1/shops/${req.shopId}/orders/${req.orderId}/payment`, openPackage(req.package));
+    if (reply === null) {
+      this.#log(method, 1, "unknown", req.shopId, { detail: "NO_RESPONSE" }, req.cartMandateId);
+      throw new ShopFailure("SHOP_ORDER_STATE_UNKNOWN");
+    }
+    if (reply.status >= 400) {
+      this.#log(method, 1, "refused", req.shopId, this.#cause(reply.body), req.cartMandateId);
+      throw new ShopFailure("SHOP_ORDER_REFUSED");
+    }
+    const b = reply.status === 200 ? Paid.safeParse(reply.body) : null;
+    if (!b?.success || b.data.id !== req.orderId) {
+      this.#log(method, 1, "unknown", req.shopId, { detail: "BAD_RESPONSE" }, req.cartMandateId);
+      throw new ShopFailure("SHOP_ORDER_STATE_UNKNOWN");
+    }
+    this.#log(method, 1, "ok", req.shopId, { detail: b.data.status }, req.cartMandateId);
+    return { status: b.data.status };
   }
 
   /** Факты витрины: магазин и товары — из витрины и профиля; профиля нет — магазин исключён (REQUIRED). */

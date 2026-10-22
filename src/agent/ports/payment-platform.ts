@@ -17,6 +17,7 @@ import type {
 import type { EventsPort } from "./events.js";
 import type { MandatePort } from "./mandates.js";
 import type { Mutation } from "./mutation.js";
+import type { SealedPackage } from "../payment-package/package.js";
 
 export type { Mutation };
 
@@ -50,6 +51,12 @@ export type ProtocolCheck =
    *  BAD_RESPONSE — ответ не по схеме, NO_RESPONSE — адрес не отвечает или отказ */
   | { status: "unknown"; detail: "NO_VERSION" | "BAD_RESPONSE" | "NO_RESPONSE" };
 
+/** Реквизит глазами ядра и пакет для продавца по нему (Р45 п. 3). */
+export interface IssuedPackage {
+  credential: Credential;
+  sealed: SealedPackage;
+}
+
 /** Порт платформы целиком; части по составу AG-К5 выделяются по мере задач (мандаты — AG-05, MandatePort; события — AG-06, EventsPort). */
 export interface PaymentPlatform extends MandatePort, EventsPort {
   capabilities(): PlatformCapabilities;
@@ -61,6 +68,9 @@ export interface PaymentPlatform extends MandatePort, EventsPort {
   registerKey(draft: KeyDraft, m: Mutation): Promise<AgentKey>;
 
   issueCredential(draft: CredentialDraft, m: Mutation): Promise<Credential>;
+  /** Реквизит и запечатанный пакет агентской оплаты по нему (Р45 п. 3): `payload` — только в пакете, ядру — `Credential`.
+   *  Ответ не целиком (вид не тот, нет `token_ref` или криптограммы, признак не свой) — UNKNOWN, пакета нет. */
+  issuePaymentPackage(draft: CredentialDraft, m: Mutation): Promise<IssuedPackage>;
 
   requestConfirmation(draft: ConfirmationDraft, m: Mutation): Promise<Confirmation>;
   getConfirmation(id: string): Promise<Confirmation>;

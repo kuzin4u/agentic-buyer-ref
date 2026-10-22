@@ -432,6 +432,14 @@ export class PaoPlatform implements PaymentPlatform {
     );
   }
 
+  /** Выдача с запечатанным пакетом (Р45 п. 3): тот же POST, `payload` — только в пакете. */
+  async issuePaymentPackage(draft: Parameters<PaymentPlatform["issuePaymentPackage"]>[0], m: Mutation) {
+    return this.call("POST /pao/v1/credentials", { body: map.credentialDraftToPao(draft, this.cur), idempotencyKey: keyOf(m) }, (r) => ({
+      credential: map.credentialFromPao(r, draft.mandate.id, this.o.agentCode),
+      sealed: map.packageFromPao(r, draft),
+    }));
+  }
+
   async requestConfirmation(draft: Parameters<PaymentPlatform["requestConfirmation"]>[0], m: Mutation) {
     return this.call(
       "POST /pao/v1/confirmations",

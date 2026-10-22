@@ -23,18 +23,18 @@ describe("зависимость от agentic-core", () => {
     );
   });
 
-  it("стенд Платформы для С0 — dev-зависимость по git+https с тегом v0.11.0 (Р24, PS-12; К2а, Р33 п. 9; К1.2, Р34 п. 10; Р41 п. 2)", () => {
+  it("стенд Платформы для С0 — dev-зависимость по git+https с тегом v0.15.0 (Р24, PS-12; К2а, Р33 п. 9; К1.2, Р34 п. 10; Р41 п. 2; Р45 п. 1)", () => {
     const pkg = JSON.parse(readFileSync("package.json", "utf8"));
     expect(pkg.devDependencies["agentic-ps-platform"]).toBe(
-      "git+https://github.com/kuzin4u/agentic-ps-platform.git#v0.11.0",
+      "git+https://github.com/kuzin4u/agentic-ps-platform.git#v0.15.0",
     );
     expect(pkg.dependencies["agentic-ps-platform"]).toBeUndefined();
     const lock = JSON.parse(readFileSync("package-lock.json", "utf8"));
     const entry = lock.packages["node_modules/agentic-ps-platform"];
-    expect(entry).toMatchObject({ version: "0.11.0", dev: true });
-    // 693a388… — коммит тега v0.11.0 (слияние PR #46 платформы, PS-20 ч. 3; ПАО 1.4.0 прежний, Р41 п. 2). npm install переписывает адрес на git+ssh — в lock только git+https.
+    expect(entry).toMatchObject({ version: "0.15.0", dev: true });
+    // 9fda145… — коммит тега v0.15.0 (PS-14 ч. 4, PR #52 платформы; ПАО 1.4.0 прежний, Р45 п. 1; прежде v0.11.0 — 693a388…, Р41 п. 2). npm install переписывает адрес на git+ssh — в lock только git+https.
     expect(entry.resolved).toBe(
-      "git+https://github.com/kuzin4u/agentic-ps-platform.git#693a38803f11af5115fb3ec40f35233edf86f6f1",
+      "git+https://github.com/kuzin4u/agentic-ps-platform.git#9fda145e1f7c8be2e73adca03ab111c518404843",
     );
     expect(readFileSync("package-lock.json", "utf8")).not.toMatch(/git\+ssh:|"github:/);
     // стенд объявляет тот же тег ядра, что и агент: npm сводит их к одной копии (Р41 п. 2)

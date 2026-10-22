@@ -260,4 +260,70 @@ describe("стадия 5 на стенде: реквизит по ПАО и па
     ]);
     await expect(r.purchase.authorize({ idempotencyKey: "idem-pay-confirm" })).rejects.toBeInstanceOf(PurchaseTransitionForbidden);
   });
+
+  it("П18: в теле выдачи серия, похожая на номер карты (адаптер в обход проверки агента) — 422 CREDENTIALS_FORBIDDEN от Платформы, без повтора, значения в журнале нет", async () => {
+    const r = await run();
+    const pan = luhnTail("900000000000000");
+    const start = r.c.calls().length;
+    const err = await r.c.platform
+      .issuePaymentPackage({ mandate: { id: "MND-any", currency: "RUB" }, orderRef: `ORD-${pan}`, merchantId: NORMAL.merchant_id, amountMax: { amount: 100, currency: "RUB" }, channel: "CARD" }, { idempotencyKey: "idem-p18" })
+      .catch((e: unknown) => e);
+    expect(err).toMatchObject({ code: "CREDENTIALS_FORBIDDEN", retry: "never", httpStatus: 422 });
+    expect(r.c.calls().slice(start).map((x) => `${x.target} ${x.route} ${x.status} ${x.code}`)).toEqual([`${CREDENTIALS} 422 CREDENTIALS_FORBIDDEN`]);
+    // нарушение зафиксировано в журнале агента (RunReport — AG-19): код, без значения
+    expect(r.c.journal.entries.filter((e) => e.kind === "pao.call" && e.method === "POST /pao/v1/credentials").map((e) => [e.result, e.reason, e.attempt])).toEqual([["refused", "CREDENTIALS_FORBIDDEN", 1]]);
+    expect(JSON.stringify(r.c.journal.entries).includes(pan)).toBe(false);
+  });
+
+  it("409 MANDATE_SCOPE: продавца области CART нет в справочнике оператора — after_human, без повтора, пакета нет (передача #51)", async () => {
+    const r = await run();
+    const OUT = "MER-NOT-IN-DIRECTORY";
+    const total = { amount: 10000, currency: "RUB" };
+    const intent = await r.c.platform.requestMandate({ ...INTENT, merchantScope: [OUT] }, { idempotencyKey: "idem-intent-scope" });
+    expect((await r.stand.issuer.sign(intent.id)).statusCode).toBe(200);
+    const cart = await r.c.platform.requestMandate(
+      { ...INTENT, kind: "CART", parentId: intent.id, amountLimit: total, merchantScope: [OUT], cart: { merchantId: OUT, lines: [{ sku: "bread", qty: 1, price: total }], total } },
+      { idempotencyKey: "idem-cart-scope" },
+    );
+    expect((await r.stand.issuer.sign(cart.id)).statusCode).toBe(200);
+    const start = r.c.calls().length;
+    const err = await r.c.platform
+      .issuePaymentPackage({ mandate: { id: cart.id, currency: "RUB" }, orderRef: "ORD-scope-1", merchantId: OUT, amountMax: total, channel: "CARD" }, { idempotencyKey: "idem-cred-scope" })
+      .catch((e: unknown) => e);
+    expect(err).toMatchObject({ code: "MANDATE_SCOPE", retry: "after_human", httpStatus: 409 });
+    expect(r.c.calls().slice(start).map((x) => `${x.target} ${x.route} ${x.status} ${x.code}`)).toEqual([`${CREDENTIALS} 409 MANDATE_SCOPE`]);
+  });
+
+  it("риск 4а (выдача): новый CART при ACTIVE прежнем — реквизит и пакет по новому CART, прежний остаётся ACTIVE и не используется", async () => {
+    const r = await run();
+    const intent = await r.purchase.intent({ ...INTENT, merchantScope: [NORMAL.merchant_id] }, { idempotencyKey: "idem-intent-4a" });
+    await r.signWhileWaiting(intent.id, () => r.purchase.awaitIntent());
+    const first = (await r.purchase.search()).contour.find((o) => o.shopId === NORMAL.id)!;
+    const old = await r.purchase.cart(one(first, 1), { idempotencyKey: "idem-cart-4a-old" });
+    await r.signWhileWaiting(old.id, () => r.purchase.awaitCart());
+    // новая выдача из CART_ACTIVE (К2а): снимок прежнего CART стёрт, у Платформы он остаётся ACTIVE (выбор 4а Р44)
+    const offer = (await r.purchase.search()).contour.find((o) => o.shopId === NORMAL.id)!;
+    const cart = await r.purchase.cart(one(offer, 2), { idempotencyKey: "idem-cart-4a-new" });
+    await r.signWhileWaiting(cart.id, () => r.purchase.awaitCart());
+    const order = await r.purchase.placeOrder({ idempotencyKey: "idem-order-4a" });
+    expect((await r.c.platform.getMandate(old.id)).status).toBe("ACTIVE");
+    const start = r.c.calls().length;
+    await expect(r.purchase.authorize({ idempotencyKey: "idem-pay-4a" })).rejects.toMatchObject({ code: "OPERATION_RESULT_UNCONFIRMED" });
+    // ворота — по новому CART; реквизит выдан (201) при ACTIVE прежнем; витрина приняла пакет — cart_mandate_id пакета
+    // совпал с мандатом заказа (новый CART)
+    expect(
+      r.c
+        .calls()
+        .slice(start)
+        .map((x) => shape(x, { intent: intent.id, cart: cart.id, old: old.id, shop: NORMAL.id, order: order.orderId }))
+        .filter((s) => !s.startsWith("pao GET /pao/v1/events")),
+    ).toEqual([
+      "pao GET /pao/v1/mandates/{intent}/verify 200",
+      "pao GET /pao/v1/mandates/{cart}/verify 200",
+      `${CREDENTIALS} 201`,
+      "merchants POST /v1/shops/{shop}/orders/{order}/payment 200",
+    ]);
+    expect(r.c.journal.entries.filter((e) => e.kind === "shop.call" && e.method?.endsWith("/payment")).map((e) => [e.mandate, e.detail])).toEqual([[cart.id, "PAID"]]);
+    expect((await r.c.platform.getMandate(old.id)).status).toBe("ACTIVE");
+  });
 });

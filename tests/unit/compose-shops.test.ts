@@ -116,4 +116,29 @@ describe("AgentCore.payment (Р45 п. 6)", () => {
     expect(s2.stub.calls.filter((c) => c.op === "POST /pao/v1/credentials")).toEqual([]);
     expect(paid).toBe(0);
   });
+
+  it.each([
+    ["реквизит USED (повтор под ключом после погашения) — CREDENTIAL_INVALID", { status: 201, body: "USED" }, "CREDENTIAL_INVALID"],
+    ["409 MANDATE_SCOPE — after_human, без повтора", { status: 409, body: "MANDATE_SCOPE" }, "MANDATE_SCOPE"],
+  ] as const)("%s: пакет продавцу не уходит (Р45 п. 2.2–2.3)", async (_, reply, code) => {
+    const s3 = new PaoStand({
+      handlers: {
+        "POST /pao/v1/credentials": ({ body }) =>
+          reply.status === 201
+            ? { status: 201, body: { credential_ref: "cr_1", kind: body.kind, payload: { token_ref: "tok_ref_1", cryptogram: "cg_1" }, aoi: { indicator: true, agent_code: AGENT, mandate_id: body.mandate_id }, status: reply.body } }
+            : { error: { code: "MANDATE_SCOPE" as const } },
+      },
+    });
+    stand = s3;
+    const { core } = await coreOn(s3);
+    await core.start();
+    let paid = 0;
+    const steps = core.payment({ pay: async () => (paid++, { status: "PAID" }) });
+    const total = { amount: 250000, currency: "RUB" };
+    const cart = { id: "m_cart", cart: { merchantId: "shop_1", lines: [], total } } as unknown as Mandate;
+    const ctx: PaymentContext = { intent: { id: "m_intent" } as Mandate, cart, shopId: "SHOP-1", merchantId: "shop_1", order: { orderId: "ORD-1", total }, signal: new AbortController().signal, sending: () => {} };
+    await expect(steps.authorize(ctx, { idempotencyKey: "idem-k3" })).rejects.toMatchObject({ code });
+    expect(paid).toBe(0);
+    expect(s3.stub.calls.filter((c) => c.op === "POST /pao/v1/credentials")).toHaveLength(1);
+  });
 });

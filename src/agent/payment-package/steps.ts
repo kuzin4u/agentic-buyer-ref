@@ -6,6 +6,7 @@ import type { IssuedPackage } from "../ports/payment-platform.js";
 import type { Mutation } from "../ports/mutation.js";
 import { PaymentFailure, ShopFailure, type PaymentContext, type PaymentSteps, type ShopPaymentPort } from "../ports/shop.js";
 import type { CredentialDraft, Operation } from "../../shared/domain.js";
+import { SAFE_ID } from "../../shared/ids.js";
 import { orderRefIssue } from "./order-ref.js";
 
 export interface ContourPaymentOptions {
@@ -14,9 +15,6 @@ export interface ContourPaymentOptions {
   journal: Journal;
   now?: () => Date;
 }
-
-/** mandate_id в журнале — по маске (Р37 п. 3). */
-const MANDATE_ID = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/;
 
 export class ContourPayment implements PaymentSteps {
   private readonly now: () => Date;
@@ -78,4 +76,4 @@ export class ContourPayment implements PaymentSteps {
   }
 }
 
-const mandateRef = (id: string): { mandate?: string } => (MANDATE_ID.test(id) ? { mandate: id } : {});
+const mandateRef = (id: string): { mandate?: string } => (SAFE_ID.test(id) ? { mandate: id } : {});

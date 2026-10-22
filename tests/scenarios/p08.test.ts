@@ -90,14 +90,14 @@ describe("П08 — витрина отказывает неопознанным"
     expect(JSON.stringify(r.c.journal.entries)).not.toContain(unknown);
   });
 
-  it("списка витрин нет целиком (эмуляция сверх эмулятора: 503 на список) — отказ стадии 2, STOPPED сделки; к каталогам ни одного обращения (ревью К1 № 11)", async () => {
+  it("списка витрин нет целиком (эмуляция сверх эмулятора: 503 на список) — отказ стадии 2, STOPPED сделки с SHOP_LIST_UNAVAILABLE (Р46 п. 2); к каталогам ни одного обращения (ревью К1 № 11)", async () => {
     const { f, seen } = recording({ path: "/v1/shops", status: 503, body: { code: "UPSTREAM_UNAVAILABLE" } });
     const r = await standPurchase({ fetch: f });
     c = r.c;
     await r.signedIntent();
-    await expect(r.purchase.search()).rejects.toThrow();
+    await expect(r.purchase.search()).rejects.toMatchObject({ name: "ShopFailure", code: "SHOP_LIST_UNAVAILABLE" });
     expect(r.purchase.state).toBe("STOPPED");
-    expect(r.purchase.reason).toBe("UNKNOWN");
+    expect(r.purchase.reason).toBe("SHOP_LIST_UNAVAILABLE");
     expect(r.c.admission()).toBeNull();
     // один повтор списка по повторяемому коду (Р42 п. 4), каталогов нет
     expect(seen.map((s) => new URL(s.url).pathname)).toEqual(["/v1/shops", "/v1/shops"]);

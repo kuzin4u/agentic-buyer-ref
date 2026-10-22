@@ -1,9 +1,10 @@
 // Адаптер витрин (Р42) на подменённом fetch: подпись до сети, схема ответа, зона, повтор только 429 и 503 на GET (один
 // раз, новой подписью, Retry-After не больше предела), заказ без повтора, неизвестный код витрины, живая проверка.
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { ShopsAdapter, type ShopProfile, type ShopsAdapterOptions } from "../../src/agent/adapters/shops/index.js";
 import { MemoryJournal } from "../../src/agent/journal/index.js";
 import { ShopFailure } from "../../src/agent/ports/index.js";
+import { sealPackage } from "../../src/agent/payment-package/index.js";
 import { SignerStopped } from "../../src/agent/signer/index.js";
 import { loadParams } from "../../src/shared/config.js";
 
@@ -182,6 +183,19 @@ describe("адаптер витрин (Р42)", () => {
     ]);
   });
 
+  it("таймер срока сработал, а часы срок ещё не отсчитали — остаток ноль: к следующей витрине не обращаются (Р46, К2а; ревью reviewer К2 № 1)", async () => {
+    // часы стоят: по ним срок не истёк никогда; прерывает только таймер срока — как при его раннем срабатывании в Node
+    const now = vi.spyOn(performance, "now").mockReturnValue(1000);
+    try {
+      const { a, seen } = adapter({ ...LIST(shop("S1"), shop("S2")), ...catalog("S1", "hang"), ...catalog("S2", ok(ITEM)) }, { params: { ...params, shop_search_deadline_ms: 300 } });
+      const out = await a.search();
+      expect(out.map((x) => ("unavailable" in x ? x.unavailable : null))).toEqual([{ reason: "SHOP_SEARCH_DEADLINE" }, { reason: "SHOP_SEARCH_DEADLINE" }]);
+      expect(seen.map((s) => s.path)).toEqual(["/v1/shops", "/v1/shops/S1/catalog"]);
+    } finally {
+      now.mockRestore();
+    }
+  });
+
   it("ожидание Retry-After не меньше остатка срока поиска — без ожидания и повтора, SHOP_SEARCH_DEADLINE (Р44 п. 6)", async () => {
     const after = Math.ceil(params.shop_search_deadline_ms / 1000);
     expect(after).toBeLessThanOrEqual(params.shop_retry_after_max_sec);
@@ -210,15 +224,15 @@ describe("адаптер витрин (Р42)", () => {
     await expect(a.search()).rejects.toBe(stopped);
   });
 
-  it("срок поиска истёк до ответа списка витрин — исключение (отказ стадии), к каталогам не обращаются (Р44 п. 6)", async () => {
+  it("срок поиска истёк до ответа списка витрин — SHOP_LIST_UNAVAILABLE (Р46 п. 2), к каталогам не обращаются (Р44 п. 6)", async () => {
     const { a, seen } = adapter({ "GET /v1/shops": ["hang"] }, { params: { ...params, shop_search_deadline_ms: 300 } });
-    await expect(a.search()).rejects.toThrow();
+    await expect(a.search()).rejects.toMatchObject({ name: "ShopFailure", code: "SHOP_LIST_UNAVAILABLE" });
     expect(seen.map((s) => s.path)).toEqual(["/v1/shops"]);
   });
 
-  it("списка витрин нет целиком — исключение (отказ стадии); запись списка не по схеме — только эта витрина (ревью КТ1 п. 1)", async () => {
-    await expect(adapter({ "GET /v1/shops": [{ status: 503, body: { code: "UPSTREAM_UNAVAILABLE" } }] }).a.search()).rejects.toThrow();
-    await expect(adapter({ "GET /v1/shops": [{ status: 200, body: { shops: "нет" } }] }).a.search()).rejects.toThrow();
+  it("списка витрин нет целиком — ShopFailure SHOP_LIST_UNAVAILABLE (Р46 п. 2); запись списка не по схеме — только эта витрина (ревью КТ1 п. 1)", async () => {
+    await expect(adapter({ "GET /v1/shops": [{ status: 503, body: { code: "UPSTREAM_UNAVAILABLE" } }] }).a.search()).rejects.toMatchObject({ name: "ShopFailure", code: "SHOP_LIST_UNAVAILABLE" });
+    await expect(adapter({ "GET /v1/shops": [{ status: 200, body: { shops: "нет" } }] }).a.search()).rejects.toMatchObject({ name: "ShopFailure", code: "SHOP_LIST_UNAVAILABLE" });
     const { a, seen } = adapter({ ...LIST({ id: "../x", merchant_id: "MER-X" }, shop("S1")), ...catalog("S1", ok(ITEM)) });
     const out = await a.search();
     expect(out[0]).toEqual({ unavailable: { detail: "BAD_RESPONSE" } });
@@ -266,6 +280,34 @@ describe("адаптер витрин (Р42)", () => {
     expect(seen[0]!.headers["content-type"]).toBe("application/json");
     // запись обращения — с витриной и мандатом корзины (ревью К1 № 4)
     expect(journal.entries.filter((e) => e.kind === "shop.call").map((e) => [e.method, e.ref, e.mandate, e.result])).toEqual([["POST /v1/shops/{id}/orders", "S1", "mnd_1", "ok"]]);
+  });
+
+  it("номер заказа — по маске ссылки агента, 128 знаков, как у Платформы (Р46 п. 1, выбор 1а): 65 и 128 — заказ, 129 — SHOP_ORDER_STATE_UNKNOWN", async () => {
+    const req = { shopId: "S1", items: [{ sku: "BRD-1", qty: 1 }], cartMandateId: "mnd_1" };
+    for (const len of [65, 128]) {
+      const id = "o".repeat(len);
+      const { a } = adapter({ "POST /v1/shops/S1/orders": [{ status: 201, body: { id, total: 39000, currency: "RUB" } }] });
+      expect((await a.order(req)).orderId).toBe(id);
+    }
+    const { a } = adapter({ "POST /v1/shops/S1/orders": [{ status: 201, body: { id: "o".repeat(129), total: 39000, currency: "RUB" } }] });
+    const err = await a.order(req).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ShopFailure);
+    expect((err as ShopFailure).code).toBe("SHOP_ORDER_STATE_UNKNOWN");
+  });
+
+  it("оплата: номер заказа 65 и 128 знаков — в путь и ответ по той же маске; 129 — исключение до обращения (Р46 п. 1, выбор 1а; ревью reviewer К1 № 2)", async () => {
+    const pkg = (orderRef: string) =>
+      sealPackage({ credential_ref: "CRD-1", kind: "CARD", payload: { token_ref: "tok_test", cryptogram: "c", valid_to: "2026-10-22T10:00:00Z" }, aoi: { indicator: true, agent_code: "nspk:agent:test:v1", mandate_id: "mnd_1" }, cart_mandate_id: "mnd_1", order_ref: orderRef });
+    for (const len of [65, 128]) {
+      const id = "o".repeat(len);
+      const { a, seen } = adapter({ [`POST /v1/shops/S1/orders/${id}/payment`]: [{ status: 200, body: { id, status: "PAID" } }] });
+      expect(await a.pay({ shopId: "S1", orderId: id, cartMandateId: "mnd_1", package: pkg(id) })).toEqual({ status: "PAID" });
+      expect(seen.map((x) => x.path)).toEqual([`/v1/shops/S1/orders/${id}/payment`]);
+    }
+    const id = "o".repeat(129);
+    const { a, seen } = adapter({});
+    await expect(a.pay({ shopId: "S1", orderId: id, cartMandateId: "mnd_1", package: pkg(id) })).rejects.toThrow();
+    expect(seen).toEqual([]);
   });
 
   it("живая проверка: sku у двух витрин — отказ без обращения; иначе цена и наличие из каталога витрины", async () => {

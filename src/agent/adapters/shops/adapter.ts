@@ -29,6 +29,8 @@ import {
 } from "../../ports/shop.js";
 import { openPackage } from "../../payment-package/package.js";
 import type { StandParams } from "../../../shared/config.js";
+import { SAFE_ID, SHOP_ID } from "../../../shared/ids.js";
+import { ORDER_REF } from "../../payment-package/order-ref.js";
 import { MERCHANT_RETRYABLE, isMerchantCode } from "./codes.js";
 
 /** Профиль магазина (Р42 п. 2): сведения, которых витрина не отдаёт. `item` — доставка и время обновления карточки;
@@ -55,10 +57,9 @@ export interface ShopsAdapterOptions {
 }
 
 /** Идентификатор от витрины — в путь и в журнал только по маске (как sku у конвейера, Р38 п. 5). */
-const ID = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$/;
-const Id = z.string().regex(ID);
-/** mandate_id в журнале — по той же маске, что у клиента мандатов (Р37 п. 3). */
-const MANDATE_ID = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/;
+const Id = z.string().regex(SHOP_ID);
+/** Номер заказа продавца — по маске ссылки агента, одно правило с Платформой (128; Р46 п. 1, выбор 1а). */
+const OrderId = z.string().regex(ORDER_REF);
 /** Знаков после запятой у валюты цены: таблицы в ядре нет (К9); витрина эмулятора — только RUB (ISO 4217). */
 const EXPONENT = { RUB: 2 } as const;
 
@@ -78,9 +79,9 @@ const Item = z.object({
   category: z.string(),
 });
 type ShopItem = z.infer<typeof Item>;
-const Order = z.object({ id: Id, total: z.number().int().nonnegative(), currency: z.enum(Object.keys(EXPONENT) as [keyof typeof EXPONENT]) });
+const Order = z.object({ id: OrderId, total: z.number().int().nonnegative(), currency: z.enum(Object.keys(EXPONENT) as [keyof typeof EXPONENT]) });
 /** Ответ на оплату — заказ продавца: статус после авторизации у эквайрера (слова продавца, не итог — инвариант 8). */
-const Paid = z.object({ id: Id, status: z.enum(["PAID", "DECLINED", "REJECTED"]) });
+const Paid = z.object({ id: OrderId, status: z.enum(["PAID", "DECLINED", "REJECTED"]) });
 
 type Method = "GET /v1/shops" | "GET /v1/shops/{id}/catalog" | "POST /v1/shops/{id}/orders" | "POST /v1/shops/{id}/orders/{order_id}/payment";
 
@@ -134,14 +135,14 @@ export class ShopsAdapter implements OfferSource, LiveOfferSource, ShopPort, Sho
     this.sleep = o.sleep ?? pause;
   }
 
-  /** Стадия 2. Список витрин не получен или не по схеме — отказ стадии (исключение). Витрина отказала в каталоге —
-   *  магазин недоступен, остальные витрины — дальше. Общий срок стадии — `shop_search_deadline_ms` с начала поиска (Р44
+  /** Стадия 2. Список витрин не получен или не по схеме — ShopFailure SHOP_LIST_UNAVAILABLE (Р46 п. 2), остановка сделки.
+   *  Витрина отказала в каталоге — магазин недоступен, остальные витрины — дальше. Общий срок стадии — `shop_search_deadline_ms` с начала поиска (Р44
    *  п. 6): по истечении к оставшимся витринам не обращаются, идущее обращение прерывается, ожидание повтора не меньше остатка
    *  не начинается — магазин недоступен с кодом SHOP_SEARCH_DEADLINE. */
   async search(): Promise<(ShopOffers | ShopUnavailable)[]> {
     const deadline = this.#deadline();
     const list = await this.#get("GET /v1/shops", "/v1/shops", Shops, undefined, undefined, deadline);
-    if (!list.ok) throw new Error("список витрин не получен или не по схеме");
+    if (!list.ok) throw new ShopFailure("SHOP_LIST_UNAVAILABLE");
     const out: (ShopOffers | ShopUnavailable)[] = [];
     for (const entry of list.body.shops) {
       const parsed = ShopEntry.safeParse(entry);
@@ -201,7 +202,7 @@ export class ShopsAdapter implements OfferSource, LiveOfferSource, ShopPort, Sho
    *  Отказ витрины — SHOP_ORDER_REFUSED; нет ответа в срок или ответ не по схеме — SHOP_ORDER_STATE_UNKNOWN. */
   async order(req: ShopOrderRequest): Promise<ShopOrder> {
     const method: Method = "POST /v1/shops/{id}/orders";
-    if (!ID.test(req.shopId)) throw new Error("id витрины не по маске");
+    if (!SHOP_ID.test(req.shopId)) throw new Error("id витрины не по маске");
     const reply = await this.#send("POST", `/v1/shops/${req.shopId}/orders`, JSON.stringify({ items: req.items, cart_mandate_id: req.cartMandateId }));
     if (reply === null) {
       this.#log(method, 1, "unknown", req.shopId, { detail: "NO_RESPONSE" }, req.cartMandateId);
@@ -226,7 +227,7 @@ export class ShopsAdapter implements OfferSource, LiveOfferSource, ShopPort, Sho
    *  заказа из ответа — detail записи shop.call: это слова продавца, а не итог операции (инвариант 8). */
   async pay(req: ShopPaymentRequest): Promise<ShopPaymentReply> {
     const method: Method = "POST /v1/shops/{id}/orders/{order_id}/payment";
-    if (!ID.test(req.shopId) || !ID.test(req.orderId)) throw new Error("id витрины или заказа не по маске");
+    if (!SHOP_ID.test(req.shopId) || !ORDER_REF.test(req.orderId)) throw new Error("id витрины или заказа не по маске");
     const reply = await this.#send("POST", `/v1/shops/${req.shopId}/orders/${req.orderId}/payment`, openPackage(req.package));
     if (reply === null) {
       this.#log(method, 1, "unknown", req.shopId, { detail: "NO_RESPONSE" }, req.cartMandateId);
@@ -295,11 +296,14 @@ export class ShopsAdapter implements OfferSource, LiveOfferSource, ShopPort, Sho
     }
   }
 
-  /** Общий срок стадии поиска с этого момента: сигнал прерывания и остаток в мс (часы — монотонные). */
+  /** Общий срок стадии поиска с этого момента: сигнал прерывания и остаток в мс (часы — монотонные). Таймер срока
+   *  срабатывает раньше, чем часы отсчитают полный срок: сработал — остаток ноль, иначе после прерванного сроком обращения
+   *  была бы ещё попытка (Р46, К2а; уточняет Р44 п. 6). */
   #deadline(): Deadline {
     const ms = this.o.params.shop_search_deadline_ms;
     const start = performance.now();
-    return { signal: AbortSignal.timeout(ms), left: () => ms - (performance.now() - start) };
+    const signal = AbortSignal.timeout(ms);
+    return { signal, left: () => (signal.aborted ? 0 : ms - (performance.now() - start)) };
   }
 
   #outcome<T>(reply: Reply, schema: z.ZodType<T>): Outcome<T> {
@@ -371,8 +375,8 @@ export class ShopsAdapter implements OfferSource, LiveOfferSource, ShopPort, Sho
       method,
       attempt,
       result,
-      ...(shopId !== undefined && ID.test(shopId) && { ref: shopId }),
-      ...(mandate !== undefined && MANDATE_ID.test(mandate) && { mandate }),
+      ...(shopId !== undefined && SHOP_ID.test(shopId) && { ref: shopId }),
+      ...(mandate !== undefined && SAFE_ID.test(mandate) && { mandate }),
       ...(cause?.detail !== undefined && { detail: cause.detail }),
       ...(cause?.reason !== undefined && { reason: cause.reason }),
     });

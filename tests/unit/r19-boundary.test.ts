@@ -242,10 +242,10 @@ describe("mandates → только ports/mandates, ports/mutation и ports/even
   });
 });
 
-// Р34: модуль событий видит из портов только порт событий; из shared — доменные типы и коды реестра (Р36); файловая
-// система и zod — для курсора.
+// Р34: модуль событий видит из портов только порт событий; из shared — доменные типы, коды реестра (Р36) и маски
+// идентификаторов (Р46 п. 1); файловая система и zod — для курсора.
 describe("events → только ports/events", () => {
-  const ALLOWED = [/^\.\/[\w-]+\.js$/, /^\.\.\/ports\/events\.js$/, /^\.\.\/\.\.\/shared\/domain\.js$/, /^\.\.\/\.\.\/shared\/diag-codes\.js$/, /^node:(fs|path)$/, /^zod$/];
+  const ALLOWED = [/^\.\/[\w-]+\.js$/, /^\.\.\/ports\/events\.js$/, /^\.\.\/\.\.\/shared\/domain\.js$/, /^\.\.\/\.\.\/shared\/diag-codes\.js$/, /^\.\.\/\.\.\/shared\/ids\.js$/, /^node:(fs|path)$/, /^zod$/];
   const files = readdirSync("src/agent/events").filter((f) => SOURCE_FILE.test(f));
   it("файлы модуля найдены; подкаталогов нет", () => {
     expect(files.length).toBeGreaterThan(0);

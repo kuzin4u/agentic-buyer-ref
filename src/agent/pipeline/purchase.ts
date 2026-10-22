@@ -5,11 +5,12 @@
 import type { StandParams } from "../../shared/config.js";
 import { PlatformFailure, type CartLine, type Mandate, type MandateDraft, type Money, type Operation } from "../../shared/domain.js";
 import type { DiagCode } from "../../shared/diag-codes.js";
+import { SAFE_ID, SHOP_ID } from "../../shared/ids.js";
 import { liveCheck, type A5SignalCode, type CatalogIssueCode, type CatalogProduct, type LiveCheckParams, type LiveFactCode } from "../catalog/index.js";
 import { ruleForDeclineReason } from "../declines/index.js";
 import { MandateRefused, type MandateClient } from "../mandates/index.js";
 import { issuedByShell, spend } from "../policy/a5-issued.js";
-import { acceptedA5, cartTotal, classifyOffer, mayDraftCart, mayOrder, type CartPurchase, type HumanA5Decision, type OfferVerdict, type OrderNext } from "../policy/catalog.js";
+import { acceptedA5, cartTotal, classifyOffer, mayDraftCart, mayOrder, type CartPurchase, type HumanA5Decision, type OfferVerdict, type OrderDecision, type OrderNext } from "../policy/catalog.js";
 import { confirmThreshold, currencySupported, mandateRefusal, mayAuthorize, needsConfirmation, type PaymentDecision, type Thresholds } from "../policy/payment.js";
 import type { SplitWindow } from "../policy/split.js";
 import type { LiveOfferSource } from "../ports/catalog.js";
@@ -18,6 +19,9 @@ import type { Mutation } from "../ports/mutation.js";
 import { orderRefIssue, type OrderRefIssue } from "../payment-package/order-ref.js";
 import { PaymentFailure, ShopFailure, type OfferSource, type PaymentContext, type PaymentSteps, type ShopOffers, type ShopOrder, type ShopPort, type ShopUnavailable, type ShopUnavailableCause } from "../ports/shop.js";
 import { PurchaseMachine, PurchaseTransitionForbidden, allowed, type PurchaseJournal, type PurchaseState, type StopCause } from "./machine.js";
+
+/** Почему оставлен CART (Р46 п. 3): новый поиск из CART_ACTIVE или отказ живой проверки перед заказом. */
+export type CartAbandoned = "NEW_SEARCH" | "REFUSED_BEFORE_ORDER";
 
 /** Записи конвейера сверх записей машины (Р38 п. 5, Р37 п. 5). */
 export interface PipelineJournal extends PurchaseJournal {
@@ -39,6 +43,9 @@ export interface PipelineJournal extends PurchaseJournal {
       /** магазин отказал в каталоге (Т4, Р42 п. 4): detail — код витрины, BAD_RESPONSE или NO_RESPONSE; reason — код вне
        *  перечня; merchant — код продавца по маске */
       | ({ at: string; kind: "shop.unavailable"; mandate?: string; merchant?: string } & ShopUnavailableCause)
+      /** прежний CART больше не используется (Т15, Р46 п. 3): mandate — id CART по маске, detail — причина закрытым
+       *  перечнем; сумм, позиций и продавца нет. У Платформы CART остаётся ACTIVE (риск 4а) */
+      | { at: string; kind: "cart.abandoned"; detail: CartAbandoned; mandate?: string }
       /** ворота: держимый мандат вышел (отзыв, иной статус) — отказ действовать (Р38 п. 3) */
       | { at: string; kind: "agent.refused"; reason: "MANDATE_NOT_ACTIVE"; mandate?: string }
       /** ворота: остатка Платформы по мандату не хватает на итог CART (Р38 п. 3, К4а) */
@@ -174,8 +181,7 @@ export interface PurchaseOptions {
 }
 
 /** sku из фида — в журнале только по маске идентификатора (Р38 п. 5, инвариант 5). */
-const SKU = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$/;
-const skuRef = (sku: string): { ref?: string } => (SKU.test(sku) ? { ref: sku } : {});
+const skuRef = (sku: string): { ref?: string } => (SHOP_ID.test(sku) ? { ref: sku } : {});
 
 /** Отказ подписи — ждать человека, а не останавливать покупку (SPEC §7а PRINCIPAL_SIGNATURE_PENDING); только у ожидания
  *  подписи мандата: тот же код из порта витрины или оплаты — остановка (ревью К3 повторное Н1, инвариант 4). */
@@ -262,7 +268,8 @@ export class Purchase {
   }
 
   /** Стадия 2: выдача в двух зонах. Перед поиском — INTENT держится и подтверждён verify (Т2); решения каталога —
-   *  в журнал (Р37 п. 5): `policy/` журнала не получает (инвариант 3). Новая выдача стирает снимок прежнего CART (К2а). */
+   *  в журнал (Р37 п. 5): `policy/` журнала не получает (инвариант 3). Новая выдача стирает снимок прежнего CART (К2а),
+   *  запись cart.abandoned — Р46 п. 3. */
   search(): Promise<OfferZones> {
     return this.#stage("OFFERS", async () => {
       const intent = this.#need(this.#intent);
@@ -273,6 +280,9 @@ export class Purchase {
       const zones = snapshot(await this.#guard(async () => this.#classify(shops)));
       // отзыв мог прийти по ленте, пока шёл поиск (ревью К2.2 № 15)
       this.#held(intent);
+      // оставленный CART — в журнал до смены выдачи и снимка: сбой записи — STOPPED с прежними выдачей и CART (Р46 п. 3,
+      // инвариант 4; ревью reviewer К3 № 1)
+      this.#abandon("NEW_SEARCH");
       this.#zones = zones;
       // выдача сменилась — прежний CART наружу как текущий не отдаётся и не исполняется: новый CART — по новому выбору
       // (общее правило с отказом перед заказом; решение владельца 21.10, К2а)
@@ -407,25 +417,21 @@ export class Purchase {
         this.#halt("MANDATE_REPLY_MISMATCH");
       }
       this.#held(intent, cart);
-      for (const [i, line] of basket.lines.entries()) {
-        const offer = offers[i]!;
-        const req = { sku: line.sku, quantity: line.qty, ...(this.o.region !== undefined && { region: this.o.region }) };
-        const live = await liveCheck(offer.product, req, this.o.live, this.o.params, () => this.now().getTime());
-        this.#alive();
-        const d = mayOrder(live);
-        if (d.allow) continue;
-        for (const reason of d.codes) this.#record({ kind: "order.live_refused", reason, detail: d.next, ...skuRef(line.sku), ...merchantRef(offer.merchantId) });
-        // прежний CART больше не используется ничем и наружу как текущий не отдаётся — после любого отказа (Р44 п. 4,
-        // выбор 4а; решение владельца по ревью КТ1 п. 1); новая цена — и выдача: новый CART только после нового поиска (Т6)
-        this.#cart = null;
-        this.#lines = null;
-        if (d.next === "NEW_CART_MANDATE") this.#zones = null;
-        this.#machine.to("OFFERS");
-        throw new OrderRefused(d.next, d.codes);
-      }
+      let checked = await this.#liveBeforeOrder(basket.lines, offers);
       // проверка по мандату непосредственно перед заказом (Р44 п. 5, Р-149): остаток не меньше итога CART, продавец и
       // валюта в пределах — иначе STOPPED до заказа, у продавца не остаётся неоплаченного заказа; ворота стадии 5 остаются
       await this.#scope(intent, cart);
+      // два verify могли состарить живые проверки (до registry_cache_ttl_sec каждый): хоть одна старше
+      // live_check_max_age_sec — все повторяются ровно один раз, без нового verify (Р46 п. 4, выбор 4а); итог повторной —
+      // как первой (б). Возраст повторной — прямо перед заказом: старше — отказ LIVE_STALE путём Р44, второго круга нет (а1)
+      if (checked.some((at) => this.#stale(at))) {
+        checked = await this.#liveBeforeOrder(basket.lines, offers);
+        this.#held(intent, cart);
+        const i = checked.findIndex((at) => this.#stale(at));
+        // решение — политикой (инвариант 3); `!d.allow` всегда истинно при ok: false — сужение типа
+        const d = i >= 0 ? mayOrder({ ok: false, codes: ["LIVE_STALE"], offer: null }) : null;
+        if (d !== null && !d.allow) this.#refuseOrder(basket.lines[i]!.sku, offers[i]!, d);
+      }
       const shopId = offers[0]!.shopId;
       const order = await this.#guard(async () => {
         const reply = snapshot(await this.o.shop.order({ shopId, items: basket.lines.map((l) => ({ sku: l.sku, qty: l.qty })), cartMandateId: cart.id }, m));
@@ -687,6 +693,46 @@ export class Purchase {
     this.#halt(d.code);
   }
 
+  /** Живая проверка каждой позиции перед заказом (Р32 п. 3, Р44 п. 2): до первой не ok — отказ путём Р44. Итог — время
+   *  каждой проверки (`checkedAt`, мс) для оценки возраста перед заказом (Р46 п. 4). */
+  async #liveBeforeOrder(lines: readonly CartLine[], offers: readonly Offer[]): Promise<number[]> {
+    const at: number[] = [];
+    for (const [i, line] of lines.entries()) {
+      const offer = offers[i]!;
+      const req = { sku: line.sku, quantity: line.qty, ...(this.o.region !== undefined && { region: this.o.region }) };
+      const live = await liveCheck(offer.product, req, this.o.live, this.o.params, () => this.now().getTime());
+      this.#alive();
+      const d = mayOrder(live);
+      if (!d.allow) this.#refuseOrder(line.sku, offer, d);
+      at.push(Date.parse(d.offer.checkedAt));
+    }
+    return at;
+  }
+
+  /** Проверка старше live_check_max_age_sec по часам агента; время не разобралось — старше (инвариант 4). */
+  #stale(at: number): boolean {
+    return !(this.now().getTime() - at <= this.o.params.live_check_max_age_sec * 1000);
+  }
+
+  /** Отказ перед заказом (Р44 п. 4): записи order.live_refused, оставленный CART, снимок стёрт, CART_ACTIVE → OFFERS. */
+  #refuseOrder(sku: string, offer: Offer, d: Extract<OrderDecision, { allow: false }>): never {
+    for (const reason of d.codes) this.#record({ kind: "order.live_refused", reason, detail: d.next, ...skuRef(sku), ...merchantRef(offer.merchantId) });
+    // прежний CART больше не используется ничем и наружу как текущий не отдаётся — после любого отказа (Р44 п. 4,
+    // выбор 4а; решение владельца по ревью КТ1 п. 1); новая цена — и выдача: новый CART только после нового поиска (Т6)
+    this.#abandon("REFUSED_BEFORE_ORDER");
+    this.#cart = null;
+    this.#lines = null;
+    if (d.next === "NEW_CART_MANDATE") this.#zones = null;
+    this.#machine.to("OFFERS");
+    throw new OrderRefused(d.next, d.codes);
+  }
+
+  /** Оставленный CART — запись до того, как снимок стёрт (Р46 п. 3); CART не было — записи нет. Мандат — только CART:
+   *  id не по маске — запись без mandate, а не с id INTENT (ревью reviewer К3 № 2). */
+  #abandon(detail: CartAbandoned): void {
+    if (this.#cart !== null) this.#record({ kind: "cart.abandoned", detail, ...maskedMandate(this.#cart.id) }, false);
+  }
+
   #halt(code: DiagCode, cause?: StopCause): never {
     this.#machine.stop(code, cause);
     throw new PurchaseStopped(code);
@@ -700,7 +746,7 @@ export class Purchase {
       result = await step();
     } catch (e) {
       if (e instanceof PurchaseTransitionForbidden || e instanceof PurchaseStopped) throw e;
-      // отказ витрины на заказе и шага оплаты — остановка этой сделки, не агента (Р42 п. 4, Р45)
+      // отказ витрины на заказе, сбой списка витрин и шага оплаты — остановка этой сделки, не агента (Р42 п. 4, Р45, Р46 п. 2)
       const code =
         e instanceof MandateRefused
           ? e.reason
@@ -723,9 +769,9 @@ export class Purchase {
 
   /** mandate — INTENT покупки, если запись не называет свой (ворота по CART). Сбой журнала — покупка остановлена
    *  (UNKNOWN), исходная ошибка наружу: решение без записи не исполняется (инвариант 4, ревью К5 № 1). */
-  #record(e: DistributiveOmit<Parameters<PipelineJournal["record"]>[0], "at">): void {
+  #record(e: DistributiveOmit<Parameters<PipelineJournal["record"]>[0], "at">, purchaseMandate = true): void {
     try {
-      this.o.journal.record({ at: this.now().toISOString(), ...this.#machine.mandate, ...e } as Parameters<PipelineJournal["record"]>[0]);
+      this.o.journal.record({ at: this.now().toISOString(), ...(purchaseMandate && this.#machine.mandate), ...e } as Parameters<PipelineJournal["record"]>[0]);
     } catch (err) {
       try {
         this.#machine.stop("UNKNOWN");
@@ -788,7 +834,7 @@ function copy<T>(x: T): T {
 
 type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K> : never;
 
-const MANDATE_ID = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/;
-const maskedMandate = (id: string): { mandate?: string } => (MANDATE_ID.test(id) ? { mandate: id } : {});
+// mandate_id и код продавца в журнале — по маске (Р37 п. 3, Р46 п. 1)
+const maskedMandate = (id: string): { mandate?: string } => (SAFE_ID.test(id) ? { mandate: id } : {});
 /** код продавца из выдачи — данные продавца: в журнале только по маске идентификатора (Р38 п. 5, инвариант 5) */
-const merchantRef = (id: string): { merchant?: string } => (MANDATE_ID.test(id) ? { merchant: id } : {});
+const merchantRef = (id: string): { merchant?: string } => (SAFE_ID.test(id) ? { merchant: id } : {});

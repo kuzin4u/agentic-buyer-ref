@@ -3,6 +3,7 @@
 // Остаток и счётчики агент не вычисляет — только переносит ответ verify (инвариант 6, A3 п. 4.3).
 // По типу мандата нет закрытых перечней со switch/never: условие ставится только там, где тип что-то требует (CART).
 import type { StandParams } from "../../shared/config.js";
+import { SAFE_ID } from "../../shared/ids.js";
 import {
   PlatformFailure,
   type Cart,
@@ -39,8 +40,7 @@ export interface MandateJournal {
  *  «мандата нет» у GET мандата по копии ПАО нет: прочие отказы (503, UNKNOWN и др.) — сбой, курсор на месте (Р34 п. 3). */
 /** mandate_id в журнале — только по маске идентификатора (та же, что у адаптера для pao.call, Р37 п. 3): id приходит и от
  *  вызывающего (оболочка), не только из ответа Платформы; не прошёл — запись без поля mandate (ревью К2.4 № 1). */
-const MANDATE_ID = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/;
-const masked = (id: string | undefined): { mandate?: string } => (id !== undefined && MANDATE_ID.test(id) ? { mandate: id } : {});
+const masked = (id: string | undefined): { mandate?: string } => (id !== undefined && SAFE_ID.test(id) ? { mandate: id } : {});
 
 const VANISHED = "MANDATE_NOT_FOUND" satisfies FailureCode;
 

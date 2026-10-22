@@ -5,7 +5,9 @@ import { afterEach, describe, expect, it } from "vitest";
 import { CartLiveRefused, CartRefused, OrderRefused, PurchaseStopped, type CartChoice, type CartChoiceLine } from "../../src/agent/pipeline/index.js";
 import { isSpent } from "../../src/agent/policy/a5-issued.js";
 import { humanA5Decision } from "../../src/agent/shell/index.js";
+import type { JournalEntry } from "../../src/agent/journal/index.js";
 import { expectJournalClean } from "../support/journal.js";
+import { loadParams } from "../../src/shared/config.js";
 import { AGENT, type PaoStand } from "../support/pao-stand.js";
 import { SHOP, purchaseOn, signedIntent, stages, type PurchaseRun, type PurchaseSetup } from "../support/purchase.js";
 import { bakery, feedPrice, liveOffers, payments, shopOrders, type FeedShop } from "../support/shop.js";
@@ -52,6 +54,10 @@ async function sign(r: PurchaseRun, id: string) {
   r.setFeed({ kind: "event", event: r.consents.sign(id) });
   return r.purchase.awaitCart();
 }
+
+/** Записи об оставленном CART (Р46 п. 3): только причина и id CART — сумм, позиций и продавца нет. */
+const abandoned = (r: { tail: () => JournalEntry[] }) =>
+  r.tail().filter((e) => e.kind === "cart.abandoned").map((e) => ({ ...e, at: undefined, agent: undefined }));
 
 describe("Р44 п. 1–3 — корзина из нескольких позиций одного продавца", () => {
   it("две позиции: живая проверка каждой перед CART и перед заказом, итог — Σ, заказ — все позиции, Order.total = итогу CART", async () => {
@@ -206,9 +212,14 @@ describe("Р44 п. 4 — новая цена после согласования
     expect(r.purchase.cartMandate).toBeNull();
     expect(r.purchase.offers).toBeNull();
     expect(r.consents.mandates.get(old.id)!.status).toBe("ACTIVE");
+    // оставленный CART — в журнале (Р46 п. 3)
+    const left = [{ kind: "cart.abandoned", detail: "REFUSED_BEFORE_ORDER", mandate: old.id, at: undefined, agent: undefined }];
+    expect(abandoned(r)).toEqual(left);
 
     // новый показ — новая цена; CART по ней, заказ и оплата — только по новому CART
     const zones = await r.purchase.search();
+    // поиск из OFFERS — CART не было, новой записи нет
+    expect(abandoned(r)).toEqual(left);
     expect(zones.contour.find((o) => o.sku === "zavarnoy")!.product.price).toEqual({ amount: 41000, currency: "RUB" });
     const fresh = await r.purchase.cart(pick({ sku: "tartine", qty: 2 }, { sku: "zavarnoy", qty: 1 }), { idempotencyKey: "idem-cart-2" });
     const total = { amount: 2 * TARTINE + 41000, currency: "RUB" };
@@ -309,9 +320,12 @@ describe("К2а — новая выдача при подписанном CART �
     expect(r.purchase.state).toBe("CART_ACTIVE");
     expect(r.purchase.needsConfirmation).toBe(false);
     const from = r.stand.stub.calls.length;
+    expect(abandoned(r)).toEqual([]);
     await r.purchase.search();
     // новый поиск — только verify INTENT; по прежнему CART обращений нет
     expect(opsFrom(r, from)).toEqual([VERIFY]);
+    // оставленный CART — в журнале до того, как снимок стёрт (Р46 п. 3)
+    expect(abandoned(r)).toEqual([{ kind: "cart.abandoned", detail: "NEW_SEARCH", mandate: old.id, at: undefined, agent: undefined }]);
     expect(r.purchase.state).toBe("OFFERS");
     expect(r.purchase.cartMandate).toBeNull();
     expect(r.purchase.needsConfirmation).toBe(true);
@@ -471,5 +485,113 @@ describe("Р44 п. 5 — проверка по мандату непосредс
     expect(opsFrom(r, from)).toEqual([]);
     const cart = await r.purchase.cart(pick({ sku: "tartine", qty: 1, decision: humanA5Decision(shownIn(r), shown, shown.a5) }), { idempotencyKey: "idem-cart-1" });
     expect(cart.cart?.total).toEqual({ amount: 47000, currency: "RUB" });
+  });
+});
+
+// Р46 п. 4 (выбор 4а): два verify перед заказом (до registry_cache_ttl_sec каждый) могут состарить живые проверки.
+// Часы стенда двигает живая проверка: setImmediate — после сравнения ядром (микрозадачи) и во время verify (обращения к
+// стенду), синхронно — до ответа продавца.
+describe("Р46 п. 4 — возраст живой проверки перед заказом", () => {
+  // порог — из стендовых параметров, не литералом (ревью reviewer К4 № 1)
+  const MAX_AGE_MS = loadParams().live_check_max_age_sec * 1000;
+
+  /** Живая проверка по фиду магазина; `step(i)` — перед i-м обращением с момента `arm()`. */
+  function timed(shop: FeedShop) {
+    const inner = liveOffers(shop, () => stand!.clock);
+    let i = -1;
+    let step: (i: number) => void = () => {};
+    const src = {
+      calls: inner.calls,
+      fetch: (...args: Parameters<typeof inner.fetch>) => {
+        if (i >= 0) step(++i);
+        return inner.fetch(...args);
+      },
+      arm(s: (i: number) => void) {
+        i = 0;
+        step = s;
+      },
+      get armed() {
+        return i;
+      },
+    };
+    return src;
+  }
+  const later = (ms: number) => setImmediate(() => (stand!.clock = new Date(stand!.clock.getTime() + ms)));
+  const now = (ms: number) => (stand!.clock = new Date(stand!.clock.getTime() + ms));
+
+  async function onTimed(...lines: CartChoiceLine[]) {
+    const shop = shopWithPrices();
+    const live = timed(shop);
+    const r = await setup({ shops: [shop], live, shop: shopOrders(shop), payment: payments() });
+    await signedIntent(r);
+    await r.purchase.search();
+    const cart = await r.purchase.cart(pick(...lines), { idempotencyKey: "idem-cart-1" });
+    await sign(r, cart.id);
+    return { r, shop, live, cart };
+  }
+
+  it("проверки не устарели — повтора нет: одна живая проверка на позицию, заказ", async () => {
+    const { r, live } = await onTimed({ sku: "tartine", qty: 1 });
+    live.arm(() => {});
+    await r.purchase.placeOrder({ idempotencyKey: "idem-order-1" });
+    expect(live.armed).toBe(1);
+    expect(r.purchase.state).toBe("ORDERED");
+  });
+
+  it("после verify проверка старше live_check_max_age_sec — повтор ровно один раз без нового verify, затем заказ", async () => {
+    const { r, live } = await onTimed({ sku: "tartine", qty: 1 });
+    live.arm((i) => {
+      if (i === 1) later(MAX_AGE_MS + 1000);
+    });
+    const from = r.stand.stub.calls.length;
+    await r.purchase.placeOrder({ idempotencyKey: "idem-order-1" });
+    expect(live.armed).toBe(2);
+    // verify INTENT и CART — только до повтора
+    expect(opsFrom(r, from)).toEqual([VERIFY, VERIFY]);
+    expect(r.purchase.state).toBe("ORDERED");
+    expect(r.shop.calls).toHaveLength(1);
+    expect(r.tail().filter((e) => e.kind === "order.live_refused")).toEqual([]);
+  });
+
+  it("(б) повторная показала новую цену — путь Р44: заказа нет, выдача сброшена, CART оставлен", async () => {
+    const { r, shop, live, cart } = await onTimed({ sku: "tartine", qty: 1 });
+    live.arm((i) => {
+      if (i === 1) later(MAX_AGE_MS + 1000);
+      if (i === 2) shop.price("tartine", "999");
+    });
+    const from = r.stand.stub.calls.length;
+    const err = await r.purchase.placeOrder({ idempotencyKey: "idem-order-1" }).catch((e: unknown) => e);
+    // verify — только до повтора (ревью reviewer К4 № 3)
+    expect(opsFrom(r, from)).toEqual([VERIFY, VERIFY]);
+    expect(err).toBeInstanceOf(OrderRefused);
+    expect(err).toMatchObject({ next: "NEW_CART_MANDATE", codes: ["LIVE_PRICE_UP"] });
+    expect(live.armed).toBe(2);
+    expect(r.shop.calls).toEqual([]);
+    expect(r.purchase.state).toBe("OFFERS");
+    expect(r.purchase.offers).toBeNull();
+    expect(r.tail().filter((e) => e.kind === "cart.abandoned").map((e) => [e.detail, e.mandate])).toEqual([["REFUSED_BEFORE_ORDER", cart.id]]);
+  });
+
+  it("(а1) повторная к заказу тоже устарела (медленный продавец) — отказ LIVE_STALE путём Р44, второго круга нет", async () => {
+    const { r, live, cart } = await onTimed({ sku: "tartine", qty: 1 }, { sku: "zavarnoy", qty: 1 });
+    live.arm((i) => {
+      if (i === 2) later(MAX_AGE_MS + 1000);
+      // вторая позиция повторной проверки отвечает через минуту: первая к заказу старше live_check_max_age_sec
+      if (i === 4) now(MAX_AGE_MS + 1000);
+    });
+    const from = r.stand.stub.calls.length;
+    const err = await r.purchase.placeOrder({ idempotencyKey: "idem-order-1" }).catch((e: unknown) => e);
+    expect(opsFrom(r, from)).toEqual([VERIFY, VERIFY]);
+    expect(err).toBeInstanceOf(OrderRefused);
+    expect(err).toMatchObject({ next: "TELL_UNCONFIRMED", codes: ["LIVE_STALE"] });
+    // две позиции × ровно два круга
+    expect(live.armed).toBe(4);
+    expect(r.shop.calls).toEqual([]);
+    expect(r.purchase.state).toBe("OFFERS");
+    expect(r.purchase.cartMandate).toBeNull();
+    // не ценовой отказ — выдача остаётся (новый выбор из того же показа, Р44 п. 4)
+    expect(r.purchase.offers).not.toBeNull();
+    expect(r.tail().filter((e) => e.kind === "order.live_refused").map((e) => [e.reason, e.detail, e.ref])).toEqual([["LIVE_STALE", "TELL_UNCONFIRMED", "tartine"]]);
+    expect(r.tail().filter((e) => e.kind === "cart.abandoned").map((e) => [e.detail, e.mandate])).toEqual([["REFUSED_BEFORE_ORDER", cart.id]]);
   });
 });

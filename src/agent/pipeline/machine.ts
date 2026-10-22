@@ -3,6 +3,7 @@
 // сейчас». Запрещённый переход — дефект вызывающего или конвейера: покупка остановлена, запись agent.refused.
 // Состояние — только в памяти (Р38 п. 6): после перезапуска покупка не восстанавливается.
 import type { DiagCode } from "../../shared/diag-codes.js";
+import { SAFE_ID } from "../../shared/ids.js";
 
 export const PURCHASE_STATES = [
   /** стадия 0: покупка создана, допуск агента для неё не проверен */
@@ -93,9 +94,6 @@ export class PurchaseTransitionForbidden extends Error {
   }
 }
 
-/** mandate_id в журнале — только по маске идентификатора (как у клиента мандатов и адаптера, Р37 п. 3). */
-const MANDATE_ID = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/;
-
 export interface PurchaseMachineOptions {
   journal: PurchaseJournal;
   now?: () => Date;
@@ -128,7 +126,7 @@ export class PurchaseMachine {
 
   /** mandate_id INTENT для записей покупки — ставит стадия 1; не прошёл маску — записи без mandate. */
   bind(mandateId: string): void {
-    this.#mandate = MANDATE_ID.test(mandateId) ? mandateId : undefined;
+    this.#mandate = SAFE_ID.test(mandateId) ? mandateId : undefined;
   }
 
   get mandate(): { mandate?: string } {

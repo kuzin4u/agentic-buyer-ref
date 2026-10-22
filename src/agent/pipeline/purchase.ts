@@ -10,7 +10,7 @@ import { liveCheck, type A5SignalCode, type CatalogIssueCode, type CatalogProduc
 import { ruleForDeclineReason } from "../declines/index.js";
 import { MandateRefused, type MandateClient } from "../mandates/index.js";
 import { issuedByShell, spend } from "../policy/a5-issued.js";
-import { acceptedA5, cartTotal, classifyOffer, mayDraftCart, mayOrder, type CartPurchase, type HumanA5Decision, type OfferVerdict, type OrderNext } from "../policy/catalog.js";
+import { acceptedA5, cartTotal, classifyOffer, mayDraftCart, mayOrder, type CartPurchase, type HumanA5Decision, type OfferVerdict, type OrderDecision, type OrderNext } from "../policy/catalog.js";
 import { confirmThreshold, currencySupported, mandateRefusal, mayAuthorize, needsConfirmation, type PaymentDecision, type Thresholds } from "../policy/payment.js";
 import type { SplitWindow } from "../policy/split.js";
 import type { LiveOfferSource } from "../ports/catalog.js";
@@ -417,26 +417,21 @@ export class Purchase {
         this.#halt("MANDATE_REPLY_MISMATCH");
       }
       this.#held(intent, cart);
-      for (const [i, line] of basket.lines.entries()) {
-        const offer = offers[i]!;
-        const req = { sku: line.sku, quantity: line.qty, ...(this.o.region !== undefined && { region: this.o.region }) };
-        const live = await liveCheck(offer.product, req, this.o.live, this.o.params, () => this.now().getTime());
-        this.#alive();
-        const d = mayOrder(live);
-        if (d.allow) continue;
-        for (const reason of d.codes) this.#record({ kind: "order.live_refused", reason, detail: d.next, ...skuRef(line.sku), ...merchantRef(offer.merchantId) });
-        // прежний CART больше не используется ничем и наружу как текущий не отдаётся — после любого отказа (Р44 п. 4,
-        // выбор 4а; решение владельца по ревью КТ1 п. 1); новая цена — и выдача: новый CART только после нового поиска (Т6)
-        this.#abandon("REFUSED_BEFORE_ORDER");
-        this.#cart = null;
-        this.#lines = null;
-        if (d.next === "NEW_CART_MANDATE") this.#zones = null;
-        this.#machine.to("OFFERS");
-        throw new OrderRefused(d.next, d.codes);
-      }
+      let checked = await this.#liveBeforeOrder(basket.lines, offers);
       // проверка по мандату непосредственно перед заказом (Р44 п. 5, Р-149): остаток не меньше итога CART, продавец и
       // валюта в пределах — иначе STOPPED до заказа, у продавца не остаётся неоплаченного заказа; ворота стадии 5 остаются
       await this.#scope(intent, cart);
+      // два verify могли состарить живые проверки (до registry_cache_ttl_sec каждый): хоть одна старше
+      // live_check_max_age_sec — все повторяются ровно один раз, без нового verify (Р46 п. 4, выбор 4а); итог повторной —
+      // как первой (б). Возраст повторной — прямо перед заказом: старше — отказ LIVE_STALE путём Р44, второго круга нет (а1)
+      if (checked.some((at) => this.#stale(at))) {
+        checked = await this.#liveBeforeOrder(basket.lines, offers);
+        this.#held(intent, cart);
+        const i = checked.findIndex((at) => this.#stale(at));
+        // решение — политикой (инвариант 3); `!d.allow` всегда истинно при ok: false — сужение типа
+        const d = i >= 0 ? mayOrder({ ok: false, codes: ["LIVE_STALE"], offer: null }) : null;
+        if (d !== null && !d.allow) this.#refuseOrder(basket.lines[i]!.sku, offers[i]!, d);
+      }
       const shopId = offers[0]!.shopId;
       const order = await this.#guard(async () => {
         const reply = snapshot(await this.o.shop.order({ shopId, items: basket.lines.map((l) => ({ sku: l.sku, qty: l.qty })), cartMandateId: cart.id }, m));
@@ -696,6 +691,40 @@ export class Purchase {
     if (d === null || d.allow) return;
     this.#record({ kind: "agent.refused", reason: d.code, ...(d.mandate && maskedMandate(d.mandate.id)) });
     this.#halt(d.code);
+  }
+
+  /** Живая проверка каждой позиции перед заказом (Р32 п. 3, Р44 п. 2): до первой не ok — отказ путём Р44. Итог — время
+   *  каждой проверки (`checkedAt`, мс) для оценки возраста перед заказом (Р46 п. 4). */
+  async #liveBeforeOrder(lines: readonly CartLine[], offers: readonly Offer[]): Promise<number[]> {
+    const at: number[] = [];
+    for (const [i, line] of lines.entries()) {
+      const offer = offers[i]!;
+      const req = { sku: line.sku, quantity: line.qty, ...(this.o.region !== undefined && { region: this.o.region }) };
+      const live = await liveCheck(offer.product, req, this.o.live, this.o.params, () => this.now().getTime());
+      this.#alive();
+      const d = mayOrder(live);
+      if (!d.allow) this.#refuseOrder(line.sku, offer, d);
+      at.push(Date.parse(d.offer.checkedAt));
+    }
+    return at;
+  }
+
+  /** Проверка старше live_check_max_age_sec по часам агента; время не разобралось — старше (инвариант 4). */
+  #stale(at: number): boolean {
+    return !(this.now().getTime() - at <= this.o.params.live_check_max_age_sec * 1000);
+  }
+
+  /** Отказ перед заказом (Р44 п. 4): записи order.live_refused, оставленный CART, снимок стёрт, CART_ACTIVE → OFFERS. */
+  #refuseOrder(sku: string, offer: Offer, d: Extract<OrderDecision, { allow: false }>): never {
+    for (const reason of d.codes) this.#record({ kind: "order.live_refused", reason, detail: d.next, ...skuRef(sku), ...merchantRef(offer.merchantId) });
+    // прежний CART больше не используется ничем и наружу как текущий не отдаётся — после любого отказа (Р44 п. 4,
+    // выбор 4а; решение владельца по ревью КТ1 п. 1); новая цена — и выдача: новый CART только после нового поиска (Т6)
+    this.#abandon("REFUSED_BEFORE_ORDER");
+    this.#cart = null;
+    this.#lines = null;
+    if (d.next === "NEW_CART_MANDATE") this.#zones = null;
+    this.#machine.to("OFFERS");
+    throw new OrderRefused(d.next, d.codes);
   }
 
   /** Оставленный CART — запись до того, как снимок стёрт (Р46 п. 3); CART не было — записи нет. Мандат — только CART:

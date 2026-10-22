@@ -47,6 +47,13 @@ export type ContourMode = "stub" | "stand";
 
 export interface ContourOptions {
   pao: ContourMode;
+  /** только для "stand": часы клиента ПАО агента (x-timestamp подписи) — тест двигает их вместе с часами стенда */
+  now?: () => Date;
+  /** только для "stand", ПОДМЕНА ДО PS-11 (Р47, К4, решение владельца — вариант (а)): ОПКЦ стенда — заглушка, ADP
+   *  продавец не достигает. Заглушка отвечает продавцу отказом, а копию сообщения эквайрера тест передаёт в настоящий
+   *  ADP стенда (`POST /adp/v1/decide`): запрос подтверждения, событие и решение банка — настоящие. После PS-11 —
+   *  снять. */
+  adpUntilPs11?: boolean;
   /** только для "stub": настройки обёртки PaoStand (ключи, обработчики операций, незарегистрированный агент) */
   stub?: StandOptions;
 }
@@ -86,6 +93,8 @@ export interface Merchants {
 }
 
 export interface Contour {
+  /** только "stand" с `adpUntilPs11`: ответы ADP стенда на копии сообщений эквайрера (подмена до PS-11) */
+  adpDecisions?(): Promise<unknown[]>;
   readonly mode: ContourMode;
   readonly agentCode: string;
   readonly keysDir: string;
@@ -157,10 +166,11 @@ function captureCredentials(app: Stand["app"], out: string[]): void {
 }
 
 /** Повтор compose до AG-09 (см. шапку): связка ключей и адаптер ПАО с портом подписи. */
-function agent(o: { dir: string; baseUrl: string; agentCode: string; params: StandParams; journal: MemoryJournal; now?: () => Date }) {
+function agent(o: { dir: string; baseUrl: string; agentCode: string; params: StandParams; journal: MemoryJournal; now?: () => Date; paoNow?: () => Date }) {
   const ring = new KeyRing({ dir: o.dir, params: o.params, journal: o.journal, ...(o.now && { now: o.now }) });
   // Часы клиента ПАО — системные, как в tests/support/core.ts: окно времени подписи проверяет сервер по своим часам.
-  const pao = { baseUrl: o.baseUrl, agentCode: o.agentCode, params: o.params, sleep: async () => {}, journal: o.journal };
+  // `paoNow` — только для стенда, когда тест двигает часы стенда (setClock) и клиента вместе (истечение подтверждения, Р47)
+  const pao = { baseUrl: o.baseUrl, agentCode: o.agentCode, params: o.params, sleep: async () => {}, journal: o.journal, ...(o.paoNow && { now: o.paoNow }) };
   const platform = new PaoPlatform({ ...pao, signing: ring.port() });
   let admitted = false;
   return {
@@ -189,7 +199,7 @@ export function shopBy(behaviour: ShopBehaviour): MerchantFixture {
 }
 
 export async function createContour(o: ContourOptions): Promise<Contour> {
-  return o.pao === "stub" ? stubContour(o.stub) : standContour();
+  return o.pao === "stub" ? stubContour(o.stub) : standContour(o.now, o.adpUntilPs11 === true);
 }
 
 async function stubContour(opts: StandOptions | undefined): Promise<Contour> {
@@ -235,7 +245,7 @@ async function stubContour(opts: StandOptions | undefined): Promise<Contour> {
   };
 }
 
-async function standContour(): Promise<Contour> {
+async function standContour(paoNow?: () => Date, adpUntilPs11 = false): Promise<Contour> {
   const fixture = AGENT_FIXTURES.find((f) => f.registered && f.class === "BUYER");
   if (!fixture) throw new Error("в AGENT_FIXTURES нет зарегистрированного агента BUYER");
   const params = loadParams();
@@ -257,7 +267,17 @@ async function standContour(): Promise<Contour> {
   try {
     dir = mkdtempSync(join(tmpdir(), "buyref-contour-"));
     stand = createStand();
-    emulator = createMerchants(stand);
+    const adp: Promise<unknown>[] = [];
+    const s = stand;
+    emulator = adpUntilPs11
+      ? createMerchants(stand, {
+          // до PS-11: решение заглушки — отказ продавцу; решение ADP — по копии сообщения, без влияния на ответ продавца
+          decide: (msg) => {
+            adp.push(s.app.inject({ method: "POST", url: "/adp/v1/decide", payload: msg }).then((res) => res.json() as unknown));
+            return { approved: false, reason: "CONFIRMATION_REQUIRED" };
+          },
+        })
+      : createMerchants(stand);
     record(stand.app, "pao", log);
     record(emulator.app, "merchants", log);
     captureCredentials(stand.app, secrets);
@@ -266,7 +286,7 @@ async function standContour(): Promise<Contour> {
     const decision = stand.admit(agentApplication(fixture, { alg: descriptor.alg, public_key: descriptor.public_key }), fixture.operator);
     if (!decision.admitted) throw new Error(`стенд не допустил агента фикстуры: ${JSON.stringify(decision)}`);
     const [baseUrl, merchantsUrl] = await Promise.all([stand.listen(), emulator.listen()]);
-    const a = agent({ dir, baseUrl, agentCode: fixture.agent_code, params, journal });
+    const a = agent({ dir, baseUrl, agentCode: fixture.agent_code, params, journal, ...(paoNow && { paoNow }) });
     ring = a.ring;
     const signing = a.ring.port();
 
@@ -320,6 +340,7 @@ async function standContour(): Promise<Contour> {
       stand,
       calls: () => log.map((c) => ({ ...c })),
       violations: () => [],
+      adpDecisions: () => Promise.all(adp),
       issuedSecrets: () => [...secrets],
       close: release,
     };

@@ -54,11 +54,17 @@ export interface StandPurchaseOptions {
   issue?: (real: PaymentPlatform["issuePaymentPackage"]) => PaymentPlatform["issuePaymentPackage"];
   /** уведомление оболочки (Р47 п. 5, В3) */
   notify?: (code: "CONFIRMATION_PENDING") => void | Promise<void>;
+  /** часы клиента ПАО и модуля подтверждений — тест двигает их вместе с часами стенда (истечение, РП51 п. 6) */
+  now?: () => Date;
+  /** таймер модуля подтверждений — тест срабатывает его сам (срок решения — минуты по order_hold_sec Платформы) */
+  confirmationTimer?: (fn: () => void, ms: number) => () => void;
+  /** ПОДМЕНА ДО PS-11: авторизация продавца доходит до ADP стенда копией сообщения (createContour, `adpUntilPs11`) */
+  adpUntilPs11?: boolean;
 }
 
 /** Контур со стендом и витринами после start(), покупка на адаптере витрин. Закрыть — `c.close()` у вызывающего. */
 export async function standPurchase(o: StandPurchaseOptions = {}) {
-  const c: Contour = await createContour({ pao: "stand" });
+  const c: Contour = await createContour({ pao: "stand", ...(o.now && { now: o.now }), ...(o.adpUntilPs11 && { adpUntilPs11: true }) });
   const self = await c.start();
   const { stand } = c;
   if (!stand) throw new Error("контур без стенда");
@@ -75,6 +81,8 @@ export async function standPurchase(o: StandPurchaseOptions = {}) {
     port: c.platform,
     journal: c.journal,
     params,
+    ...(o.now && { now: o.now }),
+    ...(o.confirmationTimer && { timer: o.confirmationTimer }),
     wake: async () => {
       const items = await c.platform.listEvents(cursor);
       if (items.length === 0) await pause(20);

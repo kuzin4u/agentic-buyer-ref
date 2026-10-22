@@ -108,6 +108,9 @@ export interface Contour {
   calls(): ContourCall[];
   /** нарушения схемы ПАО, найденные PaoStub; в режиме "stand" — всегда [] (схему проверяет стенд ответом) */
   violations(): string[];
+  /** только "stand": `token_ref` и криптограммы из ответов стенда на POST /pao/v1/credentials — образцы для проверки, что
+   *  реквизит не утёк в журнал, вывод и ошибки (Р45 п. 3); в журнал обращений они не попадают */
+  issuedSecrets(): string[];
   close(): Promise<void>;
 }
 
@@ -138,6 +141,17 @@ function record(app: Stand["app"], target: ContourCall["target"], log: ContourCa
       ...(nonce !== undefined && { nonce }),
       ...(idempotencyKey !== undefined && { idempotencyKey }),
     });
+    return payload;
+  });
+}
+
+/** Реквизит из ответов на выдачу — отдельно от журнала обращений (в нём тел нет): только образцы для теста утечки. */
+function captureCredentials(app: Stand["app"], out: string[]): void {
+  app.addHook("onSend", async (req, reply, payload) => {
+    if (req.method === "POST" && req.url.split("?")[0] === "/pao/v1/credentials" && reply.statusCode === 201 && typeof payload === "string") {
+      const p = (JSON.parse(payload) as { payload?: Record<string, unknown> }).payload ?? {};
+      for (const v of [p.token_ref, p.cryptogram]) if (typeof v === "string" && v !== "") out.push(v);
+    }
     return payload;
   });
 }
@@ -210,6 +224,7 @@ async function stubContour(opts: StandOptions | undefined): Promise<Contour> {
         replayed: c.replayed,
       })),
     violations: () => [...paoStand.stub.violations],
+    issuedSecrets: () => [],
     async close() {
       try {
         a.ring.close();
@@ -226,6 +241,7 @@ async function standContour(): Promise<Contour> {
   const params = loadParams();
   const journal = new MemoryJournal();
   const log: ContourCall[] = [];
+  const secrets: string[] = [];
   let dir: string | undefined;
   let stand: Stand | undefined;
   let emulator: MerchantsStand | undefined;
@@ -244,6 +260,7 @@ async function standContour(): Promise<Contour> {
     emulator = createMerchants(stand);
     record(stand.app, "pao", log);
     record(emulator.app, "merchants", log);
+    captureCredentials(stand.app, secrets);
     // Допуск — заявлением оператора по фикстуре: только открытый ключ (инвариант 2).
     const { descriptor } = generateKey(dir);
     const decision = stand.admit(agentApplication(fixture, { alg: descriptor.alg, public_key: descriptor.public_key }), fixture.operator);
@@ -303,6 +320,7 @@ async function standContour(): Promise<Contour> {
       stand,
       calls: () => log.map((c) => ({ ...c })),
       violations: () => [],
+      issuedSecrets: () => [...secrets],
       close: release,
     };
   } catch (e) {

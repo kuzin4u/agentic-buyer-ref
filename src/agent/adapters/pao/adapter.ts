@@ -137,7 +137,13 @@ export interface PaoPlatformOptions {
   sleep?: (ms: number) => Promise<void>;
   now?: () => Date;
   nonce?: () => string;
+  /** монотонные часы в мс — длительность попыток выдачи реквизита для её общего срока (Р45 п. 2.4); по умолчанию
+   *  performance.now */
+  monotonic?: () => number;
 }
+
+/** Выдача реквизита (Р45 п. 2.4–2.5): свой тайм-аут и общий срок попыток вместе с ожиданием повторов. */
+const CREDENTIALS: PaoOperationKey = "POST /pao/v1/credentials";
 
 /** Retry-After в секундах; по копии ПАО — integer ≥ 0. Дату и мусор не принимаем: повтора не будет. */
 function retryAfterSec(v: string | null): number | undefined {
@@ -265,8 +271,7 @@ export class PaoPlatform implements PaymentPlatform {
   /** Одно обращение без повторов клиента; тайм-аут — pao_request_timeout_ms. Retry-After и HTTP-статус ответа — в last.
    *  Без подписанта — только операции без подписи (конфигурация); подписанная — PAO_CLIENT_SIGNER_MISSING до запроса.
    *  Свой fetch получает init целиком, вместе с redirect: "manual" клиента (передача #34 п. 4). */
-  private client(last: { retryAfter?: number; status?: number }, signer?: ReturnType<RequestSigning["current"]>): PaoClient {
-    const timeoutMs = this.o.params.pao_request_timeout_ms;
+  private client(last: { retryAfter?: number; status?: number }, signer?: ReturnType<RequestSigning["current"]>, timeoutMs = this.o.params.pao_request_timeout_ms): PaoClient {
     const f = this.fetchImpl;
     return new PaoClient({
       baseUrl: this.o.baseUrl,
@@ -295,6 +300,14 @@ export class PaoPlatform implements PaymentPlatform {
     const key = args.idempotencyKey ?? null;
     let waitedSec = 0;
     let rotations = 0;
+    // выдача реквизита — свой тайм-аут (выше предела обработчика Платформы) и общий срок: попытки и ожидание повторов
+    // вместе — не больше registry_cache_ttl_sec (Р45 п. 2.4, В2а; инвариант 4)
+    const credentials = op === CREDENTIALS;
+    const timeoutMs = credentials ? this.o.params.pao_credentials_timeout_ms : this.o.params.pao_request_timeout_ms;
+    const clock = this.o.monotonic ?? (() => performance.now());
+    let spentMs = 0;
+    // ещё одна попытка выдачи (после ожидания `waitMs`) помещается в срок; NaN часов — не помещается (fail-closed)
+    const fits = (waitMs: number) => !credentials || spentMs + waitMs + timeoutMs <= this.o.params.registry_cache_ttl_sec * 1000;
     // попытки обращения для журнала: повторы тем же ключом и переход на другой ключ (Т15)
     let tries = 0;
     for (let attempt = 1; ; ) {
@@ -302,8 +315,9 @@ export class PaoPlatform implements PaymentPlatform {
       const signer = this.o.signing.current(); // остановлен — SignerStopped, обращения нет
       tries++;
       let failure: PlatformFailure;
+      const began = clock();
       try {
-        const r = await this.client(last, signer).call(op, args);
+        const r = await this.client(last, signer, timeoutMs).call(op, args);
         // «Открыто» № 4 (ревью AG-02): ответ 2xx — по схеме ПАО до перевода; значение вне перечня (`status`, `outcome`,
         // `decision`, `kind`…) или пропущенное обязательное поле — UNKNOWN. Неизвестные поля допускаются (validatePao,
         // ПАО §7). Текст нарушений (в нём значения из тела) в отказ не переносится (инвариант 1). Ключ со статусом вне
@@ -328,6 +342,7 @@ export class PaoPlatform implements PaymentPlatform {
           failure = new PlatformFailure("UNKNOWN", "never", null, last.status, key, "ответ ПАО не по схеме");
         }
       }
+      spentMs += clock() - began;
       // попытка — только запрос, ушедший в сеть (ревью К2.2 № 1): отказ клиента до сети (PAO_CLIENT_SIGNER_MISSING) — не попытка;
       // SignerStopped и пустой Idempotency-Key — тоже до сети, сюда не доходят
       if (failure.code !== "PAO_CLIENT_SIGNER_MISSING") {
@@ -343,6 +358,8 @@ export class PaoPlatform implements PaymentPlatform {
       if (rule.action === "ROTATE_KEY") {
         this.o.signing.keyRevoked(signer.kid, failure);
         if (rotations >= (rule.maxRetries ?? 0)) throw failure;
+        // повтор выдачи другим ключом — тоже в пределах срока (Р45 п. 2.4; ревью reviewer К3 № 1)
+        if (!fits(0)) throw failure;
         rotations++;
         continue;
       }
@@ -352,6 +369,9 @@ export class PaoPlatform implements PaymentPlatform {
       // Без Retry-After повтор не раньше срока невозможен — не повторяем (ПАО §6, инвариант 9).
       const waitSec = last.retryAfter;
       if (waitSec === undefined || waitedSec + waitSec > PAO_RETRY_AFTER_MAX_SEC) throw failure;
+      // повтор выдачи — только если до конца срока остаётся не меньше ожидания и ещё одной попытки целиком (В2а)
+      if (!fits(waitSec * 1000)) throw failure;
+      spentMs += waitSec * 1000;
       waitedSec += waitSec;
       await this.sleep(waitSec * 1000);
     }
@@ -430,6 +450,14 @@ export class PaoPlatform implements PaymentPlatform {
     return this.call("POST /pao/v1/credentials", { body: map.credentialDraftToPao(draft, this.cur), idempotencyKey: keyOf(m) }, (r) =>
       map.credentialFromPao(r, draft.mandate.id, this.o.agentCode),
     );
+  }
+
+  /** Выдача с запечатанным пакетом (Р45 п. 3): тот же POST, `payload` — только в пакете. */
+  async issuePaymentPackage(draft: Parameters<PaymentPlatform["issuePaymentPackage"]>[0], m: Mutation) {
+    return this.call("POST /pao/v1/credentials", { body: map.credentialDraftToPao(draft, this.cur), idempotencyKey: keyOf(m) }, (r) => ({
+      credential: map.credentialFromPao(r, draft.mandate.id, this.o.agentCode),
+      sealed: map.packageFromPao(r, draft),
+    }));
   }
 
   async requestConfirmation(draft: Parameters<PaymentPlatform["requestConfirmation"]>[0], m: Mutation) {

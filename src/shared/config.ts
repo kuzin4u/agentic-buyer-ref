@@ -14,6 +14,10 @@ const secToMs = count.max(Math.floor(Number.MAX_SAFE_INTEGER / 1000));
  *  РП24 платформы — Retry-After у 503 в границах 0…30 с; см. STATUS, «Передача для AG-03». */
 export const PAO_RETRY_AFTER_MAX_SEC = 30;
 
+/** Предел обработчика POST /pao/v1/credentials у Платформы (передача #47 п. 3: до четырёх внешних вызовов по 5 с, предел
+ *  30 с). Свойство Платформы, не стендовое значение (Р45 п. 2.5): тайм-аут агента на выдачу — строго больше. */
+export const PAO_CREDENTIALS_HANDLER_MAX_MS = 30_000;
+
 export const StandParamsSchema = z
   .strictObject({
   _comment: z.string().optional(),
@@ -32,6 +36,8 @@ export const StandParamsSchema = z
   revocation_propagation_max_ms: count,
   pao_max_attempts: positive,
   pao_request_timeout_ms: positive,
+  // Тайм-аут выдачи реквизита POST /pao/v1/credentials (Р45 п. 2.5): выше предела обработчика Платформы.
+  pao_credentials_timeout_ms: positive.max(TIMER_MAX_MS),
   // Живая проверка перед заказом (Р32 п. 7): в checkLiveOffer ядра передаются в мс.
   live_check_timeout_ms: positive.max(TIMER_MAX_MS),
   live_check_max_age_sec: secToMs,
@@ -52,6 +58,13 @@ export const StandParamsSchema = z
     (p) => (p.pao_max_attempts * p.pao_request_timeout_ms) / 1000 + PAO_RETRY_AFTER_MAX_SEC <= p.registry_cache_ttl_sec,
     { message: "pao_max_attempts × pao_request_timeout_ms + 30 с (РП24) больше registry_cache_ttl_sec" },
   )
+  // Выдача реквизита (Р45 п. 2.4–2.5): тайм-аут строго больше предела обработчика Платформы, не меньше общего тайм-аута ПАО
+  // и вмещается в registry_cache_ttl_sec — срок выдачи вместе с повторами (В2а, инвариант 4).
+  .refine((p) => p.pao_credentials_timeout_ms > PAO_CREDENTIALS_HANDLER_MAX_MS, {
+    message: `pao_credentials_timeout_ms не больше предела обработчика Платформы ${PAO_CREDENTIALS_HANDLER_MAX_MS} мс`,
+  })
+  .refine((p) => p.pao_credentials_timeout_ms >= p.pao_request_timeout_ms, { message: "pao_credentials_timeout_ms меньше pao_request_timeout_ms" })
+  .refine((p) => p.pao_credentials_timeout_ms <= p.registry_cache_ttl_sec * 1000, { message: "pao_credentials_timeout_ms больше registry_cache_ttl_sec" })
   // Срок поиска вмещает хотя бы одно обращение к витрине (Р44 п. 6).
   .refine((p) => p.shop_search_deadline_ms >= p.shop_request_timeout_ms, { message: "shop_search_deadline_ms меньше shop_request_timeout_ms" });
 

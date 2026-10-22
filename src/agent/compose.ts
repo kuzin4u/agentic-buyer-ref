@@ -17,7 +17,8 @@ import { KeyRing, SignerKeyRejected, SignerStopped } from "./signer/index.js";
 import { Purchase } from "./pipeline/index.js";
 import { SplitWindow } from "./policy/index.js";
 import type { LiveOfferSource } from "./ports/catalog.js";
-import type { OfferSource, PaymentSteps, ShopPort } from "./ports/shop.js";
+import type { OfferSource, PaymentSteps, ShopPaymentPort, ShopPort } from "./ports/shop.js";
+import { ContourPayment } from "./payment-package/index.js";
 import {
   AGENT_DIAG,
   AGENT_STOP_CODES,
@@ -58,6 +59,9 @@ export interface AgentCore {
   /** Адаптер витрин продавцов (Р42): `offers`, `live` и `shop` для `purchase()`; обращения подписаны действующим ключом
    *  агента, попытки — в журнал ядра (shop.call). Профиль магазина — от вызывающего (до kuzin4u/agentic-ps-platform#45). */
   shops(o: ShopsOptions): ShopsAdapter;
+  /** Шаги стадий 4–6 профиля contour (Р45 п. 6): реквизит по ПАО этой платформы и пакет агентской оплаты продавцу через
+   *  `shop` (адаптер витрин); до событий операции итог не подтверждается (OPERATION_RESULT_UNCONFIRMED). */
+  payment(shop: ShopPaymentPort): PaymentSteps;
   /** Самопроверка при старте (Р36 п. 6): отчёт последнего start() (и успешного, и с отказом); до start() — null. */
   selfCheck(): SelfCheckReport | null;
   /** Стадия 0 с самопроверкой (Р36 п. 6, дополнение 2). Порядок: ключи из хранилища и выбор ключа допуска, курсор ленты
@@ -260,6 +264,7 @@ export function createAgentCore(o: AgentCoreOptions): AgentCore {
         journal,
         now,
       }),
+    payment: (shop) => new ContourPayment({ platform, shop, journal, now }),
     // Ключи загружаются до обращений к Платформе (сбой хранилища — без сети), затем курсор ленты и конфигурация, затем
     // GET /pao/v1/agent; курсор и конфигурация — один раз за start, повтор допуска (SIGNATURE_INVALID) их не повторяет.
     start: async () => {

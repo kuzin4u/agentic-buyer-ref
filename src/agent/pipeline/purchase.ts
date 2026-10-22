@@ -15,7 +15,8 @@ import type { SplitWindow } from "../policy/split.js";
 import type { LiveOfferSource } from "../ports/catalog.js";
 import type { FeedItem } from "../ports/events.js";
 import type { Mutation } from "../ports/mutation.js";
-import { ShopFailure, type OfferSource, type PaymentContext, type PaymentSteps, type ShopOffers, type ShopOrder, type ShopPort, type ShopUnavailable, type ShopUnavailableCause } from "../ports/shop.js";
+import { orderRefIssue, type OrderRefIssue } from "../payment-package/order-ref.js";
+import { PaymentFailure, ShopFailure, type OfferSource, type PaymentContext, type PaymentSteps, type ShopOffers, type ShopOrder, type ShopPort, type ShopUnavailable, type ShopUnavailableCause } from "../ports/shop.js";
 import { PurchaseMachine, PurchaseTransitionForbidden, allowed, type PurchaseJournal, type PurchaseState, type StopCause } from "./machine.js";
 
 /** Записи конвейера сверх записей машины (Р38 п. 5, Р37 п. 5). */
@@ -53,7 +54,9 @@ export interface PipelineJournal extends PurchaseJournal {
       | { at: string; kind: "agent.refused"; reason: "CART_QTY_INVALID"; ref?: string; mandate?: string }
       /** решение человека по A5 не выдано оболочкой (Р40 п. 4) — отказ действовать; ref — sku, merchant — код продавца, по
        *  маске; mandate — корневой INTENT из машины */
-      | { at: string; kind: "agent.refused"; reason: "A5_DECISION_FORGED"; ref?: string; mandate?: string; merchant?: string },
+      | { at: string; kind: "agent.refused"; reason: "A5_DECISION_FORGED"; ref?: string; mandate?: string; merchant?: string }
+      /** номер заказа продавца не передаётся дальше (Р45, 9а): detail — только причина, значения нет */
+      | { at: string; kind: "agent.refused"; reason: "SHOP_ORDER_REF_INVALID"; detail: OrderRefIssue; mandate?: string },
   ): void;
 }
 
@@ -426,6 +429,13 @@ export class Purchase {
       const shopId = offers[0]!.shopId;
       const order = await this.#guard(async () => {
         const reply = snapshot(await this.o.shop.order({ shopId, items: basket.lines.map((l) => ({ sku: l.sku, qty: l.qty })), cartMandateId: cart.id }, m));
+        // номер заказа продавца — до снимка (Р45, решение 9а): не по маске или похож на номер карты — ни в снимок, ни в
+        // журнал; у продавца остаётся неоплаченный заказ; стадия 5 проверяет ещё раз (второй рубеж)
+        const issue = orderRefIssue(reply.orderId);
+        if (issue !== null) {
+          this.#record({ kind: "agent.refused", reason: "SHOP_ORDER_REF_INVALID", detail: issue, ...maskedMandate(cart.id) });
+          this.#halt("SHOP_ORDER_REF_INVALID");
+        }
         if (reply.total.amount !== basket.total.amount || reply.total.currency !== basket.total.currency) this.#halt("ORDER_REPLY_MISMATCH");
         return reply;
       });
@@ -463,14 +473,16 @@ export class Purchase {
       if (!this.needsConfirmation) this.#machine.forbid("CONFIRMING");
       await this.#scope(c.intent, c.cart);
       this.#machine.to("CONFIRMING");
-      const status = await this.#guard(() => this.o.payment.confirm(copy(c), signal));
+      const status = await this.#guard(() => this.o.payment.confirm(this.#forPayment(c), signal));
       this.#held(c.intent, c.cart);
       if (status !== "APPROVED") this.#halt("CONFIRMATION_REQUIRED");
       this.#approved = true;
     });
   }
 
-  /** Стадия 5: авторизация через порт (AG-11): реквизит и пакет продавцу; итог — из события Платформы (инвариант 8).
+  /** Стадия 5: авторизация через порт (AG-11): реквизит и пакет продавцу; итог — из события Платформы (инвариант 8). До
+   *  событий операции (PS-16) порт профиля contour отвечает PaymentFailure OPERATION_RESULT_UNCONFIRMED — STOPPED, место в
+   *  окне дробления занято, повторной оплаты нет: из STOPPED переходов нет (Р45 п. 5).
    *  Подтверждение нужно, а APPROVED не получен (из ORDERED или пока стадия 4 ждёт) — запрещённый переход. DECLINED —
    *  STOPPED с кодом причины (SPEC §7б); Платформа требует подтверждения — STOPPED CONFIRMATION_REQUIRED (инвариант 7). */
   authorize(m: Mutation): Promise<Operation> {
@@ -486,7 +498,16 @@ export class Purchase {
       this.#machine.to("AUTHORIZING");
       const slot = this.o.split.open(c.intent.id, this.#total(c.cart));
       const op = await this.#guard(async () => {
-        const reply = snapshot(await this.o.payment.authorize(copy(c), m));
+        let reply: Operation;
+        try {
+          reply = snapshot(await this.o.payment.authorize(this.#forPayment(c), m));
+        } catch (e) {
+          // сбой или неизвестный исход (в том числе пакет передан, итог не подтверждён — Р45 п. 5) — место занято
+          slot.settle("UNKNOWN");
+          // шаг прерван остановкой покупки (Р45, Б2в (а)) — наружу та же ошибка, что у остановленной стадии
+          if (e === this.#machine.stopped.reason) throw new PurchaseStopped(this.#machine.reason ?? "UNKNOWN");
+          throw e;
+        }
         // отказ и CONFIRMATION_REQUIRED окно не занимают; сбой и неизвестный исход — занимают (fail-closed)
         if (reply.status === "DECLINED" || reply.status === "CONFIRMATION_REQUIRED") slot.settle("REFUSED");
         else if (reply.status === "AUTHORIZED") slot.settle("APPROVED");
@@ -606,10 +627,15 @@ export class Purchase {
     return zones;
   }
 
-  #context(): PaymentContext {
+  #context(): Omit<PaymentContext, "signal" | "sending"> {
     const [offer] = this.#need(this.#lines);
     if (offer === undefined) this.#halt("PIPELINE_TRANSITION_FORBIDDEN");
     return { intent: this.#need(this.#intent), cart: this.#need(this.#cart), shopId: offer.shopId, merchantId: offer.merchantId, order: this.#need(this.#order) };
+  }
+
+  /** Контекст шагу оплаты: копия снимков и связь с машиной — сигнал остановки и отметка «пакет уходит» (Р45, Б2в). */
+  #forPayment(c: Omit<PaymentContext, "signal" | "sending">): PaymentContext {
+    return { ...copy(c), signal: this.#machine.stopped, sending: () => this.#machine.sending() };
   }
 
   /** Стадия: переход не разрешён таблицей или идёт другая стадия — отказ машины до работы стадии (без обращений). */
@@ -674,9 +700,15 @@ export class Purchase {
       result = await step();
     } catch (e) {
       if (e instanceof PurchaseTransitionForbidden || e instanceof PurchaseStopped) throw e;
-      // отказ витрины на заказе — остановка этой сделки, не агента (Р42 п. 4)
+      // отказ витрины на заказе и шага оплаты — остановка этой сделки, не агента (Р42 п. 4, Р45)
       const code =
-        e instanceof MandateRefused ? e.reason : e instanceof PlatformFailure ? e.code : e instanceof ShopFailure ? e.code : (this.o.failureCode?.(e) ?? "UNKNOWN");
+        e instanceof MandateRefused
+          ? e.reason
+          : e instanceof PlatformFailure
+            ? e.code
+            : e instanceof ShopFailure || e instanceof PaymentFailure
+              ? e.code
+              : (this.o.failureCode?.(e) ?? "UNKNOWN");
       if (!waits.has(code)) this.#machine.stop(code);
       throw e;
     }

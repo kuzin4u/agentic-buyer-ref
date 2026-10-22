@@ -60,6 +60,10 @@ export const AGENT_DIAG_CODES = [
   "MERCHANT_CODE_UNKNOWN",
   // общий срок стадии поиска истёк (Р44 п. 6): оставшиеся витрины недоступны в этой выдаче
   "SHOP_SEARCH_DEADLINE",
+  // стадия 5 (Р45 п. 2.1): номер заказа продавца не по маске ссылки или похож на номер карты — обращения за реквизитом нет
+  "SHOP_ORDER_REF_INVALID",
+  // стадия 5 до событий операции (Р45 п. 5, PS-16): пакет передан продавцу, итог Платформой не подтверждён
+  "OPERATION_RESULT_UNCONFIRMED",
   // причины operation.declined (SPEC §7б): в PAO_DIAG ядра их нет
   "AOI_MISSING",
   "AOI_MISMATCH",

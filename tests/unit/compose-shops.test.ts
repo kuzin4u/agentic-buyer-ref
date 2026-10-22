@@ -3,6 +3,10 @@
 import { afterEach, describe, expect, it } from "vitest";
 import type { ShopProfile } from "../../src/agent/adapters/shops/index.js";
 import { SignerStopped } from "../../src/agent/signer/index.js";
+import { openPackage } from "../../src/agent/payment-package/index.js";
+import type { PaymentContext } from "../../src/agent/ports/index.js";
+import type { Mandate } from "../../src/shared/domain.js";
+import { luhnTail } from "../support/luhn.js";
 import { coreOn } from "../support/core.js";
 import { AGENT, PaoStand } from "../support/pao-stand.js";
 
@@ -49,5 +53,92 @@ describe("AgentCore.shops (Р42 п. 1)", () => {
     core.close();
     await expect(shops.search()).rejects.toBeInstanceOf(SignerStopped);
     expect(v.seen).toHaveLength(1);
+  });
+});
+
+// Р45 п. 6 (ревью reviewer К2 № 8): шаги оплаты профиля contour собирает место сборки — порт платформы ядра, журнал ядра
+// с кодом агента; пакет — витрине через переданный порт оплаты.
+describe("AgentCore.payment (Р45 п. 6)", () => {
+  it("реквизит — у платформы ядра под ключом вызывающего, пакет — порту витрины; итог не подтверждён; confirm — отказ", async () => {
+    const s = new PaoStand({
+      handlers: {
+        "POST /pao/v1/credentials": ({ body }) => ({
+          status: 201,
+          body: { credential_ref: "cr_1", kind: body.kind, payload: { token_ref: "tok_ref_1", cryptogram: "cg_1" }, aoi: { indicator: true, agent_code: AGENT, mandate_id: body.mandate_id }, status: "ISSUED" },
+        }),
+      },
+    });
+    stand = s;
+    const { core, journal } = await coreOn(s);
+    await core.start();
+    const sent: { shopId: string; orderId: string; cartMandateId: string; body: unknown }[] = [];
+    const steps = core.payment({
+      pay: async (req) => {
+        sent.push({ shopId: req.shopId, orderId: req.orderId, cartMandateId: req.cartMandateId, body: JSON.parse(openPackage(req.package)) });
+        return { status: "PAID" };
+      },
+    });
+    const total = { amount: 250000, currency: "RUB" };
+    const cart = { id: "m_cart", cart: { merchantId: "shop_1", lines: [], total } } as unknown as Mandate;
+    const ctx: PaymentContext = { intent: { id: "m_intent" } as Mandate, cart, shopId: "SHOP-1", merchantId: "shop_1", order: { orderId: "ORD-1", total }, signal: new AbortController().signal, sending: () => {} };
+    await expect(steps.confirm(ctx)).rejects.toMatchObject({ code: "CONFIRMATION_REQUIRED" });
+    await expect(steps.authorize(ctx, { idempotencyKey: "idem-pay-compose" })).rejects.toMatchObject({ code: "OPERATION_RESULT_UNCONFIRMED" });
+    expect(s.stub.calls.filter((c) => c.op === "POST /pao/v1/credentials").map((c) => c.idempotencyKey)).toEqual(["idem-pay-compose"]);
+    expect(sent).toEqual([
+      {
+        shopId: "SHOP-1",
+        orderId: "ORD-1",
+        cartMandateId: "m_cart",
+        body: { credential_ref: "cr_1", kind: "CARD", payload: { token_ref: "tok_ref_1", cryptogram: "cg_1" }, aoi: { indicator: true, agent_code: AGENT, mandate_id: "m_cart" }, cart_mandate_id: "m_cart", order_ref: "ORD-1" },
+      },
+    ]);
+    expect(journal.entries.filter((e) => e.kind === "pao.call" && e.method === "POST /pao/v1/credentials").map((e) => [e.agent, e.result, e.mandate])).toEqual([[AGENT, "ok", "m_cart"]]);
+    expect(JSON.stringify(journal.entries)).not.toMatch(/tok_ref_1|cg_1/);
+  });
+
+  it("второй рубеж на стадии 5 (Р45 п. 2.1) и остановленная покупка (Б2в (а)): обращений за реквизитом и к витрине нет", async () => {
+    const s2 = new PaoStand();
+    stand = s2;
+    const { core, journal } = await coreOn(s2);
+    await core.start();
+    let paid = 0;
+    const steps = core.payment({ pay: async () => (paid++, { status: "PAID" }) });
+    const total = { amount: 250000, currency: "RUB" };
+    const cart = { id: "m_cart", cart: { merchantId: "shop_1", lines: [], total } } as unknown as Mandate;
+    const ctx = (orderId: string, signal: AbortSignal): PaymentContext => ({ intent: { id: "m_intent" } as Mandate, cart, shopId: "SHOP-1", merchantId: "shop_1", order: { orderId, total }, signal, sending: () => {} });
+    const pan = luhnTail("900000000000000");
+    await expect(steps.authorize(ctx(`ORD-${pan}`, new AbortController().signal), { idempotencyKey: "idem-pan" })).rejects.toMatchObject({ code: "SHOP_ORDER_REF_INVALID" });
+    expect(journal.entries.filter((e) => e.kind === "agent.refused").map((e) => [e.reason, e.detail, e.mandate])).toEqual([["SHOP_ORDER_REF_INVALID", "PAN_LIKE", "m_cart"]]);
+    expect(JSON.stringify(journal.entries).includes(pan)).toBe(false);
+    const stopped = new AbortController();
+    stopped.abort(new Error("покупка остановлена"));
+    await expect(steps.authorize(ctx("ORD-1", stopped.signal), { idempotencyKey: "idem-stopped" })).rejects.toBe(stopped.signal.reason);
+    expect(s2.stub.calls.filter((c) => c.op === "POST /pao/v1/credentials")).toEqual([]);
+    expect(paid).toBe(0);
+  });
+
+  it.each([
+    ["реквизит USED (повтор под ключом после погашения) — CREDENTIAL_INVALID", { status: 201, body: "USED" }, "CREDENTIAL_INVALID"],
+    ["409 MANDATE_SCOPE — after_human, без повтора", { status: 409, body: "MANDATE_SCOPE" }, "MANDATE_SCOPE"],
+  ] as const)("%s: пакет продавцу не уходит (Р45 п. 2.2–2.3)", async (_, reply, code) => {
+    const s3 = new PaoStand({
+      handlers: {
+        "POST /pao/v1/credentials": ({ body }) =>
+          reply.status === 201
+            ? { status: 201, body: { credential_ref: "cr_1", kind: body.kind, payload: { token_ref: "tok_ref_1", cryptogram: "cg_1" }, aoi: { indicator: true, agent_code: AGENT, mandate_id: body.mandate_id }, status: reply.body } }
+            : { error: { code: "MANDATE_SCOPE" as const } },
+      },
+    });
+    stand = s3;
+    const { core } = await coreOn(s3);
+    await core.start();
+    let paid = 0;
+    const steps = core.payment({ pay: async () => (paid++, { status: "PAID" }) });
+    const total = { amount: 250000, currency: "RUB" };
+    const cart = { id: "m_cart", cart: { merchantId: "shop_1", lines: [], total } } as unknown as Mandate;
+    const ctx: PaymentContext = { intent: { id: "m_intent" } as Mandate, cart, shopId: "SHOP-1", merchantId: "shop_1", order: { orderId: "ORD-1", total }, signal: new AbortController().signal, sending: () => {} };
+    await expect(steps.authorize(ctx, { idempotencyKey: "idem-k3" })).rejects.toMatchObject({ code });
+    expect(paid).toBe(0);
+    expect(s3.stub.calls.filter((c) => c.op === "POST /pao/v1/credentials")).toHaveLength(1);
   });
 });

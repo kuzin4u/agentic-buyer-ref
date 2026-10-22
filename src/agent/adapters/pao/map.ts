@@ -27,6 +27,7 @@ import {
   type PlatformEventType,
 } from "../../../shared/domain.js";
 import type { FeedItem } from "../../ports/events.js";
+import { sealPackage, type SealedPackage } from "../../payment-package/package.js";
 
 function incomplete(what: string): never {
   throw new PlatformFailure("UNKNOWN", "never", null, 200, null, `ответ ПАО неполон: ${what}`);
@@ -206,6 +207,26 @@ export function credentialFromPao(c: Pao.Credential, mandateId: string, agentCod
     indicator: indicatorFromPao(c.aoi, agentCode, mandateId),
   };
 }
+
+/** Пакет агентской оплаты по ответу на выдачу (Р45 п. 3): ответ только целиком — вид запрошенный, `token_ref` и
+ *  криптограмма — непустые строки (у CARD), признак — свой (`credentialFromPao`); иначе UNKNOWN, пакета нет. В отказ —
+ *  только имя поля, не значение (инвариант 1). `payload` и `aoi` — как в ответе, без изменений. */
+export function packageFromPao(c: Pao.Credential, draft: CredentialDraft): SealedPackage {
+  if (c.kind !== draft.channel) incomplete("credential.kind — не запрошенный");
+  const p = c.payload as Record<string, unknown> | undefined;
+  if (typeof p !== "object" || p === null) incomplete("credential.payload");
+  if (c.kind === "CARD" && (!nonEmpty(p.token_ref) || !nonEmpty(p.cryptogram))) incomplete("credential.payload — нет token_ref или cryptogram");
+  return sealPackage({
+    credential_ref: c.credential_ref,
+    kind: c.kind,
+    payload: structuredClone(p),
+    aoi: structuredClone(c.aoi) as unknown as Record<string, unknown>,
+    cart_mandate_id: draft.mandate.id,
+    order_ref: draft.orderRef,
+  });
+}
+
+const nonEmpty = (v: unknown): v is string => typeof v === "string" && v !== "";
 
 /** Подтверждение: в ПАО 1.4.0 у `amount` нет валюты — сумма обязана быть в валюте мандата (Р29 п. 3). */
 export function confirmationDraftToPao(d: ConfirmationDraft, cur: Currencies): Pao.ConfirmationRequest {

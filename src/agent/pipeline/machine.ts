@@ -107,6 +107,10 @@ export class PurchaseMachine {
   #mandate: string | undefined;
   /** ворота перед стадией 5 пройдены (Р38 п. 3, К4): без них переход в AUTHORIZING запрещён */
   #gate5 = false;
+  /** покупка остановлена — сигнал шагам оплаты: после него обращений за реквизитом и к витрине нет (Р45, Б2в (а)) */
+  readonly #stopped = new AbortController();
+  /** пакет агентской оплаты уходит продавцу: до записи исхода стадии 5 запрещённый переход — отказ без остановки (Б2в (б)) */
+  #sending = false;
   private readonly now: () => Date;
 
   constructor(private readonly o: PurchaseMachineOptions) {
@@ -141,6 +145,7 @@ export class PurchaseMachine {
     // одноразовый и живёт до следующего перехода: от прежних ворот (до нового CART, до стадии 4) не остаётся
     if (next === "AUTHORIZING" && !this.#gate5) this.forbid(next);
     this.#gate5 = false;
+    this.#sending = false;
     this.#state = next;
     this.o.journal.record({ at: this.#at(), kind: "purchase.stage", detail: next, ...this.mandate });
   }
@@ -150,8 +155,22 @@ export class PurchaseMachine {
   forbid(next: PurchaseState): never {
     const from = this.#state;
     this.o.journal.record({ at: this.#at(), kind: "agent.refused", reason: "PIPELINE_TRANSITION_FORBIDDEN", detail: `${from}->${next}`, ...this.mandate });
-    if (!isTerminal(from)) this.stop("PIPELINE_TRANSITION_FORBIDDEN");
+    // исключение из Р38 (Р45, Б2в (б)): пакет уже уходит продавцу — отменять нечего, деньги, возможно, в пути; покупка
+    // завершится исходом стадии 5, а не кодом параллельного вызова
+    if (!isTerminal(from) && !(this.#sending && from === "AUTHORIZING")) this.stop("PIPELINE_TRANSITION_FORBIDDEN");
     throw new PurchaseTransitionForbidden(from, next);
+  }
+
+  /** Сигнал остановки покупки для шагов оплаты (Р45, Б2в (а)). */
+  get stopped(): AbortSignal {
+    return this.#stopped.signal;
+  }
+
+  /** Пакет агентской оплаты уходит продавцу (Р45, Б2в (б)): окно «пакет отправлен → исход стадии 5 записан» — только в
+   *  AUTHORIZING и только пока покупка не остановлена; закрывается переходом из AUTHORIZING (исход записан). */
+  sending(): void {
+    if (this.#state !== "AUTHORIZING") this.forbid("AUTHORIZING");
+    this.#sending = true;
   }
 
   /** Ворота перед стадией 5 пройдены: оба мандата держатся и подтверждены verify (Р38 п. 3). Ставит только конвейер
@@ -166,6 +185,8 @@ export class PurchaseMachine {
     if (isTerminal(this.#state)) return;
     this.#state = "STOPPED";
     this.#reason = reason;
+    this.#sending = false;
+    this.#stopped.abort(new Error(`покупка остановлена: ${reason}`));
     const detail = cause === undefined ? "STOPPED" : (`STOPPED:${cause}` as const);
     this.o.journal.record({ at: this.#at(), kind: "purchase.stage", detail, reason, ...this.mandate });
   }

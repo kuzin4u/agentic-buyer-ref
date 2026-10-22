@@ -231,3 +231,43 @@ describe("перевод ПАО ↔ ядро", () => {
     expect(map.feedFromPao([{ ...ok, at: "2026-10-19T12:00:00+03:00" }])).toMatchObject([{ event: { at: "2026-10-19T09:00:00.000Z" } }]);
   });
 });
+
+// Р45 п. 2.2, 3 (ревью reviewer К2 № 4): пакет — только по ответу целиком; в отказ — имя поля, не значение.
+describe("пакет агентской оплаты по ответу на выдачу (Р45)", () => {
+  const TOKEN = "tok_ag_секрет";
+  const CRYPTO = "crypto_секрет";
+  const ok: Pao.Credential = {
+    credential_ref: "cr_1",
+    kind: "CARD",
+    payload: { token_ref: TOKEN, cryptogram: CRYPTO, valid_to: "2026-10-22T12:00:00Z" },
+    aoi: { indicator: true, agent_code: AG, mandate_id: "m_1" },
+    status: "ISSUED",
+  };
+  const cd = { mandate: M1, orderRef: "ORD-1", merchantId: "shop_1", amountMax: { amount: 100, currency: "RUB" }, channel: "CARD" as const };
+
+  it("ответ целиком — пакет запечатан, значения не видны", () => {
+    const p = map.packageFromPao(ok, cd);
+    expect(JSON.stringify(p)).not.toContain(TOKEN);
+    expect(String(p)).not.toContain(CRYPTO);
+  });
+
+  it.each([
+    ["вид не запрошенный", { ...ok, kind: "SBP" as const }],
+    ["нет token_ref", { ...ok, payload: { cryptogram: CRYPTO } }],
+    ["пустой token_ref", { ...ok, payload: { token_ref: "", cryptogram: CRYPTO } }],
+    ["нет криптограммы", { ...ok, payload: { token_ref: TOKEN } }],
+    ["криптограмма не строка", { ...ok, payload: { token_ref: TOKEN, cryptogram: 7 as unknown as string } }],
+    ["payload не объект", { ...ok, payload: null as unknown as Pao.Credential["payload"] }],
+  ])("%s — UNKNOWN, пакета нет, значений в отказе нет", (_, bad) => {
+    let err: unknown;
+    try {
+      map.packageFromPao(bad, cd);
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(PlatformFailure);
+    expect((err as PlatformFailure).code).toBe("UNKNOWN");
+    const text = `${String(err)} ${(err as Error).stack ?? ""} ${JSON.stringify(err)}`;
+    expect(text.includes(TOKEN) || text.includes(CRYPTO)).toBe(false);
+  });
+});

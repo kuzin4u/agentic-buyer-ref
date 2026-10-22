@@ -1,4 +1,4 @@
-// Стадия 5 профиля contour на стенде Платформы v0.15.0 и эмуляторе продавцов (Р45; AG-11 ч. 1): реквизит —
+// Стадия 5 профиля contour на стенде Платформы v0.17.0 (с v0.15.0, Р45; Р47 п. 1) и эмуляторе продавцов (Р45; AG-11 ч. 1): реквизит —
 // POST /pao/v1/credentials по CART, пакет агентской оплаты — витрине подписанным обращением, итог до событий операции
 // (PS-16) не подтверждается — STOPPED OPERATION_RESULT_UNCONFIRMED. Выдача — с ТЕСТОВЫМ ПРОФИЛЕМ магазина (stand-shop.ts).
 import { afterEach, describe, expect, it } from "vitest";
@@ -244,21 +244,23 @@ describe("стадия 5 на стенде: реквизит по ПАО и па
     expect(r.c.journal.entries.filter((e) => e.kind === "purchase.stage" && e.detail === "STOPPED")).toHaveLength(1);
   });
 
-  it("стадия 4 профиля contour до AG-13: подтверждение нужно — STOPPED CONFIRMATION_REQUIRED, реквизита нет (Р45 п. 6; ревью reviewer К2 № 7)", async () => {
-    // порог ниже итога заказа — нужна стадия 4 (Т7)
+  it("выше порога агента (Р47 п. 2а): авторизация без предварительного подтверждения; ADP его не потребовала (итог ниже её порога) — путь Р45", async () => {
+    // порог агента ниже итога заказа — сведения needsConfirmation, а не ворота; порог ADP — параметр стенда (проверка ниже)
     const r = await run({ params: { confirm_above_kop: 1 } });
-    await ordered(r);
+    const { intent, cart, order } = await ordered(r);
     expect(r.purchase.needsConfirmation).toBe(true);
+    expect(order.total.amount).toBeLessThanOrEqual(r.c.stand!.params.confirm_above_kop);
     const start = r.c.calls().length;
-    await expect(r.purchase.confirm()).rejects.toMatchObject({ code: "CONFIRMATION_REQUIRED" });
-    expect(r.purchase.state).toBe("STOPPED");
-    expect(r.purchase.reason).toBe("CONFIRMATION_REQUIRED");
-    // проверка по мандату до стадии 4 (Р40 п. 5) — и больше ничего: ни реквизита, ни витрины
-    expect(r.c.calls().slice(start).map((x) => `${x.target} ${x.route.split("?")[0]}`).filter((s) => s !== "pao GET /pao/v1/events").map((s) => s.replace(/mandates\/[^/]+/, "mandates/{id}"))).toEqual([
-      "pao GET /pao/v1/mandates/{id}/verify",
-      "pao GET /pao/v1/mandates/{id}/verify",
+    await expect(r.purchase.authorize({ idempotencyKey: "idem-pay-above" })).rejects.toMatchObject({ code: "OPERATION_RESULT_UNCONFIRMED" });
+    expect(r.c.journal.entries.some((e) => e.kind === "purchase.stage" && e.detail === "CONFIRMING")).toBe(false);
+    // полный журнал обращений после заказа (ленту не считаем): ворота, реквизит, пакет — и ничего о подтверждениях
+    const ids = { intent: intent.id, cart: cart.id, shop: NORMAL.id, order: order.orderId };
+    expect(r.c.calls().slice(start).filter((x) => !x.route.startsWith("GET /pao/v1/events")).map((x) => shape(x, ids))).toEqual([
+      "pao GET /pao/v1/mandates/{intent}/verify 200",
+      "pao GET /pao/v1/mandates/{cart}/verify 200",
+      "pao POST /pao/v1/credentials 201",
+      "merchants POST /v1/shops/{shop}/orders/{order}/payment 200",
     ]);
-    await expect(r.purchase.authorize({ idempotencyKey: "idem-pay-confirm" })).rejects.toBeInstanceOf(PurchaseTransitionForbidden);
   });
 
   it("П18: в теле выдачи серия, похожая на номер карты (адаптер в обход проверки агента) — 422 CREDENTIALS_FORBIDDEN от Платформы, без повтора, значения в журнале нет", async () => {

@@ -45,9 +45,11 @@ export const TRANSITIONS: Readonly<Record<PurchaseState, readonly PurchaseState[
   CART_PENDING: ["CART_ACTIVE"],
   // живая проверка не ok — к выдаче; изменение цены — новый CART только новым выбором человека (Т6, Р5)
   CART_ACTIVE: ["ORDERED", "OFFERS"],
-  ORDERED: ["CONFIRMING", "AUTHORIZING"],
+  // стадия 4 — после отказа авторизации с требованием подтверждения: запрос создаёт ADP (Р47 п. 2); ORDERED → CONFIRMING нет
+  ORDERED: ["AUTHORIZING"],
+  // повтор после одобрения — AG-13 ч. 2; в ч. 1 этот переход не проходит ни один путь
   CONFIRMING: ["AUTHORIZING"],
-  AUTHORIZING: ["SETTLING"],
+  AUTHORIZING: ["SETTLING", "CONFIRMING"],
   SETTLING: ["DONE"],
   DONE: [],
   STOPPED: [],

@@ -17,7 +17,7 @@ import type { LiveOfferSource } from "../ports/catalog.js";
 import type { FeedItem } from "../ports/events.js";
 import type { Mutation } from "../ports/mutation.js";
 import { orderRefIssue, type OrderRefIssue } from "../payment-package/order-ref.js";
-import { PaymentFailure, ShopFailure, type OfferSource, type PaymentContext, type PaymentSteps, type ShopOffers, type ShopOrder, type ShopPort, type ShopUnavailable, type ShopUnavailableCause } from "../ports/shop.js";
+import { PaymentFailure, ShopFailure, type ConfirmationOutcome, type OfferSource, type PaymentContext, type PaymentSteps, type ShopOffers, type ShopOrder, type ShopPort, type ShopUnavailable, type ShopUnavailableCause } from "../ports/shop.js";
 import { PurchaseMachine, PurchaseTransitionForbidden, allowed, type PurchaseJournal, type PurchaseState, type StopCause } from "./machine.js";
 
 /** Почему оставлен CART (Р46 п. 3): новый поиск из CART_ACTIVE или отказ живой проверки перед заказом. */
@@ -63,7 +63,9 @@ export interface PipelineJournal extends PurchaseJournal {
        *  маске; mandate — корневой INTENT из машины */
       | { at: string; kind: "agent.refused"; reason: "A5_DECISION_FORGED"; ref?: string; mandate?: string; merchant?: string }
       /** номер заказа продавца не передаётся дальше (Р45, 9а): detail — только причина, значения нет */
-      | { at: string; kind: "agent.refused"; reason: "SHOP_ORDER_REF_INVALID"; detail: OrderRefIssue; mandate?: string },
+      | { at: string; kind: "agent.refused"; reason: "SHOP_ORDER_REF_INVALID"; detail: OrderRefIssue; mandate?: string }
+      /** уведомление оболочки упало (Р47 п. 5, В3): исход покупки не меняется */
+      | { at: string; kind: "notify.failed"; reason: "CONFIRMATION_PENDING"; mandate?: string },
   ): void;
 }
 
@@ -177,11 +179,25 @@ export interface PurchaseOptions {
   failureCode?: (e: unknown) => DiagCode | null;
   /** регион человека из профиля; нет — доступен только самовывоз (Р32 п. 5) */
   region?: string;
+  /** уведомление оболочки (Р47 п. 5, В3): CONFIRMATION_PENDING — один раз на запрос подтверждения, без link; конвейер его
+   *  не ждёт, сбой — запись notify.failed, исход не меняется */
+  notify?: (code: "CONFIRMATION_PENDING") => void | Promise<void>;
   now?: () => Date;
 }
 
 /** sku из фида — в журнале только по маске идентификатора (Р38 п. 5, инвариант 5). */
 const skuRef = (sku: string): { ref?: string } => (SHOP_ID.test(sku) ? { ref: sku } : {});
+
+/** Исход стадии 4 → код остановки (Р47 п. 4, 6): одобрение до канала к продавцу — CONFIRMATION_NOT_DELIVERED; запроса нет за
+ *  confirmation_wait_ms — OPERATION_RESULT_UNCONFIRMED (как без ожидания, Р45 п. 5); прочее — UNKNOWN (fail-closed). */
+const CONFIRMATION_STOP: Readonly<Record<ConfirmationOutcome, DiagCode>> = {
+  APPROVED: "CONFIRMATION_NOT_DELIVERED",
+  REJECTED: "CONFIRMATION_REJECTED",
+  EXPIRED: "CONFIRMATION_EXPIRED",
+  UNBOUND: "CONFIRMATION_UNBOUND",
+  NONE: "OPERATION_RESULT_UNCONFIRMED",
+  UNKNOWN: "UNKNOWN",
+};
 
 /** Отказ подписи — ждать человека, а не останавливать покупку (SPEC §7а PRINCIPAL_SIGNATURE_PENDING); только у ожидания
  *  подписи мандата: тот же код из порта витрины или оплаты — остановка (ревью К3 повторное Н1, инвариант 4). */
@@ -201,8 +217,6 @@ export class Purchase {
   #cart: Mandate | null = null;
   #order: ShopOrder | null = null;
   #operation: Operation | null = null;
-  /** стадия 4 пройдена: порт вернул APPROVED (ревью К3 № 4); вторая защита — иной выход из стадии 4 уже STOPPED */
-  #approved = false;
   /** стадия идёт: повторный вход до её окончания — запрещённый переход (ревью К3 № 4) */
   #busy = false;
 
@@ -356,7 +370,6 @@ export class Purchase {
       const cart = snapshot(await this.#guard(() => this.o.mandates.request(cartDraft(intent, choice, keyLines(lines), total), m, intent)));
       this.#lines = Object.freeze(offers);
       this.#cart = cart;
-      this.#approved = false;
       this.#machine.to("CART_PENDING");
       if (cart.status === "ACTIVE") this.#machine.to("CART_ACTIVE");
       return copy(cart);
@@ -452,50 +465,30 @@ export class Purchase {
     });
   }
 
-  /** Нужна ли стадия 4 (Т7): итог CART строго выше порога — меньшего из рыночного и клиентского (Р39 п. 1.5). Итога нет
-   *  или он не в RUB — нужна (fail-closed): ни `confirm()`, ни `authorize()` такую покупку дальше не пустят — валюта
-   *  проверяется в обоих до проверки стадии 4 (`#prepay`, CURRENCY_NOT_SUPPORTED). Итог — из своего снимка CART. Ответ
-   *  Платформы CONFIRMATION_REQUIRED на стадии 5 — `authorize`. */
+  /** Итог CART строго выше порога — меньшего из рыночного и клиентского (Р39 п. 1.5); итога нет или он не в RUB — да
+   *  (fail-closed). Сведения для оболочки, а не ворота: после Р47 п. 2 подтверждения требует ADP, агент идёт в
+   *  авторизацию и при итоге выше порога (Р-142). */
   get needsConfirmation(): boolean {
     const total = this.#cart?.cart?.total;
     if (total === undefined || !currencySupported(total)) return true;
     return needsConfirmation(total, this.#thresholds);
   }
 
-  /** Канала клиентского порога в ПАО нет (STATUS «Открыто», Р39) — только рыночный. */
+  /** Порог для окна дробления (Р39 п. 4, Р-136): канала клиентского порога в ПАО нет (STATUS «Открыто», Р39) — только
+   *  рыночный. Воротами стадии 5 порог не служит: подтверждения требует ADP (Р47 п. 2, Р-142). */
   get #thresholds(): Thresholds {
     return { marketKop: this.o.params.confirm_above_kop };
   }
 
-  /** Стадия 4: подтверждение человеком через порт (AG-13): исход — из события Платформы, конвейер его не создаёт
-   *  (инвариант 7). Без надобности — запрещённый переход. До запроса — та же проверка по мандату, что в воротах стадии 5
-   *  (Р40 п. 5): человека не просят подтвердить покупку, которую ворота затем отклонят. Не APPROVED — STOPPED
-   *  CONFIRMATION_REQUIRED. */
-  confirm(signal?: AbortSignal): Promise<void> {
-    return this.#stage("CONFIRMING", async () => {
-      // валюта и доля — до решения о стадии 4: код отказа не зависит от пути вызывающего (ревью К2 В1)
-      const c = this.#context();
-      this.#prepay(c.intent, c.cart);
-      if (!this.needsConfirmation) this.#machine.forbid("CONFIRMING");
-      await this.#scope(c.intent, c.cart);
-      this.#machine.to("CONFIRMING");
-      const status = await this.#guard(() => this.o.payment.confirm(this.#forPayment(c), signal));
-      this.#held(c.intent, c.cart);
-      if (status !== "APPROVED") this.#halt("CONFIRMATION_REQUIRED");
-      this.#approved = true;
-    });
-  }
-
   /** Стадия 5: авторизация через порт (AG-11): реквизит и пакет продавцу; итог — из события Платформы (инвариант 8). До
    *  событий операции (PS-16) порт профиля contour отвечает PaymentFailure OPERATION_RESULT_UNCONFIRMED — STOPPED, место в
-   *  окне дробления занято, повторной оплаты нет: из STOPPED переходов нет (Р45 п. 5).
-   *  Подтверждение нужно, а APPROVED не получен (из ORDERED или пока стадия 4 ждёт) — запрещённый переход. DECLINED —
-   *  STOPPED с кодом причины (SPEC §7б); Платформа требует подтверждения — STOPPED CONFIRMATION_REQUIRED (инвариант 7). */
+   *  окне дробления занято, повторной оплаты нет: из STOPPED переходов нет (Р45 п. 5). Итог выше порога предварительного
+   *  подтверждения не требует — его требует ADP (Р47 п. 2). DECLINED — STOPPED с кодом причины (SPEC §7б). Платформа
+   *  требует подтверждения (PaymentFailure CONFIRMATION_REQUIRED порта или ответ CONFIRMATION_REQUIRED) — стадия 4. */
   authorize(m: Mutation): Promise<Operation> {
     return this.#stage("AUTHORIZING", async () => {
       const c = this.#context();
       this.#prepay(c.intent, c.cart);
-      if (this.needsConfirmation && !this.#approved) this.#machine.forbid("AUTHORIZING");
       await this.#gate(c.intent, c.cart);
       // окно дробления — повторно после ворот (доля могла появиться, пока шёл verify) и сразу место в нём, без ожидания
       // между ними (Р39 п. 4): параллельная покупка под тем же INTENT увидит эту операцию. Место — после перехода:
@@ -503,31 +496,72 @@ export class Purchase {
       this.#prepay(c.intent, c.cart);
       this.#machine.to("AUTHORIZING");
       const slot = this.o.split.open(c.intent.id, this.#total(c.cart));
-      const op = await this.#guard(async () => {
+      const op = await this.#guard(async (): Promise<Operation | null> => {
         let reply: Operation;
         try {
           reply = snapshot(await this.o.payment.authorize(this.#forPayment(c), m));
         } catch (e) {
-          // сбой или неизвестный исход (в том числе пакет передан, итог не подтверждён — Р45 п. 5) — место занято
+          // сбой или неизвестный исход (в том числе пакет передан, итог не подтверждён — Р45 п. 5) — место занято; так же
+          // при ожидании подтверждения после DECLINED продавца (Р47 п. 6)
           slot.settle("UNKNOWN");
           // шаг прерван остановкой покупки (Р45, Б2в (а)) — наружу та же ошибка, что у остановленной стадии
           if (e === this.#machine.stopped.reason) throw new PurchaseStopped(this.#machine.reason ?? "UNKNOWN");
+          if (e instanceof PaymentFailure && e.code === "CONFIRMATION_REQUIRED") return null;
           throw e;
         }
-        // отказ и CONFIRMATION_REQUIRED окно не занимают; сбой и неизвестный исход — занимают (fail-closed)
-        if (reply.status === "DECLINED" || reply.status === "CONFIRMATION_REQUIRED") slot.settle("REFUSED");
+        // отказ окно не занимает; сбой, неизвестный исход и CONFIRMATION_REQUIRED (дальше стадия 4, исход не известен —
+        // Р47 п. 6, решение владельца по ревью К3 № 4) — занимают (fail-closed)
+        if (reply.status === "DECLINED") slot.settle("REFUSED");
         else if (reply.status === "AUTHORIZED") slot.settle("APPROVED");
         else slot.settle("UNKNOWN");
         if (reply.status === "DECLINED") this.#halt(ruleForDeclineReason(reply.declineReason).code);
-        if (reply.status === "CONFIRMATION_REQUIRED") this.#halt("CONFIRMATION_REQUIRED");
+        if (reply.status === "CONFIRMATION_REQUIRED") return null;
         if (reply.status !== "AUTHORIZED") this.#halt("UNKNOWN");
         return reply;
       });
+      if (op === null) return this.#confirm(c);
       this.#operation = op;
       this.#held(c.intent, c.cart);
       this.#machine.to("SETTLING");
       return copy(op);
     });
+  }
+
+  /** Стадия 4 (Т7, Р47 п. 2–6): запрос создала ADP на отказе авторизации — решение человека в приложении банка, агент
+   *  сам не подтверждает (инвариант 7). Ожидание — через порт: привязка, уведомление и статус по GET (модуль
+   *  confirmations). Канала ссылки к продавцу до AG-13 ч. 2 нет — каждый исход в ч. 1 — STOPPED; переход
+   *  CONFIRMING → AUTHORIZING в ч. 1 не проходит ни один путь. */
+  async #confirm(c: Omit<PaymentContext, "signal" | "sending">): Promise<never> {
+    this.#machine.to("CONFIRMING");
+    const outcome = await this.#guard(async () => {
+      try {
+        return await this.o.payment.confirm(this.#forPayment(c), () => this.#notify(), this.#machine.stopped);
+      } catch (e) {
+        if (e === this.#machine.stopped.reason) throw new PurchaseStopped(this.#machine.reason ?? "UNKNOWN");
+        throw e;
+      }
+    });
+    // мандаты вышли, пока человек решал (отзыв по ленте), — отказ действовать, как в воротах (Р38 п. 3)
+    this.#held(c.intent, c.cart);
+    // исход вне перечня (реализация порта вне ядра) — UNKNOWN, fail-closed
+    this.#halt(Object.hasOwn(CONFIRMATION_STOP, outcome) ? CONFIRMATION_STOP[outcome] : "UNKNOWN");
+  }
+
+  /** Уведомление оболочки (В3): не ждётся; исключение и отказ обещания — запись notify.failed, исход не меняется. */
+  #notify(): void {
+    const failed = () => {
+      try {
+        this.#record({ kind: "notify.failed", reason: "CONFIRMATION_PENDING" });
+      } catch {
+        // журнал недоступен — покупка уже остановлена (#record); уведомление исход не меняет
+      }
+    };
+    try {
+      const r = this.o.notify?.("CONFIRMATION_PENDING");
+      if (r !== undefined) Promise.resolve(r).catch(failed);
+    } catch {
+      failed();
+    }
   }
 
   /** Стадия 6: итог расчёта через порт (AG-11), из события Платформы. Не SETTLED — STOPPED UNKNOWN (инвариант 4). */

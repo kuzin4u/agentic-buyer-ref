@@ -100,7 +100,22 @@ export type JournalKind =
    *  продавца; пишет конвейер. Исключения по сроку поиска (Р44 п. 6) — reason SHOP_SEARCH_DEADLINE: срок истёк до
    *  обращения (shop.call нет) или повтор не начат, потому что Retry-After не меньше остатка (у shop.call — detail кода
    *  витрины) */
-  | "shop.unavailable";
+  | "shop.unavailable"
+  /** статус запроса подтверждения по GET (Р47 п. 3): ref — confirmation_id, detail — PENDING / APPROVED / REJECTED /
+   *  EXPIRED; ни link, ни confirmation_ref в журнал не попадают */
+  | "confirmation.status"
+  /** запрос подтверждения не этого агента — 400 на GET (Р47 п. 3): ref — confirmation_id, действий нет */
+  | "confirmation.foreign"
+  /** запрос подтверждения пришёл, когда ни одна покупка его не ждёт (Р47 п. 4, В1а): ref — confirmation_id; хранится в
+   *  памяти не дольше confirmation_wait_ms */
+  | "confirmation.unclaimed"
+  /** невостребованный запрос выброшен по сроку (Р47 п. 4, В1а): ref — confirmation_id */
+  | "confirmation.discarded"
+  /** запрос не привязан: ожидающих покупок две и больше или невостребованных больше одного (Р47 п. 4): ref —
+   *  confirmation_id, если он один */
+  | "confirmation.unbound"
+  /** уведомление оболочки (notify) упало (Р47 п. 5, В3): reason — код уведомления; исход покупки не меняется */
+  | "notify.failed";
 
 export interface JournalEntry {
   at: string;

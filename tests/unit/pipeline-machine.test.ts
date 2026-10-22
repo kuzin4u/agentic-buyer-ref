@@ -28,9 +28,9 @@ const EXPECTED: Record<PurchaseState, PurchaseState[]> = {
   OFFERS: ["OFFERS", "CART_PENDING"],
   CART_PENDING: ["CART_ACTIVE"],
   CART_ACTIVE: ["ORDERED", "OFFERS"],
-  ORDERED: ["CONFIRMING", "AUTHORIZING"],
+  ORDERED: ["AUTHORIZING"],
   CONFIRMING: ["AUTHORIZING"],
-  AUTHORIZING: ["SETTLING"],
+  AUTHORIZING: ["SETTLING", "CONFIRMING"],
   SETTLING: ["DONE"],
   DONE: [],
   STOPPED: [],
@@ -45,7 +45,8 @@ const PATH: Record<Exclude<PurchaseState, "STOPPED">, Exclude<PurchaseState, "ST
   CART_PENDING: ["INTENT_ACTIVE", "OFFERS", "CART_PENDING"],
   CART_ACTIVE: ["INTENT_ACTIVE", "OFFERS", "CART_PENDING", "CART_ACTIVE"],
   ORDERED: ["INTENT_ACTIVE", "OFFERS", "CART_PENDING", "CART_ACTIVE", "ORDERED"],
-  CONFIRMING: ["INTENT_ACTIVE", "OFFERS", "CART_PENDING", "CART_ACTIVE", "ORDERED", "CONFIRMING"],
+  // стадия 4 — после стадии 5 (Р47 п. 2)
+  CONFIRMING: ["INTENT_ACTIVE", "OFFERS", "CART_PENDING", "CART_ACTIVE", "ORDERED", "AUTHORIZING", "CONFIRMING"],
   AUTHORIZING: ["INTENT_ACTIVE", "OFFERS", "CART_PENDING", "CART_ACTIVE", "ORDERED", "AUTHORIZING"],
   SETTLING: ["INTENT_ACTIVE", "OFFERS", "CART_PENDING", "CART_ACTIVE", "ORDERED", "AUTHORIZING", "SETTLING"],
   DONE: ["INTENT_ACTIVE", "OFFERS", "CART_PENDING", "CART_ACTIVE", "ORDERED", "AUTHORIZING", "SETTLING", "DONE"],
@@ -212,15 +213,15 @@ describe("ворота перед стадией 5 (Р38 п. 3, К4): без п�
     });
   }
 
-  it("пропуск не переживает другой переход: от прежних ворот, до нового CART и до стадии 4 (ревью К4 № 1)", () => {
+  it("пропуск не переживает другой переход: от прежних ворот, до нового CART и через стадию 4 (ревью К4 № 1; Р47 п. 2)", () => {
     const early = at("CART_ACTIVE");
     early.m.passGate5();
     walk(early.m, ["OFFERS", "CART_PENDING", "CART_ACTIVE", "ORDERED"]);
     expect(() => early.m.to("AUTHORIZING")).toThrow(PurchaseTransitionForbidden);
-    const before4 = at("ORDERED");
-    before4.m.passGate5();
-    before4.m.to("CONFIRMING");
-    expect(() => before4.m.to("AUTHORIZING")).toThrow(PurchaseTransitionForbidden);
+    const in4 = at("AUTHORIZING");
+    in4.m.passGate5();
+    in4.m.to("CONFIRMING");
+    expect(() => in4.m.to("AUTHORIZING")).toThrow(PurchaseTransitionForbidden);
   });
 
   it("с пропуском — переход по таблице", () => {

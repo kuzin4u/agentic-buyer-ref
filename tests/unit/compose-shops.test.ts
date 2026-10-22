@@ -59,7 +59,7 @@ describe("AgentCore.shops (Р42 п. 1)", () => {
 // Р45 п. 6 (ревью reviewer К2 № 8): шаги оплаты профиля contour собирает место сборки — порт платформы ядра, журнал ядра
 // с кодом агента; пакет — витрине через переданный порт оплаты.
 describe("AgentCore.payment (Р45 п. 6)", () => {
-  it("реквизит — у платформы ядра под ключом вызывающего, пакет — порту витрины; итог не подтверждён; confirm — отказ", async () => {
+  it("реквизит — у платформы ядра под ключом вызывающего, пакет — порту витрины; итог не подтверждён", async () => {
     const s = new PaoStand({
       handlers: {
         "POST /pao/v1/credentials": ({ body }) => ({
@@ -81,7 +81,6 @@ describe("AgentCore.payment (Р45 п. 6)", () => {
     const total = { amount: 250000, currency: "RUB" };
     const cart = { id: "m_cart", cart: { merchantId: "shop_1", lines: [], total } } as unknown as Mandate;
     const ctx: PaymentContext = { intent: { id: "m_intent" } as Mandate, cart, shopId: "SHOP-1", merchantId: "shop_1", order: { orderId: "ORD-1", total }, signal: new AbortController().signal, sending: () => {} };
-    await expect(steps.confirm(ctx)).rejects.toMatchObject({ code: "CONFIRMATION_REQUIRED" });
     await expect(steps.authorize(ctx, { idempotencyKey: "idem-pay-compose" })).rejects.toMatchObject({ code: "OPERATION_RESULT_UNCONFIRMED" });
     expect(s.stub.calls.filter((c) => c.op === "POST /pao/v1/credentials").map((c) => c.idempotencyKey)).toEqual(["idem-pay-compose"]);
     expect(sent).toEqual([
@@ -94,6 +93,60 @@ describe("AgentCore.payment (Р45 п. 6)", () => {
     ]);
     expect(journal.entries.filter((e) => e.kind === "pao.call" && e.method === "POST /pao/v1/credentials").map((e) => [e.agent, e.result, e.mandate])).toEqual([[AGENT, "ok", "m_cart"]]);
     expect(JSON.stringify(journal.entries)).not.toMatch(/tok_ref_1|cg_1/);
+  });
+
+  it("ответ продавца DECLINED — CONFIRMATION_REQUIRED, стадия 4 (Р47 п. 4); confirm ждёт модуль подтверждений ядра и прерывается остановкой", async () => {
+    const s = new PaoStand({
+      handlers: {
+        "POST /pao/v1/credentials": ({ body }) => ({
+          status: 201,
+          body: { credential_ref: "cr_1", kind: body.kind, payload: { token_ref: "tok_ref_1", cryptogram: "cg_1" }, aoi: { indicator: true, agent_code: AGENT, mandate_id: body.mandate_id }, status: "ISSUED" },
+        }),
+      },
+    });
+    stand = s;
+    const { core } = await coreOn(s);
+    await core.start();
+    const steps = core.payment({ pay: async () => ({ status: "DECLINED" }) });
+    const total = { amount: 250000, currency: "RUB" };
+    const cart = { id: "m_cart", cart: { merchantId: "shop_1", lines: [], total } } as unknown as Mandate;
+    const ac = new AbortController();
+    const ctx: PaymentContext = { intent: { id: "m_intent" } as Mandate, cart, shopId: "SHOP-1", merchantId: "shop_1", order: { orderId: "ORD-1", total }, signal: ac.signal, sending: () => {} };
+    await expect(steps.authorize(ctx, { idempotencyKey: "idem-pay-declined" })).rejects.toMatchObject({ code: "CONFIRMATION_REQUIRED" });
+    const waiting = steps.confirm(ctx, () => {}, ac.signal);
+    ac.abort(new Error("покупка остановлена"));
+    await expect(waiting).rejects.toThrow("покупка остановлена");
+  });
+
+  it("связка ядра (Р47 п. 3): confirmation.required по ленте ядра → GET → REJECTED — исход confirm; уведомления на REJECTED нет", async () => {
+    const id = "cnf_11111111-1111-4111-8111-111111111111";
+    let served = false;
+    const s = new PaoStand({
+      handlers: {
+        "GET /pao/v1/events": () => {
+          if (served) return { status: 200, body: [] };
+          served = true;
+          return { status: 200, body: [{ event_id: "evt_cnf_1", type: "confirmation.required", at: "2026-10-22T12:00:00Z", data: { confirmation_id: id } }] };
+        },
+        "GET /pao/v1/confirmations/{id}": () => ({
+          status: 200,
+          body: { id, status: "REJECTED", link: "https://upk.stand/c/x", confirmation_ref: null, expires_at: "2026-10-22T12:15:00.000Z" },
+        }),
+      },
+    });
+    stand = s;
+    const { core, journal } = await coreOn(s);
+    await core.start();
+    const steps = core.payment({ pay: async () => ({ status: "DECLINED" }) });
+    const total = { amount: 250000, currency: "RUB" };
+    const cart = { id: "m_cart", cart: { merchantId: "shop_1", lines: [], total } } as unknown as Mandate;
+    const ctx: PaymentContext = { intent: { id: "m_intent" } as Mandate, cart, shopId: "SHOP-1", merchantId: "shop_1", order: { orderId: "ORD-1", total }, signal: new AbortController().signal, sending: () => {} };
+    const notified: string[] = [];
+    await expect(steps.confirm(ctx, () => void notified.push("n"), new AbortController().signal)).resolves.toBe("REJECTED");
+    expect(notified).toEqual([]);
+    expect(journal.entries.filter((e) => e.kind === "confirmation.status").map((e) => [e.agent, e.ref, e.detail])).toEqual([[AGENT, id, "REJECTED"]]);
+    expect(s.stub.calls.filter((c) => c.op === "GET /pao/v1/confirmations/{id}")).toHaveLength(1);
+    expect(JSON.stringify(journal.entries)).not.toContain("upk.stand");
   });
 
   it("второй рубеж на стадии 5 (Р45 п. 2.1) и остановленная покупка (Б2в (а)): обращений за реквизитом и к витрине нет", async () => {

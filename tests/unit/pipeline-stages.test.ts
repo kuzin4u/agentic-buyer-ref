@@ -430,7 +430,7 @@ describe("стадия 3 — корзина по живой цене перед 
     expect(opsFrom(r, from)).toEqual([VERIFY]);
   });
 
-  it("отзыв INTENT пришёл по ленте во время живой проверки — STOPPED MANDATE_NOT_ACTIVE, CART не запрошен, решение A5 не потрачено (Р38 п. 3)", async () => {
+  it("отзыв INTENT пришёл по ленте во время живой проверки — STOPPED MANDATE_REVOKED, CART не запрошен, решение A5 не потрачено (Р38 п. 3)", async () => {
     const ok = liveOffers(SHOP, () => stand!.clock);
     const at: { run?: PurchaseRun } = {};
     const r = await setup({
@@ -449,7 +449,7 @@ describe("стадия 3 — корзина по живой цене перед 
     const decision = humanA5Decision(shownIn(r), offer, offer.a5);
     const before = r.stand.log().filter((c) => c.op === "POST /pao/v1/mandates").length;
     await expect(r.purchase.cart(one(offer, 1, decision), { idempotencyKey: "idem-cart-1" })).rejects.toBeInstanceOf(PurchaseStopped);
-    expect(r.purchase.reason).toBe("MANDATE_NOT_ACTIVE");
+    expect(r.purchase.reason).toBe("MANDATE_REVOKED");
     expect(r.stand.log().filter((c) => c.op === "POST /pao/v1/mandates").length).toBe(before);
     expect(isSpent(decision)).toBe(false);
   });
@@ -575,13 +575,14 @@ describe("стадия 3 — сверка суммы заказа (Т6)", () => 
     await expect(r.purchase.placeOrder({ idempotencyKey: "idem-order-1" })).rejects.toMatchObject({ code: "ORDER_REPLY_MISMATCH" });
   });
 
-  it("CART отозван до заказа — STOPPED MANDATE_NOT_ACTIVE, ни проверки, ни заказа", async () => {
+  it("CART отозван до заказа — STOPPED MANDATE_REVOKED (STOP_ALL: ORDER), ни проверки, ни заказа", async () => {
     const r = await setup();
     const cart = await signedCart(r, await offers(r));
     r.consents.mandates.get(cart.id)!.status = "REVOKED";
     await r.core.mandates.refreshHeld({ kind: "event", event: event("mandate.revoked", cart.id) });
     await expect(r.purchase.placeOrder({ idempotencyKey: "idem-order-1" })).rejects.toBeInstanceOf(PurchaseStopped);
-    expect(r.purchase.reason).toBe("MANDATE_NOT_ACTIVE");
+    expect(r.purchase.reason).toBe("MANDATE_REVOKED");
+    expect(r.purchase.unfinished).toBe("ORDER");
     // только проверка перед CART (Р43 п. 1); перед заказом — нет
     expect(r.live.calls).toHaveLength(1);
     expect(r.shop.calls).toEqual([]);
@@ -767,6 +768,97 @@ describe("стадии 4–6 — исходы из порта PaymentSteps (ин
     await expect(r.purchase.authorize({ idempotencyKey: "idem-pay-1" })).rejects.toMatchObject({ code: "OPERATION_RESULT_UNCONFIRMED" });
     expect(stages(r).at(-1)).toBe("STOPPED:OPERATION_RESULT_UNCONFIRMED");
     expect(r.tail().filter((e) => e.kind === "payment.unconfirmed").map((e) => e.reason)).toEqual(["EVENTS_UNAVAILABLE"]);
+  });
+
+  it("Р50 п. 4: 409 MANDATE_REVOKED на стадии 5 до пакета — STOP_ALL: мандаты сняты с удержания, purchase.unfinished PAYMENT", async () => {
+    // отказ задан подменным портом оплаты; от контура (PaoStub, POST /pao/v1/credentials) — сценарий П22
+    const revoked = new PlatformFailure("MANDATE_REVOKED", "never", "MANDATE_REVOKED", 409, null);
+    const r = await setup({ payment: { ...payments(), authorize: () => Promise.reject(revoked) } });
+    await ordered(r);
+    const ids = [r.purchase.intentMandate!.id, r.purchase.cartMandate!.id];
+    expect(r.core.mandates.held().map((m) => m.id)).toEqual(expect.arrayContaining(ids));
+    await expect(r.purchase.authorize({ idempotencyKey: "idem-pay-1" })).rejects.toBe(revoked);
+    expect(stages(r).at(-1)).toBe("STOPPED:MANDATE_REVOKED");
+    expect(r.purchase.next).toBe("STOP_ALL");
+    expect(r.purchase.unfinished).toBe("PAYMENT");
+    expect(r.core.mandates.held().map((m) => m.id)).not.toEqual(expect.arrayContaining([ids[0]]));
+    expect(r.core.mandates.held().map((m) => m.id)).not.toEqual(expect.arrayContaining([ids[1]]));
+    expect(r.tail().filter((e) => e.kind === "purchase.unfinished").map((e) => [e.reason, e.detail])).toEqual([["MANDATE_REVOKED", "PAYMENT"]]);
+  });
+
+  it("Р50 п. 4: ворота видят CART отозванным (GET REVOKED) — STOP_ALL с MANDATE_REVOKED, реквизит не запрашивается", async () => {
+    const r = await setup();
+    await ordered(r);
+    const cart = r.purchase.cartMandate!.id;
+    r.consents.mandates.get(cart)!.status = "REVOKED";
+    await r.core.mandates.refreshHeld({ kind: "event", event: event("mandate.revoked", cart) });
+    await expect(r.purchase.authorize({ idempotencyKey: "idem-pay-1" })).rejects.toMatchObject({ code: "MANDATE_REVOKED", next: "STOP_ALL", unfinished: "PAYMENT" });
+    expect(r.payment.calls).toEqual([]);
+    expect(r.core.mandates.held().map((m) => m.id)).toEqual([]);
+  });
+
+  it("Р50 п. 4 (ревью КТ1 № 1): причина §7б MANDATE_REVOKED после пакета — STOP_ALL; итог известен — PAYMENT, а не PAYMENT_OUTCOME", async () => {
+    const r = await setup({ payment: payments({ authorize: { status: "DECLINED", declineReason: "MANDATE_REVOKED" } }) });
+    await ordered(r);
+    await expect(r.purchase.authorize({ idempotencyKey: "idem-pay-1" })).rejects.toMatchObject({ code: "DECLINED_MANDATE_REVOKED", next: "STOP_ALL", unfinished: "PAYMENT" });
+    expect(r.tail().filter((e) => e.kind === "purchase.unfinished").map((e) => e.detail)).toEqual(["PAYMENT"]);
+  });
+
+  it("Р50 п. 4 (ревью КТ1 № 3): журнал не принял purchase.unfinished — мандаты не сняты (решение без записи не исполняется), наружу — сбой журнала", async () => {
+    const down = new Error("журнал недоступен");
+    const revoked = new PlatformFailure("MANDATE_REVOKED", "never", "MANDATE_REVOKED", 409, null);
+    const r = await setup({
+      payment: { ...payments(), authorize: () => Promise.reject(revoked) },
+      tap: (e) => {
+        if (e.kind === "purchase.unfinished") throw down;
+      },
+    });
+    await ordered(r);
+    const ids = [r.purchase.intentMandate!.id, r.purchase.cartMandate!.id];
+    await expect(r.purchase.authorize({ idempotencyKey: "idem-pay-1" })).rejects.toBe(down);
+    expect(r.purchase.state).toBe("STOPPED");
+    expect(r.core.mandates.held().map((m) => m.id)).toEqual(expect.arrayContaining(ids));
+  });
+
+  it("Р50 п. 4 (ревью КТ1 № 4): CART отозван, пока ждали его подписи (GET в awaitSigned — REVOKED), — STOP_ALL MANDATE_REVOKED, ORDER", async () => {
+    const r = await setup();
+    await signedIntent(r);
+    const offer = (await r.purchase.search()).contour[0]!;
+    const cart = await r.purchase.cart(one(offer, 1), { idempotencyKey: "idem-cart-1" });
+    r.consents.mandates.get(cart.id)!.status = "REVOKED";
+    r.setFeed({ kind: "event", event: event("mandate.revoked", cart.id) });
+    await expect(r.purchase.awaitCart()).rejects.toBeInstanceOf(MandateRefused);
+    expect(r.purchase.reason).toBe("MANDATE_REVOKED");
+    expect(r.purchase.next).toBe("STOP_ALL");
+    expect(r.purchase.unfinished).toBe("ORDER");
+    expect(r.core.mandates.held()).toEqual([]);
+  });
+
+  it("Р50 п. 4 (ревью КТ1 № 5): INTENT вышел не отзывом, CART отозван — в воротах код отзыва, порядок мандатов не влияет", async () => {
+    const r = await setup();
+    await ordered(r);
+    const intent = r.purchase.intentMandate!.id;
+    const cart = r.purchase.cartMandate!.id;
+    r.consents.mandates.get(intent)!.status = "EXHAUSTED";
+    await r.core.mandates.refreshHeld({ kind: "event", event: event("mandate.exhausted", intent) });
+    r.consents.mandates.get(cart)!.status = "REVOKED";
+    await r.core.mandates.refreshHeld({ kind: "event", event: event("mandate.revoked", cart) });
+    await expect(r.purchase.authorize({ idempotencyKey: "idem-pay-1" })).rejects.toMatchObject({ code: "MANDATE_REVOKED", next: "STOP_ALL" });
+    expect(r.tail().filter((e) => e.kind === "agent.refused").map((e) => e.mandate)).toEqual([cart]);
+  });
+
+  it("Р50 п. 4: NEW_MANDATE и ASK_HUMAN — next из таблицы, без STOP_ALL (мандаты не снимаются, отчёта нет)", async () => {
+    for (const [code, next] of [["MANDATE_EXPIRED", "NEW_MANDATE"], ["LIMIT_EXCEEDED", "ASK_HUMAN"]] as const) {
+      const r = await setup({ payment: { ...payments(), authorize: () => Promise.reject(new PlatformFailure(code, "after_human", code, 409, null)) } });
+      await ordered(r);
+      const intent = r.purchase.intentMandate!.id;
+      await expect(r.purchase.authorize({ idempotencyKey: "idem-pay-1" })).rejects.toMatchObject({ code });
+      expect(r.purchase.next).toBe(next);
+      expect(r.purchase.unfinished).toBeNull();
+      expect(r.core.mandates.held().map((m) => m.id)).toContain(intent);
+      expect(r.tail().filter((e) => e.kind === "purchase.unfinished")).toEqual([]);
+      await closeStand();
+    }
   });
 
   it("Р50 дополнение 1: подпись приостановлена до отправки пакета — код приостановки, не UNKNOWN", async () => {
@@ -991,7 +1083,7 @@ describe("сбой журнала — STOPPED UNKNOWN, решение без з�
 });
 
 describe("держимые после ожиданий (Р38 п. 3, ревью К3 № 10)", () => {
-  it("INTENT отозван, пока ждали подписи CART, — STOPPED MANDATE_NOT_ACTIVE, CART_ACTIVE не записан", async () => {
+  it("INTENT отозван, пока ждали подписи CART, — STOPPED MANDATE_REVOKED, CART_ACTIVE не записан", async () => {
     const r = await setup();
     const intent = await signedIntent(r);
     const offer = (await r.purchase.search()).contour[0]!;
@@ -1002,10 +1094,10 @@ describe("держимые после ожиданий (Р38 п. 3, ревью �
       yield { kind: "event", event: r.consents.sign(cart.id) };
     });
     await expect(r.purchase.awaitCart()).rejects.toBeInstanceOf(PurchaseStopped);
-    expect(stages(r).slice(-2)).toEqual(["CART_PENDING", "STOPPED:MANDATE_NOT_ACTIVE"]);
+    expect(stages(r).slice(-2)).toEqual(["CART_PENDING", "STOPPED:MANDATE_REVOKED"]);
   });
 
-  it("CART отозван, пока человек подтверждал, — пакет ушёл: STOPPED OPERATION_RESULT_UNCONFIRMED, исходный MANDATE_NOT_ACTIVE — в журнале, повтора нет (Р49 п. 2)", async () => {
+  it("CART отозван, пока человек подтверждал, — пакет ушёл: STOPPED OPERATION_RESULT_UNCONFIRMED, исходный MANDATE_REVOKED — в журнале, повтора нет (Р49 п. 2)", async () => {
     const calls: string[] = [];
     const steps = {
       ...payments(),
@@ -1027,13 +1119,15 @@ describe("держимые после ожиданий (Р38 п. 3, ревью �
     expect(stages(r).slice(-3)).toEqual(["AUTHORIZING", "CONFIRMING", "STOPPED:OPERATION_RESULT_UNCONFIRMED"]);
     expect(r.tail().filter((e) => e.kind === "agent.refused" || e.kind === "payment.unconfirmed").map((e) => [e.kind, e.reason])).toEqual([
       ["agent.refused", "MANDATE_NOT_ACTIVE"],
-      ["payment.unconfirmed", "MANDATE_NOT_ACTIVE"],
+      ["payment.unconfirmed", "MANDATE_REVOKED"],
     ]);
+    // итоговый код после пакета — NOTIFY_HUMAN, не STOP_ALL (Р50 п. 4: next — по итоговому коду)
+    expect(r.purchase.next).toBe("NOTIFY_HUMAN");
     await expect(r.purchase.authorize({ idempotencyKey: "idem-pay-1" })).rejects.toBeInstanceOf(PurchaseTransitionForbidden);
     expect(calls).toEqual(["authorize", "confirm"]);
   });
 
-  it("CART отозван, пока продавец отвечал на заказ, — STOPPED MANDATE_NOT_ACTIVE, ORDERED не записан", async () => {
+  it("CART отозван, пока продавец отвечал на заказ, — STOPPED MANDATE_REVOKED, ORDERED не записан", async () => {
     const run: { r?: PurchaseRun } = {};
     const inner = shopOrders(SHOP);
     const order = async (req: Parameters<typeof inner.order>[0], m: Parameters<typeof inner.order>[1]) => {
@@ -1044,18 +1138,18 @@ describe("держимые после ожиданий (Р38 п. 3, ревью �
     };
     const r = (run.r = await setup({ shop: { order } }));
     await signedCart(r, await offers(r));
-    await expect(r.purchase.placeOrder({ idempotencyKey: "idem-order-1" })).rejects.toMatchObject({ code: "MANDATE_NOT_ACTIVE" });
+    await expect(r.purchase.placeOrder({ idempotencyKey: "idem-order-1" })).rejects.toMatchObject({ code: "MANDATE_REVOKED" });
     expect(r.purchase.order).toBeNull();
-    expect(stages(r).at(-1)).toBe("STOPPED:MANDATE_NOT_ACTIVE");
+    expect(stages(r).at(-1)).toBe("STOPPED:MANDATE_REVOKED");
   });
 
-  it("мандат вышел к авторизации — STOPPED MANDATE_NOT_ACTIVE до порта", async () => {
+  it("мандат вышел к авторизации не отзывом (EXHAUSTED) — STOPPED MANDATE_NOT_ACTIVE до порта, без STOP_ALL", async () => {
     const r = await setup();
     await ordered(r);
     const id = r.purchase.cartMandate!.id;
-    r.consents.mandates.get(id)!.status = "REVOKED";
-    await r.core.mandates.refreshHeld({ kind: "event", event: event("mandate.revoked", id) });
-    await expect(r.purchase.authorize({ idempotencyKey: "idem-pay-1" })).rejects.toMatchObject({ code: "MANDATE_NOT_ACTIVE" });
+    r.consents.mandates.get(id)!.status = "EXHAUSTED";
+    await r.core.mandates.refreshHeld({ kind: "event", event: event("mandate.exhausted", id) });
+    await expect(r.purchase.authorize({ idempotencyKey: "idem-pay-1" })).rejects.toMatchObject({ code: "MANDATE_NOT_ACTIVE", next: null, unfinished: null });
     expect(r.payment.calls).toEqual([]);
   });
 });
@@ -1077,7 +1171,7 @@ describe("ворота перед стадией 5 (Р38 п. 3, К4): оба м�
     }
   });
 
-  it("INTENT отозван после заказа — agent.refused MANDATE_NOT_ACTIVE, STOPPED, ни verify, ни реквизита", async () => {
+  it("INTENT отозван после заказа — agent.refused MANDATE_NOT_ACTIVE, STOPPED MANDATE_REVOKED, ни verify, ни реквизита", async () => {
     const r = await setup();
     await ordered(r);
     const id = r.purchase.intentMandate!.id;
@@ -1085,9 +1179,10 @@ describe("ворота перед стадией 5 (Р38 п. 3, К4): оба м�
     await r.core.mandates.refreshHeld({ kind: "event", event: event("mandate.revoked", id) });
     const before = verified(r).length;
     await expect(r.purchase.authorize({ idempotencyKey: "idem-pay-1" })).rejects.toBeInstanceOf(PurchaseStopped);
-    expect(r.tail().slice(-2).map((e) => [e.kind, e.reason])).toEqual([
+    expect(r.tail().slice(-3).map((e) => [e.kind, e.reason])).toEqual([
       ["agent.refused", "MANDATE_NOT_ACTIVE"],
-      ["purchase.stage", "MANDATE_NOT_ACTIVE"],
+      ["purchase.stage", "MANDATE_REVOKED"],
+      ["purchase.unfinished", "MANDATE_REVOKED"],
     ]);
     expect(verified(r).length).toBe(before);
     expect(r.payment.calls).toEqual([]);
@@ -1132,7 +1227,7 @@ describe("ворота перед стадией 5 (Р38 п. 3, К4): оба м�
     expect(r.payment.calls).toEqual([]);
   });
 
-  it("CART отозван, пока шёл verify в воротах, — STOPPED MANDATE_NOT_ACTIVE, реквизита нет", async () => {
+  it("CART отозван, пока шёл verify в воротах, — STOPPED MANDATE_REVOKED, реквизита нет", async () => {
     const r = await setup();
     await ordered(r);
     const cartId = r.purchase.cartMandate!.id;
@@ -1146,9 +1241,9 @@ describe("ворота перед стадией 5 (Р38 п. 3, К4): оба м�
       }
       return c;
     };
-    await expect(r.purchase.authorize({ idempotencyKey: "idem-pay-1" })).rejects.toMatchObject({ code: "MANDATE_NOT_ACTIVE" });
+    await expect(r.purchase.authorize({ idempotencyKey: "idem-pay-1" })).rejects.toMatchObject({ code: "MANDATE_REVOKED" });
     expect(r.tail().filter((e) => e.kind === "agent.refused").map((e) => [e.reason, e.mandate])).toEqual([["MANDATE_NOT_ACTIVE", cartId]]);
-    expect(stages(r).at(-1)).toBe("STOPPED:MANDATE_NOT_ACTIVE");
+    expect(stages(r).at(-1)).toBe("STOPPED:MANDATE_REVOKED");
     expect(r.payment.calls).toEqual([]);
   });
 
@@ -1256,14 +1351,14 @@ describe("проверка по мандату до стадии 4 (Р40 п. 5, 
     });
   }
 
-  it("INTENT отозван после заказа — MANDATE_NOT_ACTIVE до запроса подтверждения, ни verify, ни порта", async () => {
+  it("INTENT отозван после заказа — MANDATE_REVOKED до запроса подтверждения, ни verify, ни порта", async () => {
     const r = await setup();
     await ordered(r, ABOVE);
     const id = r.purchase.intentMandate!.id;
     r.consents.mandates.get(id)!.status = "REVOKED";
     await r.core.mandates.refreshHeld({ kind: "event", event: event("mandate.revoked", id) });
     const from = r.stand.stub.calls.length;
-    await expect(r.purchase.authorize({ idempotencyKey: "idem-pay-1" })).rejects.toMatchObject({ code: "MANDATE_NOT_ACTIVE" });
+    await expect(r.purchase.authorize({ idempotencyKey: "idem-pay-1" })).rejects.toMatchObject({ code: "MANDATE_REVOKED" });
     expect(opsFrom(r, from)).toEqual([]);
     expect(r.payment.calls).toEqual([]);
   });

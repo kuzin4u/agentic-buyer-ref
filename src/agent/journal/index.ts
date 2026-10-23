@@ -57,6 +57,8 @@ export type JournalKind =
   | "event.push_rejected"
   /** курсора ленты нет — первый запуск или сброс оператором: лента с начала (Р34 п. 4) */
   | "events.cursor_initial"
+  /** STOP_ALL (Р50 п. 4, Т13): что не завершено — detail из перечня UNFINISHED, reason — код остановки */
+  | "purchase.unfinished"
   /** начало серии неудачных чтений ленты (Р50 п. 2): reason — EVENTS_UNAVAILABLE, detail — код отказа первого чтения;
    *  серия не меньше registry_cache_ttl_sec — подпись приостановлена */
   | "events.unavailable"

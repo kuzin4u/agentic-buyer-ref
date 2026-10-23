@@ -102,7 +102,7 @@ export function ruleForFailure(code: FailureCode): DeclineRule {
 
 /** FIX_AGENT — исправить дефект агента, не повторять операцию; STOP — остановка по операции; NOTIFY_HUMAN — остановка по
  *  операции и уведомление человека; NEW_MANDATE — то же, человеку — новый мандат; STOP_AGENT — остановка агента (как §7а);
- *  STOP_ALL — остановить всё начатое по мандату (как §7а; исполнение — AG-12 ч. 2); STOP_AND_NOTIFY — причина вне перечня.
+ *  STOP_ALL — остановить всё начатое по мандату (как §7а; исполнение — Р50 п. 4, `stopNext`); STOP_AND_NOTIFY — причина вне перечня.
  *  Повтора операции нет ни у одного действия (Р48 п. 1). */
 export type ReasonAction = "FIX_AGENT" | "STOP" | "NOTIFY_HUMAN" | "NEW_MANDATE" | "STOP_AGENT" | "STOP_ALL" | "STOP_AND_NOTIFY";
 
@@ -182,6 +182,35 @@ export const PAYMENT_NOTICE_CODES: ReadonlySet<DiagCode> = new Set<DiagCode>([
   "SCOPE_NOT_RESERVED",
   "SCOPE_CHECK_UNRECOGNIZED",
 ]);
+
+/** Что делать оболочке после остановки покупки (Р50 п. 4) — из действия таблиц §7а и §7б, а не из текста:
+ *  NEW_MANDATE — запросить у человека новый мандат; ASK_HUMAN — передать решение человеку (инвариант 7); NOTIFY_HUMAN —
+ *  сообщить без решения; STOP_ALL — остановлено всё начатое по мандату, человеку — что не завершено (Т13). */
+export type StopNext = "NEW_MANDATE" | "ASK_HUMAN" | "NOTIFY_HUMAN" | "STOP_ALL";
+
+/** Что не завершено при STOP_ALL (Р50 п. 4) — по стадии на момент остановки: SEARCH — INTENT, поиск; CHOICE — выдача без
+ *  выбора; ORDER — CART есть, заказа нет; PAYMENT — заказ у продавца создан, не оплачен; PAYMENT_OUTCOME — пакет ушёл, итог
+ *  не подтверждён; SETTLEMENT — авторизовано, расчёт не завершён. */
+export const UNFINISHED = ["SEARCH", "CHOICE", "ORDER", "PAYMENT", "PAYMENT_OUTCOME", "SETTLEMENT"] as const;
+export type Unfinished = (typeof UNFINISHED)[number];
+
+const FAILURE_NEXT: Partial<Record<DeclineAction, StopNext>> = { NEW_MANDATE: "NEW_MANDATE", ASK_HUMAN: "ASK_HUMAN", STOP_ALL: "STOP_ALL" };
+const REASON_NEXT: Partial<Record<ReasonAction, StopNext>> = {
+  NEW_MANDATE: "NEW_MANDATE",
+  NOTIFY_HUMAN: "NOTIFY_HUMAN",
+  STOP_AND_NOTIFY: "NOTIFY_HUMAN",
+  STOP_ALL: "STOP_ALL",
+};
+
+/** Действие оболочки по коду остановки (Р50 п. 4): §7а — по `FAILURE_RULES`, §7б — по `DECLINE_REASONS` (STOP_AGENT —
+ *  остановка агента, null); после отправки пакета — по итоговому коду (OPERATION_RESULT_UNCONFIRMED — NOTIFY_HUMAN); иное —
+ *  null, просто остановка. */
+export function stopNext(code: DiagCode): StopNext | null {
+  if (Object.hasOwn(FAILURE_RULES, code)) return FAILURE_NEXT[FAILURE_RULES[code as FailureCode].action] ?? null;
+  if (code === "DECLINE_REASON_UNKNOWN" || code === "OPERATION_RESULT_UNCONFIRMED") return "NOTIFY_HUMAN";
+  const r = Object.values(DECLINE_REASONS).find((x) => x.code === code);
+  return r === undefined ? null : (REASON_NEXT[r.action] ?? null);
+}
 
 /** Код остановки после отправки пакета (Р49 п. 2): итоговый — как есть, иной — OPERATION_RESULT_UNCONFIRMED (пакет ушёл,
  *  итог операции неизвестен; совет повторить может привести ко второй оплате). */

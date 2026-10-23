@@ -233,7 +233,7 @@ describe("стадии 1–2 — INTENT и выдача (Р38 п. 2, п. 5)", ()
 });
 
 describe("ворота держимых мандатов перед поиском (Р38 п. 3)", () => {
-  it("INTENT отозван по ленте — agent.refused MANDATE_NOT_ACTIVE, STOPPED, ни verify, ни выдачи", async () => {
+  it("INTENT отозван по ленте — agent.refused MANDATE_NOT_ACTIVE, STOPPED MANDATE_REVOKED (STOP_ALL, Р50 п. 4), ни verify, ни выдачи", async () => {
     const r = await setup();
     const intent = await signedIntent(r);
     r.consents.mandates.get(intent.id)!.status = "REVOKED";
@@ -243,14 +243,16 @@ describe("ворота держимых мандатов перед поиско
     expect(r.purchase.state).toBe("STOPPED");
     expect(r.offers.calls).toBe(0);
     expect(r.stand.log().length).toBe(before);
-    expect(r.tail().slice(-3).map((e) => [e.kind, e.reason ?? e.detail])).toEqual([
+    expect(r.tail().slice(-4).map((e) => [e.kind, e.reason ?? e.detail])).toEqual([
       ["mandate.revoked", undefined],
       ["agent.refused", "MANDATE_NOT_ACTIVE"],
-      ["purchase.stage", "MANDATE_NOT_ACTIVE"],
+      ["purchase.stage", "MANDATE_REVOKED"],
+      ["purchase.unfinished", "MANDATE_REVOKED"],
     ]);
+    expect(r.purchase.unfinished).toBe("SEARCH");
   });
 
-  it("INTENT отозван, пока шёл поиск — STOPPED MANDATE_NOT_ACTIVE, выдачи нет (ревью К2.2 № 15)", async () => {
+  it("INTENT отозван, пока шёл поиск — STOPPED MANDATE_REVOKED, выдачи нет (ревью К2.2 № 15)", async () => {
     const inner = feedOffers(SHOP);
     let during: (m: { id: string }) => Promise<void> = async () => {};
     const r = await setup({ offers: { search: async (m) => (await during(m), inner.search(m)) } });
@@ -260,9 +262,9 @@ describe("ворота держимых мандатов перед поиско
       await r.core.mandates.refreshHeld({ kind: "event", event: event("mandate.revoked", m.id) });
     };
     await expect(r.purchase.search()).rejects.toBeInstanceOf(PurchaseStopped);
-    expect(r.purchase.reason).toBe("MANDATE_NOT_ACTIVE");
+    expect(r.purchase.reason).toBe("MANDATE_REVOKED");
     expect(r.purchase.offers).toBeNull();
-    expect(stages(r).at(-1)).toBe("STOPPED:MANDATE_NOT_ACTIVE");
+    expect(stages(r).at(-1)).toBe("STOPPED:MANDATE_REVOKED");
   });
 
   it("verify не CONFIRMED — STOPPED MANDATE_OUT_OF_SCOPE (запись agent.refused — клиента мандатов, одна)", async () => {

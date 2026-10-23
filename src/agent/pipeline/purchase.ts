@@ -7,7 +7,7 @@ import { PlatformFailure, type CartLine, type Mandate, type MandateDraft, type M
 import type { DiagCode } from "../../shared/diag-codes.js";
 import { SAFE_ID, SHOP_ID } from "../../shared/ids.js";
 import { liveCheck, type A5SignalCode, type CatalogIssueCode, type CatalogProduct, type LiveCheckParams, type LiveFactCode } from "../catalog/index.js";
-import { ruleForDeclineReason } from "../declines/index.js";
+import { ruleForDeclineReason, stopNext, type StopNext, type Unfinished } from "../declines/index.js";
 import { MandateRefused, type MandateClient } from "../mandates/index.js";
 import { issuedByShell, spend } from "../policy/a5-issued.js";
 import { acceptedA5, cartTotal, classifyOffer, mayDraftCart, mayOrder, type CartPurchase, type HumanA5Decision, type OfferVerdict, type OrderDecision, type OrderNext } from "../policy/catalog.js";
@@ -66,7 +66,10 @@ export interface PipelineJournal extends PurchaseJournal {
       /** номер заказа продавца не передаётся дальше (Р45, 9а): detail — только причина, значения нет */
       | { at: string; kind: "agent.refused"; reason: "SHOP_ORDER_REF_INVALID"; detail: OrderRefIssue; mandate?: string }
       /** уведомление оболочки упало (Р47 п. 5, В3): исход покупки не меняется */
-      | { at: string; kind: "notify.failed"; reason: PurchaseNotice; mandate?: string },
+      | { at: string; kind: "notify.failed"; reason: PurchaseNotice; mandate?: string }
+      /** STOP_ALL (Р50 п. 4, Т13): что не завершено — detail из перечня UNFINISHED, reason — код остановки; после
+       *  purchase.stage STOPPED */
+      | { at: string; kind: "purchase.unfinished"; reason: DiagCode; detail: Unfinished; mandate?: string },
   ): void;
 }
 
@@ -154,13 +157,18 @@ export class OrderRefused extends Error {
 
 /** Покупка остановлена воротами конвейера; код — в журнале (purchase.stage) и здесь. */
 export class PurchaseStopped extends Error {
-  /** `cause` — исходная ошибка шага, если код заменён после отправки пакета (Р49 п. 2): для оператора, не для человека */
+  /** что делать оболочке — из таблицы ядра по коду (Р50 п. 4); null — просто остановка */
+  readonly next: StopNext | null;
+  /** `cause` — исходная ошибка шага, если код заменён после отправки пакета (Р49 п. 2): для оператора, не для человека;
+   *  `unfinished` — что не завершено при STOP_ALL (Р50 п. 4) */
   constructor(
     readonly code: DiagCode,
     options?: { cause: unknown },
+    readonly unfinished: Unfinished | null = null,
   ) {
     super(`Покупка остановлена: ${code}`, options);
     this.name = "PurchaseStopped";
+    this.next = stopNext(code);
   }
 }
 
@@ -250,6 +258,18 @@ export class Purchase {
   /** Код остановки; до STOPPED — null. */
   get reason(): DiagCode | null {
     return this.#machine.reason;
+  }
+
+  /** Что делать оболочке после остановки (Р50 п. 4) — и когда наружу ушла исходная ошибка шага, а не PurchaseStopped;
+   *  до STOPPED — null. */
+  get next(): StopNext | null {
+    const reason = this.#machine.reason;
+    return reason === null ? null : stopNext(reason);
+  }
+
+  /** Что не завершено при STOP_ALL (Р50 п. 4); иначе null. */
+  get unfinished(): Unfinished | null {
+    return this.next === "STOP_ALL" ? this.#machine.unfinished : null;
   }
 
   get intentMandate(): Mandate | null {
@@ -527,7 +547,7 @@ export class Purchase {
           // при ожидании подтверждения после DECLINED продавца (Р47 п. 6)
           slot.settle("UNKNOWN");
           // шаг прерван остановкой покупки (Р45, Б2в (а)) — наружу та же ошибка, что у остановленной стадии
-          if (e === this.#machine.stopped.reason) throw new PurchaseStopped(this.#machine.reason ?? "UNKNOWN");
+          if (e === this.#machine.stopped.reason) throw this.#stopped(this.#machine.reason ?? "UNKNOWN");
           if (e instanceof PaymentFailure && e.code === "CONFIRMATION_REQUIRED") return null;
           throw e;
         }
@@ -562,7 +582,7 @@ export class Purchase {
       try {
         return await this.o.payment.confirm(this.#forPayment(c), () => this.#notify("CONFIRMATION_PENDING"), this.#machine.stopped);
       } catch (e) {
-        if (e === this.#machine.stopped.reason) throw new PurchaseStopped(this.#machine.reason ?? "UNKNOWN");
+        if (e === this.#machine.stopped.reason) throw this.#stopped(this.#machine.reason ?? "UNKNOWN");
         throw e;
       }
     });
@@ -737,11 +757,13 @@ export class Purchase {
   /** Ворота (Р38 п. 3): мандаты держатся — лента не выводила их (отзыв, иной статус); иначе отказ действовать. */
   #held(...ms: Mandate[]): void {
     const held = new Set(this.o.mandates.held().map((m) => m.id));
-    for (const m of ms) {
-      if (held.has(m.id)) continue;
-      this.#record({ kind: "agent.refused", reason: "MANDATE_NOT_ACTIVE", ...maskedMandate(m.id) });
-      this.#halt("MANDATE_NOT_ACTIVE");
-    }
+    const out = ms.filter((m) => !held.has(m.id));
+    if (out.length === 0) return;
+    // отозван хоть один (GET дал REVOKED, запись mandate.revoked у клиента) — остановка кодом §7а: STOP_ALL (Р50 п. 4, Т13);
+    // порядок мандатов не влияет (ревью КТ1 № 5). agent.refused — что увидели ворота: мандат не держится (нюанс Р50)
+    const m = out.find((x) => this.o.mandates.revoked(x.id)) ?? out[0]!;
+    this.#record({ kind: "agent.refused", reason: "MANDATE_NOT_ACTIVE", ...maskedMandate(m.id) });
+    this.#halt(this.o.mandates.revoked(m.id) ? "MANDATE_REVOKED" : "MANDATE_NOT_ACTIVE");
   }
 
   /** Итог CART из своего снимка; CART без корзины — ответ не той формы (инвариант 4). */
@@ -808,8 +830,37 @@ export class Purchase {
 
   #halt(code: DiagCode, cause?: StopCause): never {
     this.#machine.stop(code, cause);
+    this.#stopAll();
     // после отправки пакета наружу — тот же итоговый код, что у машины (Р49 п. 2)
-    throw new PurchaseStopped(this.#machine.outcome(code));
+    throw this.#stopped(this.#machine.outcome(code));
+  }
+
+  /** Отказ наружу с кодом остановки машины; `unfinished` — во всех местах, где он бросается, а не только в #halt (ревью
+   *  КТ1 № 2: ожидающий шаг после STOP_ALL параллельного вызова). */
+  #stopped(code: DiagCode, options?: { cause: unknown }): PurchaseStopped {
+    return new PurchaseStopped(code, options, this.unfinished);
+  }
+
+  /** STOP_ALL (Р50 п. 4, Т13; A7 п. 6): по итоговому коду остановки — мандаты покупки сняты с удержания и дальше не
+   *  используются, запись purchase.unfinished — что не завершено. У каждой покупки свой INTENT: «всё начатое по
+   *  мандату» — эта покупка. Событие отзыва вне обращения — AG-14. */
+  #stopAll(): void {
+    const reason = this.#machine.reason;
+    if (reason === null || stopNext(reason) !== "STOP_ALL") return;
+    // запись — до исполнения: решение без записи не исполняется (инвариант 4; ревью КТ1 № 3)
+    const unfinished = this.#machine.unfinished;
+    if (unfinished !== null) this.#record({ kind: "purchase.unfinished", reason, detail: unfinished });
+    this.o.mandates.release(...this.#mandateIds());
+  }
+
+  #mandateIds(): string[] {
+    return [this.#intent?.id, this.#cart?.id].filter((id): id is string => id !== undefined);
+  }
+
+  /** Отказ клиента мандатов: «не действует» при отзыве мандата покупки (awaitSigned, каскад от INTENT) — код отзыва §7а,
+   *  STOP_ALL (Р50 п. 4; ревью КТ1 № 4). */
+  #refusal(reason: MandateRefused["reason"]): DiagCode {
+    return reason === "MANDATE_NOT_ACTIVE" && this.#mandateIds().some((id) => this.o.mandates.revoked(id)) ? "MANDATE_REVOKED" : reason;
   }
 
   /** Отказ шага — STOPPED с кодом (Р38 п. 4); ожидание человека — без остановки; запрещённый переход — уже STOPPED.
@@ -823,7 +874,7 @@ export class Purchase {
       // отказ витрины на заказе, сбой списка витрин и шага оплаты — остановка этой сделки, не агента (Р42 п. 4, Р45, Р46 п. 2)
       const code =
         e instanceof MandateRefused
-          ? e.reason
+          ? this.#refusal(e.reason)
           : e instanceof PlatformFailure
             ? e.code
             : e instanceof ShopFailure || e instanceof PaymentFailure
@@ -831,9 +882,10 @@ export class Purchase {
               : (this.o.failureCode?.(e) ?? "UNKNOWN");
       if (waits.has(code)) throw e;
       this.#machine.stop(code);
+      this.#stopAll();
       // пакет уходил и код заменён: наружу — итоговый код машины, а не код шага с его текстом (Р49 п. 2, блокер Р-298;
       // ревью КТ1 № 1); итоговый код шага — его же ошибка
-      if (this.#machine.paid && this.#machine.reason !== code) throw new PurchaseStopped(this.#machine.reason ?? "OPERATION_RESULT_UNCONFIRMED", { cause: e });
+      if (this.#machine.paid && this.#machine.reason !== code) throw this.#stopped(this.#machine.reason ?? "OPERATION_RESULT_UNCONFIRMED", { cause: e });
       throw e;
     }
     this.#alive();
@@ -842,7 +894,7 @@ export class Purchase {
 
   /** Пока шаг ждал, покупку остановили (запрещённый переход параллельного вызова, ворота) — стадия дальше не идёт. */
   #alive(): void {
-    if (this.#machine.state === "STOPPED") throw new PurchaseStopped(this.#machine.reason ?? "UNKNOWN");
+    if (this.#machine.state === "STOPPED") throw this.#stopped(this.#machine.reason ?? "UNKNOWN");
   }
 
   /** mandate — INTENT покупки, если запись не называет свой (ворота по CART). Сбой журнала — покупка остановлена
@@ -856,7 +908,7 @@ export class Purchase {
       } catch {
         // журнал недоступен и для purchase.stage: состояние машины уже STOPPED
       }
-      if (this.#machine.paid) throw new PurchaseStopped(this.#machine.reason ?? "OPERATION_RESULT_UNCONFIRMED", { cause: err });
+      if (this.#machine.paid) throw this.#stopped(this.#machine.reason ?? "OPERATION_RESULT_UNCONFIRMED", { cause: err });
       throw err;
     }
   }

@@ -24,5 +24,6 @@
   "shop_retry_after_max_sec": 30,
   "shop_retry_default_ms": 1000,
   "shop_search_deadline_ms": 15000,
-  "confirmation_wait_ms": 30000
+  "confirmation_wait_ms": 30000,
+  "operation_outcome_max_delay_sec": 30
 }

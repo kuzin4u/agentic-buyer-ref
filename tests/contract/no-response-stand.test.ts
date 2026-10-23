@@ -111,4 +111,10 @@ describe("NO_RESPONSE на стенде v0.19.0: повтор тем же клю
     // то же правило, что при загрузке (config.ts), со сроком стенда: попытки, тайм-ауты и потолок Retry-After (ревью К2 № 10)
     expect(() => parseParams({ ...agent, idempotency_ttl_sec: s.params.idempotency_ttl_sec })).not.toThrow();
   });
+
+  it("предел задержки события итога операции у агента равен стенду (Р49 п. 1; #57 п. 4)", async () => {
+    const { s } = await setup();
+    const agent = JSON.parse(readFileSync("config/params.stand.json", "utf8")) as Record<string, unknown>;
+    expect(agent.operation_outcome_max_delay_sec).toBe(s.params.operation_outcome_max_delay_sec);
+  });
 });

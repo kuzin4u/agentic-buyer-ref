@@ -99,6 +99,7 @@ export function payments(o: { confirm?: ConfirmationOutcome; authorize?: Partial
     indicator: null,
     status: "AUTHORIZED",
     declineReason: null,
+    fulfilment: null,
     ...over,
   });
   const steps = {

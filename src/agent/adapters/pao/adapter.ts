@@ -514,6 +514,11 @@ export class PaoPlatform implements PaymentPlatform {
     return this.call("GET /pao/v1/operations/{op_ref}", { path: { op_ref: opRef } }, (r) => map.operationFromPao(r, ref, "single", this.o.agentCode));
   }
 
+  /** Операция по `op_ref` из события до привязки к покупке (Р49 п. 3): мандата вызывающий не знает. */
+  readOperation(opRef: string) {
+    return this.call("GET /pao/v1/operations/{op_ref}", { path: { op_ref: opRef } }, (r) => map.operationRecordFromPao(r, this.o.agentCode));
+  }
+
   async openDispute(draft: Parameters<PaymentPlatform["openDispute"]>[0], m: Mutation) {
     return this.call("POST /pao/v1/disputes", { body: map.disputeDraftToPao(draft), idempotencyKey: keyOf(m) }, map.disputeFromPao);
   }

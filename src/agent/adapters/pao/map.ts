@@ -24,11 +24,15 @@ import {
   type MandateDraft,
   type MandateRef,
   type Operation,
+  type OperationRecord,
+  type ScopeCheck,
   PLATFORM_EVENT_TYPES,
   type PlatformEventType,
 } from "../../../shared/domain.js";
 import type { FeedItem } from "../../ports/events.js";
 import { sealPackage, type SealedPackage } from "../../payment-package/package.js";
+import { orderRefIssue } from "../../payment-package/order-ref.js";
+import { fulfilmentIn } from "../../operations/bind.js";
 
 function incomplete(what: string): never {
   throw new PlatformFailure("BAD_RESPONSE", "never", null, 200, null, `ответ ПАО неполон: ${what}`);
@@ -265,7 +269,54 @@ export function operationFromPao(o: Pao.Operation, ref: MandateRef, scope: "list
     indicator: o.aoi ? indicatorFromPao(o.aoi, agentCode, ref.id) : null,
     status: need(o.status, "operation.status"),
     declineReason: o.reason ?? null,
+    fulfilment: fulfilmentIn(fulfilmentFromPao(o.fulfilment), ref.currency),
   };
+}
+
+/** Операция по GET до привязки к покупке (Р49 п. 3): признак — только этого агента (иначе ответ не подтверждён), мандат
+ *  признака сверяет модуль операций с CART привязанной покупки; суммы — числом без валюты. `order_ref` и `op_ref` — данные
+ *  Платформы: дальше только по маске (инвариант 5); `order_ref` не по маске ссылки агента — null. */
+export function operationRecordFromPao(o: Pao.Operation, agentCode: string): OperationRecord {
+  const opRef = need(o.op_ref, "operation.op_ref");
+  if (!SAFE_ID.test(opRef)) incomplete("operation.op_ref — не по маске");
+  if (o.aoi && (o.aoi.indicator !== true || o.aoi.agent_code !== agentCode || typeof o.aoi.mandate_id !== "string")) incomplete("operation.aoi — не признак этого агента");
+  return {
+    opRef,
+    orderRef: typeof o.order_ref === "string" && orderRefIssue(o.order_ref) === null ? o.order_ref : null,
+    channel: o.channel ?? null,
+    amountMinor: o.amount === undefined || o.amount === null ? null : count(o.amount, "operation.amount"),
+    merchantId: o.merchant_id ?? null,
+    indicator: o.aoi ? { agentCode: o.aoi.agent_code!, mandateId: o.aoi.mandate_id! } : null,
+    status: need(o.status, "operation.status"),
+    declineReason: o.reason ?? null,
+    fulfilment: fulfilmentFromPao(o.fulfilment),
+  };
+}
+
+const SCOPE_CHECKS: ReadonlySet<string> = new Set(["WITHIN_LIMITS", "EXCEEDS_AUTHORIZATION", "NOT_RESERVED"]);
+/** Значение scope_check вне перечня — человеку как есть (#59 п. 6), но только в форме кода: иное — без значения. */
+const SCOPE_CODE = /^[A-Z][A-Z0-9_]{0,63}$/;
+
+function scopeCheck(v: unknown): ScopeCheck {
+  if (typeof v !== "string") incomplete("fulfilment.scope_check");
+  if (SCOPE_CHECKS.has(v)) return v as Exclude<ScopeCheck, { other: string | null }>;
+  return { other: SCOPE_CODE.test(v) ? v : null };
+}
+
+/** Целое ≥ 0 в пределах безопасных целых — сумма в минимальных единицах. */
+function count(v: unknown, what: string): number {
+  if (typeof v !== "number" || !Number.isSafeInteger(v) || v < 0) incomplete(`${what} — не целое число минимальных единиц`);
+  return v;
+}
+
+/** Запись об исполнении (#59 п. 5): нет — null; есть — все поля, ссылка по маске, время RFC 3339. */
+function fulfilmentFromPao(f: Pao.Operation["fulfilment"]): OperationRecord["fulfilment"] {
+  if (f === undefined || f === null) return null;
+  const ref = need(f.fulfilment_ref, "fulfilment.fulfilment_ref");
+  if (!SAFE_ID.test(ref)) incomplete("fulfilment.fulfilment_ref — не по маске");
+  const at = instant(f.at);
+  if (at === null) incomplete("fulfilment.at");
+  return { ref, finalMinor: count(f.final_amount, "fulfilment.final_amount"), scopeCheck: scopeCheck(f.scope_check), spentMinor: count(f.spent_position, "fulfilment.spent_position"), at };
 }
 
 export function disputeDraftToPao(d: DisputeDraft): Pao.DisputeRequest {

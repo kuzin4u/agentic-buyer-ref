@@ -118,7 +118,22 @@ export type JournalKind =
    *  confirmation_id, если он один */
   | "confirmation.unbound"
   /** уведомление оболочки (notify) упало (Р47 п. 5, В3): reason — код уведомления; исход покупки не меняется */
-  | "notify.failed";
+  | "notify.failed"
+  /** статус операции по GET после operation.* (Р49 п. 3): ref — op_ref по маске, detail — статус из перечня ПАО */
+  | "operation.status"
+  /** операция не этого агента — 400 на GET (Р49 п. 3): ref — op_ref, действий нет */
+  | "operation.foreign"
+  /** операция без ожидающей покупки (Р49 п. 3): ref — op_ref; действий нет */
+  | "operation.unclaimed"
+  /** GET операции не подтверждён и не повторяется (ответ не по схеме, отказ): ref — op_ref, reason — код; ожидающая
+   *  покупка получит исход по сроку (Р49 п. 3) */
+  | "operation.unread"
+  /** привязанная операция не сходится с заказом и CART (Р49 п. 4): ref — op_ref, detail — поле AOI / MERCHANT / AMOUNT /
+   *  CHANNEL / OP_REF, reason — OPERATION_REPLY_MISMATCH */
+  | "operation.mismatch"
+  /** запись об исполнении (Р49 п. 7): ref — op_ref, detail — scope_check из перечня или OTHER (значение вне перечня в
+   *  журнал не пишется, инвариант 5) */
+  | "operation.settled";
 
 export interface JournalEntry {
   at: string;

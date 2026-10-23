@@ -172,6 +172,7 @@ export const PAYMENT_OUTCOME_CODES: ReadonlySet<DiagCode> = new Set<DiagCode>([
   "CONFIRMATION_UNBOUND",
   "CONFIRMATION_NOT_DELIVERED",
   "OPERATION_RESULT_UNCONFIRMED",
+  "OPERATION_REPLY_MISMATCH",
 ]);
 
 /** Код остановки после отправки пакета (Р49 п. 2): итоговый — как есть, иной — OPERATION_RESULT_UNCONFIRMED (пакет ушёл,

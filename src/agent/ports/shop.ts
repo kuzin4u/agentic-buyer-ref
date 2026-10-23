@@ -41,7 +41,7 @@ export class ShopFailure extends Error {
 /** Отказ шага оплаты профиля contour (Р45): остановка этой сделки с кодом; сообщение — только код (инвариант 1). */
 export class PaymentFailure extends Error {
   override readonly name = "PaymentFailure";
-  constructor(readonly code: Extract<DiagCode, "SHOP_ORDER_REF_INVALID" | "CREDENTIAL_INVALID" | "OPERATION_RESULT_UNCONFIRMED" | "CONFIRMATION_REQUIRED">) {
+  constructor(readonly code: Extract<DiagCode, "SHOP_ORDER_REF_INVALID" | "CREDENTIAL_INVALID" | "OPERATION_RESULT_UNCONFIRMED" | "CONFIRMATION_REQUIRED" | "OPERATION_REPLY_MISMATCH" | "SETTLEMENT_PENDING">) {
     super(`оплата: ${code}`);
   }
 }
@@ -106,6 +106,10 @@ export interface PaymentContext {
  *  confirmation_wait_ms; UNKNOWN — статус не подтверждён (fail-closed). */
 export type ConfirmationOutcome = "APPROVED" | "REJECTED" | "EXPIRED" | "UNBOUND" | "NONE" | "UNKNOWN";
 
+/** Уведомление оболочки — не исход покупки (Р47 п. 5, Р49 п. 7): запрос подтверждения ждёт человека; запись об исполнении
+ *  с scope_check не WITHIN_LIMITS. Текст — из реестра по коду; значение вне перечня — из `purchase.operation`. */
+export type PurchaseNotice = Extract<AgentDiagCode, "CONFIRMATION_PENDING" | "SCOPE_EXCEEDS_AUTHORIZATION" | "SCOPE_NOT_RESERVED" | "SCOPE_CHECK_UNRECOGNIZED">;
+
 /** Стадии 4–6. Исход каждого шага — из подписанного события Платформы, не со слов продавца (инвариант 8, Р14). */
 export interface PaymentSteps {
   /** Стадия 4 (Р47 п. 2): после отказа авторизации с требованием подтверждения — ожидание запроса ADP и решения человека
@@ -116,6 +120,7 @@ export interface PaymentSteps {
    *  требует подтверждения — PaymentFailure CONFIRMATION_REQUIRED (профиль contour — ответ продавца DECLINED, Р47 п. 4)
    *  или ответ со статусом CONFIRMATION_REQUIRED: дальше стадия 4. */
   authorize(c: PaymentContext, m: Mutation): Promise<Operation>;
-  /** Стадия 6: итог расчёта по операции (AG-11). */
+  /** Стадия 6 (Р49 п. 6): итог расчёта по операции. Расчёта ещё нет, ожидание прервано `signal` — PaymentFailure
+   *  SETTLEMENT_PENDING (ожидание, не остановка); операция не та — OPERATION_REPLY_MISMATCH. */
   settle(op: Operation, signal?: AbortSignal): Promise<Operation>;
 }

@@ -2,7 +2,7 @@
 // стадий (shop.ts). Ленты у PaoStub нет — элементы ленты задаёт тест (`setFeed`) до ожидания подписи.
 import { Purchase, type CartChoice } from "../../src/agent/pipeline/index.js";
 import type { HumanA5Decision } from "../../src/agent/shell/index.js";
-import type { FeedItem, LiveOfferSource, OfferSource, PaymentSteps, ShopPort } from "../../src/agent/ports/index.js";
+import type { FeedItem, LiveOfferSource, OfferSource, PaymentSteps, PurchaseNotice, ShopPort } from "../../src/agent/ports/index.js";
 import { OrderPriceMismatches, SplitWindow } from "../../src/agent/policy/index.js";
 import { loadParams } from "../../src/shared/config.js";
 import type { Journal } from "../../src/agent/journal/index.js";
@@ -39,7 +39,7 @@ export interface PurchaseSetup {
   /** окно дробления, общее с другой покупкой (как одно на ядро у места сборки); нет — своё */
   split?: SplitWindow;
   /** уведомление оболочки (Р47 п. 5, В3) */
-  notify?: (code: "CONFIRMATION_PENDING") => void | Promise<void>;
+  notify?: (code: PurchaseNotice) => void | Promise<void>;
 }
 
 /** `track` получает стенд до первого обращения — тест закрывает его и проверяет нарушения схемы в afterEach. */

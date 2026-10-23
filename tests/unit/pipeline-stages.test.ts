@@ -5,8 +5,8 @@ import { CartLiveRefused, CartRefused, OrderRefused, Purchase, PurchaseMachine, 
 import { MandateRefused } from "../../src/agent/mandates/index.js";
 import { isSpent } from "../../src/agent/policy/a5-issued.js";
 import { loadParams } from "../../src/shared/config.js";
-import { PlatformFailure } from "../../src/shared/domain.js";
-import { PaymentFailure, ShopFailure, type ConfirmationOutcome } from "../../src/agent/ports/index.js";
+import { PlatformFailure, type Fulfilment, type Operation } from "../../src/shared/domain.js";
+import { PaymentFailure, ShopFailure, type ConfirmationOutcome, type PaymentContext } from "../../src/agent/ports/index.js";
 import { INTENT, event } from "../support/consents.js";
 import { expectJournalClean } from "../support/journal.js";
 import { AGENT, type PaoStand } from "../support/pao-stand.js";
@@ -69,13 +69,15 @@ async function ordered(r: PurchaseRun, qty = 1) {
   return r.purchase.placeOrder({ idempotencyKey: "idem-order-1" });
 }
 
-/** Порт оплаты: авторизация — «нужно подтверждение» (как DECLINED продавца в профиле contour), стадия 4 — исход `outcome`. */
+/** Порт оплаты: авторизация — «нужно подтверждение» (как DECLINED продавца в профиле contour: пакет уже ушёл, `sending`),
+ *  стадия 4 — исход `outcome`. */
 const confirming = (outcome: ConfirmationOutcome) => {
   const steps = payments({ confirm: outcome });
   return {
     ...steps,
-    authorize: async () => {
+    authorize: async (c: PaymentContext) => {
       steps.calls.push("authorize");
+      c.sending();
       throw new PaymentFailure("CONFIRMATION_REQUIRED");
     },
   };
@@ -592,7 +594,8 @@ describe("стадии 4–6 — исходы из порта PaymentSteps (ин
       ["EXPIRED", "CONFIRMATION_EXPIRED"],
       ["UNBOUND", "CONFIRMATION_UNBOUND"],
       ["NONE", "OPERATION_RESULT_UNCONFIRMED"],
-      ["UNKNOWN", "UNKNOWN"],
+      // пакет ушёл: неитоговый код — OPERATION_RESULT_UNCONFIRMED (Р49 п. 2, блокер Р-298)
+      ["UNKNOWN", "OPERATION_RESULT_UNCONFIRMED"],
     ] as const) {
       const steps = confirming(outcome);
       const notified: string[] = [];
@@ -753,12 +756,13 @@ describe("стадии 4–6 — исходы из порта PaymentSteps (ин
     }
   });
 
-  it("расчёт не SETTLED — STOPPED UNKNOWN (инвариант 4)", async () => {
+  it("расчёт не SETTLED — STOPPED, после одобрения итоговым кодом OPERATION_RESULT_UNCONFIRMED (инвариант 4, Р49 п. 2)", async () => {
     const r = await setup({ payment: payments({ settle: "REVERSED" }) });
     await ordered(r);
     await r.purchase.authorize({ idempotencyKey: "idem-pay-1" });
-    await expect(r.purchase.settle()).rejects.toMatchObject({ code: "UNKNOWN" });
+    await expect(r.purchase.settle()).rejects.toMatchObject({ code: "OPERATION_RESULT_UNCONFIRMED" });
     expect(r.purchase.state).toBe("STOPPED");
+    expect(r.tail().filter((e) => e.kind === "payment.unconfirmed").map((e) => e.reason)).toEqual(["UNKNOWN"]);
   });
 
   it("сбой порта оплаты — STOPPED UNKNOWN, исходная ошибка наружу", async () => {
@@ -767,6 +771,60 @@ describe("стадии 4–6 — исходы из порта PaymentSteps (ин
     await ordered(r);
     await expect(r.purchase.authorize({ idempotencyKey: "idem-pay-1" })).rejects.toBe(boom);
     expect(r.purchase.reason).toBe("UNKNOWN");
+  });
+
+  it("Р49 п. 4: операция не сходится с заказом и CART — STOPPED OPERATION_REPLY_MISMATCH (итоговый код и после отправки пакета)", async () => {
+    const steps = { ...payments(), authorize: (c: PaymentContext) => (c.sending(), Promise.reject(new PaymentFailure("OPERATION_REPLY_MISMATCH"))) };
+    const r = await setup({ payment: steps });
+    await ordered(r);
+    await expect(r.purchase.authorize({ idempotencyKey: "idem-pay-1" })).rejects.toMatchObject({ code: "OPERATION_REPLY_MISMATCH" });
+    expect(r.purchase.reason).toBe("OPERATION_REPLY_MISMATCH");
+    expect(r.tail().some((e) => e.kind === "payment.unconfirmed")).toBe(false);
+  });
+
+  it("Р49 п. 6: расчёта ещё нет, ожидание прервано — SETTLEMENT_PENDING, покупка в SETTLING без остановки; settle() снова — DONE", async () => {
+    let pending = true;
+    const base = payments();
+    const steps = {
+      ...base,
+      settle: (x: Operation) => (pending ? Promise.reject(new PaymentFailure("SETTLEMENT_PENDING")) : base.settle(x)),
+    };
+    const r = await setup({ payment: steps });
+    await ordered(r);
+    await r.purchase.authorize({ idempotencyKey: "idem-pay-1" });
+    await expect(r.purchase.settle()).rejects.toMatchObject({ code: "SETTLEMENT_PENDING" });
+    expect(r.purchase.state).toBe("SETTLING");
+    expect(r.purchase.reason).toBeNull();
+    pending = false;
+    await expect(r.purchase.settle()).resolves.toMatchObject({ status: "SETTLED" });
+    expect(stages(r).slice(-2)).toEqual(["SETTLING", "DONE"]);
+  });
+
+  it("Р49 п. 7: scope_check не WITHIN_LIMITS — уведомление оболочки, покупка DONE; WITHIN_LIMITS — без уведомления", async () => {
+    const cases: [Fulfilment["scopeCheck"] | null, string[]][] = [
+      ["WITHIN_LIMITS", []],
+      ["EXCEEDS_AUTHORIZATION", ["SCOPE_EXCEEDS_AUTHORIZATION"]],
+      ["NOT_RESERVED", ["SCOPE_NOT_RESERVED"]],
+      [{ other: "PARTIAL" }, ["SCOPE_CHECK_UNRECOGNIZED"]],
+      [null, ["SCOPE_CHECK_UNRECOGNIZED"]],
+    ];
+    for (const [scopeCheck, expected] of cases) {
+      const settle = async (x: Operation): Promise<Operation> => ({
+        ...x,
+        status: "SETTLED",
+        fulfilment: scopeCheck === null ? null : { ref: "ful_1", finalAmount: x.amount!, scopeCheck, spentPosition: x.amount!, at: "2026-10-23T12:05:00.000Z" },
+      });
+      const notified: string[] = [];
+      const r = await setup({ payment: payments({ settle }), notify: (c) => void notified.push(c) });
+      await ordered(r);
+      await r.purchase.authorize({ idempotencyKey: "idem-pay-1" });
+      const op = await r.purchase.settle();
+      expect(r.purchase.state).toBe("DONE");
+      expect(notified, JSON.stringify(scopeCheck)).toEqual(expected);
+      // значение вне перечня — человеку как есть из операции покупки (#59 п. 6)
+      if (typeof scopeCheck === "object" && scopeCheck !== null) expect(op.fulfilment?.scopeCheck).toEqual({ other: "PARTIAL" });
+      await closeStand();
+    }
   });
 });
 
@@ -781,7 +839,7 @@ describe("ответ порта не той формы или сбой — STOPP
     }
   });
 
-  it("авторизация и расчёт: ответ null — STOPPED UNKNOWN", async () => {
+  it("авторизация и расчёт: ответ null — STOPPED UNKNOWN до отправки пакета; после одобрения — OPERATION_RESULT_UNCONFIRMED наружу (Р49 п. 2)", async () => {
     const auth = await setup({ payment: { ...payments(), authorize: async () => null as never } });
     await ordered(auth);
     await expect(auth.purchase.authorize({ idempotencyKey: "idem-pay-1" })).rejects.toThrow();
@@ -790,8 +848,54 @@ describe("ответ порта не той формы или сбой — STOPP
     const settle = await setup({ payment: { ...payments(), settle: async () => null as never } });
     await ordered(settle);
     await settle.purchase.authorize({ idempotencyKey: "idem-pay-1" });
-    await expect(settle.purchase.settle()).rejects.toThrow();
-    expect(stages(settle).at(-1)).toBe("STOPPED:UNKNOWN");
+    await expect(settle.purchase.settle()).rejects.toMatchObject({ code: "OPERATION_RESULT_UNCONFIRMED" });
+    expect(stages(settle).at(-1)).toBe("STOPPED:OPERATION_RESULT_UNCONFIRMED");
+  });
+
+  it("ревью КТ1 № 1: после отправки пакета сбой шага с кодом и без — наружу PurchaseStopped OPERATION_RESULT_UNCONFIRMED, исходная ошибка — в cause", async () => {
+    const failure = new PlatformFailure("STATE_UNAVAILABLE", "same_key", "STATE_UNAVAILABLE", 503, null);
+    for (const boom of [failure, new Error("журнал витрины недоступен")]) {
+      const r = await setup({ payment: { ...payments(), authorize: (c: PaymentContext) => (c.sending(), Promise.reject(boom)) } });
+      await ordered(r);
+      const err = await r.purchase.authorize({ idempotencyKey: "idem-pay-1" }).catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(PurchaseStopped);
+      expect(err).toMatchObject({ code: "OPERATION_RESULT_UNCONFIRMED", cause: boom });
+      expect(r.purchase.reason).toBe("OPERATION_RESULT_UNCONFIRMED");
+      await closeStand();
+    }
+  });
+
+  it("ревью КТ1 № 6: итог стадии 5 уже SETTLED (событие одобрения прочитано поздно) — как одобрение: SETTLING, расчёт заберёт settle", async () => {
+    const r = await setup({ payment: payments({ authorize: { status: "SETTLED" } }) });
+    await ordered(r);
+    await expect(r.purchase.authorize({ idempotencyKey: "idem-pay-1" })).resolves.toMatchObject({ status: "SETTLED" });
+    expect(r.purchase.state).toBe("SETTLING");
+    await expect(r.purchase.settle()).resolves.toMatchObject({ status: "SETTLED" });
+    expect(r.purchase.state).toBe("DONE");
+  });
+
+  it("ревью КТ1 № 7: второй settle(), пока первый ждёт, — SETTLEMENT_PENDING без остановки; остановка покупки прерывает ожидание расчёта", async () => {
+    let seen: AbortSignal | undefined;
+    let finish: (op: Operation) => void = () => {};
+    const steps = {
+      ...payments(),
+      settle: (x: Operation, signal?: AbortSignal) => {
+        seen = signal;
+        return new Promise<Operation>((res) => (finish = (op) => res(op)));
+      },
+    };
+    const r = await setup({ payment: steps });
+    await ordered(r);
+    const authorized = await r.purchase.authorize({ idempotencyKey: "idem-pay-1" });
+    const first = r.purchase.settle();
+    await expect(r.purchase.settle()).rejects.toMatchObject({ code: "SETTLEMENT_PENDING" });
+    expect(r.purchase.state).toBe("SETTLING");
+    // порту передан сигнал: остановка покупки его прерывает
+    expect(seen).toBeInstanceOf(AbortSignal);
+    expect(seen!.aborted).toBe(false);
+    finish({ ...authorized, status: "SETTLED", fulfilment: { ref: "ful_1", finalAmount: authorized.amount!, scopeCheck: "WITHIN_LIMITS", spentPosition: authorized.amount!, at: "2026-10-23T12:05:00.000Z" } });
+    await expect(first).resolves.toMatchObject({ status: "SETTLED" });
+    expect(r.purchase.state).toBe("DONE");
   });
 });
 
@@ -881,11 +985,11 @@ describe("держимые после ожиданий (Р38 п. 3, ревью �
     expect(stages(r).slice(-2)).toEqual(["CART_PENDING", "STOPPED:MANDATE_NOT_ACTIVE"]);
   });
 
-  it("CART отозван, пока человек подтверждал, — STOPPED MANDATE_NOT_ACTIVE, повтора нет", async () => {
+  it("CART отозван, пока человек подтверждал, — пакет ушёл: STOPPED OPERATION_RESULT_UNCONFIRMED, исходный MANDATE_NOT_ACTIVE — в журнале, повтора нет (Р49 п. 2)", async () => {
     const calls: string[] = [];
     const steps = {
       ...payments(),
-      authorize: () => (calls.push("authorize"), Promise.reject(new PaymentFailure("CONFIRMATION_REQUIRED"))),
+      authorize: (c: PaymentContext) => (calls.push("authorize"), c.sending(), Promise.reject(new PaymentFailure("CONFIRMATION_REQUIRED"))),
     };
     const run: { r?: PurchaseRun } = {};
     const confirm = async () => {
@@ -898,9 +1002,13 @@ describe("держимые после ожиданий (Р38 п. 3, ревью �
     };
     const r = (run.r = await setup({ payment: { ...steps, confirm } }));
     await ordered(r, Math.floor(THRESHOLD / TARTINE) + 1);
-    await expect(r.purchase.authorize({ idempotencyKey: "idem-pay-1" })).rejects.toMatchObject({ code: "MANDATE_NOT_ACTIVE" });
-    expect(stages(r).slice(-3)).toEqual(["AUTHORIZING", "CONFIRMING", "STOPPED:MANDATE_NOT_ACTIVE"]);
-    expect(r.tail().filter((e) => e.kind === "agent.refused").map((e) => e.reason)).toEqual(["MANDATE_NOT_ACTIVE"]);
+    await expect(r.purchase.authorize({ idempotencyKey: "idem-pay-1" })).rejects.toMatchObject({ code: "OPERATION_RESULT_UNCONFIRMED" });
+    expect(r.purchase.reason).toBe("OPERATION_RESULT_UNCONFIRMED");
+    expect(stages(r).slice(-3)).toEqual(["AUTHORIZING", "CONFIRMING", "STOPPED:OPERATION_RESULT_UNCONFIRMED"]);
+    expect(r.tail().filter((e) => e.kind === "agent.refused" || e.kind === "payment.unconfirmed").map((e) => [e.kind, e.reason])).toEqual([
+      ["agent.refused", "MANDATE_NOT_ACTIVE"],
+      ["payment.unconfirmed", "MANDATE_NOT_ACTIVE"],
+    ]);
     await expect(r.purchase.authorize({ idempotencyKey: "idem-pay-1" })).rejects.toBeInstanceOf(PurchaseTransitionForbidden);
     expect(calls).toEqual(["authorize", "confirm"]);
   });

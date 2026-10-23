@@ -7,6 +7,7 @@ import { PurchaseStopped, PurchaseTransitionForbidden } from "../../src/agent/pi
 import { PaymentFailure } from "../../src/agent/ports/index.js";
 import { SplitWindow } from "../../src/agent/policy/index.js";
 import { DIAG } from "../../src/agent/compose.js";
+import { loadParams } from "../../src/shared/config.js";
 import { INTENT } from "../support/consents.js";
 import { shopBy, type Contour, type ContourCall } from "../support/contour.js";
 import { luhnTail } from "../support/luhn.js";
@@ -22,8 +23,12 @@ afterEach(async () => {
 const NORMAL = shopBy("NORMAL");
 const CREDENTIALS = "pao POST /pao/v1/credentials";
 
+/** Без подмены до PS-11 продавец решает сам и до ADP стенда не доходит: операции у Платформы нет, события operation.* не
+ *  будет — итог стадии 5 по сроку (Р49 п. 5). Срок — не больше 1 с от стендового, чтобы тест не ждал (ревью КТ1 № 13). */
+const SHORT_DELAY_SEC = Math.min(loadParams().operation_outcome_max_delay_sec, 1);
+
 async function run(o: StandPurchaseOptions = {}) {
-  const r = await standPurchase({ ...o, contourPayment: true });
+  const r = await standPurchase({ ...o, params: { operation_outcome_max_delay_sec: SHORT_DELAY_SEC, ...o.params }, contourPayment: true });
   c = r.c;
   return r;
 }
@@ -132,7 +137,7 @@ describe("стадия 5 на стенде: реквизит по ПАО и па
     const out = outward(r, err);
     for (const s of secrets) expect(out.includes(s), "реквизит в выводе").toBe(false);
     // человеку — «итог не подтверждён», не «деньги не списывались» (Р45, Б1а)
-    expect(DIAG.OPERATION_RESULT_UNCONFIRMED!.human.ru).toMatch(/не подтвердила/);
+    expect(DIAG.OPERATION_RESULT_UNCONFIRMED!.human.ru).toMatch(/не подтверждён/);
     expect(out).not.toMatch(/не списывались/);
   });
 

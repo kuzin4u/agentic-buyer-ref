@@ -17,9 +17,10 @@ import { KeyRing, SignerKeyRejected, SignerStopped } from "./signer/index.js";
 import { Purchase } from "./pipeline/index.js";
 import { OrderPriceMismatches, SplitWindow } from "./policy/index.js";
 import type { LiveOfferSource } from "./ports/catalog.js";
-import type { OfferSource, PaymentSteps, ShopPaymentPort, ShopPort } from "./ports/shop.js";
+import type { OfferSource, PaymentSteps, PurchaseNotice, ShopPaymentPort, ShopPort } from "./ports/shop.js";
 import { ContourPayment } from "./payment-package/index.js";
 import { Confirmations } from "./confirmations/index.js";
+import { Operations } from "./operations/index.js";
 import {
   AGENT_DIAG,
   AGENT_STOP_CODES,
@@ -98,8 +99,9 @@ export interface PurchasePorts {
   shop: ShopPort;
   payment: PaymentSteps;
   region?: string;
-  /** уведомление оболочки (Р47 п. 5, В3): CONFIRMATION_PENDING — нужно подтверждение в приложении банка */
-  notify?: (code: "CONFIRMATION_PENDING") => void | Promise<void>;
+  /** уведомление оболочки (Р47 п. 5, В3; Р49 п. 7): CONFIRMATION_PENDING — нужно подтверждение в приложении банка; SCOPE_*
+   *  — запись об исполнении не WITHIN_LIMITS (значение вне перечня — из `purchase.operation`) */
+  notify?: (code: PurchaseNotice) => void | Promise<void>;
 }
 
 export interface AgentCoreOptions {
@@ -226,6 +228,10 @@ export function createAgentCore(o: AgentCoreOptions): AgentCore {
   // к покупке считает все ожидающие покупки агента; пока покупка ждёт, лента читается
   const confirmations = new Confirmations({ port: platform, journal, params, wake: () => events.signal(), now });
   events.listen(confirmations.listener);
+  // итог операции (Р49 п. 3–6): operation.* — сигнал, итог по GET; один модуль на ядро — привязка по order_ref среди всех
+  // покупок агента; пока покупка ждёт, лента читается
+  const operations = new Operations({ port: platform, journal, params, wake: () => events.signal(), now });
+  events.listen(operations.listener);
   // окно дробления — одно на ядро: доли разных покупок под одним INTENT видят друг друга (Р39 п. 4)
   const split = new SplitWindow(params, now);
   // пометка Д02 — одна на ядро: расхождение заказа одной покупки видно в выдачах следующих (Р48 п. 5)
@@ -276,7 +282,7 @@ export function createAgentCore(o: AgentCoreOptions): AgentCore {
         journal,
         now,
       }),
-    payment: (shop) => new ContourPayment({ platform, shop, journal, confirmations, now }),
+    payment: (shop) => new ContourPayment({ platform, shop, journal, confirmations, operations, params, now }),
     // Ключи загружаются до обращений к Платформе (сбой хранилища — без сети), затем курсор ленты и конфигурация, затем
     // GET /pao/v1/agent; курсор и конфигурация — один раз за start, повтор допуска (SIGNATURE_INVALID) их не повторяет.
     start: async () => {

@@ -120,6 +120,37 @@ export interface Operation {
   status: OperationStatus;
   /** причина отклонения как её прислала платформа (SPEC §7б) */
   declineReason: string | null;
+  /** запись об исполнении после клиринга (Р49 п. 7); до SETTLED — null */
+  fulfilment: Fulfilment | null;
+}
+
+/** Проверка клиринга Платформой (#59 п. 6): известные значения или `other` — значение вне перечня как есть (человеку без
+ *  догадки); не по форме кода — `null` (инвариант 5). В 1.4.0 — строка, `enum` — с ПАО 1.5.0. */
+export type ScopeCheck = "WITHIN_LIMITS" | "EXCEEDS_AUTHORIZATION" | "NOT_RESERVED" | { other: string | null };
+
+/** Запись об исполнении (Т11, #59 п. 5–7): суммы — в валюте операции (её мандата); `spentPosition` — значение Платформы,
+ *  агент его не пересчитывает (инвариант 6). */
+export interface Fulfilment {
+  ref: string;
+  finalAmount: Money;
+  scopeCheck: ScopeCheck;
+  spentPosition: Money;
+  at: string;
+}
+
+/** Операция по GET до привязки к покупке (Р49 п. 3): суммы — целым числом минимальных единиц без валюты (в ПАО 1.4.0
+ *  валюты у операции нет), валюту даёт CART привязанной покупки; признак — этого агента, мандат признака не сверен.
+ *  `orderRef` не по маске ссылки агента — null (не привязывается). */
+export interface OperationRecord {
+  opRef: string;
+  orderRef: string | null;
+  channel: PaymentChannel | null;
+  amountMinor: number | null;
+  merchantId: string | null;
+  indicator: AgentIndicator | null;
+  status: OperationStatus;
+  declineReason: string | null;
+  fulfilment: { ref: string; finalMinor: number; scopeCheck: ScopeCheck; spentMinor: number; at: string } | null;
 }
 
 export interface DisputeDraft {

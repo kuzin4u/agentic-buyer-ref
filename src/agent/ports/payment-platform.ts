@@ -13,6 +13,7 @@ import type {
   KeyDraft,
   MandateRef,
   Operation,
+  OperationRecord,
 } from "../../shared/domain.js";
 import type { EventsPort } from "./events.js";
 import type { MandatePort } from "./mandates.js";
@@ -78,6 +79,8 @@ export interface PaymentPlatform extends MandatePort, EventsPort {
   /** Суммы операций — в валюте мандата ссылки; признак операции другого мандата — отказ UNKNOWN (Р29 п. 3). */
   listOperations(ref: MandateRef): Promise<Operation[]>;
   getOperation(opRef: string, ref: MandateRef): Promise<Operation>;
+  /** Операция по `op_ref` из события, без привязки к мандату (Р49 п. 3): суммы — числом, признак — этого агента. */
+  readOperation(opRef: string): Promise<OperationRecord>;
 
   openDispute(draft: DisputeDraft, m: Mutation): Promise<Dispute>;
   getDispute(id: string): Promise<Dispute>;

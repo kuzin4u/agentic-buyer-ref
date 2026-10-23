@@ -40,6 +40,16 @@ describe("стендовые параметры", () => {
     expect(() => parseParams({ ...tight, idempotency_ttl_sec: 45 })).not.toThrow();
   });
 
+  it("Р49 п. 1: operation_outcome_max_delay_sec — целое > 0, срок таймера Node и не больше registry_cache_ttl_sec", () => {
+    const without = { ...stand };
+    delete without.operation_outcome_max_delay_sec;
+    expect(() => parseParams(without)).toThrow(/operation_outcome_max_delay_sec/);
+    expect(() => parseParams({ ...stand, operation_outcome_max_delay_sec: 0 })).toThrow(ConfigError);
+    expect(() => parseParams({ ...stand, operation_outcome_max_delay_sec: 1.5 })).toThrow(ConfigError);
+    expect(() => parseParams({ ...stand, operation_outcome_max_delay_sec: stand.registry_cache_ttl_sec + 1 })).toThrow(/registry_cache_ttl_sec/);
+    expect(() => parseParams({ ...stand, operation_outcome_max_delay_sec: stand.registry_cache_ttl_sec })).not.toThrow();
+  });
+
   it("живая проверка (Р32 п. 7): три параметра обязательны, таймаут — целое 1…2^31 − 1 мс", () => {
     for (const k of ["live_check_timeout_ms", "live_check_max_age_sec", "live_check_clock_skew_sec"]) {
       const rest = { ...stand };

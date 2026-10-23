@@ -54,6 +54,10 @@ export const StandParamsSchema = z
   shop_search_deadline_ms: positive.max(TIMER_MAX_MS),
   // Ожидание запроса подтверждения после ответа продавца DECLINED (Р47 п. 4): не пришёл — OPERATION_RESULT_UNCONFIRMED.
   confirmation_wait_ms: positive.max(TIMER_MAX_MS),
+  // Предел задержки события итога операции (#57 п. 4, Р49 п. 1): на стадии 5 — ожидание operation.* после ответа продавца,
+  // на стадии 6 — промежуток перечитывания GET без события (#59 п. 3). Равен параметру стенда (тест стенда).
+  // × 1000 — срок таймера: не больше его предела (как shop_retry_after_max_sec); 0 — ожидания нет, не допускается
+  operation_outcome_max_delay_sec: positive.max(Math.floor(TIMER_MAX_MS / 1000)),
 })
   // Обращения и ожидание повторов укладываются в registry_cache_ttl_sec (инвариант 4, Р20).
   .refine(
@@ -74,6 +78,8 @@ export const StandParamsSchema = z
   .refine((p) => p.pao_credentials_timeout_ms <= p.registry_cache_ttl_sec * 1000, { message: "pao_credentials_timeout_ms больше registry_cache_ttl_sec" })
   // Ожидание запроса подтверждения — в пределах registry_cache_ttl_sec (Р47 п. 4, инвариант 4).
   .refine((p) => p.confirmation_wait_ms <= p.registry_cache_ttl_sec * 1000, { message: "confirmation_wait_ms больше registry_cache_ttl_sec" })
+  // Ожидание итога операции — в пределах registry_cache_ttl_sec (Р49 п. 1, инвариант 4).
+  .refine((p) => p.operation_outcome_max_delay_sec <= p.registry_cache_ttl_sec, { message: "operation_outcome_max_delay_sec больше registry_cache_ttl_sec" })
   // Срок поиска вмещает хотя бы одно обращение к витрине (Р44 п. 6).
   .refine((p) => p.shop_search_deadline_ms >= p.shop_request_timeout_ms, { message: "shop_search_deadline_ms меньше shop_request_timeout_ms" });
 

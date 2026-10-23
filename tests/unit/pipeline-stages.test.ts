@@ -743,7 +743,7 @@ describe("стадии 4–6 — исходы из порта PaymentSteps (ин
   });
 
   it("операция отклонена — STOPPED с кодом причины (SPEC §7б); неизвестная причина — DECLINE_REASON_UNKNOWN", async () => {
-    for (const [reason, code] of [["INSUFFICIENT_FUNDS", "INSUFFICIENT_FUNDS"], ["что-то новое", "DECLINE_REASON_UNKNOWN"]] as const) {
+    for (const [reason, code] of [["INSUFFICIENT_FUNDS", "INSUFFICIENT_FUNDS"], ["LIMIT_EXCEEDED", "DECLINED_LIMIT_EXCEEDED"], ["ISSUER_DECLINED", "ISSUER_DECLINED"], ["что-то новое", "DECLINE_REASON_UNKNOWN"]] as const) {
       const r = await setup({ payment: payments({ authorize: { status: "DECLINED", declineReason: reason } }) });
       await ordered(r);
       await expect(r.purchase.authorize({ idempotencyKey: "idem-pay-1" })).rejects.toMatchObject({ code });

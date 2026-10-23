@@ -47,14 +47,40 @@ describe("реестр кодов агента (Р36)", () => {
     }
   });
 
-  it("причины operation.declined (SPEC §7б) и реестр согласны: код = ключ, запись есть, действие по таблице", () => {
-    const ACTION: Record<ReasonAction, DiagAction> = { STOP: "stop", STOP_AND_NOTIFY: "stop", NOTIFY_HUMAN: "after_human", FIX_AGENT: "after_fix" };
+  it("причины operation.declined (SPEC §7б) и реестр согласны: код — ключ или DECLINED_<ключ> у кода §7а, запись есть, действие по таблице", () => {
+    const ACTION: Record<ReasonAction, DiagAction> = {
+      STOP: "stop", STOP_AND_NOTIFY: "stop", NOTIFY_HUMAN: "after_human", FIX_AGENT: "after_fix",
+      NEW_MANDATE: "after_human", STOP_AGENT: "stop", STOP_ALL: "stop",
+    };
     const rules = [...Object.entries(DECLINE_REASONS), ["(неизвестная)", ruleForDeclineReason("SOMETHING_NEW")] as const];
     for (const [key, rule] of rules) {
-      if (key !== "(неизвестная)") expect(rule.code, key).toBe(key);
+      // Р48 п. 1: причина, совпадающая с кодом §7а (он в PAO_DIAG ядра), — с приставкой DECLINED_
+      if (key !== "(неизвестная)") {
+        expect(rule.code, key).toBe(Object.hasOwn(PAO_ERRORS, key) ? `DECLINED_${key}` : key);
+        expect(AGENT_DIAG[rule.code]?.component, key).toBe("pao");
+      }
       expect(DIAG[rule.code]?.action, key).toBe(ACTION[rule.action]);
     }
     expect(ruleForDeclineReason(null).code).toBe("DECLINE_REASON_UNKNOWN");
+  });
+
+  it("Р48 п. 2: тексты человеку причин §7б — без совета повторить, с «итог проверьте в приложении банка»", () => {
+    const codes = [...Object.values(DECLINE_REASONS).map((r) => r.code), ruleForDeclineReason(null).code];
+    for (const code of codes) {
+      const human = AGENT_DIAG[code].human.ru;
+      expect(human, code).not.toMatch(/повтор|ещё раз|снова|попробуйте|пополните|другой способ|позже/i);
+      expect(human, code).toContain("итог проверьте в приложении банка");
+    }
+  });
+
+  it("Р48 п. 1: перечень §7б — закрытый перечень Платформы v0.19.0 (передача #57) плюс AOI_MISSING и INSUFFICIENT_FUNDS", () => {
+    // Перечень стенда не экспортируется (exports пакета — stand и fixtures): читается текст объявления из dist; до ПАО 1.5.0
+    // enum в YAML нет (#37). Сломается при переносе файла на стороне платформы — тогда сверка по CHANGELOG и #57.
+    const dts = readFileSync("node_modules/agentic-ps-platform/dist/fulfilment/outcomes.d.ts", "utf8");
+    const list = /DECLINE_EVENT_REASONS: readonly \[([^\]]*)\]/.exec(dts)?.[1] ?? "";
+    const platform = [...list.matchAll(/"([A-Z_]+)"/g)].map((m) => m[1]!);
+    expect(platform).toHaveLength(10);
+    expect(Object.keys(DECLINE_REASONS).sort()).toEqual([...platform, "AOI_MISSING", "INSUFFICIENT_FUNDS"].sort());
   });
 
   it("тексты ядра не повторяются; текст отказа мандата без порядка отзыва — один (Р36 п. 1, п. 3)", () => {

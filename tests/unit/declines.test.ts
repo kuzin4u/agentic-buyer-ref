@@ -56,6 +56,13 @@ describe("таблица отказов", () => {
     expect(ruleForDeclineReason("AOI_MISMATCH").action).toBe("STOP");
     expect(ruleForDeclineReason("INSUFFICIENT_FUNDS").action).toBe("NOTIFY_HUMAN");
     expect(ruleForDeclineReason("AOI_MISSING").action).toBe("FIX_AGENT");
+    // Р48 п. 1: перечень #57 — без повтора операции; совпадающие с §7а — с кодом DECLINED_
+    expect(ruleForDeclineReason("AGENT_SUSPENDED")).toMatchObject({ code: "DECLINED_AGENT_SUSPENDED", action: "STOP_AGENT" });
+    expect(ruleForDeclineReason("MANDATE_REVOKED")).toMatchObject({ code: "DECLINED_MANDATE_REVOKED", action: "STOP_ALL" });
+    for (const r of ["MANDATE_NOT_FOUND", "MANDATE_EXPIRED", "MANDATE_SCOPE"]) expect(ruleForDeclineReason(r).action, r).toBe("NEW_MANDATE");
+    for (const r of ["LIMIT_EXCEEDED", "ISSUER_DECLINED"]) expect(ruleForDeclineReason(r).action, r).toBe("NOTIFY_HUMAN");
+    for (const r of ["CREDENTIAL_INVALID", "STATE_UNAVAILABLE"]) expect(ruleForDeclineReason(r).action, r).toBe("STOP");
+    expect(ruleForDeclineReason("ISSUER_DECLINED").code).toBe("ISSUER_DECLINED");
     expect(ruleForDeclineReason("SOMETHING_NEW")).toEqual({ code: "DECLINE_REASON_UNKNOWN", action: "STOP_AND_NOTIFY", defect: false, journal: true, unknown: true });
     expect(ruleForDeclineReason(null).unknown).toBe(true);
   });

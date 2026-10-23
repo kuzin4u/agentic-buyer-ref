@@ -6,6 +6,7 @@ import type { FeedItem, LiveOfferSource, OfferSource, PaymentSteps, PurchaseNoti
 import { OrderPriceMismatches, SplitWindow } from "../../src/agent/policy/index.js";
 import { loadParams } from "../../src/shared/config.js";
 import type { Journal } from "../../src/agent/journal/index.js";
+import type { AgentCore } from "../../src/agent/compose.js";
 import type { DiagCode } from "../../src/shared/diag-codes.js";
 import type { MandateDraft } from "../../src/shared/domain.js";
 import { Consents, INTENT, feed } from "./consents.js";
@@ -31,7 +32,8 @@ export interface PurchaseSetup {
   offers?: OfferSource;
   live?: LiveOfferSource;
   shop?: ShopPort;
-  payment?: PaymentSteps;
+  /** порт оплаты; функция — от ядра (настоящие шаги ядра `core.payment` на PaoStub, Р50 п. 5) */
+  payment?: PaymentSteps | ((core: AgentCore) => PaymentSteps);
   /** запись журнала до журнала ядра: бросает — сбой журнала (ревью К5 № 1) */
   tap?: (entry: Parameters<Journal["record"]>[0]) => void;
   /** стендовые параметры поверх config/params.stand.json (граница порога и т. п.) */
@@ -55,7 +57,7 @@ export async function purchaseOn(o: PurchaseSetup, track: (s: PaoStand) => void)
   const offers = o.offers ?? feedOffers(...(o.shops ?? [SHOP]));
   const live = o.live ?? liveOffers(first, () => s.clock);
   const shop = o.shop ?? shopOrders(first);
-  const payment = o.payment ?? payments();
+  const payment = typeof o.payment === "function" ? o.payment(core) : (o.payment ?? payments());
   const split = o.split ?? new SplitWindow({ ...loadParams(), ...o.params }, () => s.clock);
   let items: FeedItem[] = [];
   let stream: (() => AsyncIterable<FeedItem>) | null = null;

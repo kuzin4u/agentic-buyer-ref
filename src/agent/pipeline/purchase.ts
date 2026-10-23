@@ -12,6 +12,7 @@ import { MandateRefused, type MandateClient } from "../mandates/index.js";
 import { issuedByShell, spend } from "../policy/a5-issued.js";
 import { acceptedA5, cartTotal, classifyOffer, mayDraftCart, mayOrder, type CartPurchase, type HumanA5Decision, type OfferVerdict, type OrderDecision, type OrderNext } from "../policy/catalog.js";
 import { confirmThreshold, currencySupported, mandateRefusal, mayAuthorize, needsConfirmation, type PaymentDecision, type Thresholds } from "../policy/payment.js";
+import type { OrderPriceMismatches } from "../policy/order-mismatch.js";
 import type { SplitWindow } from "../policy/split.js";
 import type { LiveOfferSource } from "../ports/catalog.js";
 import type { FeedItem } from "../ports/events.js";
@@ -32,8 +33,8 @@ export interface PipelineJournal extends PurchaseJournal {
        *  продавца, оба по маске (у решений каталога ниже — так же) */
       | { at: string; kind: "offer.excluded"; reason: CatalogIssueCode; ref?: string; mandate?: string; merchant?: string }
       | { at: string; kind: "offer.excluded"; detail: "REGION"; ref?: string; mandate?: string; merchant?: string }
-      /** сигнал A5 — показ с пометкой */
-      | { at: string; kind: "offer.flagged"; reason: A5SignalCode; ref?: string; mandate?: string; merchant?: string }
+      /** сигнал A5 — показ с пометкой; detail ORDER_REPLY_MISMATCH — пометка Д02 по прежнему заказу (Р48 п. 5) */
+      | { at: string; kind: "offer.flagged"; reason: A5SignalCode; detail?: "ORDER_REPLY_MISMATCH"; ref?: string; mandate?: string; merchant?: string }
       /** проект CART не готовится (Р32 п. 2, Р40 п. 4): reason — код сигнала A5, detail — решение политики */
       | { at: string; kind: "cart.refused"; reason: A5SignalCode; detail: CartRefusal; ref?: string; mandate?: string; merchant?: string }
       /** заказа нет — живая проверка не ok (Р32 п. 3–4): reason — код проверки, detail — следующий шаг */
@@ -172,6 +173,8 @@ export interface PurchaseOptions {
   params: LiveCheckParams & Pick<StandParams, "confirm_above_kop">;
   /** окно дробления (Р39 п. 4) — одно на ядро: общее для всех покупок, иначе доли разных покупок друг друга не видят */
   split: SplitWindow;
+  /** пометка Д02 (Р48 п. 5) — одна на ядро: заказ одной покупки помечает предложение в выдачах следующих */
+  orderMismatches: OrderPriceMismatches;
   journal: PipelineJournal;
   /** стадия 0 (Р38 п. 2): null — последний start() дал допуск (Р36 п. 6) и подпись не остановлена; иначе код остановки */
   admission: () => DiagCode | null;
@@ -455,7 +458,11 @@ export class Purchase {
           this.#record({ kind: "agent.refused", reason: "SHOP_ORDER_REF_INVALID", detail: issue, ...maskedMandate(cart.id) });
           this.#halt("SHOP_ORDER_REF_INVALID");
         }
-        if (reply.total.amount !== basket.total.amount || reply.total.currency !== basket.total.currency) this.#halt("ORDER_REPLY_MISMATCH");
+        if (reply.total.amount !== basket.total.amount || reply.total.currency !== basket.total.currency) {
+          // Д02 (Р48 п. 5): какая позиция расходится, по итогу не видно — помечаются все позиции заказа
+          for (const l of basket.lines) this.o.orderMismatches.mark(offers[0]!.merchantId, l.sku);
+          this.#halt("ORDER_REPLY_MISMATCH");
+        }
         return reply;
       });
       this.#held(intent, cart);
@@ -659,6 +666,11 @@ export class Purchase {
           continue;
         }
         for (const reason of v.a5) this.#record({ kind: "offer.flagged", reason, ...ref });
+        // Д02 (Р48 п. 5): позиция уже расходилась с заказом у этого продавца — пометка в показе, источник — заказ
+        if (this.o.orderMismatches.has(s.merchantId, p.product.sku) && !v.a5.includes("A5_PRICE_MISMATCH")) {
+          v.a5.push("A5_PRICE_MISMATCH");
+          this.#record({ kind: "offer.flagged", reason: "A5_PRICE_MISMATCH", detail: "ORDER_REPLY_MISMATCH", ...ref });
+        }
         const offer: Offer = { shopId: shop.id, merchantId: s.merchantId, sku: p.product.sku, product: p.product, a5: v.a5 };
         if (s.inContour) zones.contour.push(offer);
         else zones.market.push({ ...offer, ...(s.link !== undefined && { link: s.link }) });

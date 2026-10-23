@@ -9,7 +9,7 @@
 // системные.
 import { afterEach, describe, expect, it } from "vitest";
 import { MandateClient, MandateRefused } from "../../src/agent/mandates/index.js";
-import { SplitWindow } from "../../src/agent/policy/index.js";
+import { OrderPriceMismatches, SplitWindow } from "../../src/agent/policy/index.js";
 import { Purchase } from "../../src/agent/pipeline/index.js";
 import { MERCHANT_FIXTURES } from "agentic-ps-platform/fixtures";
 import { INTENT } from "../support/consents.js";
@@ -152,7 +152,7 @@ describe("конвейер на стенде Платформы (Р38 п. 8, К6
     expect(contour.admission()).toBe("NOT_ADMITTED");
     const mandates = new MandateClient({ port: contour.platform, params: contour.params, journal: contour.journal });
     const shops = standShops(contour);
-    const p = new Purchase({ mandates, events: feedOf(contour.platform), offers: shops, live: shops, shop: shops, payment: payments(), params: contour.params, split: new SplitWindow(contour.params, () => new Date()), journal: contour.journal, admission: () => contour.admission() });
+    const p = new Purchase({ mandates, events: feedOf(contour.platform), offers: shops, live: shops, shop: shops, payment: payments(), params: contour.params, split: new SplitWindow(contour.params, () => new Date()), orderMismatches: new OrderPriceMismatches(), journal: contour.journal, admission: () => contour.admission() });
     const before = contour.calls().length;
     await expect(p.intent({ ...INTENT, merchantScope: [NORMAL.merchant_id] }, { idempotencyKey: "idem-intent-stand" })).rejects.toMatchObject({ code: "NOT_ADMITTED" });
     expect(contour.calls().length).toBe(before);

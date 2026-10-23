@@ -10,7 +10,7 @@ import { Confirmations } from "../../src/agent/confirmations/index.js";
 import { MandateClient } from "../../src/agent/mandates/index.js";
 import { ContourPayment } from "../../src/agent/payment-package/index.js";
 import { Purchase } from "../../src/agent/pipeline/index.js";
-import { SplitWindow } from "../../src/agent/policy/index.js";
+import { OrderPriceMismatches, SplitWindow } from "../../src/agent/policy/index.js";
 import type { FeedItem, HttpRequestSigning, PaymentPlatform } from "../../src/agent/ports/index.js";
 import { parseParams, type StandParams } from "../../src/shared/config.js";
 import type { Mandate } from "../../src/shared/domain.js";
@@ -94,20 +94,25 @@ export async function standPurchase(o: StandPurchaseOptions = {}) {
   });
   const steps = o.contourPayment ? new ContourPayment({ platform, shop: shops, journal: c.journal, confirmations }) : payment;
   const split = new SplitWindow(params, () => new Date());
-  const purchase = new Purchase({
-    mandates,
-    events: feedOf(c.platform),
-    offers: shops,
-    live: shops,
-    shop: shops,
-    payment: steps,
-    params,
-    split,
-    journal: c.journal,
-    admission: () => c.admission(),
-    region: "77",
-    ...(o.notify !== undefined && { notify: o.notify }),
-  });
+  // пометка Д02 — одна на ядро, как у места сборки (Р48 п. 5): следующая покупка (next) видит расхождение прежней
+  const orderMismatches = new OrderPriceMismatches();
+  const next = () =>
+    new Purchase({
+      mandates,
+      events: feedOf(c.platform),
+      offers: shops,
+      live: shops,
+      shop: shops,
+      payment: steps,
+      params,
+      split,
+      orderMismatches,
+      journal: c.journal,
+      admission: () => c.admission(),
+      region: "77",
+      ...(o.notify !== undefined && { notify: o.notify }),
+    });
+  const purchase = next();
   /** обращений к ПАО за мандатом id — GET мандата */
   const gets = (id: string) => c.calls().filter((x) => x.target === "pao" && x.route === `GET /pao/v1/mandates/${id}`).length;
   /** Подпись человека во время ожидания: после первого GET ожидания — эмулятор банка подписывает, решение — по событию. */
@@ -127,5 +132,5 @@ export async function standPurchase(o: StandPurchaseOptions = {}) {
     await signWhileWaiting(intent.id, () => purchase.awaitIntent());
     return intent;
   }
-  return { c, self, stand, purchase, payment, split, params, confirmations, signWhileWaiting, signedIntent };
+  return { c, self, stand, purchase, next, orderMismatches, payment, split, params, confirmations, signWhileWaiting, signedIntent };
 }

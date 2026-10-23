@@ -15,7 +15,7 @@ import { MandateClient } from "./mandates/index.js";
 import { EventFeed, EventsStopped, FileCursorStore, acceptPush, type PushReply } from "./events/index.js";
 import { KeyRing, SignerKeyRejected, SignerStopped } from "./signer/index.js";
 import { Purchase } from "./pipeline/index.js";
-import { SplitWindow } from "./policy/index.js";
+import { OrderPriceMismatches, SplitWindow } from "./policy/index.js";
 import type { LiveOfferSource } from "./ports/catalog.js";
 import type { OfferSource, PaymentSteps, ShopPaymentPort, ShopPort } from "./ports/shop.js";
 import { ContourPayment } from "./payment-package/index.js";
@@ -228,6 +228,8 @@ export function createAgentCore(o: AgentCoreOptions): AgentCore {
   events.listen(confirmations.listener);
   // окно дробления — одно на ядро: доли разных покупок под одним INTENT видят друг друга (Р39 п. 4)
   const split = new SplitWindow(params, now);
+  // пометка Д02 — одна на ядро: расхождение заказа одной покупки видно в выдачах следующих (Р48 п. 5)
+  const orderMismatches = new OrderPriceMismatches();
   return {
     params,
     platform,
@@ -258,6 +260,7 @@ export function createAgentCore(o: AgentCoreOptions): AgentCore {
         payment: p.payment,
         params,
         split,
+        orderMismatches,
         ...(p.region !== undefined && { region: p.region }),
         ...(p.notify !== undefined && { notify: p.notify }),
       }),

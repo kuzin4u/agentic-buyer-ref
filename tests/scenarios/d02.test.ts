@@ -2,10 +2,13 @@
 // витрине эмулятора с поведением DUAL_PRICE: опознанному агенту витрина показывает свою цену, заказ считает по цене «для
 // всех». Главный инвариант Р43: в мандат CART идёт только итог по живой цене продавца из своей выдачи; `Order.total`
 // продавца ≠ итогу CART — STOPPED `ORDER_REPLY_MISMATCH` до любого обращения к реквизиту и оплате. «Предложение помечено»
-// (пометка витрины в следующих выдачах) — не в AG-10 ч. 1: Д02 в счёт не идёт (Р43 п. 4, STATUS «Открыто»).
+// (Р48 п. 5): в следующих выдачах того же ядра позиция продавца — с сигналом A5_PRICE_MISMATCH (источник — заказ),
+// зона прежняя, корзина — только по явному решению человека; пометка — в памяти процесса до перезапуска (нюанс Р48).
 // Цены — из фикстур Платформы, не литералы.
+import { MERCHANT_FIXTURES } from "agentic-ps-platform/fixtures";
 import { afterEach, describe, expect, it } from "vitest";
-import { PurchaseStopped } from "../../src/agent/pipeline/index.js";
+import { CartRefused, PurchaseStopped } from "../../src/agent/pipeline/index.js";
+import { INTENT } from "../support/consents.js";
 import { shopBy, type Contour } from "../support/contour.js";
 import { expectJournalClean } from "../support/journal.js";
 import { STAND_TIMEOUT_MS, standPurchase } from "../support/stand-purchase.js";
@@ -22,7 +25,44 @@ const DUAL = shopBy("DUAL_PRICE");
 const AGENT_ITEM = DUAL.agent_items[0]!;
 const HUMAN_ITEM = DUAL.items.find((i) => i.sku === AGENT_ITEM.sku)!;
 
-describe("Д02 — агенту цена ниже, чем человеку (частично)", { timeout: STAND_TIMEOUT_MS }, () => {
+describe("Д02 — агенту цена ниже, чем человеку", { timeout: STAND_TIMEOUT_MS }, () => {
+  it("после ORDER_REPLY_MISMATCH позиция продавца в следующей выдаче помечена A5_PRICE_MISMATCH; корзина без решения человека не готовится (Р48 п. 5)", async () => {
+    const r = await standPurchase();
+    c = r.c;
+    await r.signedIntent();
+    const firstZones = await r.purchase.search();
+    const first = firstZones.contour.find((o) => o.shopId === DUAL.id && o.sku === AGENT_ITEM.sku)!;
+    // до заказа сигнала нет: пометка — от расхождения при заказе, а не от текста витрины
+    expect(first.a5).toEqual([]);
+    const cart = await r.purchase.cart(one(first, 1), { idempotencyKey: "idem-cart-d02-m1" });
+    await r.signWhileWaiting(cart.id, () => r.purchase.awaitCart());
+    await expect(r.purchase.placeOrder({ idempotencyKey: "idem-order-d02-m1" })).rejects.toBeInstanceOf(PurchaseStopped);
+    expect(r.purchase.reason).toBe("ORDER_REPLY_MISMATCH");
+
+    // следующая покупка того же ядра: новый INTENT, тот же поиск
+    const p2 = r.next();
+    const intent2 = await p2.intent({ ...INTENT, merchantScope: MERCHANT_FIXTURES.map((f) => f.merchant_id) }, { idempotencyKey: "idem-intent-d02-m2" });
+    await r.signWhileWaiting(intent2.id, () => p2.awaitIntent());
+    const flaggedBefore = r.c.journal.entries.filter((e) => e.kind === "offer.flagged").length;
+    const zones = await p2.search();
+    const again = zones.contour.find((o) => o.shopId === DUAL.id && o.sku === AGENT_ITEM.sku)!;
+    // зона прежняя (контур), цена — продавца, без пересчёта; сигнал — один
+    expect(again).toBeDefined();
+    expect(again.a5).toEqual(["A5_PRICE_MISMATCH"]);
+    expect(again.product.price.amount).toBe(AGENT_ITEM.price);
+    expect(zones.market.some((o) => o.shopId === DUAL.id)).toBe(false);
+    // прочие позиции и продавцы — с теми же сигналами, что в первой выдаче (у CONTRADICTORY — свой, по тексту витрины)
+    const signals = (zs: typeof zones) => zs.contour.filter((o) => !(o.shopId === DUAL.id && o.sku === AGENT_ITEM.sku)).map((o) => [o.shopId, o.sku, o.a5]);
+    expect(signals(zones)).toEqual(signals(firstZones));
+    expect(r.c.journal.entries.filter((e) => e.kind === "offer.flagged").slice(flaggedBefore).filter((e) => e.merchant === DUAL.merchant_id)).toEqual([
+      expect.objectContaining({ kind: "offer.flagged", reason: "A5_PRICE_MISMATCH", detail: "ORDER_REPLY_MISMATCH", ref: AGENT_ITEM.sku, merchant: DUAL.merchant_id }),
+    ]);
+    // без явного решения человека корзина не готовится, обращений нет
+    const before = r.c.calls().length;
+    await expect(p2.cart(one(again, 1), { idempotencyKey: "idem-cart-d02-m2" })).rejects.toBeInstanceOf(CartRefused);
+    expect(r.c.calls().length).toBe(before);
+  });
+
   it("DUAL_PRICE: CART по цене агента, Order.total по цене для всех — STOPPED ORDER_REPLY_MISMATCH, оплаты нет", async () => {
     expect(DUAL.zone).toBe("CONTOUR");
     expect(AGENT_ITEM.price!).toBeLessThan(HUMAN_ITEM.price!);

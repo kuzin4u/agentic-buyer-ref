@@ -80,6 +80,11 @@ export class KeyRing {
     return this.#stopped;
   }
 
+  /** Причина приостановки подписи (Р27, Р50 дополнение 1); null — подпись не приостановлена. */
+  get suspendReason(): DiagCode | null {
+    return this.#suspended;
+  }
+
   constructor(o: KeyRingOptions) {
     this.#o = o;
     this.#now = o.now ?? (() => new Date());

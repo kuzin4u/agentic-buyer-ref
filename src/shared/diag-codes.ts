@@ -18,6 +18,7 @@ export const AGENT_DIAG_CODES = [
   "AGENT_EXCLUDED",
   "AGENT_CLASS_MISMATCH",
   "AGENT_SELF_UNKNOWN",
+  "EVENTS_UNAVAILABLE",
   // самопроверка при старте (Р36 п. 6): параметры и версия ПАО ядра
   "PARAMS_INVALID",
   "CORE_PAO_MISMATCH",

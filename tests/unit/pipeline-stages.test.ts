@@ -13,6 +13,8 @@ import { AGENT, type PaoStand } from "../support/pao-stand.js";
 import { SHOP, one, purchaseOn, signedIntent, stages, type PurchaseRun, type PurchaseSetup } from "../support/purchase.js";
 import { bakery, feedOffers, feedPrice, liveOffers, payments, shopOrders } from "../support/shop.js";
 import { humanA5Decision } from "../../src/agent/shell/index.js";
+import { startFailureCode } from "../../src/agent/compose.js";
+import { SignerSuspended } from "../../src/agent/signer/index.js";
 
 let stand: PaoStand | undefined;
 afterEach(async () => {
@@ -754,6 +756,24 @@ describe("стадии 4–6 — исходы из порта PaymentSteps (ин
       expect(r.payment.calls).toEqual(["authorize"]);
       await closeStand();
     }
+  });
+
+  it("Р50 дополнение 1 п. 3: подпись приостановлена после отправки пакета — итоговый OPERATION_RESULT_UNCONFIRMED (Р-298), исходный код — в payment.unconfirmed", async () => {
+    const r = await setup({
+      failureCode: startFailureCode,
+      payment: { ...payments(), authorize: async (c: PaymentContext) => (c.sending(), Promise.reject(new SignerSuspended("EVENTS_UNAVAILABLE"))) },
+    });
+    await ordered(r);
+    await expect(r.purchase.authorize({ idempotencyKey: "idem-pay-1" })).rejects.toMatchObject({ code: "OPERATION_RESULT_UNCONFIRMED" });
+    expect(stages(r).at(-1)).toBe("STOPPED:OPERATION_RESULT_UNCONFIRMED");
+    expect(r.tail().filter((e) => e.kind === "payment.unconfirmed").map((e) => e.reason)).toEqual(["EVENTS_UNAVAILABLE"]);
+  });
+
+  it("Р50 дополнение 1: подпись приостановлена до отправки пакета — код приостановки, не UNKNOWN", async () => {
+    const r = await setup({ failureCode: startFailureCode, payment: { ...payments(), authorize: () => Promise.reject(new SignerSuspended("EVENTS_UNAVAILABLE")) } });
+    await ordered(r);
+    await expect(r.purchase.authorize({ idempotencyKey: "idem-pay-1" })).rejects.toBeInstanceOf(SignerSuspended);
+    expect(stages(r).at(-1)).toBe("STOPPED:EVENTS_UNAVAILABLE");
   });
 
   it("расчёт не SETTLED — STOPPED, после одобрения итоговым кодом OPERATION_RESULT_UNCONFIRMED (инвариант 4, Р49 п. 2)", async () => {

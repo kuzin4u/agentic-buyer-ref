@@ -9,6 +9,7 @@ import { loadParams } from "../../src/shared/config.js";
 
 const AT = "2026-10-19T09:00:00Z";
 const POLL = loadParams().event_poll_interval_ms;
+const TTL_SEC = loadParams().registry_cache_ttl_sec;
 const event = (id: string, extra: object = {}) => JSON.stringify({ event_id: id, type: "mandate.signed", at: AT, data: { mandate_id: "m_1" }, ...extra });
 
 function setup(items: FeedItem[] = []) {
@@ -27,7 +28,8 @@ function setup(items: FeedItem[] = []) {
     store: new MemoryCursorStore(),
     journal,
     stop: () => {},
-    params: { event_poll_interval_ms: POLL },
+    suspend: () => {},
+    params: { event_poll_interval_ms: POLL, registry_cache_ttl_sec: TTL_SEC },
     now: () => new Date(t),
     sleep: async (ms) => void (t += ms),
   });
@@ -88,7 +90,7 @@ describe("приём push (Р34 п. 2)", () => {
       const store = new MemoryCursorStore();
       store.invalid = true;
       const journal = new MemoryJournal();
-      const feed = new EventFeed({ port: { listEvents: async () => [], subscribe: async () => {} }, store, journal, stop: () => {}, params: { event_poll_interval_ms: POLL } });
+      const feed = new EventFeed({ port: { listEvents: async () => [], subscribe: async () => {} }, store, journal, stop: () => {}, suspend: () => {}, params: { event_poll_interval_ms: POLL, registry_cache_ttl_sec: TTL_SEC } });
       for (let i = 0; i < 3; i++) expect(acceptPush({ wake: () => feed.signal(), journal }, event("evt_1"), { "x-event-id": "evt_1" }).status).toBe(200);
       await new Promise((r) => setTimeout(r, 10));
       expect(unhandled).toEqual([]);

@@ -40,6 +40,8 @@ export interface PurchaseSetup {
   split?: SplitWindow;
   /** уведомление оболочки (Р47 п. 5, В3) */
   notify?: (code: PurchaseNotice) => void | Promise<void>;
+  /** код остановки по ошибке вне ядра — как у места сборки (`startFailureCode`); нет — UNKNOWN */
+  failureCode?: (e: unknown) => DiagCode | null;
 }
 
 /** `track` получает стенд до первого обращения — тест закрывает его и проверяет нарушения схемы в afterEach. */
@@ -69,6 +71,7 @@ export async function purchaseOn(o: PurchaseSetup, track: (s: PaoStand) => void)
     orderMismatches: new OrderPriceMismatches(),
     journal: { record: (e) => (o.tap?.(e), core.journal.record(e)) },
     admission: () => o.admission ?? null,
+    ...(o.failureCode !== undefined && { failureCode: o.failureCode }),
     ...(o.region !== null && { region: o.region ?? "77" }),
     ...(o.notify !== undefined && { notify: o.notify }),
     now: () => s.clock,

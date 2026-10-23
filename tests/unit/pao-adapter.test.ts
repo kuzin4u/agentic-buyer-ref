@@ -593,3 +593,22 @@ describe("NO_RESPONSE: повтор тем же ключом (Р48 п. 4)", () =
     expect(calls).toHaveLength(1);
   });
 });
+
+describe("Р50 п. 6 (а): 403 AGENT_SUSPENDED на GET операции — подпись агента остановлена (оговорка ревью КТ1 Р49 снята)", () => {
+  it("readOperation (стадия 5, событие operation.*) — остановка подписи AGENT_SUSPENDED, без повтора", async () => {
+    const stopped: string[] = [];
+    stub = new PaoStub({ agents: [{ agentCode: AGENT, keys: [{ kid: "kid_test", alg: "ed25519", publicKey, status: "ACTIVE" }] }] });
+    stub.fail("GET /pao/v1/operations/{op_ref}", { code: "AGENT_SUSPENDED" });
+    const platform = new PaoPlatform({
+      journal: new MemoryJournal(),
+      baseUrl: await stub.start(),
+      agentCode: AGENT,
+      signing: { ...signing, stop: (r: string) => void stopped.push(r) },
+      params,
+      sleep: async () => {},
+    });
+    await expect(platform.readOperation("op_1")).rejects.toMatchObject({ code: "AGENT_SUSPENDED", httpStatus: 403 });
+    expect(stopped).toEqual(["AGENT_SUSPENDED"]);
+    expect(stub.calls.filter((c) => c.op === "GET /pao/v1/operations/{op_ref}")).toHaveLength(1);
+  });
+});

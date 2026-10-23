@@ -1294,6 +1294,20 @@ describe("ворота перед стадией 5 (Р38 п. 3, К4): оба м�
     expect(r.tail().slice(start).filter((e) => e.kind === "agent.refused")).toEqual([]);
     expect(r.payment.calls).toEqual([]);
   });
+
+  it("Р50 п. 6 (б): ядро не повторяет сверх бюджета адаптера — отказ RETRY_SAME_KEY, дошедший до конвейера, — остановка; следующее обращение прошло бы, но его нет", async () => {
+    const r = await setup();
+    await ordered(r);
+    const attempts = loadParams().pao_max_attempts;
+    // отказов ровно столько, сколько попыток у адаптера: повтор ядра получил бы ответ 200 и пошёл дальше
+    r.stand.stub.fail(VERIFY, { code: "STATE_UNAVAILABLE", retryAfterSec: 0 }, attempts);
+    const from = r.stand.stub.calls.length;
+    await expect(r.purchase.authorize({ idempotencyKey: "idem-pay-1" })).rejects.toMatchObject({ code: "STATE_UNAVAILABLE" });
+    expect(opsFrom(r, from)).toEqual(Array(attempts).fill(VERIFY));
+    expect(r.purchase.state).toBe("STOPPED");
+    await expect(r.purchase.authorize({ idempotencyKey: "idem-pay-1" })).rejects.toBeInstanceOf(PurchaseTransitionForbidden);
+    expect(opsFrom(r, from)).toHaveLength(attempts);
+  });
 });
 
 describe("проверка по мандату до стадии 4 (Р40 п. 5, К4а № 3; после Р47 п. 2 — ворота стадии 5): человека не просят подтвердить покупку, которую ворота отклонят", () => {

@@ -10,6 +10,7 @@ import { PlatformFailure, type PlatformEventType } from "../../src/shared/domain
 
 /** промежуток опроса — из стендовой конфигурации, не литералом */
 const POLL = loadParams().event_poll_interval_ms;
+const TTL_SEC = loadParams().registry_cache_ttl_sec;
 
 const ev = (id: string, type: PlatformEventType = "mandate.signed", mandateId: string | null = "m_1"): FeedItem => ({
   kind: "event",
@@ -38,6 +39,7 @@ function setup(items: FeedItem[], o: { store?: MemoryCursorStore; interval?: num
   const store = o.store ?? new MemoryCursorStore();
   const journal = new MemoryJournal();
   const stops: [string, string][] = [];
+  const suspends: string[] = [];
   let t = Date.parse("2026-10-19T09:00:00Z");
   const sleeps: number[] = [];
   const feed = new EventFeed({
@@ -45,7 +47,8 @@ function setup(items: FeedItem[], o: { store?: MemoryCursorStore; interval?: num
     store,
     journal,
     stop: (r, d) => void stops.push([r, d]),
-    params: { event_poll_interval_ms: o.interval ?? POLL },
+    suspend: (r) => void suspends.push(r),
+    params: { event_poll_interval_ms: o.interval ?? POLL, registry_cache_ttl_sec: TTL_SEC },
     now: () => new Date(t),
     sleep: async (ms) => {
       sleeps.push(ms);
@@ -54,8 +57,73 @@ function setup(items: FeedItem[], o: { store?: MemoryCursorStore; interval?: num
   });
   const seen: FeedItem[] = [];
   feed.listen((i) => void seen.push(i));
-  return { feed, port, store, journal, stops, sleeps, seen, tick: (ms: number) => (t += ms) };
+  return { feed, port, store, journal, stops, suspends, sleeps, seen, tick: (ms: number) => (t += ms) };
 }
+
+describe("лента: недоступность дольше registry_cache_ttl_sec (Р50 п. 2, дополнение 1; Т14)", () => {
+  const unavailable = () => new PlatformFailure("UPSTREAM_UNAVAILABLE", "same_key", "UPSTREAM_UNAVAILABLE", 503, null);
+
+  it("серия отказов: первая — events.unavailable с кодом; не меньше TTL — приостановка; до TTL — нет", async () => {
+    const s = setup([ev("e1")]);
+    s.port.listEvents = async () => {
+      throw unavailable();
+    };
+    await expect(s.feed.signal()).rejects.toBeInstanceOf(PlatformFailure);
+    s.tick(TTL_SEC * 1000 - 1);
+    await expect(s.feed.signal()).rejects.toBeInstanceOf(PlatformFailure);
+    expect(s.suspends).toEqual([]);
+    s.tick(1);
+    await expect(s.feed.signal()).rejects.toBeInstanceOf(PlatformFailure);
+    expect(s.suspends).toEqual(["EVENTS_UNAVAILABLE"]);
+    const marks = s.journal.entries.filter((e) => e.kind === "events.unavailable");
+    expect(marks.map((e) => [e.reason, e.detail])).toEqual([["EVENTS_UNAVAILABLE", "UPSTREAM_UNAVAILABLE"]]);
+    expect(s.stops).toEqual([]);
+  });
+
+  it("успешное чтение сбрасывает серию: новая серия считается заново", async () => {
+    const s = setup([ev("e1")]);
+    const real = s.port.listEvents.bind(s.port);
+    let down = true;
+    s.port.listEvents = async (after) => {
+      if (down) throw unavailable();
+      return real(after);
+    };
+    await expect(s.feed.signal()).rejects.toBeInstanceOf(PlatformFailure);
+    s.tick(TTL_SEC * 1000 - 1);
+    down = false;
+    await s.feed.signal();
+    down = true;
+    s.tick(1);
+    await expect(s.feed.signal()).rejects.toBeInstanceOf(PlatformFailure);
+    expect(s.suspends).toEqual([]);
+    expect(s.journal.entries.filter((e) => e.kind === "events.unavailable")).toHaveLength(2);
+  });
+
+  it("отказ слушателя (долгий 503 на GET операции или подтверждения) — та же серия; после снятия приостановки первое неудачное чтение приостанавливает снова", async () => {
+    const s = setup([ev("e1", "operation.authorized", null)]);
+    s.feed.listen(() => {
+      throw unavailable();
+    });
+    await expect(s.feed.signal()).rejects.toBeInstanceOf(PlatformFailure);
+    s.tick(TTL_SEC * 1000);
+    await expect(s.feed.signal()).rejects.toBeInstanceOf(PlatformFailure);
+    // recheck() снял приостановку снаружи; лента всё ещё не читается — серия не сброшена
+    await expect(s.feed.signal()).rejects.toBeInstanceOf(PlatformFailure);
+    expect(s.suspends).toEqual(["EVENTS_UNAVAILABLE", "EVENTS_UNAVAILABLE"]);
+    expect(s.store.saved).toEqual([]);
+  });
+
+  it("остановка по курсору (REJECTED) — не серия недоступности: записи events.unavailable и приостановки нет", async () => {
+    const store = new MemoryCursorStore();
+    store.after = "evt_foreign";
+    const s = setup([ev("e1")], { store });
+    await expect(s.feed.signal()).rejects.toBeInstanceOf(EventsStopped);
+    s.tick(TTL_SEC * 1000);
+    await expect(s.feed.signal()).rejects.toBeInstanceOf(EventsStopped);
+    expect(s.journal.entries.filter((e) => e.kind === "events.unavailable")).toEqual([]);
+    expect(s.suspends).toEqual([]);
+  });
+});
 
 describe("лента: порядок и курсор (Р34 п. 1, 3, 4)", () => {
   it("первый запуск — с начала, страницы до пустой; курсор — после каждого события; журнал — event_id и тип", async () => {

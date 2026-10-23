@@ -63,7 +63,7 @@ function record(status: OperationRecord["status"], over: Partial<OperationRecord
   };
 }
 
-function setup(wake?: (ops: Operations) => Promise<void>, pollMs?: number) {
+function setup(wake?: (ops: Operations) => Promise<void>, pollMs?: number, seenMax = PARAMS.event_seen_max) {
   const c = clock();
   const answers = new Map<string, OperationRecord | Error>();
   const gets: string[] = [];
@@ -79,7 +79,7 @@ function setup(wake?: (ops: Operations) => Promise<void>, pollMs?: number) {
       },
     },
     journal: { record: (e) => void journal.push(e) },
-    params: { operation_outcome_max_delay_sec: DELAY_SEC, registry_cache_ttl_sec: TTL_SEC, ...(pollMs !== undefined && { event_poll_interval_ms: pollMs }) },
+    params: { operation_outcome_max_delay_sec: DELAY_SEC, registry_cache_ttl_sec: TTL_SEC, event_seen_max: seenMax, ...(pollMs !== undefined && { event_poll_interval_ms: pollMs }) },
     ...(wake && { wake: (): Promise<void> => wake(ops) }),
     now: c.now,
     timer: c.timer,
@@ -166,6 +166,19 @@ describe("стадия 5: итог операции по событию и GET (
     await s.event("operation.authorized", "op_1", "evt_same");
     await s.event("operation.authorized", "op_1", "evt_same");
     expect(s.gets).toEqual(["op_1"]);
+  });
+
+  it("Р50 п. 1: окно event_seen_max — дубль в окне без GET, вытесненное событие читается снова", async () => {
+    const s = setup(undefined, undefined, 2);
+    for (const op of ["op_a", "op_b", "op_c"]) s.answers.set(op, record("AUTHORIZED"));
+    await s.event("operation.authorized", "op_a", "evt_a");
+    await s.event("operation.authorized", "op_b", "evt_b");
+    await s.event("operation.authorized", "op_c", "evt_c");
+    await s.event("operation.authorized", "op_c", "evt_c");
+    await s.event("operation.authorized", "op_b", "evt_b");
+    expect(s.gets).toEqual(["op_a", "op_b", "op_c"]);
+    await s.event("operation.authorized", "op_a", "evt_a");
+    expect(s.gets).toEqual(["op_a", "op_b", "op_c", "op_a"]);
   });
 
   it("GET 503 — событие не отмечено обработанным и читается снова; ответ не по схеме — operation.unread, итог по сроку", async () => {
@@ -352,7 +365,7 @@ describe("стадия 6: расчёт по operation.settled и GET (Р49 п. 6
         },
       },
       journal: { record: () => {} },
-      params: { operation_outcome_max_delay_sec: DELAY_SEC, registry_cache_ttl_sec: TTL_SEC },
+      params: { operation_outcome_max_delay_sec: DELAY_SEC, registry_cache_ttl_sec: TTL_SEC, event_seen_max: PARAMS.event_seen_max },
       now: c.now,
       timer: c.timer,
     });

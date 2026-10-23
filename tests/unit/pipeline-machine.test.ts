@@ -9,8 +9,29 @@ import {
   PurchaseTransitionForbidden,
   TRANSITIONS,
   allowed,
+  unfinishedAt,
   type PurchaseState,
 } from "../../src/agent/pipeline/index.js";
+
+describe("что не завершено при STOP_ALL — по состоянию остановки (Р50 п. 4; ревью КТ1 № 7)", () => {
+  it("каждое состояние × итог после пакета неизвестен (известный отказ §7б — PAYMENT)", () => {
+    const want: Record<PurchaseState, [string | null, string | null]> = {
+      NEW: [null, null],
+      INTENT_PENDING: ["SEARCH", "SEARCH"],
+      INTENT_ACTIVE: ["SEARCH", "SEARCH"],
+      OFFERS: ["CHOICE", "CHOICE"],
+      CART_PENDING: ["ORDER", "ORDER"],
+      CART_ACTIVE: ["ORDER", "ORDER"],
+      ORDERED: ["PAYMENT", "PAYMENT"],
+      AUTHORIZING: ["PAYMENT", "PAYMENT_OUTCOME"],
+      CONFIRMING: ["PAYMENT", "PAYMENT_OUTCOME"],
+      SETTLING: ["SETTLEMENT", "SETTLEMENT"],
+      DONE: [null, null],
+      STOPPED: [null, null],
+    };
+    for (const s of PURCHASE_STATES) expect([unfinishedAt(s, false), unfinishedAt(s, true)], s).toEqual(want[s]);
+  });
+});
 
 const AT = new Date("2026-10-20T09:00:00Z");
 

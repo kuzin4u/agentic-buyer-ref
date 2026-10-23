@@ -4,7 +4,7 @@
 // Состояние — только в памяти (Р38 п. 6): после перезапуска покупка не восстанавливается.
 import type { DiagCode } from "../../shared/diag-codes.js";
 import { SAFE_ID } from "../../shared/ids.js";
-import { afterPayment } from "../declines/table.js";
+import { afterPayment, type Unfinished } from "../declines/table.js";
 
 export const PURCHASE_STATES = [
   /** стадия 0: покупка создана, допуск агента для неё не проверен */
@@ -62,6 +62,34 @@ export function isTerminal(s: PurchaseState): boolean {
   return TERMINAL.has(s);
 }
 
+/** Что не завершено, если покупку остановили в состоянии `s` (Р50 п. 4); `unknown` — пакет уходил и итог не подтверждён
+ *  (OPERATION_RESULT_UNCONFIRMED). Известный отказ §7б после пакета — PAYMENT: заказ создан и не оплачен (решение
+ *  владельца по ревью КТ1 № 1). */
+export function unfinishedAt(s: PurchaseState, unknown: boolean): Unfinished | null {
+  switch (s) {
+    case "INTENT_PENDING":
+    case "INTENT_ACTIVE":
+      return "SEARCH";
+    case "OFFERS":
+      return "CHOICE";
+    case "CART_PENDING":
+    case "CART_ACTIVE":
+      return "ORDER";
+    case "ORDERED":
+      return "PAYMENT";
+    // стадия 4 — после ответа продавца на переданный пакет (Р47 п. 2)
+    case "AUTHORIZING":
+    case "CONFIRMING":
+      return unknown ? "PAYMENT_OUTCOME" : "PAYMENT";
+    // сейчас недостижимо: в SETTLING итоговых кодов STOP_ALL нет — отказ расчёта заменяется OPERATION_RESULT_UNCONFIRMED
+    // (Р49 п. 2); значение — на случай итога §7б после авторизации (ревью КТ1 № 7)
+    case "SETTLING":
+      return "SETTLEMENT";
+    default:
+      return null;
+  }
+}
+
 /** Переход разрешён таблицей: в STOPPED — из любого не конечного, иначе — по TRANSITIONS. */
 export function allowed(from: PurchaseState, to: PurchaseState): boolean {
   if (isTerminal(from)) return false;
@@ -108,6 +136,8 @@ export interface PurchaseMachineOptions {
 export class PurchaseMachine {
   #state: PurchaseState = "NEW";
   #reason: DiagCode | null = null;
+  /** состояние, из которого покупка остановлена (Р50 п. 4: что не завершено) */
+  #stoppedFrom: PurchaseState | null = null;
   #mandate: string | undefined;
   /** ворота перед стадией 5 пройдены (Р38 п. 3, К4): без них переход в AUTHORIZING запрещён */
   #gate5 = false;
@@ -187,6 +217,11 @@ export class PurchaseMachine {
     return this.#paid;
   }
 
+  /** Что не завершено (Р50 п. 4) — по состоянию на момент остановки; не остановлена или остановлена до мандата — null. */
+  get unfinished(): Unfinished | null {
+    return this.#stoppedFrom === null ? null : unfinishedAt(this.#stoppedFrom, this.#paid && this.#reason === "OPERATION_RESULT_UNCONFIRMED");
+  }
+
   /** Код, с которым остановится покупка (Р49 п. 2): после отправки пакета неитоговый — OPERATION_RESULT_UNCONFIRMED. */
   outcome(reason: DiagCode): DiagCode {
     return this.#paid ? afterPayment(reason) : reason;
@@ -204,6 +239,7 @@ export class PurchaseMachine {
   stop(reason: DiagCode, cause?: StopCause): void {
     if (isTerminal(this.#state)) return;
     const code = this.outcome(reason);
+    this.#stoppedFrom = this.#state;
     this.#state = "STOPPED";
     this.#reason = code;
     this.#sending = false;

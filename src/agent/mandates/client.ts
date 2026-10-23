@@ -125,6 +125,9 @@ export class MandateClient {
   /** Мандаты, которые сейчас читаются по GET перед удержанием: true — во время GET пришло событие о мандате, ответ мог
    *  устареть — перечитать (гонка «revoked во время GET», ревью К2.3 № 1). */
   readonly #reading = new Map<string, boolean>();
+  /** Мандаты покупок, у которых GET дал REVOKED (держимые — Т15, ожидающие подписи — awaitSigned): конвейер отличает
+   *  отзыв от прочего выхода — STOP_ALL (Р50 п. 4). Снимается `release`. */
+  readonly #revoked = new Set<string>();
 
   constructor(private readonly o: MandateClientOptions) {
     this.now = o.now ?? (() => new Date());
@@ -165,6 +168,20 @@ export class MandateClient {
    *  (check, requireActive; инвариант 6). */
   held(): readonly Mandate[] {
     return [...this.#held.values()];
+  }
+
+  /** Держимый мандат вышел по GET со статусом REVOKED (Р50 п. 4). */
+  revoked(id: string): boolean {
+    return this.#revoked.has(id);
+  }
+
+  /** Снять мандаты с удержания (STOP_ALL, Р50 п. 4): покупка остановлена, дальше они не используются; отметка отзыва
+   *  больше не нужна (рост без предела, ревью КТ1 № 6). Идущая перечитка GET их не вернёт (`#recheckHeld`). */
+  release(...ids: string[]): void {
+    for (const id of ids) {
+      this.#held.delete(id);
+      this.#revoked.delete(id);
+    }
   }
 
   #hold(m: Mandate): Mandate {
@@ -229,13 +246,18 @@ export class MandateClient {
       }
       throw e;
     }
+    // снят с удержания, пока шёл GET (release при STOP_ALL), — не возвращать (ревью КТ1 № 6)
+    if (!this.#held.has(id)) return;
     // порядок отзыва — тоже предел мандата (Р33 п. 4, ревью К2.3 № 4)
     if (actual.status === "ACTIVE" && sameTerms(held, actual) && actual.revocationOrder === held.revocationOrder) {
       this.#held.set(id, actual);
       return;
     }
     this.#held.delete(id);
-    if (actual.status === "REVOKED") this.o.journal.record({ at: at(), kind: "mandate.revoked", ...masked(id) });
+    if (actual.status === "REVOKED") {
+      this.#revoked.add(id);
+      this.o.journal.record({ at: at(), kind: "mandate.revoked", ...masked(id) });
+    }
     // отказ без исключения: мандат просто перестаёт держаться — запись той же точкой, что у прочих отказов (ревью К2.4 № 2)
     else if (actual.status === "ACTIVE") void this.#refuse("MANDATE_REPLY_MISMATCH", "держимый мандат с другими пределами", id);
     else this.o.journal.record({ at: at(), kind: "mandate.status_changed", ...masked(id), detail: actual.status });
@@ -284,6 +306,8 @@ export class MandateClient {
         return this.#hold(actual);
       }
       if (actual.status === "PENDING_SIGNATURE" && mode === "wait") return null;
+      // отзыв, пока ждали подписи (каскад от INTENT), — конвейер остановится кодом отзыва: STOP_ALL (Р50 п. 4; ревью КТ1 № 4)
+      if (actual.status === "REVOKED") this.#revoked.add(mandate.id);
       throw this.#refuse("MANDATE_NOT_ACTIVE", `событие о мандате и статус у платформы — ${actual.status}`, mandate.id);
     };
     const it = events[Symbol.asyncIterator]();

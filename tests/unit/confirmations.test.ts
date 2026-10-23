@@ -4,6 +4,7 @@
 import { describe, expect, it } from "vitest";
 import { Confirmations, type ConfirmationOutcome } from "../../src/agent/confirmations/index.js";
 import type { FeedItem } from "../../src/agent/ports/events.js";
+import { loadParams } from "../../src/shared/config.js";
 import { PlatformFailure, type Confirmation, type PlatformEventType } from "../../src/shared/domain.js";
 
 const ID1 = "cnf_11111111-1111-4111-8111-111111111111";
@@ -14,6 +15,7 @@ const T0 = Date.parse("2026-10-22T12:00:00.000Z");
 const HOLD_MS = 900_000;
 const SKEW_SEC = 300;
 const WAIT_MS = 30_000;
+const SEEN_MAX = loadParams().event_seen_max;
 
 /** Часы и таймеры теста: время двигает только advance; `early` — первый таймер длиннее `early` срабатывает раньше
  *  срока на столько мс (ранний таймер Node, нюанс Р46 К2а). */
@@ -57,7 +59,7 @@ function confirmation(status: Confirmation["status"], over: Partial<Confirmation
   };
 }
 
-function setup(early = 0) {
+function setup(early = 0, seenMax = SEEN_MAX) {
   const c = clock(early);
   const answers = new Map<string, Confirmation | Error>();
   const gets: string[] = [];
@@ -74,7 +76,7 @@ function setup(early = 0) {
   const conf = new Confirmations({
     port,
     journal: { record: (e) => void journal.push(e) },
-    params: { confirmation_wait_ms: WAIT_MS, signature_skew_sec: SKEW_SEC },
+    params: { confirmation_wait_ms: WAIT_MS, signature_skew_sec: SKEW_SEC, event_seen_max: seenMax },
     now: c.now,
     timer: c.timer,
   });
@@ -125,6 +127,23 @@ describe("модуль подтверждений: сигнал → GET → ст
     await s.event("confirmation.required", ID1, "evt_dup");
     await s.event("confirmation.required", ID1, "evt_dup");
     expect(s.gets).toEqual([ID1]);
+    expect(w.pending).toEqual(["PENDING"]);
+  });
+
+  it("Р50 п. 1: окно event_seen_max — дубль в окне без GET; вытесненное событие — второй GET, но не второе уведомление", async () => {
+    const s = setup(0, 2);
+    const w = s.waiter();
+    s.answers.set(ID1, confirmation("PENDING"));
+    await s.event("confirmation.required", ID1, "evt_a");
+    await s.event("confirmation.required", ID1, "evt_b");
+    await s.event("confirmation.required", ID1, "evt_c");
+    expect(s.gets).toHaveLength(3);
+    await s.event("confirmation.required", ID1, "evt_c");
+    await s.event("confirmation.required", ID1, "evt_b");
+    expect(s.gets).toHaveLength(3);
+    // evt_a вытеснено: читается снова (Р34 п. 3), уведомление по запросу уже было
+    await s.event("confirmation.required", ID1, "evt_a");
+    expect(s.gets).toHaveLength(4);
     expect(w.pending).toEqual(["PENDING"]);
   });
 
@@ -265,7 +284,7 @@ describe("модуль подтверждений: сигнал → GET → ст
           if (fail) throw new Error("журнал недоступен");
         },
       },
-      params: { confirmation_wait_ms: WAIT_MS, signature_skew_sec: SKEW_SEC },
+      params: { confirmation_wait_ms: WAIT_MS, signature_skew_sec: SKEW_SEC, event_seen_max: SEEN_MAX },
       now: c.now,
       timer: c.timer,
     });
@@ -505,7 +524,7 @@ describe("вход вызывающего и прерывание (Р47 п. 8, �
     const conf = new Confirmations({
       port: { getConfirmation: async () => confirmation("PENDING") },
       journal: { record: () => undefined },
-      params: { confirmation_wait_ms: WAIT_MS, signature_skew_sec: SKEW_SEC },
+      params: { confirmation_wait_ms: WAIT_MS, signature_skew_sec: SKEW_SEC, event_seen_max: SEEN_MAX },
       now: c.now,
       timer: c.timer,
       wake: async () => {
@@ -529,7 +548,7 @@ describe("вход вызывающего и прерывание (Р47 п. 8, �
     const conf = new Confirmations({
       port: { getConfirmation: async () => confirmation("PENDING") },
       journal: { record: () => undefined },
-      params: { confirmation_wait_ms: 20, signature_skew_sec: SKEW_SEC },
+      params: { confirmation_wait_ms: 20, signature_skew_sec: SKEW_SEC, event_seen_max: SEEN_MAX },
       wake: async () => void wakes++,
     });
     await expect(conf.wait({ signal: new AbortController().signal })).resolves.toBe("NONE");
@@ -542,7 +561,7 @@ describe("вход вызывающего и прерывание (Р47 п. 8, �
     const conf = new Confirmations({
       port: { getConfirmation: async () => confirmation("PENDING") },
       journal: { record: () => undefined },
-      params: { confirmation_wait_ms: WAIT_MS, signature_skew_sec: SKEW_SEC },
+      params: { confirmation_wait_ms: WAIT_MS, signature_skew_sec: SKEW_SEC, event_seen_max: SEEN_MAX },
       now: c.now,
       timer: c.timer,
       wake: async () => {

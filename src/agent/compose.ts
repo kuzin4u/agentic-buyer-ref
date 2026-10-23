@@ -13,7 +13,7 @@ import { CATALOG_DIAG } from "./catalog/index.js";
 import { MemoryJournal, type Journal } from "./journal/index.js";
 import { MandateClient } from "./mandates/index.js";
 import { EventFeed, EventsStopped, FileCursorStore, acceptPush, type PushReply } from "./events/index.js";
-import { KeyRing, SignerKeyRejected, SignerStopped } from "./signer/index.js";
+import { KeyRing, SignerKeyRejected, SignerStopped, SignerSuspended } from "./signer/index.js";
 import { Purchase } from "./pipeline/index.js";
 import { OrderPriceMismatches, SplitWindow } from "./policy/index.js";
 import type { LiveOfferSource } from "./ports/catalog.js";
@@ -130,8 +130,10 @@ function nested(a: string, b: string): boolean {
 const OK: CheckResult = { status: "ok" };
 
 /** Код реестра по отказу старта; null — не отказ проверки (дефект), уходит наружу как есть. */
-function startFailureCode(e: unknown): DiagCode | null {
+export function startFailureCode(e: unknown): DiagCode | null {
   if (e instanceof SignerStopped) return e.reason === "CLOSED" ? null : e.reason;
+  // приостановка во время шага покупки — её код, а не UNKNOWN (Р50 дополнение 1); после отправки пакета — итоговый (Р49 п. 2)
+  if (e instanceof SignerSuspended) return e.reason;
   if (e instanceof PlatformFailure) return e.code;
   if (e instanceof EventsStopped) return "EVENTS_CURSOR_INVALID";
   if (e instanceof SignerKeyRejected) return "KEY_REJECTED";
@@ -184,6 +186,8 @@ export function createAgentCore(o: AgentCoreOptions): AgentCore {
     store: new FileCursorStore(o.stateDir, now),
     journal,
     stop: (reason, detail) => signing.stop(reason, detail),
+    // недоступность дольше registry_cache_ttl_sec — приостановка до recheck() (Р50 дополнение 1)
+    suspend: (reason) => signing.suspend(reason),
     params,
     now,
   });
@@ -256,6 +260,8 @@ export function createAgentCore(o: AgentCoreOptions): AgentCore {
         admission: () => {
           const stopped = ring.stopReason;
           if (stopped !== null) return stopped === "CLOSED" ? "UNKNOWN" : stopped;
+          // приостановка (AGENT_SELF_UNKNOWN, EVENTS_UNAVAILABLE) — отказ стадии 0 без обращения (Р50 дополнение 1 п. 2)
+          if (ring.suspendReason !== null) return ring.suspendReason;
           return lastReport?.ready === true ? null : "NOT_ADMITTED";
         },
         failureCode: startFailureCode,

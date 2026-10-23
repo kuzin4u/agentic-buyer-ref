@@ -16,12 +16,16 @@ export interface EventsJournal {
     entry:
       | { at: string; kind: "event.handled"; ref: string; detail: PlatformEventType }
       | { at: string; kind: "event.ignored"; ref: string; detail: "UNKNOWN_TYPE" | "INVALID_DATA" }
-      | { at: string; kind: "events.cursor_initial" },
+      | { at: string; kind: "events.cursor_initial" }
+      | { at: string; kind: "events.unavailable"; reason: "EVENTS_UNAVAILABLE"; detail: DiagCode },
   ): void;
 }
 
 /** Остановка агента целиком (порт подписи, `RequestSigning.stop`); ключ через неё не проходит (инвариант 2). */
 export type StopAgent = (reason: DiagCode, detail: string) => void;
+
+/** Приостановка подписи до успешной сверки с реестром (порт подписи, `RequestSigning.suspend`; Р50 дополнение 1). */
+export type SuspendAgent = (reason: DiagCode) => void;
 
 /** Лента остановлена: курсор не читается или отвергнут Платформой; агент уже остановлен (Р34 п. 4). */
 export class EventsStopped extends Error {
@@ -38,7 +42,8 @@ export interface EventFeedOptions {
   store: EventCursorStore;
   journal: EventsJournal;
   stop: StopAgent;
-  params: { event_poll_interval_ms: number };
+  suspend: SuspendAgent;
+  params: { event_poll_interval_ms: number; registry_cache_ttl_sec: number };
   now?: () => Date;
   sleep?: (ms: number) => Promise<void>;
 }
@@ -54,6 +59,8 @@ export class EventFeed {
   #running: Promise<void> | null = null;
   #again = false;
   #lastStart = Number.NEGATIVE_INFINITY;
+  /** начало серии неудачных чтений (Р50 п. 2); null — последнее чтение дошло до пустой страницы */
+  #failingSince: number | null = null;
   /** число чтений ленты (первых страниц) — для проверки слияния сигналов */
   reads = 0;
 
@@ -124,6 +131,7 @@ export class EventFeed {
         if (wait > 0) await this.#sleep(wait);
         this.#lastStart = this.#now().getTime();
         await this.#readToEnd();
+        this.#failingSince = null;
         if (!this.#again) {
           this.#running = null;
           return;
@@ -131,8 +139,22 @@ export class EventFeed {
       }
     } catch (e) {
       this.#running = null;
+      if (!(e instanceof EventsStopped)) this.#failed(e);
       throw e;
     }
+  }
+
+  /** Чтение не дошло до пустой страницы (отказ Платформы, слушатель упал — в том числе долгий 503 на GET операции или
+   *  подтверждения, подпись приостановлена): первое в серии — запись events.unavailable; серия не меньше
+   *  registry_cache_ttl_sec — приостановка подписи (Р50 п. 2, дополнение 1; Т14). Серию сбрасывает только успешное
+   *  чтение: после снятия приостановки recheck() первое неудачное чтение приостанавливает снова. Сбой журнала — наружу. */
+  #failed(e: unknown): void {
+    const now = this.#now().getTime();
+    if (this.#failingSince === null) {
+      this.#failingSince = now;
+      this.#o.journal.record({ at: this.#at(), kind: "events.unavailable", reason: "EVENTS_UNAVAILABLE", detail: e instanceof PlatformFailure ? e.code : "UNKNOWN" });
+    }
+    if (now - this.#failingSince >= this.#o.params.registry_cache_ttl_sec * 1000) this.#o.suspend("EVENTS_UNAVAILABLE");
   }
 
   /** Самопроверка при старте (Р36 п. 6): курсор читается до обращений к Платформе; не читается — остановка агента

@@ -7,7 +7,7 @@ import { CATALOG_DIAG, CATALOG_DIAG_CODES } from "@kuzin4u/agentic-core/catalog"
 import { checkDiagRegistry, diagAction } from "@kuzin4u/agentic-core/diag";
 import { PAO_CLIENT_CODES, PAO_CLIENT_DIAG, PAO_DIAG, PAO_ERRORS, PAO_RETRY_ACTION } from "@kuzin4u/agentic-core/pao";
 import { DIAG } from "../../src/agent/compose.js";
-import { AGENT_DIAG, DECLINE_REASONS, FAILURE_RULES, PAYMENT_NOTICE_CODES, PAYMENT_OUTCOME_CODES, afterPayment, mergeDiag, ruleForDeclineReason, type DiagAction, type ReasonAction } from "../../src/agent/declines/index.js";
+import { AGENT_DIAG, DECLINE_REASONS, FAILURE_RULES, PAYMENT_NOTICE_CODES, PAYMENT_OUTCOME_CODES, UNFINISHED, UNFINISHED_TEXT, afterPayment, mergeDiag, ruleForDeclineReason, stopNext, type DiagAction, type ReasonAction } from "../../src/agent/declines/index.js";
 import { REVOCATION_ORDER_MISSING_TEXT } from "../../src/agent/mandates/index.js";
 import { STOP_CAUSES } from "../../src/agent/pipeline/index.js";
 import { AGENT_DIAG_CODES } from "../../src/shared/diag-codes.js";
@@ -70,6 +70,37 @@ describe("реестр кодов агента (Р36)", () => {
       const human = AGENT_DIAG[code].human.ru;
       expect(human, code).not.toMatch(/повтор|ещё раз|снова|попробуйте|пополните|другой способ|позже/i);
       expect(human, code).toContain("итог проверьте в приложении банка");
+    }
+  });
+
+  it("Р50 п. 4 (условие владельца 2): тексты «что не завершено» — у каждого значения; PAYMENT, PAYMENT_OUTCOME, SETTLEMENT — по Р-298", () => {
+    expect(Object.keys(UNFINISHED_TEXT).sort()).toEqual([...UNFINISHED].sort());
+    for (const u of ["PAYMENT", "PAYMENT_OUTCOME", "SETTLEMENT"] as const) {
+      expect(UNFINISHED_TEXT[u], u).toContain("итог проверьте в приложении банка");
+    }
+    for (const u of UNFINISHED) expect(UNFINISHED_TEXT[u], u).not.toMatch(/повтор|ещё раз|снова|попроб|позже|пополните|другой способ/i);
+    // PAYMENT — и до пакета, и после известного отказа §7б: «оплата не прошла», заказ не оплачен (ревью КТ1 № 1)
+    expect(UNFINISHED_TEXT.PAYMENT).toContain("оплата не прошла");
+    expect(UNFINISHED_TEXT.PAYMENT).toContain("не оплачен");
+  });
+
+  it("Р50 п. 4: next — из действия таблиц §7а и §7б, а не из текста", () => {
+    expect(stopNext("MANDATE_REVOKED")).toBe("STOP_ALL");
+    expect(stopNext("DECLINED_MANDATE_REVOKED")).toBe("STOP_ALL");
+    expect(stopNext("MANDATE_EXPIRED")).toBe("NEW_MANDATE");
+    expect(stopNext("DECLINED_MANDATE_SCOPE")).toBe("NEW_MANDATE");
+    expect(stopNext("LIMIT_EXCEEDED")).toBe("ASK_HUMAN");
+    expect(stopNext("CONFIRMATION_REQUIRED")).toBe("ASK_HUMAN");
+    expect(stopNext("DECLINED_LIMIT_EXCEEDED")).toBe("NOTIFY_HUMAN");
+    expect(stopNext("DECLINE_REASON_UNKNOWN")).toBe("NOTIFY_HUMAN");
+    expect(stopNext("OPERATION_RESULT_UNCONFIRMED")).toBe("NOTIFY_HUMAN");
+    expect(stopNext("DECLINED_AGENT_SUSPENDED")).toBeNull();
+    expect(stopNext("UNKNOWN")).toBeNull();
+    expect(stopNext("MANDATE_NOT_ACTIVE")).toBeNull();
+    // каждое действие таблиц сводится: §7а — STOP_ALL, NEW_MANDATE, ASK_HUMAN; прочее — null
+    for (const [code, r] of Object.entries(FAILURE_RULES)) {
+      const want = r.action === "STOP_ALL" || r.action === "NEW_MANDATE" || r.action === "ASK_HUMAN" ? r.action : null;
+      expect(stopNext(code as keyof typeof FAILURE_RULES), code).toBe(want);
     }
   });
 

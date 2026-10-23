@@ -4,6 +4,7 @@
 // ровно одна покупка (4а): ошибка привязки денег не стоит — ADP сверяет ссылку с мандатом, продавцом, суммой и order_ref.
 // link и confirmation_ref дальше разбора ответа не идут: ни в журнал, ни в исход, ни человеку (инвариант 1, Р47 п. 5).
 import { poll } from "../events/poll.js";
+import { SeenWindow } from "../events/seen.js";
 import type { FeedItem } from "../ports/events.js";
 import type { ConfirmationOutcome } from "../ports/shop.js";
 import { PlatformFailure, type Confirmation } from "../../shared/domain.js";
@@ -33,7 +34,7 @@ export interface ConfirmationsOptions {
   port: ConfirmationsPort;
   journal: ConfirmationsJournal;
   /** event_poll_interval_ms — пауза опроса после отказа ленты (ревью КТ1 AG-11 ч. 2 № 3); нет — опрос прекращается */
-  params: { confirmation_wait_ms: number; signature_skew_sec: number; event_poll_interval_ms?: number };
+  params: { confirmation_wait_ms: number; signature_skew_sec: number; event_seen_max: number; event_poll_interval_ms?: number };
   /** прочитать ленту (`EventFeed.signal`): ожидание будит её, пока не решится; частоту чтений ограничивает лента */
   wake?: () => Promise<void>;
   now?: () => Date;
@@ -71,15 +72,16 @@ export class Confirmations {
   readonly #o: ConfirmationsOptions;
   readonly #now: () => Date;
   readonly #timer: (fn: () => void, ms: number) => () => void;
-  /** event_id обработанных событий: дубль ленты или push — без второго GET и уведомления */
-  readonly #seen = new Set<string>();
+  /** event_id обработанных событий: дубль ленты или push — без второго GET и уведомления; окно event_seen_max (Р50 п. 1) */
+  readonly #seen: SeenWindow;
   /** покупки, ждущие запрос (В2: привязанные к запросу в счёт не входят) */
   readonly #waiters = new Set<Waiter>();
   /** запрос → покупка, ждущая решения */
   readonly #bound = new Map<string, Waiter>();
   /** невостребованные запросы (В1а): пришли без ожидающих, хранятся не дольше confirmation_wait_ms */
   readonly #unclaimed = new Map<string, { read: Read; drop: () => void; seq: number }>();
-  /** запросы, по которым решено (исход, чужой, неоднозначный, выброшен): события по ним больше ничего не делают */
+  /** запросы, по которым решено (исход, чужой, неоднозначный, выброшен): события по ним больше ничего не делают. Без
+   *  окна (Р50, нюанс; условие владельца 1): растёт по запросам подтверждения, а не по событиям — пересмотр при пилоте */
   readonly #done = new Set<string>();
   /** запросы, о которых человеку уже сообщили */
   readonly #notified = new Set<string>();
@@ -91,6 +93,7 @@ export class Confirmations {
 
   constructor(o: ConfirmationsOptions) {
     this.#o = o;
+    this.#seen = new SeenWindow(o.params.event_seen_max);
     this.#now = o.now ?? (() => new Date());
     this.#timer =
       o.timer ??

@@ -58,6 +58,8 @@ export const StandParamsSchema = z
   // на стадии 6 — промежуток перечитывания GET без события (#59 п. 3). Равен параметру стенда (тест стенда).
   // × 1000 — срок таймера: не больше его предела (как shop_retry_after_max_sec); 0 — ожидания нет, не допускается
   operation_outcome_max_delay_sec: positive.max(Math.floor(TIMER_MAX_MS / 1000)),
+  // Окно обработанных event_id у модулей операций и подтверждений (Р50 п. 1): вытеснение старейшего, рост ограничен.
+  event_seen_max: positive,
 })
   // Обращения и ожидание повторов укладываются в registry_cache_ttl_sec (инвариант 4, Р20).
   .refine(

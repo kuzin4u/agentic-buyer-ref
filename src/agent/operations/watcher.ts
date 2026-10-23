@@ -4,6 +4,7 @@
 // покупка встаёт в ожидание до отправки пакета. Сверка с заказом и CART — bind.ts. Слова продавца сюда не попадают
 // (инвариант 8).
 import { poll } from "../events/poll.js";
+import { SeenWindow } from "../events/seen.js";
 import type { FeedItem } from "../ports/events.js";
 import { PlatformFailure, type FailureCode, type Mandate, type Operation, type OperationRecord, type OperationStatus, type ScopeCheck } from "../../shared/domain.js";
 import type { DiagCode } from "../../shared/diag-codes.js";
@@ -37,7 +38,7 @@ export interface OperationsOptions {
   journal: OperationsJournal;
   /** registry_cache_ttl_sec — предел недоступности GET на стадии 6 (инвариант 4); event_poll_interval_ms — пауза опроса
    *  ленты после её отказа (без него опрос прекращается) */
-  params: { operation_outcome_max_delay_sec: number; registry_cache_ttl_sec: number; event_poll_interval_ms?: number };
+  params: { operation_outcome_max_delay_sec: number; registry_cache_ttl_sec: number; event_seen_max: number; event_poll_interval_ms?: number };
   /** прочитать ленту (`EventFeed.signal`): ожидание будит её, пока не решится; частоту чтений ограничивает лента */
   wake?: () => Promise<void>;
   now?: () => Date;
@@ -76,8 +77,8 @@ export class Operations {
   readonly #o: OperationsOptions;
   readonly #now: () => Date;
   readonly #timer: (fn: () => void, ms: number) => () => void;
-  /** event_id обработанных событий: дубль ленты или push — без второго GET */
-  readonly #seen = new Set<string>();
+  /** event_id обработанных событий: дубль ленты или push — без второго GET; окно event_seen_max (Р50 п. 1) */
+  readonly #seen: SeenWindow;
   /** order_ref → покупка, ждущая итог стадии 5 */
   readonly #byOrder = new Map<string, Expectation>();
   /** op_ref → ожидания расчёта (стадия 6): событие только будит их, GET делает ожидание */
@@ -85,6 +86,7 @@ export class Operations {
 
   constructor(o: OperationsOptions) {
     this.#o = o;
+    this.#seen = new SeenWindow(o.params.event_seen_max);
     this.#now = o.now ?? (() => new Date());
     this.#timer =
       o.timer ??

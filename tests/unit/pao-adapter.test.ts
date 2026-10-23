@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { describe, it, expect, afterEach } from "vitest";
 import { newEd25519Signer } from "@kuzin4u/agentic-core";
 import { PaoStub } from "@kuzin4u/agentic-core/pao";
@@ -141,10 +142,10 @@ describe("адаптер ПАО против заглушки agentic-core", () 
     ["MANDATE_REVOKED", 500],
     ["UPSTREAM_UNAVAILABLE", 500],
     ["RATE_LIMITED", 400],
-  ] as const)("код %s с чужим статусом %i: одно обращение, UNKNOWN", async (code, status) => {
+  ] as const)("код %s с чужим статусом %i: одно обращение, BAD_RESPONSE (Р48 п. 3)", async (code, status) => {
     const { platform, stub } = await setup();
     stub.fail("GET /pao/v1/mandates/{id}/verify", { code, status, retry: "same_key", retryAfterSec: 0 }, 3);
-    await expect(platform.verifyMandate(M1)).rejects.toMatchObject({ code: "UNKNOWN", retry: "never", platformCode: code });
+    await expect(platform.verifyMandate(M1)).rejects.toMatchObject({ code: "BAD_RESPONSE", retry: "never", platformCode: code });
     expect(stub.calls.filter((c) => c.op === "GET /pao/v1/mandates/{id}/verify")).toHaveLength(1);
   });
 
@@ -189,13 +190,13 @@ describe("валюта — из мандата, множество платфо�
     expect(stub.calls).toEqual([]);
   });
 
-  it("мандат платформы в USD — UNKNOWN (поломка «не RUB принят»)", async () => {
+  it("мандат платформы в USD — BAD_RESPONSE (поломка «не RUB принят»)", async () => {
     const mandate = {
       id: "m_usd", agent_code: AGENT, revocation_order: "bank:pr_1:revocation:v1", type: "INTENT", subject: "хлеб", amount_limit: 500000, currency: "USD", valid_to: "2026-11-14T00:00:00Z",
       merchant_scope: ["shop_1"], principal_ref: "pr_1", mode: "IMMEDIATE", status: "ACTIVE",
     };
     const { platform } = fake(() => json(200, mandate));
-    await expect(platform.getMandate("m_usd")).rejects.toMatchObject({ code: "UNKNOWN" });
+    await expect(platform.getMandate("m_usd")).rejects.toMatchObject({ code: "BAD_RESPONSE" });
     const rub = fake(() => json(200, { ...mandate, currency: "RUB" }));
     expect((await rub.platform.getMandate("m_usd")).amountLimit).toEqual({ amount: 500000, currency: "RUB" });
   });
@@ -207,10 +208,10 @@ describe("валюта — из мандата, множество платфо�
     expect(stub.calls).toEqual([]);
   });
 
-  it("операция чужого мандата — UNKNOWN; без признака: по одной — сумма не подтверждена, в списке — валюта мандата", async () => {
+  it("операция чужого мандата — BAD_RESPONSE; без признака: по одной — сумма не подтверждена, в списке — валюта мандата", async () => {
     const op = { op_ref: "op_1", amount: 1000, status: "DECLINED" };
     const other = fake(() => json(200, { ...op, aoi: { indicator: true, agent_code: AGENT, mandate_id: "m_2" } }));
-    await expect(other.platform.getOperation("op_1", M1)).rejects.toMatchObject({ code: "UNKNOWN" });
+    await expect(other.platform.getOperation("op_1", M1)).rejects.toMatchObject({ code: "BAD_RESPONSE" });
     const bare = fake(() => json(200, op));
     expect(await bare.platform.getOperation("op_1", M1)).toMatchObject({ amount: null, indicator: null });
     const list = fake(() => json(200, [op]));
@@ -219,15 +220,15 @@ describe("валюта — из мандата, множество платфо�
 });
 
 describe("fail-closed без заглушки", () => {
-  // «Открыто» № 4 (ревью AG-02): ответ 2xx — по схеме ПАО; значение вне перечня — UNKNOWN без фрагментов тела.
+  // «Открыто» № 4 (ревью AG-02): ответ 2xx — по схеме ПАО; значение вне перечня — BAD_RESPONSE без фрагментов тела (Р48 п. 3).
   it.each([
     ["outcome вне перечня", { outcome: "MAYBE_LATER", amount_left: 1, valid_to: "2026-10-20T00:00:00Z" }],
     ["нет обязательного amount_left", { outcome: "CONFIRMED", valid_to: "2026-10-20T00:00:00Z" }],
     ["valid_to не дата-время", { outcome: "CONFIRMED", amount_left: 1, valid_to: "MAYBE_LATER" }],
-  ])("verify: %s — UNKNOWN", async (_, body) => {
+  ])("verify: %s — BAD_RESPONSE", async (_, body) => {
     const { platform, calls } = fake(() => json(200, body));
     const err = (await platform.verifyMandate(M1).catch((e: unknown) => e)) as PlatformFailure;
-    expect(err).toMatchObject({ code: "UNKNOWN", retry: "never", httpStatus: 200 });
+    expect(err).toMatchObject({ code: "BAD_RESPONSE", retry: "never", httpStatus: 200 });
     expect(err.message).not.toContain("MAYBE_LATER");
     expect(calls).toHaveLength(1);
   });
@@ -251,21 +252,21 @@ describe("fail-closed без заглушки", () => {
     expect(calls).toHaveLength(1);
   });
 
-  it("лента: элемент без event_id — UNKNOWN всего ответа (Р34 п. 6)", async () => {
+  it("лента: элемент без event_id — BAD_RESPONSE всего ответа (Р34 п. 6)", async () => {
     const { platform } = fake(() => json(200, [{ type: "mandate.signed", at: "2026-10-19T09:00:00Z", data: { mandate_id: "m_1" } }]));
-    await expect(platform.listEvents(null)).rejects.toMatchObject({ code: "UNKNOWN", httpStatus: 200 });
+    await expect(platform.listEvents(null)).rejects.toMatchObject({ code: "BAD_RESPONSE", httpStatus: 200 });
   });
 
-  it("подписка: ответ с другим адресом или составом — UNKNOWN (Р34 п. 8)", async () => {
+  it("подписка: ответ с другим адресом или составом — BAD_RESPONSE без повтора (Р34 п. 8, Р48 п. 3)", async () => {
     const url = "https://agent.example/pao/events";
     for (const body of [{ url: "https://evil.example/x", events: ["mandate.signed"] }, { url, events: [] }]) {
       const { platform, calls } = fake(() => json(200, body));
-      await expect(platform.subscribe(url, ["mandate.signed"], { idempotencyKey: "idem-s" })).rejects.toMatchObject({ code: "UNKNOWN", httpStatus: 200 });
-      expect(calls).toHaveLength(1); // UNKNOWN — без повтора
+      await expect(platform.subscribe(url, ["mandate.signed"], { idempotencyKey: "idem-s" })).rejects.toMatchObject({ code: "BAD_RESPONSE", httpStatus: 200 });
+      expect(calls).toHaveLength(1); // 2xx изменяющего запроса не по контракту — без повтора (Р48 п. 3)
     }
     // без Idempotency-Key — отказ до обращения (инвариант 9)
     const empty = fake(() => json(200, { url, events: ["mandate.signed"] }));
-    await expect(empty.platform.subscribe(url, ["mandate.signed"], { idempotencyKey: "" })).rejects.toMatchObject({ code: "UNKNOWN" });
+    await expect(empty.platform.subscribe(url, ["mandate.signed"], { idempotencyKey: "" })).rejects.toMatchObject({ code: "AGENT_REQUEST_DEFECT" });
     expect(empty.calls).toHaveLength(0);
     const { platform, calls } = fake(() => json(200, { url, events: ["mandate.signed"] }));
     await platform.subscribe(url, ["mandate.signed"], { idempotencyKey: "idem-s" });
@@ -277,14 +278,14 @@ describe("fail-closed без заглушки", () => {
     expect((await platform.verifyMandate(M1)).amountLeft).toEqual({ amount: 7, currency: "RUB" });
   });
 
-  it("реквизит с aoi чужого мандата или агента — UNKNOWN («Открыто» № 17)", async () => {
+  it("реквизит с aoi чужого мандата или агента — BAD_RESPONSE («Открыто» № 17)", async () => {
     const cred = (aoi: object) => ({ credential_ref: "cr_1", kind: "CARD", payload: {}, aoi, status: "ISSUED" });
     for (const aoi of [
       { indicator: true, agent_code: AGENT, mandate_id: "m_2" },
       { indicator: true, agent_code: "nspk:agent:other:v1", mandate_id: "m_1" },
     ]) {
       const { platform } = fake(() => json(201, cred(aoi)));
-      await expect(platform.issueCredential(draft, { idempotencyKey: "idem_aoi" })).rejects.toMatchObject({ code: "UNKNOWN" });
+      await expect(platform.issueCredential(draft, { idempotencyKey: "idem_aoi" })).rejects.toMatchObject({ code: "BAD_RESPONSE" });
     }
   });
 
@@ -304,27 +305,27 @@ describe("fail-closed без заглушки", () => {
     expect(calls).toHaveLength(1);
   });
 
-  it("503 без тела ПАО — одно обращение, UNKNOWN", async () => {
+  it("503 без тела ПАО — одно обращение, BAD_RESPONSE", async () => {
     const { platform, calls } = fake(() => new Response("bad gateway", { status: 503, headers: { "retry-after": "1" } }));
-    await expect(platform.verifyMandate(M1)).rejects.toMatchObject({ code: "UNKNOWN" });
+    await expect(platform.verifyMandate(M1)).rejects.toMatchObject({ code: "BAD_RESPONSE" });
     expect(calls).toHaveLength(1);
   });
 
-  it("пустое тело 2xx — UNKNOWN, а не TypeError", async () => {
+  it("пустое тело 2xx — BAD_RESPONSE, а не TypeError", async () => {
     const { platform } = fake(() => new Response("", { status: 200 }));
     const err = await platform.getMandate("m_1").catch((e: unknown) => e);
     expect(err).toBeInstanceOf(PlatformFailure);
-    expect(err).toMatchObject({ code: "UNKNOWN", retry: "never" });
+    expect(err).toMatchObject({ code: "BAD_RESPONSE", retry: "never" });
   });
 
   it("битый ответ /credentials — в тексте отказа нет фрагментов тела (инвариант 1)", async () => {
     const { platform } = fake(() => new Response('{"credential_ref":"cr_1","payload":{"cryptogram": SECRETCRYP', { status: 201 }));
     const err = (await platform.issueCredential(draft, { idempotencyKey: "idem_cr_3" }).catch((e: unknown) => e)) as PlatformFailure;
-    expect(err).toMatchObject({ code: "UNKNOWN", retry: "never" });
+    expect(err).toMatchObject({ code: "BAD_RESPONSE", retry: "never" });
     expect(err.message).not.toMatch(/SECRETCRYP|cryptogram|payload/);
   });
 
-  it("тайм-аут обращения — UNKNOWN, без повтора", async () => {
+  it("тайм-аут GET — NO_RESPONSE, без повтора (Р48 п. 4а)", async () => {
     const calls: unknown[] = [];
     const platform = new PaoPlatform({
       journal: new MemoryJournal(),
@@ -338,7 +339,7 @@ describe("fail-closed без заглушки", () => {
           init?.signal?.addEventListener("abort", () => reject(init.signal!.reason));
         }),
     });
-    await expect(platform.verifyMandate(M1)).rejects.toMatchObject({ code: "UNKNOWN", httpStatus: 0 });
+    await expect(platform.verifyMandate(M1)).rejects.toMatchObject({ code: "NO_RESPONSE", httpStatus: 0 });
     expect(calls).toHaveLength(1);
   });
 
@@ -370,9 +371,9 @@ describe("fail-closed без заглушки", () => {
       ["нет class", () => json(200, { agent_code: AGENT, status: "ACTIVE", keys: [] })],
       ["класс вне перечня", () => json(200, { ...self, class: "ADMIN" })],
       ["статус вне перечня", () => json(200, { ...self, status: "BLOCKED" })],
-    ])("%s — UNKNOWN с HTTP 200, подпись приостановлена", async (_n, reply) => {
+    ])("%s — BAD_RESPONSE с HTTP 200, подпись приостановлена", async (_n, reply) => {
       const { platform, suspended, stopped } = watched(reply);
-      await expect(platform.agentSelf()).rejects.toMatchObject({ code: "UNKNOWN", httpStatus: 200 });
+      await expect(platform.agentSelf()).rejects.toMatchObject({ code: "BAD_RESPONSE", httpStatus: 200 });
       expect(suspended).toEqual(["AGENT_SELF_UNKNOWN"]);
       expect(stopped).toEqual([]);
     });
@@ -385,7 +386,7 @@ describe("fail-closed без заглушки", () => {
         },
       });
       const { platform, suspended } = watched(() => new Response(body, { status: 200, headers: { "content-type": "application/json" } }));
-      await expect(platform.agentSelf()).rejects.toMatchObject({ code: "UNKNOWN", httpStatus: 200 });
+      await expect(platform.agentSelf()).rejects.toMatchObject({ code: "BAD_RESPONSE", httpStatus: 200 });
       expect(suspended).toEqual(["AGENT_SELF_UNKNOWN"]);
     });
 
@@ -395,7 +396,7 @@ describe("fail-closed без заглушки", () => {
       expect(suspended).toEqual([]);
     });
 
-    it("тайм-аут — UNKNOWN без ответа (HTTP 0), не приостановка", async () => {
+    it("тайм-аут — NO_RESPONSE (HTTP 0), не приостановка", async () => {
       const suspended: string[] = [];
       const platform = new PaoPlatform({
         journal: new MemoryJournal(),
@@ -405,7 +406,7 @@ describe("fail-closed без заглушки", () => {
         params: { ...params, pao_request_timeout_ms: 30 },
         fetch: (_url, init) => new Promise((_, reject) => init?.signal?.addEventListener("abort", () => reject(init.signal!.reason))),
       });
-      await expect(platform.agentSelf()).rejects.toMatchObject({ code: "UNKNOWN", httpStatus: 0 });
+      await expect(platform.agentSelf()).rejects.toMatchObject({ code: "NO_RESPONSE", httpStatus: 0 });
       expect(suspended).toEqual([]);
     });
 
@@ -431,7 +432,7 @@ describe("fail-closed без заглушки", () => {
 
   it.each(["", "   "])("пустой Idempotency-Key (%j) — отказ до отправки", async (key) => {
     const { platform, calls } = fake(() => json(201, {}));
-    await expect(platform.issueCredential(draft, { idempotencyKey: key })).rejects.toMatchObject({ code: "UNKNOWN" });
+    await expect(platform.issueCredential(draft, { idempotencyKey: key })).rejects.toMatchObject({ code: "AGENT_REQUEST_DEFECT", retry: "never" });
     expect(calls).toHaveLength(0);
   });
 });
@@ -507,5 +508,88 @@ describe("экспорт адаптера ПАО (ревью AG-02 № 19)", () 
   it("наружу — только адаптер, версия копии, проверка версии и реестры кодов ПАО и клиента ПАО (Р36, Р37 п. 1); переводчики ПАО (map) не экспортируются", async () => {
     const exported = Object.keys(await import("../../src/agent/adapters/pao/index.js")).sort();
     expect(exported).toEqual(["PAO_CLIENT_CODES", "PAO_CLIENT_DIAG", "PAO_COPY_VERSION", "PAO_DIAG", "PaoPlatform", "assertPaoVersion"]);
+  });
+});
+
+// Р48 п. 4: нет ответа — повтор тем же Idempotency-Key с новой подписью, без ожидания, до pao_max_attempts — только у
+// методов, где ПАО требует ключ; выдача реквизита и GET — без повтора.
+describe("NO_RESPONSE: повтор тем же ключом (Р48 п. 4)", () => {
+  const lost = () => Promise.reject(new TypeError("fetch failed"));
+
+  it("перечень методов с повтором — методы YAML 1.4.0 с обязательным Idempotency-Key (SPEC §7а, Р48 п. 4а)", async () => {
+    const { KEYED_OPERATIONS } = await import("../../src/agent/adapters/pao/adapter.js");
+    const yaml = readFileSync("docs/core/protocol/agent-protocol.v1.4.0.yaml", "utf8");
+    // по YAML: обязательный заголовок задаёт якорь &id007 (Idempotency-Key) или общий набор параметров *id009 с ним
+    const keyed: string[] = [];
+    let path = "";
+    let method = "";
+    for (const line of yaml.split("\n")) {
+      const p = /^ {2}(\/pao\/[^:]+):$/.exec(line);
+      if (p) path = p[1]!;
+      const m = /^ {4}(get|post|put|delete):$/.exec(line);
+      if (m) method = m[1]!.toUpperCase();
+      if (/[&*]id007\b|parameters: \*id009\b/.test(line)) keyed.push(`${method} ${path}`);
+    }
+    expect(yaml).toMatch(/- &id007\n\s+\$ref: '#\/components\/parameters\/IdempotencyKey'/);
+    expect([...KEYED_OPERATIONS].sort()).toEqual([...new Set(keyed)].sort());
+  });
+
+  it("PUT /pao/v1/subscription: нет ответа — повтор тем же ключом, новая подпись, до pao_max_attempts; затем NO_RESPONSE", async () => {
+    const { platform, calls } = fake(lost);
+    await expect(platform.subscribe("https://agent.example/pao/events", ["mandate.signed"], { idempotencyKey: "idem-nr" })).rejects.toMatchObject({
+      code: "NO_RESPONSE",
+      retry: "same_key",
+      httpStatus: 0,
+    });
+    expect(calls).toHaveLength(params.pao_max_attempts);
+    expect(new Set(calls.map((c) => new Headers(c.headers).get("idempotency-key")))).toEqual(new Set(["idem-nr"]));
+    expect(new Set(calls.map((c) => new Headers(c.headers).get("x-nonce"))).size).toBe(params.pao_max_attempts);
+  });
+
+  it("нет ответа, затем ответ — итог второй попытки", async () => {
+    let n = 0;
+    const url = "https://agent.example/pao/events";
+    const { platform, calls } = fake(() => (++n === 1 ? lost() : json(200, { url, events: ["mandate.signed"] })));
+    await platform.subscribe(url, ["mandate.signed"], { idempotencyKey: "idem-nr2" });
+    expect(calls).toHaveLength(2);
+  });
+
+  it("выдача реквизита: нет ответа — одно обращение, NO_RESPONSE never (Р45 п. 3)", async () => {
+    const { platform, calls } = fake(lost);
+    await expect(platform.issueCredential(draft, { idempotencyKey: "idem-nr-cr" })).rejects.toMatchObject({ code: "NO_RESPONSE", retry: "never" });
+    expect(calls).toHaveLength(1);
+  });
+
+  it("GET: нет ответа — одно обращение, NO_RESPONSE never (Р48 п. 4а)", async () => {
+    const { platform, calls } = fake(lost);
+    await expect(platform.getMandate("m_1")).rejects.toMatchObject({ code: "NO_RESPONSE", retry: "never" });
+    expect(calls).toHaveLength(1);
+  });
+
+  it("изменяющий запрос: заголовки 201 пришли, тело оборвалось — BAD_RESPONSE с HTTP 201, одно обращение (ревью reviewer К2 № 6)", async () => {
+    const broken = () => {
+      const body = new ReadableStream<Uint8Array>({
+        start(c) {
+          c.enqueue(new TextEncoder().encode('{"id":'));
+          c.error(new Error("соединение оборвано"));
+        },
+      });
+      return new Response(body, { status: 201, headers: { "content-type": "application/json" } });
+    };
+    const { platform, calls } = fake(broken);
+    await expect(platform.requestMandate(INTENT, { idempotencyKey: "idem-broken" })).rejects.toMatchObject({ code: "BAD_RESPONSE", retry: "never", httpStatus: 201 });
+    expect(calls).toHaveLength(1);
+  });
+
+  it("изменяющий запрос: 503 без тела ПАО — BAD_RESPONSE, одно обращение (ревью reviewer К2 № 6)", async () => {
+    const { platform, calls } = fake(() => new Response("bad gateway", { status: 503, headers: { "retry-after": "0" } }));
+    await expect(platform.requestMandate(INTENT, { idempotencyKey: "idem-503" })).rejects.toMatchObject({ code: "BAD_RESPONSE", httpStatus: 503 });
+    expect(calls).toHaveLength(1);
+  });
+
+  it("2xx не по контракту на изменяющий запрос — BAD_RESPONSE без повтора (Р48 п. 3)", async () => {
+    const { platform, calls } = fake(() => new Response("{", { status: 201 }));
+    await expect(platform.requestMandate(INTENT, { idempotencyKey: "idem-bad" })).rejects.toMatchObject({ code: "BAD_RESPONSE", httpStatus: 201 });
+    expect(calls).toHaveLength(1);
   });
 });

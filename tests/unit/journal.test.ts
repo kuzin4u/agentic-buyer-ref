@@ -1,5 +1,6 @@
 // Журнал решений агента (Р37 п. 3, SPEC §4, Т15): код реестра в reason, закрытый набор полей, код агента и время ставит
 // место сборки, штатное закрытие — не код реестра.
+import { readFileSync } from "node:fs";
 import { afterEach, describe, expect, expectTypeOf, it, vi } from "vitest";
 import { PaoCallError, PaoClient } from "@kuzin4u/agentic-core/pao";
 import { CATALOG_DIAG_CODES, type CatalogDiagCode } from "@kuzin4u/agentic-core/catalog";
@@ -91,7 +92,7 @@ describe("записи ядра (Р37 п. 3)", () => {
     expectJournalClean(journal.entries, AGENT, s.stub.calls);
   });
 
-  it("нет ответа (тайм-аут транспорта) — result unknown, UNKNOWN, без HTTP-статуса", async () => {
+  it("нет ответа (тайм-аут транспорта) — result unknown, NO_RESPONSE, без HTTP-статуса; повтор тем же ключом до pao_max_attempts (Р48 п. 4)", async () => {
     const consents: Consents = new Consents(() => s.clock);
     const s: PaoStand = (stand = new PaoStand({ handlers: consents.handlers(), configuration: { versions: ["1.4.0"] } }));
     let down = false;
@@ -99,15 +100,18 @@ describe("записи ядра (Р37 п. 3)", () => {
     const { core, journal } = await coreOn(s, { fetch: fetchImpl });
     await core.start();
     down = true;
-    await expect(core.mandates.request(INTENT, { idempotencyKey: "idem_journal_down" })).rejects.toMatchObject({ code: "UNKNOWN" });
-    expect(journal.entries.filter((e) => e.kind === "pao.call").at(-1)).toEqual({
+    await expect(core.mandates.request(INTENT, { idempotencyKey: "idem_journal_down" })).rejects.toMatchObject({ code: "NO_RESPONSE" });
+    const { pao_max_attempts } = JSON.parse(readFileSync("config/params.stand.json", "utf8")) as { pao_max_attempts: number };
+    const down_ = journal.entries.filter((e) => e.kind === "pao.call" && e.method === "POST /pao/v1/mandates");
+    expect(down_.map((e) => e.attempt)).toEqual(Array.from({ length: pao_max_attempts }, (_, i) => i + 1));
+    expect(down_.at(-1)).toEqual({
       at: s.clock.toISOString(),
       agent: AGENT,
       kind: "pao.call",
       method: "POST /pao/v1/mandates",
-      attempt: 1,
+      attempt: pao_max_attempts,
       result: "unknown",
-      reason: "UNKNOWN",
+      reason: "NO_RESPONSE",
     });
     expect(s.stub.calls).toHaveLength(2);
     expectJournalClean(journal.entries, AGENT, s.stub.calls, ["idem_journal_down"]);
@@ -128,10 +132,20 @@ describe("записи ядра (Р37 п. 3)", () => {
     expectJournalClean(journal.entries, AGENT, s.stub.calls, ["idem_journal_cr1", "idem_journal_cr2"]);
   });
 
+  it.each([
+    ["versions не массив", { versions: 7 }],
+    ["тело не объект", []],
+  ] as const)("конфигурация 2xx не по форме (%s) — pao.call с тем же BAD_RESPONSE, что platform.version_unknown (ревью reviewer К2 № 2)", async (_, reply: unknown) => {
+    const { core, journal } = await setup({ handlers: { "GET /.well-known/pao-configuration": () => ({ status: 200, body: reply as never }) } });
+    await core.start();
+    expect(journal.entries.find((e) => e.kind === "pao.call")).toMatchObject({ method: "GET /.well-known/pao-configuration", result: "unknown", reason: "BAD_RESPONSE" });
+    expect(journal.entries.find((e) => e.kind === "platform.version_unknown")).toMatchObject({ detail: "BAD_RESPONSE" });
+  });
+
   it("конфигурация 404 — unknown с HTTP-статусом; PAO_CLIENT_SIGNER_MISSING — не попытка, pao.call нет (ревью К2.2 № 1, № 8)", async () => {
     const { core, journal } = await setup({ handlers: { "GET /.well-known/pao-configuration": () => ({ status: 404, body: {} }) } });
     await core.start();
-    expect(journal.entries.find((e) => e.kind === "pao.call")).toMatchObject({ method: "GET /.well-known/pao-configuration", attempt: 1, result: "unknown", reason: "UNKNOWN", detail: "404" });
+    expect(journal.entries.find((e) => e.kind === "pao.call")).toMatchObject({ method: "GET /.well-known/pao-configuration", attempt: 1, result: "unknown", reason: "BAD_RESPONSE", detail: "404" });
     const spy = vi.spyOn(PaoClient.prototype, "call").mockRejectedValueOnce(new PaoCallError(0, undefined, 0, undefined, { clientCode: "PAO_CLIENT_SIGNER_MISSING" }));
     try {
       const before = journal.entries.filter((e) => e.kind === "pao.call").length;

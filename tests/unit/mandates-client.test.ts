@@ -311,13 +311,13 @@ describe("клиент мандатов на PaoStub", () => {
     await expect(core.mandates.requireActive(signed)).rejects.toMatchObject({ reason: "MANDATE_OUT_OF_SCOPE" });
   });
 
-  it("as_of не дата-время — ответ не по схеме ПАО: UNKNOWN в адаптере («Открыто» № 4)", async () => {
+  it("as_of не дата-время — ответ не по схеме ПАО: BAD_RESPONSE в адаптере («Открыто» № 4)", async () => {
     const { core, consents } = await setup();
     const m = await core.mandates.request(INTENT, { idempotencyKey: "idem_s" });
     const signed = await core.mandates.awaitSigned(m, feed(consents.sign(m.id)));
     consents.asOf = "вчера";
     const err = (await core.mandates.check(signed).catch((e: unknown) => e)) as Error;
-    expect(err).toMatchObject({ code: "UNKNOWN", retry: "never", httpStatus: 200 });
+    expect(err).toMatchObject({ code: "BAD_RESPONSE", retry: "never", httpStatus: 200 });
     expect(err.message).toMatch(/не по схеме/);
     expect(err.message).not.toContain("вчера"); // значения из тела в отказ не переносятся (инвариант 1)
   });

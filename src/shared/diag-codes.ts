@@ -6,6 +6,10 @@ export const AGENT_DIAG_CODES = [
   // словарь ядра вне ПАО (FailureCode): агент выводит их сам из ответа Платформы (Р33)
   "MANDATE_REVOCATION_ORDER_MISSING",
   "PLATFORM_PROTOCOL_UNSUPPORTED",
+  // разделение UNKNOWN (Р48 п. 3): нет ответа, ответ не подтверждён контрактом, дефект агента до сети
+  "NO_RESPONSE",
+  "BAD_RESPONSE",
+  "AGENT_REQUEST_DEFECT",
   "UNKNOWN",
   // предупреждение: версия ПАО Платформы не определена (Р33 п. 10)
   "PLATFORM_VERSION_UNKNOWN",
@@ -73,9 +77,18 @@ export const AGENT_DIAG_CODES = [
   "CONFIRMATION_EXPIRED",
   "CONFIRMATION_NOT_DELIVERED",
   "CONFIRMATION_UNBOUND",
-  // причины operation.declined (SPEC §7б): в PAO_DIAG ядра их нет
+  // причины operation.declined (SPEC §7б, Р48 п. 1): совпадающие с кодом §7а — с приставкой DECLINED_ (код ПАО уже в PAO_DIAG ядра)
   "AOI_MISSING",
   "AOI_MISMATCH",
+  "DECLINED_AGENT_SUSPENDED",
+  "DECLINED_CREDENTIAL_INVALID",
+  "DECLINED_MANDATE_NOT_FOUND",
+  "DECLINED_MANDATE_EXPIRED",
+  "DECLINED_MANDATE_REVOKED",
+  "DECLINED_MANDATE_SCOPE",
+  "DECLINED_LIMIT_EXCEEDED",
+  "DECLINED_STATE_UNAVAILABLE",
+  "ISSUER_DECLINED",
   "INSUFFICIENT_FUNDS",
   "DECLINE_REASON_UNKNOWN",
 ] as const;

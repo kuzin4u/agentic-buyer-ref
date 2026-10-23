@@ -1,5 +1,6 @@
 // Отказ ПАО → отказ ядра (SPEC §7а, Р20). Класс повтора — из таблицы ядра по коду, не из тела ответа.
-// Неизвестный код, отказ без тела ПАО, сбой транспорта, тайм-аут, битый ответ — UNKNOWN, never (инвариант 4).
+// Р48 п. 3: тайм-аут и сбой сети до заголовков — NO_RESPONSE (same_key); отказ без тела ПАО и пара «код, HTTP» не по
+// x-pao-errors — BAD_RESPONSE; код вне ПАО 1.4.0 и неразобранное — UNKNOWN (never, инвариант 4).
 import { PAO_ERRORS, PaoCallError, type ErrorCode } from "@kuzin4u/agentic-core/pao";
 import { PlatformFailure, type FailureCode } from "../../../shared/domain.js";
 import { FAILURE_RULES } from "../../declines/index.js";
@@ -45,12 +46,13 @@ export function toFailure(e: unknown, idempotencyKey: string | null = null): Pla
     const code = raw !== null && Object.hasOwn(CODES, raw) ? CODES[raw as ErrorCode] : undefined;
     const key = e.idempotencyKey ?? idempotencyKey;
     if (code === undefined) {
-      const detail = e.status === 0 ? "нет ответа" : e.body ? "код не из ПАО 1.4.0" : "ответ без тела ПАО";
-      return new PlatformFailure("UNKNOWN", "never", raw, e.status, key, detail);
+      if (e.status === 0) return new PlatformFailure("NO_RESPONSE", FAILURE_RULES.NO_RESPONSE.retry, null, 0, key, "нет ответа");
+      if (!e.body) return new PlatformFailure("BAD_RESPONSE", "never", null, e.status, key, "ответ без тела ПАО");
+      return new PlatformFailure("UNKNOWN", "never", raw, e.status, key, "код не из ПАО 1.4.0");
     }
     // Пара «код, HTTP» должна совпасть с x-pao-errors; иначе ответ не подтверждён контрактом (инвариант 4).
     if (PAO_ERRORS[raw as ErrorCode].http !== e.status) {
-      return new PlatformFailure("UNKNOWN", "never", raw, e.status, key, "HTTP-статус не совпадает с кодом ПАО");
+      return new PlatformFailure("BAD_RESPONSE", "never", raw, e.status, key, "HTTP-статус не совпадает с кодом ПАО");
     }
     return new PlatformFailure(code, FAILURE_RULES[code].retry, raw, e.status, key);
   }

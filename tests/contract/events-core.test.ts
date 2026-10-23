@@ -242,7 +242,7 @@ describe("ядро и события на стенде v0.11.0 (Р34)", { timeou
 
   it.each([
     ["503 STATE_UNAVAILABLE без Retry-After", () => Response.json({ code: "STATE_UNAVAILABLE", message: "x", norm: "x", retry: "same_key" }, { status: 503 }), "STATE_UNAVAILABLE"],
-    ["ответ — не та подписка (UNKNOWN)", () => Response.json({ url: "https://evil.example/x", events: [] }, { status: 200 }), "UNKNOWN"],
+    ["ответ — не та подписка (BAD_RESPONSE)", () => Response.json({ url: "https://evil.example/x", events: [] }, { status: 200 }), "BAD_RESPONSE"],
   ] as const)("подписка: %s — старт успешен, events.subscription_failed без адреса, лента работает (дополнение Р34 п. 1)", async (_, reply, code) => {
     const { core, replace, pushUrl } = await setup();
     replace.set("PUT /pao/v1/subscription", reply);

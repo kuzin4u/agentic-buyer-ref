@@ -3,7 +3,7 @@
 import { Purchase, type CartChoice } from "../../src/agent/pipeline/index.js";
 import type { HumanA5Decision } from "../../src/agent/shell/index.js";
 import type { FeedItem, LiveOfferSource, OfferSource, PaymentSteps, ShopPort } from "../../src/agent/ports/index.js";
-import { SplitWindow } from "../../src/agent/policy/index.js";
+import { OrderPriceMismatches, SplitWindow } from "../../src/agent/policy/index.js";
 import { loadParams } from "../../src/shared/config.js";
 import type { Journal } from "../../src/agent/journal/index.js";
 import type { DiagCode } from "../../src/shared/diag-codes.js";
@@ -66,6 +66,7 @@ export async function purchaseOn(o: PurchaseSetup, track: (s: PaoStand) => void)
     payment,
     params: { ...loadParams(), ...o.params },
     split,
+    orderMismatches: new OrderPriceMismatches(),
     journal: { record: (e) => (o.tap?.(e), core.journal.record(e)) },
     admission: () => o.admission ?? null,
     ...(o.region !== null && { region: o.region ?? "77" }),

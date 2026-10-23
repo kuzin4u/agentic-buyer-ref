@@ -60,6 +60,11 @@ export const StandParamsSchema = z
     (p) => (p.pao_max_attempts * p.pao_request_timeout_ms) / 1000 + PAO_RETRY_AFTER_MAX_SEC <= p.registry_cache_ttl_sec,
     { message: "pao_max_attempts × pao_request_timeout_ms + 30 с (РП24) больше registry_cache_ttl_sec" },
   )
+  // Повторы тем же ключом (Р48 п. 4б): весь бюджет повторов — в сроке хранения ключа идемпотентности на Платформе.
+  .refine(
+    (p) => (p.pao_max_attempts * p.pao_request_timeout_ms) / 1000 + PAO_RETRY_AFTER_MAX_SEC <= p.idempotency_ttl_sec,
+    { message: "pao_max_attempts × pao_request_timeout_ms + 30 с (РП24) больше idempotency_ttl_sec" },
+  )
   // Выдача реквизита (Р45 п. 2.4–2.5): тайм-аут строго больше предела обработчика Платформы, не меньше общего тайм-аута ПАО
   // и вмещается в registry_cache_ttl_sec — срок выдачи вместе с повторами (В2а, инвариант 4).
   .refine((p) => p.pao_credentials_timeout_ms > PAO_CREDENTIALS_HANDLER_MAX_MS, {

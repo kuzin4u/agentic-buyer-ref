@@ -78,7 +78,13 @@ export const FAILURE_RULES: Readonly<Record<FailureCode, DeclineRule>> = {
   // Р37 п. 1: отказы клиента ПАО ядра (after_fix ядра) — без повтора; агент не останавливается (не AGENT_STOP_CODES).
   PAO_CLIENT_REDIRECT: rule("STOP", "after_fix", 0, false, true),
   PAO_CLIENT_SIGNER_MISSING: rule("STOP", "after_fix", 0, true),
-  // Неопознанный ответ платформы — не дефект агента, но остановка и событие в журнал (SPEC §7а).
+  // Р48 п. 3–4: нет ответа — повтор тем же ключом без ожидания (адаптер: только методы с Idempotency-Key, кроме выдачи
+  // реквизита; в пределах pao_max_attempts и registry_cache_ttl_sec); ответ не подтверждён контрактом — без повтора;
+  // дефект агента до сети — без повтора, прогон отмечается.
+  NO_RESPONSE: rule("RETRY_SAME_KEY", "same_key", null, false, true),
+  BAD_RESPONSE: rule("STOP", "never", 0, false, true),
+  AGENT_REQUEST_DEFECT: rule("STOP", "never", 0, true),
+  // Неопознанный код платформы — не дефект агента, но остановка и событие в журнал (SPEC §7а).
   UNKNOWN: rule("STOP", "never", 0, false, true),
 };
 
@@ -94,12 +100,15 @@ export function ruleForFailure(code: FailureCode): DeclineRule {
   return FAILURE_RULES[code] ?? FAILURE_RULES.UNKNOWN;
 }
 
-/** FIX_AGENT — исправить дефект агента, не повторять операцию; STOP_AND_NOTIFY — остановка по операции и уведомление человека. */
-export type ReasonAction = "FIX_AGENT" | "STOP" | "NOTIFY_HUMAN" | "STOP_AND_NOTIFY";
+/** FIX_AGENT — исправить дефект агента, не повторять операцию; STOP — остановка по операции; NOTIFY_HUMAN — остановка по
+ *  операции и уведомление человека; NEW_MANDATE — то же, человеку — новый мандат; STOP_AGENT — остановка агента (как §7а);
+ *  STOP_ALL — остановить всё начатое по мандату (как §7а; исполнение — AG-12 ч. 2); STOP_AND_NOTIFY — причина вне перечня.
+ *  Повтора операции нет ни у одного действия (Р48 п. 1). */
+export type ReasonAction = "FIX_AGENT" | "STOP" | "NOTIFY_HUMAN" | "NEW_MANDATE" | "STOP_AGENT" | "STOP_ALL" | "STOP_AND_NOTIFY";
 
 export interface ReasonRule {
   /** код реестра (Р36): причина из перечня §7б или DECLINE_REASON_UNKNOWN */
-  code: Extract<AgentDiagCode, "AOI_MISSING" | "AOI_MISMATCH" | "INSUFFICIENT_FUNDS" | "DECLINE_REASON_UNKNOWN">;
+  code: DeclineReasonCode;
   action: ReasonAction;
   defect: boolean;
   /** отдельное событие в журнал (SPEC §7б) */
@@ -108,11 +117,42 @@ export interface ReasonRule {
   unknown: boolean;
 }
 
-/** SPEC §7б: причины отклонения операции (operation.declined). Повтора операции нет ни у одной. */
+/** Коды реестра причин §7б (Р48 п. 1): причина, совпадающая с кодом §7а, — с приставкой DECLINED_. */
+export type DeclineReasonCode = Extract<
+  AgentDiagCode,
+  | "AOI_MISSING"
+  | "AOI_MISMATCH"
+  | "DECLINED_AGENT_SUSPENDED"
+  | "DECLINED_CREDENTIAL_INVALID"
+  | "DECLINED_MANDATE_NOT_FOUND"
+  | "DECLINED_MANDATE_EXPIRED"
+  | "DECLINED_MANDATE_REVOKED"
+  | "DECLINED_MANDATE_SCOPE"
+  | "DECLINED_LIMIT_EXCEEDED"
+  | "DECLINED_STATE_UNAVAILABLE"
+  | "ISSUER_DECLINED"
+  | "INSUFFICIENT_FUNDS"
+  | "DECLINE_REASON_UNKNOWN"
+>;
+
+const reason = (code: DeclineReasonCode, action: ReasonAction, defect = false, journal = defect): ReasonRule =>
+  ({ code, action, defect, journal, unknown: false });
+
+/** SPEC §7б: закрытый перечень причин operation.declined по передаче Платформы #57 (v0.19.0) плюс AOI_MISSING и
+ *  INSUFFICIENT_FUNDS (контракт ПАО 1.5.0, #37). Повтора операции нет ни у одной (Р48 п. 1). */
 export const DECLINE_REASONS: Readonly<Record<string, ReasonRule>> = {
-  AOI_MISSING: { code: "AOI_MISSING", action: "FIX_AGENT", defect: true, journal: true, unknown: false },
-  AOI_MISMATCH: { code: "AOI_MISMATCH", action: "STOP", defect: true, journal: true, unknown: false },
-  INSUFFICIENT_FUNDS: { code: "INSUFFICIENT_FUNDS", action: "NOTIFY_HUMAN", defect: false, journal: false, unknown: false },
+  AOI_MISSING: reason("AOI_MISSING", "FIX_AGENT", true),
+  AOI_MISMATCH: reason("AOI_MISMATCH", "STOP", true),
+  AGENT_SUSPENDED: reason("DECLINED_AGENT_SUSPENDED", "STOP_AGENT"),
+  CREDENTIAL_INVALID: reason("DECLINED_CREDENTIAL_INVALID", "STOP"),
+  MANDATE_NOT_FOUND: reason("DECLINED_MANDATE_NOT_FOUND", "NEW_MANDATE"),
+  MANDATE_EXPIRED: reason("DECLINED_MANDATE_EXPIRED", "NEW_MANDATE"),
+  MANDATE_REVOKED: reason("DECLINED_MANDATE_REVOKED", "STOP_ALL"),
+  MANDATE_SCOPE: reason("DECLINED_MANDATE_SCOPE", "NEW_MANDATE"),
+  LIMIT_EXCEEDED: reason("DECLINED_LIMIT_EXCEEDED", "NOTIFY_HUMAN"),
+  STATE_UNAVAILABLE: reason("DECLINED_STATE_UNAVAILABLE", "STOP"),
+  ISSUER_DECLINED: reason("ISSUER_DECLINED", "NOTIFY_HUMAN"),
+  INSUFFICIENT_FUNDS: reason("INSUFFICIENT_FUNDS", "NOTIFY_HUMAN"),
 };
 
 export function ruleForDeclineReason(reason: string | null): ReasonRule {

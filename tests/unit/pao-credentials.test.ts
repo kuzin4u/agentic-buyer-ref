@@ -77,7 +77,7 @@ describe("тайм-аут выдачи реквизита (Р45 п. 2.5)", () =>
           init?.signal?.addEventListener("abort", () => (clearTimeout(t), reject(init.signal!.reason)), { once: true });
         }),
     });
-    await expect(platform.issuePaymentPackage(draft, { idempotencyKey: "idem-own-timeout" })).rejects.toMatchObject({ code: "UNKNOWN", retry: "never" });
+    await expect(platform.issuePaymentPackage(draft, { idempotencyKey: "idem-own-timeout" })).rejects.toMatchObject({ code: "NO_RESPONSE", retry: "never" });
     expect(calls).toBe(1);
   });
 
@@ -109,7 +109,7 @@ describe("тайм-аут выдачи реквизита (Р45 п. 2.5)", () =>
     });
     await expect(platform.issuePaymentPackage(draft, { idempotencyKey: "idem-slow" })).resolves.toMatchObject({ credential: { status: "ISSUED" } });
     mode = "verify";
-    await expect(platform.verifyMandate({ id: "m_cart", currency: "RUB" })).rejects.toMatchObject({ code: "UNKNOWN" });
+    await expect(platform.verifyMandate({ id: "m_cart", currency: "RUB" })).rejects.toMatchObject({ code: "NO_RESPONSE" });
   });
 });
 
@@ -188,14 +188,14 @@ describe("повторы выдачи в пределах срока (Р45 п. 2
     expect(slow.calls).toHaveLength(1);
   });
 
-  it("тайм-аут выдачи — UNKNOWN без повтора (исход выдачи неизвестен, fail-closed)", async () => {
+  it("тайм-аут выдачи — NO_RESPONSE без повтора (исход выдачи неизвестен, fail-closed; Р45 п. 3, Р48 п. 4)", async () => {
     const f = fake([
       () => {
         throw new DOMException("The operation was aborted due to timeout", "TimeoutError");
       },
       () => issued("m_cart"),
     ], { p: P });
-    await expect(f.platform.issuePaymentPackage(draft, { idempotencyKey: "idem-timeout" })).rejects.toMatchObject({ code: "UNKNOWN", retry: "never" });
+    await expect(f.platform.issuePaymentPackage(draft, { idempotencyKey: "idem-timeout" })).rejects.toMatchObject({ code: "NO_RESPONSE", retry: "never" });
     expect(f.calls).toHaveLength(1);
   });
 

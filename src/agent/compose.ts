@@ -15,7 +15,7 @@ import { MandateClient } from "./mandates/index.js";
 import { EventFeed, EventsStopped, FileCursorStore, acceptPush, type PushReply } from "./events/index.js";
 import { KeyRing, SignerKeyRejected, SignerStopped } from "./signer/index.js";
 import { Purchase } from "./pipeline/index.js";
-import { SplitWindow } from "./policy/index.js";
+import { OrderPriceMismatches, SplitWindow } from "./policy/index.js";
 import type { LiveOfferSource } from "./ports/catalog.js";
 import type { OfferSource, PaymentSteps, ShopPaymentPort, ShopPort } from "./ports/shop.js";
 import { ContourPayment } from "./payment-package/index.js";
@@ -71,10 +71,10 @@ export interface AgentCore {
    *  определена — предупреждение platform.version_unknown и допуск), затем сверка с реестром (GET /pao/v1/agent); до
    *  успеха никакие обращения, кроме допуска, не подписываются. Отчёт — в журнал (agent.selfcheck) и в selfCheck().
    *  Отказ — AgentNotReady с отчётом, исходная ошибка (SignerStopped, PlatformFailure, EventsStopped, SignerKeyRejected) — в
-   *  cause; действие кода в реестре stop (нет ключа, EXCLUDED / SUSPENDED, класс не BUYER, AGENT_UNKNOWN, UNKNOWN —
-   *  ответ не по схеме или тайм-аут) — подписант остановлен; иначе (503, KEY_REJECTED) агент не допущен и start() можно
-   *  повторить. После допуска — подписка на push, если задан `pushUrl` (Р34 п. 8): адрес отвергнут (400) —
-   *  events.subscription_rejected; прочий отказ Платформы после повторов адаптера (503, UNKNOWN) —
+   *  cause; действие кода в реестре stop (нет ключа, EXCLUDED / SUSPENDED, класс не BUYER, AGENT_UNKNOWN, BAD_RESPONSE —
+   *  ответ не по схеме, UNKNOWN) — подписант остановлен; иначе (503, NO_RESPONSE — нет ответа, Р48 п. 3; KEY_REJECTED) агент
+   *  не допущен и start() можно повторить. После допуска — подписка на push, если задан `pushUrl` (Р34 п. 8): адрес отвергнут (400) —
+   *  events.subscription_rejected; прочий отказ Платформы после повторов адаптера (503, NO_RESPONSE, BAD_RESPONSE) —
    *  events.subscription_failed; в обоих случаях старт успешен, работа по ленте, повтор подписки — при следующем старте
    *  (дополнение Р34 п. 1) — events.subscription: warn. Коды остановки агента и остановленная подпись на подписке —
    *  events.subscription: fail, AgentNotReady (ревью К2.2 № 4, дополнение 2 п. 5). */
@@ -228,6 +228,8 @@ export function createAgentCore(o: AgentCoreOptions): AgentCore {
   events.listen(confirmations.listener);
   // окно дробления — одно на ядро: доли разных покупок под одним INTENT видят друг друга (Р39 п. 4)
   const split = new SplitWindow(params, now);
+  // пометка Д02 — одна на ядро: расхождение заказа одной покупки видно в выдачах следующих (Р48 п. 5)
+  const orderMismatches = new OrderPriceMismatches();
   return {
     params,
     platform,
@@ -258,6 +260,7 @@ export function createAgentCore(o: AgentCoreOptions): AgentCore {
         payment: p.payment,
         params,
         split,
+        orderMismatches,
         ...(p.region !== undefined && { region: p.region }),
         ...(p.notify !== undefined && { notify: p.notify }),
       }),

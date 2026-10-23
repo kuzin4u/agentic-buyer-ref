@@ -6,3 +6,4 @@ export type { PaymentDecision, PaymentFacts, PaymentRefusal, Thresholds } from "
 export { confirmThreshold, currencySupported, mandateRefusal, mayAuthorize, needsConfirmation } from "./payment.js";
 export type { SplitOutcome, SplitSlot } from "./split.js";
 export { SplitWindow } from "./split.js";
+export { OrderPriceMismatches } from "./order-mismatch.js";

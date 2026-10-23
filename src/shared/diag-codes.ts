@@ -6,6 +6,10 @@ export const AGENT_DIAG_CODES = [
   // словарь ядра вне ПАО (FailureCode): агент выводит их сам из ответа Платформы (Р33)
   "MANDATE_REVOCATION_ORDER_MISSING",
   "PLATFORM_PROTOCOL_UNSUPPORTED",
+  // разделение UNKNOWN (Р48 п. 3): нет ответа, ответ не подтверждён контрактом, дефект агента до сети
+  "NO_RESPONSE",
+  "BAD_RESPONSE",
+  "AGENT_REQUEST_DEFECT",
   "UNKNOWN",
   // предупреждение: версия ПАО Платформы не определена (Р33 п. 10)
   "PLATFORM_VERSION_UNKNOWN",

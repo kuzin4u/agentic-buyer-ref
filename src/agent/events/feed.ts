@@ -171,7 +171,7 @@ export class EventFeed {
       for (const item of page) {
         const ref = item.kind === "event" ? item.event.eventId : item.eventId;
         // маска — и здесь, до журнала и курсора, а не только в адаптере (ревью К2.2 № 7)
-        if (!EVENT_ID.test(ref)) throw new PlatformFailure("UNKNOWN", "never", null, 200, null, "event_id не по форме");
+        if (!EVENT_ID.test(ref)) throw new PlatformFailure("BAD_RESPONSE", "never", null, 200, null, "event_id не по форме");
         for (const l of [...this.#listeners]) await l(item);
         // журнал — после слушателей: «обработано» пишется один раз, когда обработка прошла (ревью К2.2 № 2)
         if (item.kind === "event") this.#o.journal.record({ at: this.#at(), kind: "event.handled", ref, detail: item.event.type });

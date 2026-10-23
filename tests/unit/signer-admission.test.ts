@@ -391,20 +391,38 @@ describe("после допуска", () => {
     expect(journal.entries.filter((e) => e.kind === "agent.stopped")).toEqual([expect.objectContaining({ reason: "AGENT_SUSPENDED" })]);
   });
 
-  // Дополнение 2 к Р36 (а): UNKNOWN — действие реестра stop, подписант остановлен (fail-closed); повтор допуска — после
-  // разделения UNKNOWN в AG-12 (сбой среды — retry_same_key). Прежде (Р27) — «повтор допуска возможен».
-  it("нет class в ответе реестра при допуске — UNKNOWN, допуск не состоялся, подписи нет; агент остановлен", async () => {
+  // Дополнение 2 к Р36 (а): ответ не по схеме — действие реестра stop, подписант остановлен (fail-closed); с Р48 п. 3 —
+  // BAD_RESPONSE; сбой среды (NO_RESPONSE, retry_same_key) — допуск можно повторить (тест ниже).
+  it("нет class в ответе реестра при допуске — BAD_RESPONSE, допуск не состоялся, подписи нет; агент остановлен", async () => {
     stand = new PaoStand({ handlers: CREDENTIALS });
     stand.agentClass = undefined;
     const { core, journal } = await coreOn(stand);
-    await expect(startCause(core.start())).rejects.toMatchObject({ code: "UNKNOWN" });
+    await expect(startCause(core.start())).rejects.toMatchObject({ code: "BAD_RESPONSE" });
     await expect(core.platform.issueCredential(DRAFT, { idempotencyKey: "i1" })).rejects.toThrow(SignerStopped);
     expect(stand.calls(OP)).toHaveLength(0);
     expect(journal.entries.map((e) => e.kind)).not.toContain("signing.suspended");
-    expect(lastEntry(journal)).toMatchObject({ kind: "agent.stopped", reason: "UNKNOWN" });
+    expect(lastEntry(journal)).toMatchObject({ kind: "agent.stopped", reason: "BAD_RESPONSE" });
     stand.agentClass = "BUYER";
-    await expect(startCause(core.start())).rejects.toMatchObject({ reason: "UNKNOWN" });
+    await expect(startCause(core.start())).rejects.toMatchObject({ reason: "BAD_RESPONSE" });
     expect(stand.calls("GET /pao/v1/agent")).toHaveLength(1);
+  });
+
+  // Р48 п. 3 (отменяет дополнение 2 к Р36 п. 4 (а) в части тайм-аута): нет ответа на GET /pao/v1/agent — допуск не
+  // состоялся, но агент не остановлен (действие реестра retry_same_key); повторный запуск допускает.
+  it("нет ответа реестра при допуске — NO_RESPONSE, агент не остановлен; повторный start — допуск", async () => {
+    stand = new PaoStand({ handlers: CREDENTIALS });
+    let down = true;
+    const fetchImpl: typeof fetch = (url, init) =>
+      down && new URL(String(url)).pathname === "/pao/v1/agent" ? Promise.reject(new TypeError("fetch failed")) : fetch(url, init);
+    const { core, journal } = await coreOn(stand, { fetch: fetchImpl });
+    await expect(startCause(core.start())).rejects.toMatchObject({ code: "NO_RESPONSE", httpStatus: 0 });
+    expect(journal.entries.map((e) => e.kind)).not.toContain("agent.stopped");
+    // не остановлен, а ещё не допущен: подпись — только после допуска
+    await expect(core.platform.issueCredential(DRAFT, { idempotencyKey: "i1" })).rejects.toMatchObject({ reason: "NOT_ADMITTED" });
+    expect(stand.calls(OP)).toHaveLength(0);
+    down = false;
+    await expect(core.start()).resolves.toMatchObject({ status: "ACTIVE", agentClass: "BUYER" });
+    await expect(core.platform.issueCredential(DRAFT, { idempotencyKey: "i1" })).resolves.toMatchObject({ status: "ISSUED" });
   });
 
   // Р27 (уточнение): после допуска ответ не по схеме — приостановка до успешной повторной сверки, не бессрочная остановка.
@@ -417,14 +435,14 @@ describe("после допуска", () => {
     const { core, journal } = await coreOn(stand);
     await core.start();
     garble(stand);
-    await expect(core.platform.agentSelf()).rejects.toMatchObject({ code: "UNKNOWN" });
+    await expect(core.platform.agentSelf()).rejects.toMatchObject({ code: "BAD_RESPONSE" });
     await expect(core.platform.issueCredential(DRAFT, { idempotencyKey: "i1" })).rejects.toThrow(SignerSuspended);
     expect(stand.calls(OP)).toHaveLength(0);
     expect(journal.entries.filter((e) => e.kind === "signing.suspended")).toEqual([
       expect.objectContaining({ reason: "AGENT_SELF_UNKNOWN" }),
     ]);
     // повторная сверка, пока ответ не по схеме, — приостановка остаётся
-    await expect(core.recheck()).rejects.toMatchObject({ code: "UNKNOWN" });
+    await expect(core.recheck()).rejects.toMatchObject({ code: "BAD_RESPONSE" });
     await expect(core.platform.issueCredential(DRAFT, { idempotencyKey: "i1" })).rejects.toThrow(SignerSuspended);
     expect(journal.entries.filter((e) => e.kind === "signing.suspended")).toHaveLength(1);
     // ответ снова по схеме: ACTIVE и BUYER — подпись возобновлена
@@ -441,7 +459,7 @@ describe("после допуска", () => {
     const { core, journal } = await coreOn(stand);
     await core.start();
     stand.agentClass = undefined;
-    await expect(core.platform.agentSelf()).rejects.toMatchObject({ code: "UNKNOWN" });
+    await expect(core.platform.agentSelf()).rejects.toMatchObject({ code: "BAD_RESPONSE" });
     stand.agentClass = "SELLER";
     await expect(core.recheck()).rejects.toMatchObject({ reason: "AGENT_CLASS_MISMATCH" });
     expect(journal.entries.filter((e) => e.kind === "agent.stopped")).toEqual([

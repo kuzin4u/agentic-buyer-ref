@@ -33,6 +33,13 @@ describe("стендовые параметры", () => {
     expect(() => parseParams({ ...stand, pao_max_attempts: 0 })).toThrow(ConfigError);
   });
 
+  it("Р48 п. 4б: бюджет повторов тем же ключом не больше idempotency_ttl_sec (срок хранения ключа на Платформе)", () => {
+    // 3 × 5 с + 30 с = 45 с: при registry_cache_ttl_sec 45 срок ключа 44 с — отказ, 45 с — принят
+    const tight = { ...stand, registry_cache_ttl_sec: 45, pao_max_attempts: 3, pao_request_timeout_ms: 5000 };
+    expect(() => parseParams({ ...tight, idempotency_ttl_sec: 44 })).toThrow(/idempotency_ttl_sec/);
+    expect(() => parseParams({ ...tight, idempotency_ttl_sec: 45 })).not.toThrow();
+  });
+
   it("живая проверка (Р32 п. 7): три параметра обязательны, таймаут — целое 1…2^31 − 1 мс", () => {
     for (const k of ["live_check_timeout_ms", "live_check_max_age_sec", "live_check_clock_skew_sec"]) {
       const rest = { ...stand };

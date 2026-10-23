@@ -2,6 +2,7 @@
 // Повторы клиента agentic-core отключены: клиент берёт retry из тела ответа при неизвестном коде (STATUS, ожидание CO-1).
 // Повторяет адаптер — только по таблице ядра (RETRY_SAME_KEY), с прежним Idempotency-Key и новой подписью (Р21).
 // AGENT_KEY_REVOKED (ROTATE_KEY): другой действующий ключ из порта подписи и один повтор тем же Idempotency-Key.
+// NO_RESPONSE (Р48 п. 4): повтор тем же ключом без ожидания — только у методов с Idempotency-Key, кроме выдачи реквизита.
 import {
   PAO_OPERATIONS,
   PAO_VERSION,
@@ -145,6 +146,24 @@ export interface PaoPlatformOptions {
 /** Выдача реквизита (Р45 п. 2.4–2.5): свой тайм-аут и общий срок попыток вместе с ожиданием повторов. */
 const CREDENTIALS: PaoOperationKey = "POST /pao/v1/credentials";
 
+/** Методы, где ПАО требует Idempotency-Key (ПАО §1; YAML 1.4.0 — обязательный заголовок; SPEC §7а, Р48 п. 4а). */
+export const KEYED_OPERATIONS: ReadonlySet<PaoOperationKey> = new Set<PaoOperationKey>([
+  "POST /pao/v1/agent/keys",
+  "POST /pao/v1/agent/keys/{kid}/revoke",
+  "POST /pao/v1/mandates",
+  "POST /pao/v1/mandates/{id}/relinquish",
+  "POST /pao/v1/credentials",
+  "POST /pao/v1/confirmations",
+  "POST /pao/v1/disputes",
+  "PUT /pao/v1/subscription",
+]);
+
+/** Нет ответа — повтор тем же ключом: метод с Idempotency-Key, кроме выдачи реквизита (Р45 п. 3, Р48 п. 4). */
+const retriesNoResponse = (op: PaoOperationKey): boolean => KEYED_OPERATIONS.has(op) && op !== CREDENTIALS;
+
+/** Исход обращения не подтверждён (а не отказ Платформы) — в журнале попытка unknown. */
+const UNCONFIRMED: ReadonlySet<FailureCode> = new Set<FailureCode>(["UNKNOWN", "NO_RESPONSE", "BAD_RESPONSE"]);
+
 /** Retry-After в секундах; по копии ПАО — integer ≥ 0. Дату и мусор не принимаем: повтора не будет. */
 function retryAfterSec(v: string | null): number | undefined {
   return v !== null && /^\d{1,6}$/.test(v.trim()) ? Number(v.trim()) : undefined;
@@ -154,7 +173,7 @@ function retryAfterSec(v: string | null): number | undefined {
 function keyOf(m: Mutation): string {
   const key = m.idempotencyKey;
   if (typeof key !== "string" || key.trim() === "") {
-    throw new PlatformFailure("UNKNOWN", "never", null, 0, null, "пустой Idempotency-Key, обращение не отправлено");
+    throw new PlatformFailure("AGENT_REQUEST_DEFECT", "never", null, 0, null, "пустой Idempotency-Key, обращение не отправлено");
   }
   return key;
 }
@@ -206,7 +225,7 @@ export class PaoPlatform implements PaymentPlatform {
       // Ответ не по форме — попытка unknown, как в call() (ревью К2.2 № 2).
       const v = typeof r === "object" && r !== null && !Array.isArray(r) ? (r as { versions?: unknown }).versions : null;
       if (v === null || (v !== undefined && !isStringArray(v))) {
-        this.logCall(CONFIG, 1, "unknown", last.status ?? 200, "UNKNOWN");
+        this.logCall(CONFIG, 1, "unknown", last.status ?? 200, "BAD_RESPONSE");
         return this.unknownVersion("BAD_RESPONSE");
       }
       this.logCall(CONFIG, 1, "ok", last.status ?? 200);
@@ -216,8 +235,9 @@ export class PaoPlatform implements PaymentPlatform {
       // (например, вызов подписи) не маскируется под «адрес не отвечает» (ревью К2.3 № 4).
       // попытка — только запрос, ушедший в сеть: PAO_CLIENT_SIGNER_MISSING в pao.call не пишется (ревью К2.2 № 1)
       if (e instanceof SyntaxError || (e instanceof PaoCallError && e.clientCode !== "PAO_CLIENT_SIGNER_MISSING")) {
-        const f = toFailure(e);
-        this.logCall(CONFIG, 1, f.code === "UNKNOWN" ? "unknown" : "refused", f.httpStatus || (last.status ?? 0), f.code);
+        // битый JSON 2xx — тот же BAD_RESPONSE, что в platform.version_unknown (ревью reviewer К2 № 2)
+        const f = e instanceof SyntaxError ? new PlatformFailure("BAD_RESPONSE", "never", null, last.status ?? 200, null) : toFailure(e);
+        this.logCall(CONFIG, 1, UNCONFIRMED.has(f.code) ? "unknown" : "refused", f.httpStatus || (last.status ?? 0), f.code);
       }
       if (e instanceof SyntaxError) return this.unknownVersion("BAD_RESPONSE");
       // Отказ самого клиента — не «адрес не отвечает»: 3xx — ответ указывает на другой адрес, агент не стартует (Р37 п. 2);
@@ -328,25 +348,30 @@ export class PaoPlatform implements PaymentPlatform {
         const schema = op === "GET /pao/v1/events" ? undefined : PAO_OPERATIONS[op].response;
         if (schema !== undefined && validatePao(schema, r).length > 0) {
           if (!this.protocolConfirmed && mandateWithoutOrder(op, r)) throw this.unsupported("MANDATE", null, last.status ?? 200, key);
-          throw new PlatformFailure("UNKNOWN", "never", null, last.status ?? 200, key, "ответ ПАО не по схеме");
+          throw new PlatformFailure("BAD_RESPONSE", "never", null, last.status ?? 200, key, "ответ ПАО не по схеме");
         }
         const out = to(r);
         this.logCall(op, tries, "ok", last.status ?? 200, undefined, mandateOf(op, args, r));
         return out;
       } catch (e) {
         failure = toFailure(e, key);
-        // Заголовки 2xx пришли, но ответ не разобран (не JSON, пустое тело, не по схеме, обрыв или тайм-аут при чтении
-        // тела) — HTTP-статус ответа сохраняется: «ответ не подтверждён» (Р27, fail-closed) отличается от тайм-аута и
-        // обрыва до заголовков (httpStatus 0).
-        if (failure.code === "UNKNOWN" && failure.httpStatus === 0 && last.status !== undefined && last.status >= 200 && last.status < 300) {
-          failure = new PlatformFailure("UNKNOWN", "never", null, last.status, key, "ответ ПАО не по схеме");
+        // Заголовки пришли, но ответ не разобран (не JSON, пустое тело, не по схеме, обрыв или тайм-аут при чтении тела) —
+        // BAD_RESPONSE с HTTP-статусом ответа: «ответ не подтверждён» (Р27, fail-closed) отличается от тайм-аута и обрыва до
+        // заголовков (NO_RESPONSE, httpStatus 0). При 2xx изменяющего запроса действие, вероятно, выполнено — повтора нет
+        // (Р48 п. 3; сверка по GET — ч. 2).
+        if ((failure.code === "UNKNOWN" || failure.code === "BAD_RESPONSE") && failure.httpStatus === 0 && last.status !== undefined) {
+          failure = new PlatformFailure("BAD_RESPONSE", "never", null, last.status, key, "ответ ПАО не по схеме");
+        }
+        // Нет ответа у метода без повтора (GET, выдача реквизита) — класс never: вызывающий не повторяет (Р48 п. 4а).
+        if (failure.code === "NO_RESPONSE" && !retriesNoResponse(op)) {
+          failure = new PlatformFailure("NO_RESPONSE", "never", null, 0, key, "нет ответа; метод без повтора");
         }
       }
       spentMs += clock() - began;
       // попытка — только запрос, ушедший в сеть (ревью К2.2 № 1): отказ клиента до сети (PAO_CLIENT_SIGNER_MISSING) — не попытка;
       // SignerStopped и пустой Idempotency-Key — тоже до сети, сюда не доходят
       if (failure.code !== "PAO_CLIENT_SIGNER_MISSING") {
-        this.logCall(op, tries, failure.code === "UNKNOWN" ? "unknown" : "refused", failure.httpStatus, failure.code, mandateOf(op, args));
+        this.logCall(op, tries, UNCONFIRMED.has(failure.code) ? "unknown" : "refused", failure.httpStatus, failure.code, mandateOf(op, args));
       }
       const rule = ruleForFailure(failure.code);
       // Отказ в допуске — остановка агента целиком (SPEC §7а, П03).
@@ -365,6 +390,13 @@ export class PaoPlatform implements PaymentPlatform {
       }
       // Повтор — только по таблице ядра, в пределах попыток и потолка ожидания (инвариант 4, Р20).
       if (rule.action !== "RETRY_SAME_KEY" || attempt >= this.o.params.pao_max_attempts) throw failure;
+      // Нет ответа (Р48 п. 4): тем же ключом и без ожидания — Retry-After нет; GET и выдача реквизита — без повтора.
+      // Число попыток и тайм-аут каждой укладываются в registry_cache_ttl_sec и idempotency_ttl_sec (проверка конфигурации).
+      if (failure.code === "NO_RESPONSE") {
+        if (!retriesNoResponse(op)) throw failure;
+        attempt++;
+        continue;
+      }
       attempt++;
       // Без Retry-After повтор не раньше срока невозможен — не повторяем (ПАО §6, инвариант 9).
       const waitSec = last.retryAfter;
@@ -386,7 +418,7 @@ export class PaoPlatform implements PaymentPlatform {
     } catch (e) {
       // Р27: ответ 2xx получен, но не по схеме — состояние агента в реестре не подтверждено: приостановка подписи
       // до успешной повторной сверки (не бессрочно: ответы Платформы не подписаны до ПАО 1.5.0, Р34 п. 11).
-      if (e instanceof PlatformFailure && e.code === "UNKNOWN" && e.httpStatus >= 200 && e.httpStatus < 300) {
+      if (e instanceof PlatformFailure && e.code === "BAD_RESPONSE" && e.httpStatus >= 200 && e.httpStatus < 300) {
         this.o.signing.suspend("AGENT_SELF_UNKNOWN");
       }
       throw e;
@@ -495,18 +527,18 @@ export class PaoPlatform implements PaymentPlatform {
     return this.call("GET /pao/v1/events", after === null ? {} : { query: { after } }, map.feedFromPao);
   }
 
-  /** Подписка (Р34 п. 8, РП40 п. 1): ответ — та же подписка; другой адрес или состав в ответе — UNKNOWN. */
+  /** Подписка (Р34 п. 8, РП40 п. 1): ответ — та же подписка; другой адрес или состав в ответе — BAD_RESPONSE. */
   async subscribe(url: string, types: readonly PlatformEventType[], m: Mutation) {
     const events = [...types];
-    // ответ — не та подписка: UNKNOWN; httpStatus 0 — call подставит статус ответа 2xx и ключ (как «не по схеме»)
+    // ответ — не та подписка: BAD_RESPONSE; httpStatus 0 — call подставит статус ответа 2xx и ключ (как «не по схеме»)
     await this.call("PUT /pao/v1/subscription", { body: { url, events }, idempotencyKey: keyOf(m) }, (r) => {
       const same = r.events.length === events.length && events.every((t) => r.events.includes(t));
-      if (r.url !== url || !same) throw new PlatformFailure("UNKNOWN", "never", null, 0, null, "ответ ПАО: подписка не та");
+      if (r.url !== url || !same) throw new PlatformFailure("BAD_RESPONSE", "never", null, 0, null, "ответ ПАО: подписка не та");
     });
   }
 }
 
 function need<T>(r: T[] | undefined): T[] {
-  if (!Array.isArray(r)) throw new PlatformFailure("UNKNOWN", "never", null, 200, null, "ответ ПАО неполон: ожидался список");
+  if (!Array.isArray(r)) throw new PlatformFailure("BAD_RESPONSE", "never", null, 200, null, "ответ ПАО неполон: ожидался список");
   return r;
 }

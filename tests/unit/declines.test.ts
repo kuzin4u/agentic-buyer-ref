@@ -7,16 +7,27 @@ import { EVENTS_CURSOR_INVALID } from "../../src/agent/events/index.js";
 const spec = readFileSync("docs/core/SPEC.md", "utf8");
 /** коды агента вне ПАО — своя часть §7а (Р33) */
 const AGENT_CODES = ["MANDATE_REVOCATION_ORDER_MISSING", "PLATFORM_PROTOCOL_UNSUPPORTED"];
+/** разделение UNKNOWN (Р48 п. 3) */
+const SPLIT_CODES = ["NO_RESPONSE", "BAD_RESPONSE", "AGENT_REQUEST_DEFECT"];
 const specRows = [...spec.matchAll(/^\| ([A-Z_]+) \| (\d{3}) \| (\w+) \|/gm)].map((m) => ({ code: m[1]!, http: Number(m[2]), retry: m[3]! }));
 
 describe("таблица отказов", () => {
-  it("коды ядра = коды ПАО 1.4.0 + коды агента вне ПАО (Р33) + коды клиента ПАО (Р37 п. 1) + UNKNOWN", () => {
-    expect(Object.keys(FAILURE_RULES).sort()).toEqual([...Object.keys(PAO_ERRORS), ...AGENT_CODES, ...PAO_CLIENT_CODES, "UNKNOWN"].sort());
+  it("коды ядра = коды ПАО 1.4.0 + коды агента вне ПАО (Р33, Р48 п. 3) + коды клиента ПАО (Р37 п. 1) + UNKNOWN", () => {
+    expect(Object.keys(FAILURE_RULES).sort()).toEqual([...Object.keys(PAO_ERRORS), ...AGENT_CODES, ...SPLIT_CODES, ...PAO_CLIENT_CODES, "UNKNOWN"].sort());
   });
 
   it("Р33 п. 4: MANDATE_REVOCATION_ORDER_MISSING — стоп без повтора, событие в журнал; строка в SPEC §7а", () => {
     expect(ruleForFailure("MANDATE_REVOCATION_ORDER_MISSING")).toMatchObject({ action: "STOP", retry: "never", maxRetries: 0, defect: false, journal: true });
     for (const c of AGENT_CODES) expect(spec).toMatch(new RegExp(`^\\| ${c} \\| — \\| never \\|`, "m"));
+  });
+
+  it("Р48 п. 3: NO_RESPONSE — повтор тем же ключом (адаптер ограничивает методами), BAD_RESPONSE и AGENT_REQUEST_DEFECT — без повтора; строки в SPEC §7а", () => {
+    expect(ruleForFailure("NO_RESPONSE")).toMatchObject({ action: "RETRY_SAME_KEY", retry: "same_key", maxRetries: null, defect: false, journal: true });
+    expect(ruleForFailure("BAD_RESPONSE")).toMatchObject({ action: "STOP", retry: "never", maxRetries: 0, defect: false, journal: true });
+    expect(ruleForFailure("AGENT_REQUEST_DEFECT")).toMatchObject({ action: "STOP", retry: "never", maxRetries: 0, defect: true, journal: true });
+    expect(spec).toMatch(/^\| NO_RESPONSE \| — \| same_key \|/m);
+    expect(spec).toMatch(/^\| BAD_RESPONSE \| любой \| never \|/m);
+    expect(spec).toMatch(/^\| AGENT_REQUEST_DEFECT \| — \| never \|/m);
   });
 
   it("Р37 п. 1: коды клиента ПАО — без повтора, агент не останавливается; строки в SPEC §7а", () => {

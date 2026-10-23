@@ -122,10 +122,10 @@ describe("перевод ПАО ↔ ядро", () => {
     const req = { ...map.mandateDraftToPao(draft, CUR), id: "m_1", status: "ACTIVE" as const, revocation_order: RO };
     expect(() => map.mandateFromPao({ ...req, agent_code: "nspk:agent:other:v1" }, CUR, AG)).toThrow(/не этот агент/);
     expect(map.mandateFromPao({ ...req, agent_code: AG }, CUR, AG).id).toBe("m_1");
-    // Р33 п. 3: agent_code обязателен — нет поля (ответ в обход схемы) — UNKNOWN
+    // Р33 п. 3: agent_code обязателен — нет поля (ответ в обход схемы) — BAD_RESPONSE (Р48 п. 3)
     const noCode: Partial<Pao.Mandate> = { ...req, agent_code: AG };
     delete noCode.agent_code;
-    expect(() => map.mandateFromPao(noCode as Pao.Mandate, CUR, AG)).toThrow(expect.objectContaining({ code: "UNKNOWN" }));
+    expect(() => map.mandateFromPao(noCode as Pao.Mandate, CUR, AG)).toThrow(expect.objectContaining({ code: "BAD_RESPONSE" }));
   });
 
   // Р33 п. 4: порядок отзыва — реквизит мандата (A7 п. 2.2); нет — свой код агента, не UNKNOWN.
@@ -146,8 +146,8 @@ describe("перевод ПАО ↔ ядро", () => {
     expect((err as Error).message).toMatch(/старше ПАО 1\.4\.0 или дефект/);
   });
 
-  // Р27: класс обязателен для ядра (в ПАО 1.4.0 необязателен) — нет поля или значение вне перечня — UNKNOWN.
-  it("агент: класс переводится; нет class или значение вне перечня — UNKNOWN", () => {
+  // Р27: класс обязателен для ядра (в ПАО 1.4.0 необязателен) — нет поля или значение вне перечня — BAD_RESPONSE (Р48 п. 3).
+  it("агент: класс переводится; нет class или значение вне перечня — BAD_RESPONSE", () => {
     const a = { agent_code: "nspk:agent:x:v1", status: "ACTIVE" as const, keys: [] };
     expect(map.agentSelfFromPao({ ...a, class: "SELLER" })).toMatchObject({ agentClass: "SELLER" });
     expect(map.agentSelfFromPao({ ...a, class: "BUYER" })).toMatchObject({ agentClass: "BUYER" });
@@ -160,7 +160,7 @@ describe("перевод ПАО ↔ ядро", () => {
         }
       })();
       expect(err).toBeInstanceOf(PlatformFailure);
-      expect(err).toMatchObject({ code: "UNKNOWN" });
+      expect(err).toMatchObject({ code: "BAD_RESPONSE" });
     }
   });
 
@@ -266,7 +266,7 @@ describe("пакет агентской оплаты по ответу на вы
     ["нет криптограммы", { ...ok, payload: { token_ref: TOKEN } }],
     ["криптограмма не строка", { ...ok, payload: { token_ref: TOKEN, cryptogram: 7 as unknown as string } }],
     ["payload не объект", { ...ok, payload: null as unknown as Pao.Credential["payload"] }],
-  ])("%s — UNKNOWN, пакета нет, значений в отказе нет", (_, bad) => {
+  ])("%s — BAD_RESPONSE, пакета нет, значений в отказе нет", (_, bad) => {
     let err: unknown;
     try {
       map.packageFromPao(bad, cd);
@@ -274,7 +274,7 @@ describe("пакет агентской оплаты по ответу на вы
       err = e;
     }
     expect(err).toBeInstanceOf(PlatformFailure);
-    expect((err as PlatformFailure).code).toBe("UNKNOWN");
+    expect((err as PlatformFailure).code).toBe("BAD_RESPONSE");
     const text = `${String(err)} ${(err as Error).stack ?? ""} ${JSON.stringify(err)}`;
     expect(text.includes(TOKEN) || text.includes(CRYPTO)).toBe(false);
   });

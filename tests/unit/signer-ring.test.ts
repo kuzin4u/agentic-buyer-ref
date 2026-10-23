@@ -227,9 +227,9 @@ describe("сверка с реестром (fail-closed)", () => {
         k.r.recheck(async (signing) => {
           kept = signing;
           expect(() => signing.current()).not.toThrow();
-          throw new PlatformFailure("UNKNOWN", "never", null, 200, null, "ответ ПАО не по схеме");
+          throw new PlatformFailure("BAD_RESPONSE", "never", null, 200, null, "ответ ПАО не по схеме");
         }),
-      ).rejects.toMatchObject({ code: "UNKNOWN" });
+      ).rejects.toMatchObject({ code: "BAD_RESPONSE" });
       expect(() => kept!.current()).toThrow(SignerSuspended);
       expect(() => k.r.port().current()).toThrow(SignerSuspended);
     });
@@ -270,10 +270,10 @@ describe("сверка с реестром (fail-closed)", () => {
           (fresh = k.key({ kid: kidOf(draft.publicKey), publicKey: draft.publicKey, validFrom: "2026-10-12T09:00:00Z" })),
         agentSelf: async (): Promise<AgentSelf> => {
           k.r.port().suspend("AGENT_SELF_UNKNOWN");
-          throw new PlatformFailure("UNKNOWN", "never", null, 200, null, "ответ ПАО не по схеме");
+          throw new PlatformFailure("BAD_RESPONSE", "never", null, 200, null, "ответ ПАО не по схеме");
         },
       };
-      await expect(k.r.rotate(p)).rejects.toMatchObject({ code: "UNKNOWN" });
+      await expect(k.r.rotate(p)).rejects.toMatchObject({ code: "BAD_RESPONSE" });
       expect(fresh).toBeDefined();
       expect(() => k.r.port().current()).toThrow(SignerSuspended);
     });
@@ -405,9 +405,9 @@ describe("сверка с реестром (fail-closed)", () => {
     it("прочий отказ (итог неизвестен) — тот же ключ и тот же Idempotency-Key, в счёт предела не идёт", async () => {
       const k = ring();
       await k.r.start(k.self([k.key()]));
-      const unknown = () => new PlatformFailure("UNKNOWN", "never", null, 0, null, "нет ответа");
+      const unknown = () => new PlatformFailure("NO_RESPONSE", "never", null, 0, null, "нет ответа");
       const p = scripted(k, [unknown, unknown, unknown, keyInvalid]);
-      for (let i = 0; i < 3; i++) await expect(k.r.rotate(p)).rejects.toMatchObject({ code: "UNKNOWN" });
+      for (let i = 0; i < 3; i++) await expect(k.r.rotate(p)).rejects.toMatchObject({ code: "NO_RESPONSE" });
       await expect(k.r.rotate(p)).rejects.toMatchObject({ code: "KEY_INVALID" });
       expect(new Set(p.sent.map((s) => `${s.kid}/${s.idem}`)).size).toBe(1);
       expect(stopped(k.j)).toEqual([]);

@@ -71,10 +71,10 @@ export interface AgentCore {
    *  определена — предупреждение platform.version_unknown и допуск), затем сверка с реестром (GET /pao/v1/agent); до
    *  успеха никакие обращения, кроме допуска, не подписываются. Отчёт — в журнал (agent.selfcheck) и в selfCheck().
    *  Отказ — AgentNotReady с отчётом, исходная ошибка (SignerStopped, PlatformFailure, EventsStopped, SignerKeyRejected) — в
-   *  cause; действие кода в реестре stop (нет ключа, EXCLUDED / SUSPENDED, класс не BUYER, AGENT_UNKNOWN, UNKNOWN —
-   *  ответ не по схеме или тайм-аут) — подписант остановлен; иначе (503, KEY_REJECTED) агент не допущен и start() можно
-   *  повторить. После допуска — подписка на push, если задан `pushUrl` (Р34 п. 8): адрес отвергнут (400) —
-   *  events.subscription_rejected; прочий отказ Платформы после повторов адаптера (503, UNKNOWN) —
+   *  cause; действие кода в реестре stop (нет ключа, EXCLUDED / SUSPENDED, класс не BUYER, AGENT_UNKNOWN, BAD_RESPONSE —
+   *  ответ не по схеме, UNKNOWN) — подписант остановлен; иначе (503, NO_RESPONSE — нет ответа, Р48 п. 3; KEY_REJECTED) агент
+   *  не допущен и start() можно повторить. После допуска — подписка на push, если задан `pushUrl` (Р34 п. 8): адрес отвергнут (400) —
+   *  events.subscription_rejected; прочий отказ Платформы после повторов адаптера (503, NO_RESPONSE, BAD_RESPONSE) —
    *  events.subscription_failed; в обоих случаях старт успешен, работа по ленте, повтор подписки — при следующем старте
    *  (дополнение Р34 п. 1) — events.subscription: warn. Коды остановки агента и остановленная подпись на подписке —
    *  events.subscription: fail, AgentNotReady (ревью К2.2 № 4, дополнение 2 п. 5). */

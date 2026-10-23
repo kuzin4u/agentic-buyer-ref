@@ -31,7 +31,7 @@ import type { FeedItem } from "../../ports/events.js";
 import { sealPackage, type SealedPackage } from "../../payment-package/package.js";
 
 function incomplete(what: string): never {
-  throw new PlatformFailure("UNKNOWN", "never", null, 200, null, `ответ ПАО неполон: ${what}`);
+  throw new PlatformFailure("BAD_RESPONSE", "never", null, 200, null, `ответ ПАО неполон: ${what}`);
 }
 
 function need<T>(v: T | null | undefined, what: string): T {

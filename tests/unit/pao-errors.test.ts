@@ -17,9 +17,9 @@ describe("отказ ПАО → отказ ядра", () => {
     expect([f.code, f.retry, f.platformCode]).toEqual(["UNKNOWN", "never", "NEW_CODE"]);
   });
 
-  it("нет ответа (status 0) и отказ без тела — UNKNOWN, never", () => {
-    expect(toFailure(new PaoCallError(0, undefined, 3)).code).toBe("UNKNOWN");
-    expect(toFailure(new PaoCallError(503, undefined, 3)).retry).toBe("never");
+  it("нет ответа (status 0) — NO_RESPONSE, same_key; отказ без тела — BAD_RESPONSE, never; не разобрано — UNKNOWN (Р48 п. 3)", () => {
+    expect([toFailure(new PaoCallError(0, undefined, 3)).code, toFailure(new PaoCallError(0, undefined, 3)).retry]).toEqual(["NO_RESPONSE", "same_key"]);
+    expect([toFailure(new PaoCallError(503, undefined, 3)).code, toFailure(new PaoCallError(503, undefined, 3)).retry]).toEqual(["BAD_RESPONSE", "never"]);
     expect(toFailure(new Error("сбой")).code).toBe("UNKNOWN");
   });
 
@@ -33,9 +33,9 @@ describe("отказ ПАО → отказ ядра", () => {
     expect([u.code, u.retry]).toEqual(["UNKNOWN", "never"]);
   });
 
-  it("известный код с чужим HTTP-статусом — UNKNOWN, never", () => {
+  it("известный код с чужим HTTP-статусом — BAD_RESPONSE, never (Р48 п. 3)", () => {
     const f = toFailure(new PaoCallError(500, { code: "UPSTREAM_UNAVAILABLE", message: "m", retry: "same_key" }, 1));
-    expect([f.code, f.retry, f.platformCode]).toEqual(["UNKNOWN", "never", "UPSTREAM_UNAVAILABLE"]);
+    expect([f.code, f.retry, f.platformCode]).toEqual(["BAD_RESPONSE", "never", "UPSTREAM_UNAVAILABLE"]);
   });
 
   it("сообщение исключения и мусорный код не переносятся", () => {

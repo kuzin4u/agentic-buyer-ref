@@ -278,7 +278,7 @@ describe("шаг 2 — версия не определена: по первом
     expect(kinds("agent.stopped")).toEqual([expect.objectContaining({ reason: "PLATFORM_PROTOCOL_UNSUPPORTED" })]);
   });
 
-  it("после подтверждения мандат без agent_code — UNKNOWN на этом обращении, агент работает", async () => {
+  it("после подтверждения мандат без agent_code — BAD_RESPONSE на этом обращении, агент работает", async () => {
     const { core, consents, kinds } = await setup({ configuration: { versions: ["1.4.0"] } });
     await core.start();
     consents.tamper = (m) => {
@@ -287,7 +287,7 @@ describe("шаг 2 — версия не определена: по первом
       delete (r as { agent_code?: string }).agent_code;
       return r;
     };
-    await expect(core.mandates.request(INTENT, { idempotencyKey: "idem_n2" })).rejects.toMatchObject({ code: "UNKNOWN" });
+    await expect(core.mandates.request(INTENT, { idempotencyKey: "idem_n2" })).rejects.toMatchObject({ code: "BAD_RESPONSE" });
     expect(kinds("agent.stopped")).toEqual([]);
     expect(kinds("platform.protocol_unsupported")).toEqual([]);
   });

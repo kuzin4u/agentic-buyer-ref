@@ -93,7 +93,8 @@ export interface Merchants {
 }
 
 export interface Contour {
-  /** только "stand" с `adpUntilPs11`: ответы ADP стенда на копии сообщений эквайрера (подмена до PS-11) */
+  /** только "stand" с `adpUntilPs11`: ответы ADP стенда на копии сообщений эквайрера (подмена до PS-11), с `op_ref`
+   *  сообщения */
   adpDecisions?(): Promise<unknown[]>;
   readonly mode: ContourMode;
   readonly agentCode: string;
@@ -273,7 +274,9 @@ async function standContour(paoNow?: () => Date, adpUntilPs11 = false): Promise<
       ? createMerchants(stand, {
           // до PS-11: решение заглушки — отказ продавцу; решение ADP — по копии сообщения, без влияния на ответ продавца
           decide: (msg) => {
-            adp.push(s.app.inject({ method: "POST", url: "/adp/v1/decide", payload: msg }).then((res) => res.json() as unknown));
+            // op_ref — из сообщения эквайрера: процессинг (тест) шлёт по нему ответ эмитента и клиринг (ПИ-3, Р49 К5)
+            const op_ref = (msg as { op_ref?: unknown }).op_ref;
+            adp.push(s.app.inject({ method: "POST", url: "/adp/v1/decide", payload: msg }).then((res) => ({ op_ref, ...(res.json() as object) }) as unknown));
             return { approved: false, reason: "CONFIRMATION_REQUIRED" };
           },
         })

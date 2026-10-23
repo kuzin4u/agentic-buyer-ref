@@ -61,11 +61,15 @@ describe("каталог сценариев приёмки", () => {
   });
 
   // Сломанный разбор дал бы пустой перечень и пустую проверку ниже (ревью Р26 № 1).
-  it("перечни кодов разобраны полностью: ПАО — 20 кодов (Р31), SPEC §7б — три причины", () => {
+  it("перечни кодов разобраны полностью: ПАО — 20 кодов (Р31), SPEC §7б — перечень #57 и две причины ПАО 1.5.0 (Р48)", () => {
     expect(paoErrors).toHaveLength(20);
     // Независимый источник: таблица ошибок agentic-core по той же версии ПАО.
     expect([...paoErrors].sort()).toEqual(Object.keys(PAO_ERRORS).sort());
-    expect(reasons).toEqual(["AOI_MISSING", "AOI_MISMATCH", "INSUFFICIENT_FUNDS"]);
+    // Р48 п. 1: закрытый перечень передачи #57 (v0.19.0) плюс AOI_MISSING и INSUFFICIENT_FUNDS (#37).
+    expect(reasons).toEqual([
+      "AOI_MISSING", "AOI_MISMATCH", "AGENT_SUSPENDED", "CREDENTIAL_INVALID", "MANDATE_NOT_FOUND", "MANDATE_EXPIRED",
+      "MANDATE_REVOKED", "MANDATE_SCOPE", "LIMIT_EXCEEDED", "STATE_UNAVAILABLE", "ISSUER_DECLINED", "INSUFFICIENT_FUNDS",
+    ]);
   });
 
   it("коды отказа в сценариях — из x-pao-errors ПАО или причин SPEC §7б (Р26)", () => {

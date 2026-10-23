@@ -132,7 +132,7 @@ describe("стадия 5 на стенде: реквизит по ПАО и па
     const out = outward(r, err);
     for (const s of secrets) expect(out.includes(s), "реквизит в выводе").toBe(false);
     // человеку — «итог не подтверждён», не «деньги не списывались» (Р45, Б1а)
-    expect(DIAG.OPERATION_RESULT_UNCONFIRMED!.human.ru).toMatch(/не подтвердила/);
+    expect(DIAG.OPERATION_RESULT_UNCONFIRMED!.human.ru).toMatch(/не подтверждён/);
     expect(out).not.toMatch(/не списывались/);
   });
 

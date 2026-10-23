@@ -1,6 +1,6 @@
 // Таблица «код отказа → поведение» (SPEC §7, Р20). Ключи — словарь ядра; адаптер переводит коды платформы в него.
 import type { FailureCode, RetryClass } from "../../shared/domain.js";
-import type { AgentDiagCode } from "../../shared/diag-codes.js";
+import type { AgentDiagCode, DiagCode } from "../../shared/diag-codes.js";
 
 export type DeclineAction =
   /** остановка; без повтора */
@@ -159,4 +159,23 @@ export function ruleForDeclineReason(reason: string | null): ReasonRule {
   if (reason !== null && Object.hasOwn(DECLINE_REASONS, reason)) return DECLINE_REASONS[reason]!;
   // Р20 (уточнение 11.10.2026): неизвестная причина — остановка по операции, уведомить человека, без повтора.
   return { code: "DECLINE_REASON_UNKNOWN", action: "STOP_AND_NOTIFY", defect: false, journal: true, unknown: true };
+}
+
+/** Итоговые коды остановки после отправки пакета продавцу и после решения человека (Р49 п. 2, блокер Р-298): причины §7б,
+ *  исходы стадии 4 и неподтверждённый итог. Текст человеку у каждого — «итог проверьте в приложении банка», без совета
+ *  повторить (тест реестра). */
+export const PAYMENT_OUTCOME_CODES: ReadonlySet<DiagCode> = new Set<DiagCode>([
+  ...Object.values(DECLINE_REASONS).map((r) => r.code),
+  "DECLINE_REASON_UNKNOWN",
+  "CONFIRMATION_REJECTED",
+  "CONFIRMATION_EXPIRED",
+  "CONFIRMATION_UNBOUND",
+  "CONFIRMATION_NOT_DELIVERED",
+  "OPERATION_RESULT_UNCONFIRMED",
+]);
+
+/** Код остановки после отправки пакета (Р49 п. 2): итоговый — как есть, иной — OPERATION_RESULT_UNCONFIRMED (пакет ушёл,
+ *  итог операции неизвестен; совет повторить может привести ко второй оплате). */
+export function afterPayment(code: DiagCode): DiagCode {
+  return PAYMENT_OUTCOME_CODES.has(code) ? code : "OPERATION_RESULT_UNCONFIRMED";
 }

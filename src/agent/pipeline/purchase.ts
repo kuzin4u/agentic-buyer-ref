@@ -781,7 +781,8 @@ export class Purchase {
 
   #halt(code: DiagCode, cause?: StopCause): never {
     this.#machine.stop(code, cause);
-    throw new PurchaseStopped(code);
+    // после отправки пакета наружу — тот же итоговый код, что у машины (Р49 п. 2)
+    throw new PurchaseStopped(this.#machine.outcome(code));
   }
 
   /** Отказ шага — STOPPED с кодом (Р38 п. 4); ожидание человека — без остановки; запрещённый переход — уже STOPPED.

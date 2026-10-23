@@ -6,7 +6,7 @@ import { MandateRefused } from "../../src/agent/mandates/index.js";
 import { isSpent } from "../../src/agent/policy/a5-issued.js";
 import { loadParams } from "../../src/shared/config.js";
 import { PlatformFailure } from "../../src/shared/domain.js";
-import { PaymentFailure, ShopFailure, type ConfirmationOutcome } from "../../src/agent/ports/index.js";
+import { PaymentFailure, ShopFailure, type ConfirmationOutcome, type PaymentContext } from "../../src/agent/ports/index.js";
 import { INTENT, event } from "../support/consents.js";
 import { expectJournalClean } from "../support/journal.js";
 import { AGENT, type PaoStand } from "../support/pao-stand.js";
@@ -69,13 +69,15 @@ async function ordered(r: PurchaseRun, qty = 1) {
   return r.purchase.placeOrder({ idempotencyKey: "idem-order-1" });
 }
 
-/** Порт оплаты: авторизация — «нужно подтверждение» (как DECLINED продавца в профиле contour), стадия 4 — исход `outcome`. */
+/** Порт оплаты: авторизация — «нужно подтверждение» (как DECLINED продавца в профиле contour: пакет уже ушёл, `sending`),
+ *  стадия 4 — исход `outcome`. */
 const confirming = (outcome: ConfirmationOutcome) => {
   const steps = payments({ confirm: outcome });
   return {
     ...steps,
-    authorize: async () => {
+    authorize: async (c: PaymentContext) => {
       steps.calls.push("authorize");
+      c.sending();
       throw new PaymentFailure("CONFIRMATION_REQUIRED");
     },
   };
@@ -592,7 +594,8 @@ describe("стадии 4–6 — исходы из порта PaymentSteps (ин
       ["EXPIRED", "CONFIRMATION_EXPIRED"],
       ["UNBOUND", "CONFIRMATION_UNBOUND"],
       ["NONE", "OPERATION_RESULT_UNCONFIRMED"],
-      ["UNKNOWN", "UNKNOWN"],
+      // пакет ушёл: неитоговый код — OPERATION_RESULT_UNCONFIRMED (Р49 п. 2, блокер Р-298)
+      ["UNKNOWN", "OPERATION_RESULT_UNCONFIRMED"],
     ] as const) {
       const steps = confirming(outcome);
       const notified: string[] = [];
@@ -881,11 +884,11 @@ describe("держимые после ожиданий (Р38 п. 3, ревью �
     expect(stages(r).slice(-2)).toEqual(["CART_PENDING", "STOPPED:MANDATE_NOT_ACTIVE"]);
   });
 
-  it("CART отозван, пока человек подтверждал, — STOPPED MANDATE_NOT_ACTIVE, повтора нет", async () => {
+  it("CART отозван, пока человек подтверждал, — пакет ушёл: STOPPED OPERATION_RESULT_UNCONFIRMED, исходный MANDATE_NOT_ACTIVE — в журнале, повтора нет (Р49 п. 2)", async () => {
     const calls: string[] = [];
     const steps = {
       ...payments(),
-      authorize: () => (calls.push("authorize"), Promise.reject(new PaymentFailure("CONFIRMATION_REQUIRED"))),
+      authorize: (c: PaymentContext) => (calls.push("authorize"), c.sending(), Promise.reject(new PaymentFailure("CONFIRMATION_REQUIRED"))),
     };
     const run: { r?: PurchaseRun } = {};
     const confirm = async () => {
@@ -898,9 +901,13 @@ describe("держимые после ожиданий (Р38 п. 3, ревью �
     };
     const r = (run.r = await setup({ payment: { ...steps, confirm } }));
     await ordered(r, Math.floor(THRESHOLD / TARTINE) + 1);
-    await expect(r.purchase.authorize({ idempotencyKey: "idem-pay-1" })).rejects.toMatchObject({ code: "MANDATE_NOT_ACTIVE" });
-    expect(stages(r).slice(-3)).toEqual(["AUTHORIZING", "CONFIRMING", "STOPPED:MANDATE_NOT_ACTIVE"]);
-    expect(r.tail().filter((e) => e.kind === "agent.refused").map((e) => e.reason)).toEqual(["MANDATE_NOT_ACTIVE"]);
+    await expect(r.purchase.authorize({ idempotencyKey: "idem-pay-1" })).rejects.toMatchObject({ code: "OPERATION_RESULT_UNCONFIRMED" });
+    expect(r.purchase.reason).toBe("OPERATION_RESULT_UNCONFIRMED");
+    expect(stages(r).slice(-3)).toEqual(["AUTHORIZING", "CONFIRMING", "STOPPED:OPERATION_RESULT_UNCONFIRMED"]);
+    expect(r.tail().filter((e) => e.kind === "agent.refused" || e.kind === "payment.unconfirmed").map((e) => [e.kind, e.reason])).toEqual([
+      ["agent.refused", "MANDATE_NOT_ACTIVE"],
+      ["payment.unconfirmed", "MANDATE_NOT_ACTIVE"],
+    ]);
     await expect(r.purchase.authorize({ idempotencyKey: "idem-pay-1" })).rejects.toBeInstanceOf(PurchaseTransitionForbidden);
     expect(calls).toEqual(["authorize", "confirm"]);
   });

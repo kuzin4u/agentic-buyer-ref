@@ -4,6 +4,7 @@
 // Состояние — только в памяти (Р38 п. 6): после перезапуска покупка не восстанавливается.
 import type { DiagCode } from "../../shared/diag-codes.js";
 import { SAFE_ID } from "../../shared/ids.js";
+import { afterPayment } from "../declines/table.js";
 
 export const PURCHASE_STATES = [
   /** стадия 0: покупка создана, допуск агента для неё не проверен */
@@ -80,7 +81,10 @@ export interface PurchaseJournal {
       /** detail — новое состояние; у остановки с уточнением — «STOPPED:уточнение» (Р40 п. 6, единственное значение) */
       | { at: string; kind: "purchase.stage"; detail: PurchaseState | `STOPPED:${StopCause}`; mandate?: string; reason?: DiagCode }
       /** detail — запрошенный переход «откуда->куда», оба из PURCHASE_STATES (ревью К2.1 № 4) */
-      | { at: string; kind: "agent.refused"; reason: "PIPELINE_TRANSITION_FORBIDDEN"; detail: `${PurchaseState}->${PurchaseState}`; mandate?: string },
+      | { at: string; kind: "agent.refused"; reason: "PIPELINE_TRANSITION_FORBIDDEN"; detail: `${PurchaseState}->${PurchaseState}`; mandate?: string }
+      /** пакет ушёл продавцу, остановка по неитоговому коду (Р49 п. 2): reason — исходный код; остановка — с
+       *  OPERATION_RESULT_UNCONFIRMED следующей записью purchase.stage */
+      | { at: string; kind: "payment.unconfirmed"; reason: DiagCode; mandate?: string },
   ): void;
 }
 
@@ -111,6 +115,8 @@ export class PurchaseMachine {
   readonly #stopped = new AbortController();
   /** пакет агентской оплаты уходит продавцу: до записи исхода стадии 5 запрещённый переход — отказ без остановки (Б2в (б)) */
   #sending = false;
+  /** пакет хоть раз уходил продавцу: дальше остановка — только итоговым кодом (Р49 п. 2), до конца покупки */
+  #paid = false;
   private readonly now: () => Date;
 
   constructor(private readonly o: PurchaseMachineOptions) {
@@ -171,6 +177,12 @@ export class PurchaseMachine {
   sending(): void {
     if (this.#state !== "AUTHORIZING") this.forbid("AUTHORIZING");
     this.#sending = true;
+    this.#paid = true;
+  }
+
+  /** Код, с которым остановится покупка (Р49 п. 2): после отправки пакета неитоговый — OPERATION_RESULT_UNCONFIRMED. */
+  outcome(reason: DiagCode): DiagCode {
+    return this.#paid ? afterPayment(reason) : reason;
   }
 
   /** Ворота перед стадией 5 пройдены: оба мандата держатся и подтверждены verify (Р38 п. 3). Ставит только конвейер
@@ -180,15 +192,18 @@ export class PurchaseMachine {
   }
 
   /** Остановка с кодом реестра; из конечного состояния — без действия (первая причина остаётся). `cause` — уточнение в
-   *  detail записи (Р40 п. 6), отдельной записи нет. */
+   *  detail записи (Р40 п. 6), отдельной записи нет. После отправки пакета неитоговый код заменяется (`outcome`), исходный —
+   *  в записи payment.unconfirmed перед purchase.stage (Р49 п. 2). */
   stop(reason: DiagCode, cause?: StopCause): void {
     if (isTerminal(this.#state)) return;
+    const code = this.outcome(reason);
     this.#state = "STOPPED";
-    this.#reason = reason;
+    this.#reason = code;
     this.#sending = false;
-    this.#stopped.abort(new Error(`покупка остановлена: ${reason}`));
+    this.#stopped.abort(new Error(`покупка остановлена: ${code}`));
+    if (code !== reason) this.o.journal.record({ at: this.#at(), kind: "payment.unconfirmed", reason, ...this.mandate });
     const detail = cause === undefined ? "STOPPED" : (`STOPPED:${cause}` as const);
-    this.o.journal.record({ at: this.#at(), kind: "purchase.stage", detail, reason, ...this.mandate });
+    this.o.journal.record({ at: this.#at(), kind: "purchase.stage", detail, reason: code, ...this.mandate });
   }
 
   #at(): string {

@@ -264,12 +264,43 @@ describe("окно отправки пакета (Р45, Б2в)", () => {
     expect(stops(journal)).toEqual(["UNKNOWN"]);
   });
 
-  it("после перехода из AUTHORIZING окно закрыто: запрещённый переход снова останавливает покупку", () => {
+  it("после перехода из AUTHORIZING окно закрыто: запрещённый переход снова останавливает покупку — пакет ушёл, код итоговый (Р49 п. 2)", () => {
     const { m, journal } = at("AUTHORIZING");
     m.sending();
     m.to("SETTLING");
     expect(() => m.to("OFFERS")).toThrow(PurchaseTransitionForbidden);
-    expect(m.reason).toBe("PIPELINE_TRANSITION_FORBIDDEN");
-    expect(stops(journal)).toEqual(["PIPELINE_TRANSITION_FORBIDDEN"]);
+    expect(m.reason).toBe("OPERATION_RESULT_UNCONFIRMED");
+    expect(stops(journal)).toEqual(["OPERATION_RESULT_UNCONFIRMED"]);
+    expect(journal.entries.filter((e) => e.kind === "payment.unconfirmed").map((e) => e.reason)).toEqual(["PIPELINE_TRANSITION_FORBIDDEN"]);
+  });
+});
+
+describe("остановка после отправки пакета (Р49 п. 2, блокер Р-298)", () => {
+  const kinds = (journal: MemoryJournal) => journal.entries.map((e) => `${e.kind}:${e.reason ?? ""}`);
+
+  it("неитоговый код — OPERATION_RESULT_UNCONFIRMED; исходный — запись payment.unconfirmed перед purchase.stage", () => {
+    const { m, journal } = at("AUTHORIZING");
+    m.sending();
+    m.to("CONFIRMING");
+    m.stop("MANDATE_NOT_ACTIVE");
+    expect(m.reason).toBe("OPERATION_RESULT_UNCONFIRMED");
+    expect(kinds(journal).slice(-2)).toEqual(["payment.unconfirmed:MANDATE_NOT_ACTIVE", "purchase.stage:OPERATION_RESULT_UNCONFIRMED"]);
+  });
+
+  it("итоговый код (§7б, исходы стадии 4) — как есть, без записи payment.unconfirmed", () => {
+    for (const code of ["DECLINED_LIMIT_EXCEEDED", "CONFIRMATION_REJECTED", "OPERATION_RESULT_UNCONFIRMED"] as const) {
+      const { m, journal } = at("AUTHORIZING");
+      m.sending();
+      m.stop(code);
+      expect(m.reason).toBe(code);
+      expect(kinds(journal).filter((k) => k.startsWith("payment.unconfirmed"))).toEqual([]);
+    }
+  });
+
+  it("до отправки пакета код не заменяется", () => {
+    const { m } = at("AUTHORIZING");
+    m.stop("UNKNOWN");
+    expect(m.reason).toBe("UNKNOWN");
+    expect(m.outcome("UNKNOWN")).toBe("UNKNOWN");
   });
 });

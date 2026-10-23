@@ -5,7 +5,7 @@ import { CartLiveRefused, CartRefused, OrderRefused, Purchase, PurchaseMachine, 
 import { MandateRefused } from "../../src/agent/mandates/index.js";
 import { isSpent } from "../../src/agent/policy/a5-issued.js";
 import { loadParams } from "../../src/shared/config.js";
-import { PlatformFailure } from "../../src/shared/domain.js";
+import { PlatformFailure, type Fulfilment, type Operation } from "../../src/shared/domain.js";
 import { PaymentFailure, ShopFailure, type ConfirmationOutcome, type PaymentContext } from "../../src/agent/ports/index.js";
 import { INTENT, event } from "../support/consents.js";
 import { expectJournalClean } from "../support/journal.js";
@@ -770,6 +770,60 @@ describe("стадии 4–6 — исходы из порта PaymentSteps (ин
     await ordered(r);
     await expect(r.purchase.authorize({ idempotencyKey: "idem-pay-1" })).rejects.toBe(boom);
     expect(r.purchase.reason).toBe("UNKNOWN");
+  });
+
+  it("Р49 п. 4: операция не сходится с заказом и CART — STOPPED OPERATION_REPLY_MISMATCH (итоговый код и после отправки пакета)", async () => {
+    const steps = { ...payments(), authorize: (c: PaymentContext) => (c.sending(), Promise.reject(new PaymentFailure("OPERATION_REPLY_MISMATCH"))) };
+    const r = await setup({ payment: steps });
+    await ordered(r);
+    await expect(r.purchase.authorize({ idempotencyKey: "idem-pay-1" })).rejects.toMatchObject({ code: "OPERATION_REPLY_MISMATCH" });
+    expect(r.purchase.reason).toBe("OPERATION_REPLY_MISMATCH");
+    expect(r.tail().some((e) => e.kind === "payment.unconfirmed")).toBe(false);
+  });
+
+  it("Р49 п. 6: расчёта ещё нет, ожидание прервано — SETTLEMENT_PENDING, покупка в SETTLING без остановки; settle() снова — DONE", async () => {
+    let pending = true;
+    const base = payments();
+    const steps = {
+      ...base,
+      settle: (x: Operation) => (pending ? Promise.reject(new PaymentFailure("SETTLEMENT_PENDING")) : base.settle(x)),
+    };
+    const r = await setup({ payment: steps });
+    await ordered(r);
+    await r.purchase.authorize({ idempotencyKey: "idem-pay-1" });
+    await expect(r.purchase.settle()).rejects.toMatchObject({ code: "SETTLEMENT_PENDING" });
+    expect(r.purchase.state).toBe("SETTLING");
+    expect(r.purchase.reason).toBeNull();
+    pending = false;
+    await expect(r.purchase.settle()).resolves.toMatchObject({ status: "SETTLED" });
+    expect(stages(r).slice(-2)).toEqual(["SETTLING", "DONE"]);
+  });
+
+  it("Р49 п. 7: scope_check не WITHIN_LIMITS — уведомление оболочки, покупка DONE; WITHIN_LIMITS — без уведомления", async () => {
+    const cases: [Fulfilment["scopeCheck"] | null, string[]][] = [
+      ["WITHIN_LIMITS", []],
+      ["EXCEEDS_AUTHORIZATION", ["SCOPE_EXCEEDS_AUTHORIZATION"]],
+      ["NOT_RESERVED", ["SCOPE_NOT_RESERVED"]],
+      [{ other: "PARTIAL" }, ["SCOPE_CHECK_UNRECOGNIZED"]],
+      [null, ["SCOPE_CHECK_UNRECOGNIZED"]],
+    ];
+    for (const [scopeCheck, expected] of cases) {
+      const settle = async (x: Operation): Promise<Operation> => ({
+        ...x,
+        status: "SETTLED",
+        fulfilment: scopeCheck === null ? null : { ref: "ful_1", finalAmount: x.amount!, scopeCheck, spentPosition: x.amount!, at: "2026-10-23T12:05:00.000Z" },
+      });
+      const notified: string[] = [];
+      const r = await setup({ payment: payments({ settle }), notify: (c) => void notified.push(c) });
+      await ordered(r);
+      await r.purchase.authorize({ idempotencyKey: "idem-pay-1" });
+      const op = await r.purchase.settle();
+      expect(r.purchase.state).toBe("DONE");
+      expect(notified, JSON.stringify(scopeCheck)).toEqual(expected);
+      // значение вне перечня — человеку как есть из операции покупки (#59 п. 6)
+      if (typeof scopeCheck === "object" && scopeCheck !== null) expect(op.fulfilment?.scopeCheck).toEqual({ other: "PARTIAL" });
+      await closeStand();
+    }
   });
 });
 

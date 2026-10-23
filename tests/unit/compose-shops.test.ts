@@ -59,12 +59,22 @@ describe("AgentCore.shops (Р42 п. 1)", () => {
 // Р45 п. 6 (ревью reviewer К2 № 8): шаги оплаты профиля contour собирает место сборки — порт платформы ядра, журнал ядра
 // с кодом агента; пакет — витрине через переданный порт оплаты.
 describe("AgentCore.payment (Р45 п. 6)", () => {
-  it("реквизит — у платформы ядра под ключом вызывающего, пакет — порту витрины; итог не подтверждён", async () => {
+  it("реквизит — у платформы ядра под ключом вызывающего, пакет — порту витрины; итог — operation.authorized по ленте ядра → GET → операция по заказу (Р49 п. 3, 5)", async () => {
+    let served = false;
     const s = new PaoStand({
       handlers: {
         "POST /pao/v1/credentials": ({ body }) => ({
           status: 201,
           body: { credential_ref: "cr_1", kind: body.kind, payload: { token_ref: "tok_ref_1", cryptogram: "cg_1" }, aoi: { indicator: true, agent_code: AGENT, mandate_id: body.mandate_id }, status: "ISSUED" },
+        }),
+        "GET /pao/v1/events": () => {
+          if (served) return { status: 200, body: [] };
+          served = true;
+          return { status: 200, body: [{ event_id: "evt_op_1", type: "operation.authorized", at: "2026-10-23T12:00:00Z", data: { op_ref: "op_1" } }] };
+        },
+        "GET /pao/v1/operations/{op_ref}": () => ({
+          status: 200,
+          body: { op_ref: "op_1", order_ref: "ORD-1", channel: "CARD", amount: 250000, merchant_id: "shop_1", aoi: { indicator: true, agent_code: AGENT, mandate_id: "m_cart" }, status: "AUTHORIZED", reason: null, fulfilment: null, deal_ref: null },
         }),
       },
     });
@@ -81,7 +91,8 @@ describe("AgentCore.payment (Р45 п. 6)", () => {
     const total = { amount: 250000, currency: "RUB" };
     const cart = { id: "m_cart", cart: { merchantId: "shop_1", lines: [], total } } as unknown as Mandate;
     const ctx: PaymentContext = { intent: { id: "m_intent" } as Mandate, cart, shopId: "SHOP-1", merchantId: "shop_1", order: { orderId: "ORD-1", total }, signal: new AbortController().signal, sending: () => {} };
-    await expect(steps.authorize(ctx, { idempotencyKey: "idem-pay-compose" })).rejects.toMatchObject({ code: "OPERATION_RESULT_UNCONFIRMED" });
+    await expect(steps.authorize(ctx, { idempotencyKey: "idem-pay-compose" })).resolves.toMatchObject({ opRef: "op_1", orderRef: "ORD-1", status: "AUTHORIZED", amount: total });
+    expect(journal.entries.filter((e) => e.kind === "operation.status").map((e) => [e.agent, e.ref, e.detail])).toEqual([[AGENT, "op_1", "AUTHORIZED"]]);
     expect(s.stub.calls.filter((c) => c.op === "POST /pao/v1/credentials").map((c) => c.idempotencyKey)).toEqual(["idem-pay-compose"]);
     expect(sent).toEqual([
       {
@@ -95,12 +106,62 @@ describe("AgentCore.payment (Р45 п. 6)", () => {
     expect(JSON.stringify(journal.entries)).not.toMatch(/tok_ref_1|cg_1/);
   });
 
-  it("ответ продавца DECLINED — CONFIRMATION_REQUIRED, стадия 4 (Р47 п. 4); confirm ждёт модуль подтверждений ядра и прерывается остановкой", async () => {
+  it("связка ядра (Р49 п. 4, 6): операция по заказу с чужим продавцом — OPERATION_REPLY_MISMATCH; расчёт — GET по op_ref, SETTLED с записью об исполнении", async () => {
+    let served = false;
+    let merchant = "shop_other";
+    let status: "AUTHORIZED" | "SETTLED" = "AUTHORIZED";
+    const ful = { fulfilment_ref: "ful_0123456789abcdef01234567", final_amount: 250000, scope_check: "WITHIN_LIMITS", spent_position: 250000, at: "2026-10-23T12:05:00Z" };
     const s = new PaoStand({
       handlers: {
         "POST /pao/v1/credentials": ({ body }) => ({
           status: 201,
           body: { credential_ref: "cr_1", kind: body.kind, payload: { token_ref: "tok_ref_1", cryptogram: "cg_1" }, aoi: { indicator: true, agent_code: AGENT, mandate_id: body.mandate_id }, status: "ISSUED" },
+        }),
+        "GET /pao/v1/events": () => {
+          if (served) return { status: 200, body: [] };
+          served = true;
+          return { status: 200, body: [{ event_id: "evt_op_2", type: "operation.authorized", at: "2026-10-23T12:00:00Z", data: { op_ref: "op_2" } }] };
+        },
+        "GET /pao/v1/operations/{op_ref}": () => ({
+          status: 200,
+          body: { op_ref: "op_2", order_ref: "ORD-2", channel: "CARD", amount: 250000, merchant_id: merchant, aoi: { indicator: true, agent_code: AGENT, mandate_id: "m_cart" }, status, reason: null, fulfilment: status === "SETTLED" ? ful : null, deal_ref: null },
+        }),
+      },
+    });
+    stand = s;
+    const { core, journal } = await coreOn(s);
+    await core.start();
+    const steps = core.payment({ pay: async () => ({ status: "PAID" }) });
+    const total = { amount: 250000, currency: "RUB" };
+    const cart = { id: "m_cart", cart: { merchantId: "shop_1", lines: [], total } } as unknown as Mandate;
+    const ctx: PaymentContext = { intent: { id: "m_intent" } as Mandate, cart, shopId: "SHOP-1", merchantId: "shop_1", order: { orderId: "ORD-2", total }, signal: new AbortController().signal, sending: () => {} };
+    await expect(steps.authorize(ctx, { idempotencyKey: "idem-pay-mismatch" })).rejects.toMatchObject({ code: "OPERATION_REPLY_MISMATCH" });
+    expect(journal.entries.filter((e) => e.kind === "operation.mismatch").map((e) => [e.ref, e.detail, e.mandate])).toEqual([["op_2", "MERCHANT", "m_cart"]]);
+
+    merchant = "shop_1";
+    status = "SETTLED";
+    const authorized = { opRef: "op_2", orderRef: "ORD-2", channel: "CARD" as const, amount: total, merchantId: "shop_1", indicator: { agentCode: AGENT, mandateId: "m_cart" }, status: "AUTHORIZED" as const, declineReason: null, fulfilment: null };
+    await expect(steps.settle(authorized)).resolves.toMatchObject({ status: "SETTLED", fulfilment: { finalAmount: total, spentPosition: total, scopeCheck: "WITHIN_LIMITS" } });
+    expect(journal.entries.filter((e) => e.kind === "operation.settled").map((e) => [e.ref, e.detail])).toEqual([["op_2", "WITHIN_LIMITS"]]);
+  });
+
+  it("ответ продавца DECLINED и запрос подтверждения раньше операции — CONFIRMATION_REQUIRED, стадия 4 (Р47 п. 4, Р49 п. 5); confirm ждёт модуль подтверждений ядра и прерывается остановкой", async () => {
+    const id = "cnf_11111111-1111-4111-8111-111111111111";
+    let served = false;
+    const s = new PaoStand({
+      handlers: {
+        "POST /pao/v1/credentials": ({ body }) => ({
+          status: 201,
+          body: { credential_ref: "cr_1", kind: body.kind, payload: { token_ref: "tok_ref_1", cryptogram: "cg_1" }, aoi: { indicator: true, agent_code: AGENT, mandate_id: body.mandate_id }, status: "ISSUED" },
+        }),
+        "GET /pao/v1/events": () => {
+          if (served) return { status: 200, body: [] };
+          served = true;
+          return { status: 200, body: [{ event_id: "evt_cnf_1", type: "confirmation.required", at: "2026-10-23T12:00:00Z", data: { confirmation_id: id } }] };
+        },
+        "GET /pao/v1/confirmations/{id}": () => ({
+          status: 200,
+          body: { id, status: "PENDING", link: "https://upk.stand/c/x", confirmation_ref: null, expires_at: "2099-10-23T12:15:00.000Z" },
         }),
       },
     });

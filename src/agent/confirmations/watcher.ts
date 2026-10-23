@@ -81,6 +81,8 @@ export class Confirmations {
   readonly #done = new Set<string>();
   /** запросы, о которых человеку уже сообщили */
   readonly #notified = new Set<string>();
+  /** ждущие появления невостребованного запроса (Р49 п. 5: гонка итога операции с запросом подтверждения) */
+  readonly #arrivals = new Set<() => void>();
 
   constructor(o: ConfirmationsOptions) {
     this.#o = o;
@@ -224,6 +226,27 @@ export class Confirmations {
     }, this.#o.params.confirmation_wait_ms);
     this.#unclaimed.set(id, { read, drop });
     this.#record({ kind: "confirmation.unclaimed", ref: id });
+    for (const arrived of [...this.#arrivals]) arrived();
+  }
+
+  /**
+   * Появился невостребованный запрос подтверждения (Р49 п. 5): уже есть — сразу. Не привязывает и не уведомляет: запрос
+   * берёт `wait` стадии 4 (В1а). Прерывание `signal` — отказ с его причиной.
+   */
+  arrival(signal: AbortSignal): Promise<void> {
+    if (signal.aborted) return Promise.reject(signal.reason);
+    if (this.#unclaimed.size > 0) return Promise.resolve();
+    return new Promise<void>((resolve, reject) => {
+      const end = (done: () => void) => {
+        this.#arrivals.delete(arrived);
+        signal.removeEventListener("abort", onAbort);
+        done();
+      };
+      const arrived = () => end(resolve);
+      const onAbort = () => end(() => reject(signal.reason));
+      this.#arrivals.add(arrived);
+      signal.addEventListener("abort", onAbort, { once: true });
+    });
   }
 
   #unbound(id: string | undefined, waiting: Waiter[]): void {

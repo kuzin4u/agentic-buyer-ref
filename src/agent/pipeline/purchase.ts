@@ -18,7 +18,7 @@ import type { LiveOfferSource } from "../ports/catalog.js";
 import type { FeedItem } from "../ports/events.js";
 import type { Mutation } from "../ports/mutation.js";
 import { orderRefIssue, type OrderRefIssue } from "../payment-package/order-ref.js";
-import { PaymentFailure, ShopFailure, type ConfirmationOutcome, type OfferSource, type PaymentContext, type PaymentSteps, type ShopOffers, type ShopOrder, type ShopPort, type ShopUnavailable, type ShopUnavailableCause } from "../ports/shop.js";
+import { PaymentFailure, ShopFailure, type ConfirmationOutcome, type OfferSource, type PaymentContext, type PaymentSteps, type PurchaseNotice, type ShopOffers, type ShopOrder, type ShopPort, type ShopUnavailable, type ShopUnavailableCause } from "../ports/shop.js";
 import { PurchaseMachine, PurchaseTransitionForbidden, allowed, type PurchaseJournal, type PurchaseState, type StopCause } from "./machine.js";
 
 /** Почему оставлен CART (Р46 п. 3): новый поиск из CART_ACTIVE или отказ живой проверки перед заказом. */
@@ -66,7 +66,7 @@ export interface PipelineJournal extends PurchaseJournal {
       /** номер заказа продавца не передаётся дальше (Р45, 9а): detail — только причина, значения нет */
       | { at: string; kind: "agent.refused"; reason: "SHOP_ORDER_REF_INVALID"; detail: OrderRefIssue; mandate?: string }
       /** уведомление оболочки упало (Р47 п. 5, В3): исход покупки не меняется */
-      | { at: string; kind: "notify.failed"; reason: "CONFIRMATION_PENDING"; mandate?: string },
+      | { at: string; kind: "notify.failed"; reason: PurchaseNotice; mandate?: string },
   ): void;
 }
 
@@ -182,9 +182,9 @@ export interface PurchaseOptions {
   failureCode?: (e: unknown) => DiagCode | null;
   /** регион человека из профиля; нет — доступен только самовывоз (Р32 п. 5) */
   region?: string;
-  /** уведомление оболочки (Р47 п. 5, В3): CONFIRMATION_PENDING — один раз на запрос подтверждения, без link; конвейер его
-   *  не ждёт, сбой — запись notify.failed, исход не меняется */
-  notify?: (code: "CONFIRMATION_PENDING") => void | Promise<void>;
+  /** уведомление оболочки (Р47 п. 5, В3; Р49 п. 7): CONFIRMATION_PENDING — один раз на запрос подтверждения, без link;
+   *  SCOPE_* — запись об исполнении не WITHIN_LIMITS; конвейер его не ждёт, сбой — запись notify.failed, исход не меняется */
+  notify?: (code: PurchaseNotice) => void | Promise<void>;
   now?: () => Date;
 }
 
@@ -205,7 +205,18 @@ const CONFIRMATION_STOP: Readonly<Record<ConfirmationOutcome, DiagCode>> = {
 /** Отказ подписи — ждать человека, а не останавливать покупку (SPEC §7а PRINCIPAL_SIGNATURE_PENDING); только у ожидания
  *  подписи мандата: тот же код из порта витрины или оплаты — остановка (ревью К3 повторное Н1, инвариант 4). */
 const WAITS_HUMAN: ReadonlySet<DiagCode> = new Set(["MANDATE_SIGNATURE_PENDING"]);
+/** Расчёта ещё нет, ожидание прервал вызывающий (Р49 п. 6) — покупка ждёт в SETTLING, только у стадии 6. */
+const WAITS_SETTLEMENT: ReadonlySet<DiagCode> = new Set(["SETTLEMENT_PENDING"]);
 const NONE: ReadonlySet<DiagCode> = new Set();
+
+/** Уведомление по записи об исполнении (Р49 п. 7): всё, кроме WITHIN_LIMITS; записи нет у SETTLED — не распознано. */
+function scopeNotice(op: Operation): PurchaseNotice | null {
+  const s = op.fulfilment?.scopeCheck;
+  if (s === "WITHIN_LIMITS") return null;
+  if (s === "EXCEEDS_AUTHORIZATION") return "SCOPE_EXCEEDS_AUTHORIZATION";
+  if (s === "NOT_RESERVED") return "SCOPE_NOT_RESERVED";
+  return "SCOPE_CHECK_UNRECOGNIZED";
+}
 
 export class Purchase {
   // машина — только у конвейера: вызывающему — чтение состояния и кода (ревью К3 повторное Н2: переход в обход стадии)
@@ -487,9 +498,9 @@ export class Purchase {
     return { marketKop: this.o.params.confirm_above_kop };
   }
 
-  /** Стадия 5: авторизация через порт (AG-11): реквизит и пакет продавцу; итог — из события Платформы (инвариант 8). До
-   *  событий операции (PS-16) порт профиля contour отвечает PaymentFailure OPERATION_RESULT_UNCONFIRMED — STOPPED, место в
-   *  окне дробления занято, повторной оплаты нет: из STOPPED переходов нет (Р45 п. 5). Итог выше порога предварительного
+  /** Стадия 5: авторизация через порт (AG-11): реквизит и пакет продавцу; итог — из события Платформы и GET операции
+   *  (инвариант 8, Р49 п. 5). Итога нет в срок — порт отвечает PaymentFailure OPERATION_RESULT_UNCONFIRMED — STOPPED, место
+   *  в окне дробления занято, повторной оплаты нет: из STOPPED переходов нет. Итог выше порога предварительного
    *  подтверждения не требует — его требует ADP (Р47 п. 2). DECLINED — STOPPED с кодом причины (SPEC §7б). Платформа
    *  требует подтверждения (PaymentFailure CONFIRMATION_REQUIRED порта или ответ CONFIRMATION_REQUIRED) — стадия 4. */
   authorize(m: Mutation): Promise<Operation> {
@@ -542,7 +553,7 @@ export class Purchase {
     this.#machine.to("CONFIRMING");
     const outcome = await this.#guard(async () => {
       try {
-        return await this.o.payment.confirm(this.#forPayment(c), () => this.#notify(), this.#machine.stopped);
+        return await this.o.payment.confirm(this.#forPayment(c), () => this.#notify("CONFIRMATION_PENDING"), this.#machine.stopped);
       } catch (e) {
         if (e === this.#machine.stopped.reason) throw new PurchaseStopped(this.#machine.reason ?? "UNKNOWN");
         throw e;
@@ -555,23 +566,26 @@ export class Purchase {
   }
 
   /** Уведомление оболочки (В3): не ждётся; исключение и отказ обещания — запись notify.failed, исход не меняется. */
-  #notify(): void {
+  #notify(code: PurchaseNotice): void {
     const failed = () => {
       try {
-        this.#record({ kind: "notify.failed", reason: "CONFIRMATION_PENDING" });
+        this.#record({ kind: "notify.failed", reason: code });
       } catch {
         // журнал недоступен — покупка уже остановлена (#record); уведомление исход не меняет
       }
     };
     try {
-      const r = this.o.notify?.("CONFIRMATION_PENDING");
+      const r = this.o.notify?.(code);
       if (r !== undefined) Promise.resolve(r).catch(failed);
     } catch {
       failed();
     }
   }
 
-  /** Стадия 6: итог расчёта через порт (AG-11), из события Платформы. Не SETTLED — STOPPED UNKNOWN (инвариант 4). */
+  /** Стадия 6 (Р49 п. 6–7): итог расчёта через порт — из события Платформы и GET. Расчёта ещё нет, ожидание прервал
+   *  вызывающий — SETTLEMENT_PENDING наружу, покупка остаётся SETTLING (settle() можно вызвать снова). Не SETTLED —
+   *  STOPPED (после отправки пакета — OPERATION_RESULT_UNCONFIRMED, Р49 п. 2). scope_check не WITHIN_LIMITS —
+   *  уведомление оболочки, покупка DONE. */
   settle(signal?: AbortSignal): Promise<Operation> {
     return this.#stage("DONE", async () => {
       const authorized = this.#need(this.#operation);
@@ -579,9 +593,11 @@ export class Purchase {
         const reply = snapshot(await this.o.payment.settle(copy(authorized), signal));
         if (reply.status !== "SETTLED") this.#halt("UNKNOWN");
         return reply;
-      });
+      }, WAITS_SETTLEMENT);
       this.#operation = op;
       this.#machine.to("DONE");
+      const notice = scopeNotice(op);
+      if (notice !== null) this.#notify(notice);
       return copy(op);
     });
   }

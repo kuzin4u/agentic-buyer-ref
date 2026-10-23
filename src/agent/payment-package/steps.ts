@@ -1,12 +1,14 @@
-// Шаги стадий 4–6 профиля contour (Р45 п. 2, 5, 6; Р47 п. 2–4): реквизит по ПАО и пакет агентской оплаты продавцу,
-// ожидание подтверждения человеком. Собирается в месте сборки из порта платформы, адаптера витрин и модуля подтверждений.
-// До событий операции (PS-16) итог не подтверждается: после передачи пакета — PaymentFailure OPERATION_RESULT_UNCONFIRMED,
-// ответ продавца — только в журнале адаптера витрин (инвариант 8); DECLINED продавца — CONFIRMATION_REQUIRED: стадия 4.
+// Шаги стадий 4–6 профиля contour (Р45 п. 2, 6; Р47 п. 2–4; Р49 п. 3–6): реквизит по ПАО и пакет агентской оплаты
+// продавцу, итог — из события operation.* и GET операции (модуль операций), ожидание подтверждения человеком, расчёт по
+// operation.settled. Собирается в месте сборки из порта платформы, адаптера витрин и модулей подтверждений и операций.
+// Ответ продавца — только в журнале адаптера витрин и повод ждать запрос подтверждения (инвариант 8).
 import type { Journal } from "../journal/index.js";
+import type { OperationOutcome, OperationWait, SettleOutcome } from "../operations/index.js";
 import type { IssuedPackage } from "../ports/payment-platform.js";
 import type { Mutation } from "../ports/mutation.js";
-import { PaymentFailure, ShopFailure, type ConfirmationOutcome, type PaymentContext, type PaymentSteps, type ShopPaymentPort } from "../ports/shop.js";
-import type { CredentialDraft, Operation } from "../../shared/domain.js";
+import { PaymentFailure, ShopFailure, type ConfirmationOutcome, type PaymentContext, type PaymentSteps, type ShopPaymentPort, type ShopPaymentReply } from "../ports/shop.js";
+import type { StandParams } from "../../shared/config.js";
+import type { CredentialDraft, Mandate, Operation } from "../../shared/domain.js";
 import { SAFE_ID } from "../../shared/ids.js";
 import { orderRefIssue } from "./order-ref.js";
 
@@ -14,8 +16,17 @@ export interface ContourPaymentOptions {
   platform: { issuePaymentPackage(draft: CredentialDraft, m: Mutation): Promise<IssuedPackage> };
   shop: ShopPaymentPort;
   journal: Journal;
-  /** модуль подтверждений (Р47 п. 3–4): ожидание запроса ADP и решения человека */
-  confirmations: { wait(o: { signal: AbortSignal; onPending?: () => void }): Promise<ConfirmationOutcome> };
+  /** модуль подтверждений (Р47 п. 3–4): ожидание запроса ADP и решения человека; появление запроса — гонка стадии 5 */
+  confirmations: {
+    wait(o: { signal: AbortSignal; onPending?: () => void }): Promise<ConfirmationOutcome>;
+    arrival(signal: AbortSignal): Promise<void>;
+  };
+  /** модуль операций (Р49 п. 3–6): итог по order_ref на стадии 5, расчёт по op_ref на стадии 6 */
+  operations: {
+    expect(orderRef: string, cart: Mandate): OperationWait;
+    settle(authorized: Operation, signal: AbortSignal): Promise<SettleOutcome>;
+  };
+  params: Pick<StandParams, "operation_outcome_max_delay_sec" | "confirmation_wait_ms">;
   now?: () => Date;
 }
 
@@ -34,9 +45,10 @@ export class ContourPayment implements PaymentSteps {
 
   /** Стадия 5 (Т8): номер заказа — до обращения к Платформе (второй рубеж после стадии 3); реквизит по CART под ключом
    *  вызывающего; пакет — продавцу. Покупка остановлена — ни реквизита, ни пакета. Реквизит не ISSUED (повтор под ключом
-   *  после погашения или срока) — пакета нет, CREDENTIAL_INVALID. Пакет передан, отказ витрины или исход неизвестен —
-   *  OPERATION_RESULT_UNCONFIRMED: итог — только из события Платформы (PS-16, AG-11 ч. 2). Ответ продавца DECLINED —
-   *  CONFIRMATION_REQUIRED: ADP могла потребовать подтверждения, конвейер ждёт запрос (Р47 п. 4); прочие ответы — Р45. */
+   *  после погашения или срока) — пакета нет, CREDENTIAL_INVALID. Итог — операция, привязанная по order_ref (Р49 п. 5):
+   *  ожидание — до отправки пакета. Ответ продавца DECLINED — ещё и гонка с запросом подтверждения (ADP могла потребовать
+   *  подтверждения, Р47 п. 4): пришёл раньше операции — CONFIRMATION_REQUIRED, стадия 4. Итога нет в срок —
+   *  OPERATION_RESULT_UNCONFIRMED; операция не сходится с покупкой — OPERATION_REPLY_MISMATCH. */
   async authorize(c: PaymentContext, m: Mutation): Promise<Operation> {
     const orderRef = c.order.orderId;
     const issue = orderRefIssue(orderRef);
@@ -63,24 +75,60 @@ export class ContourPayment implements PaymentSteps {
     // остановили, пока выдавался реквизит, — пакет не уходит; реквизит истечёт неиспользованным. Проверка и отметка
     // «пакет уходит» — синхронно, без ожидания между ними (Р45, Б2в)
     c.signal.throwIfAborted();
-    c.sending();
-    let reply;
+    // ожидание итога — до отправки пакета: событие могут прочитать, пока продавец отвечает (Р49 п. 3)
+    const wait = this.o.operations.expect(orderRef, c.cart);
     try {
-      reply = await this.o.shop.pay({ shopId: c.shopId, orderId: orderRef, cartMandateId: c.cart.id, package: sealed });
-    } catch (e) {
-      // пакет ушёл (или мог уйти): отказ витрины, нет ответа, ответ не по схеме — итог не подтверждён, «деньги не
-      // списывались» не говорим (Р45, Б1а; инвариант 8); код витрины — detail записи shop.call
-      if (e instanceof ShopFailure) throw new PaymentFailure("OPERATION_RESULT_UNCONFIRMED");
-      throw e;
+      c.sending();
+      let reply: ShopPaymentReply | null = null;
+      try {
+        reply = await this.o.shop.pay({ shopId: c.shopId, orderId: orderRef, cartMandateId: c.cart.id, package: sealed });
+      } catch (e) {
+        // пакет ушёл (или мог уйти): отказ витрины, нет ответа, ответ не по схеме — итог по событию, «деньги не
+        // списывались» не говорим (Р45, Б1а; инвариант 8); код витрины — detail записи shop.call
+        if (!(e instanceof ShopFailure)) throw e;
+      }
+      return await this.#outcome(wait, reply, c.signal);
+    } finally {
+      wait.close();
     }
-    // слова продавца не итог (инвариант 8): DECLINED — только повод ждать запрос подтверждения не дольше confirmation_wait_ms
-    if (reply.status === "DECLINED") throw new PaymentFailure("CONFIRMATION_REQUIRED");
-    throw new PaymentFailure("OPERATION_RESULT_UNCONFIRMED");
   }
 
-  /** Стадия 6 не наступает до событий операции (Р45 п. 5). */
-  settle(): Promise<never> {
-    return Promise.reject(new PaymentFailure("OPERATION_RESULT_UNCONFIRMED"));
+  /** Итог стадии 5 (Р49 п. 5): первое из — привязанная операция или (только при DECLINED продавца) запрос подтверждения. */
+  async #outcome(wait: OperationWait, reply: ShopPaymentReply | null, signal: AbortSignal): Promise<Operation> {
+    const delayMs = this.o.params.operation_outcome_max_delay_sec * 1000;
+    let outcome: OperationOutcome | "CONFIRMATION";
+    if (reply?.status === "DECLINED") {
+      // слова продавца не итог (инвариант 8): DECLINED — повод ждать и запрос подтверждения; гонка снимается вместе
+      const race = new AbortController();
+      const stop = () => race.abort(signal.reason);
+      signal.addEventListener("abort", stop, { once: true });
+      try {
+        outcome = await Promise.race([
+          wait.outcome(Math.max(delayMs, this.o.params.confirmation_wait_ms), race.signal),
+          this.o.confirmations.arrival(race.signal).then(() => "CONFIRMATION" as const),
+        ]);
+      } finally {
+        signal.removeEventListener("abort", stop);
+        race.abort(new Error("гонка стадии 5 решена"));
+      }
+    } else {
+      outcome = await wait.outcome(delayMs, signal);
+    }
+    if (outcome === "CONFIRMATION") throw new PaymentFailure("CONFIRMATION_REQUIRED");
+    if (outcome.kind === "MISMATCH") throw new PaymentFailure("OPERATION_REPLY_MISMATCH");
+    if (outcome.kind === "NONE") throw new PaymentFailure("OPERATION_RESULT_UNCONFIRMED");
+    return outcome.operation;
+  }
+
+  /** Стадия 6 (Р49 п. 6): расчёт по operation.settled и GET; без `signal` — ждёт, пока расчёт не придёт. Прервано —
+   *  SETTLEMENT_PENDING (ожидание, не остановка); операция не та — OPERATION_REPLY_MISMATCH; GET не подтверждён —
+   *  OPERATION_RESULT_UNCONFIRMED. */
+  async settle(op: Operation, signal?: AbortSignal): Promise<Operation> {
+    const r = await this.o.operations.settle(op, signal ?? new AbortController().signal);
+    if (r.kind === "PENDING") throw new PaymentFailure("SETTLEMENT_PENDING");
+    if (r.kind === "MISMATCH") throw new PaymentFailure("OPERATION_REPLY_MISMATCH");
+    if (r.kind === "UNREAD") throw new PaymentFailure("OPERATION_RESULT_UNCONFIRMED");
+    return r.operation;
   }
 }
 

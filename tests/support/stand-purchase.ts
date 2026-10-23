@@ -8,10 +8,11 @@ import { MERCHANT_FIXTURES } from "agentic-ps-platform/fixtures";
 import type { ShopsAdapter, ShopProfile } from "../../src/agent/adapters/shops/index.js";
 import { Confirmations } from "../../src/agent/confirmations/index.js";
 import { MandateClient } from "../../src/agent/mandates/index.js";
+import { Operations } from "../../src/agent/operations/index.js";
 import { ContourPayment } from "../../src/agent/payment-package/index.js";
 import { Purchase } from "../../src/agent/pipeline/index.js";
 import { OrderPriceMismatches, SplitWindow } from "../../src/agent/policy/index.js";
-import type { FeedItem, HttpRequestSigning, PaymentPlatform } from "../../src/agent/ports/index.js";
+import type { FeedItem, HttpRequestSigning, PaymentPlatform, PurchaseNotice } from "../../src/agent/ports/index.js";
 import { parseParams, type StandParams } from "../../src/shared/config.js";
 import type { Mandate } from "../../src/shared/domain.js";
 import { INTENT } from "./consents.js";
@@ -53,7 +54,7 @@ export interface StandPurchaseOptions {
   /** выдача реквизита поверх настоящей платформы контура — действие теста посреди стадии 5 (параллельный вызов, Р45 Б2в) */
   issue?: (real: PaymentPlatform["issuePaymentPackage"]) => PaymentPlatform["issuePaymentPackage"];
   /** уведомление оболочки (Р47 п. 5, В3) */
-  notify?: (code: "CONFIRMATION_PENDING") => void | Promise<void>;
+  notify?: (code: PurchaseNotice) => void | Promise<void>;
   /** часы клиента ПАО и модуля подтверждений — тест двигает их вместе с часами стенда (истечение, РП51 п. 6) */
   now?: () => Date;
   /** таймер модуля подтверждений — тест срабатывает его сам (срок решения — минуты по order_hold_sec Платформы) */
@@ -75,24 +76,28 @@ export async function standPurchase(o: StandPurchaseOptions = {}) {
   const real: PaymentPlatform["issuePaymentPackage"] = (d, m) => c.platform.issuePaymentPackage(d, m);
   const platform = { issuePaymentPackage: o.issue ? o.issue(real) : real };
   const params = parseParams({ ...c.params, ...o.params });
-  // модуль подтверждений на ленте стенда, как у места сборки (compose): wake — одно чтение ленты со своим курсором
+  // модули подтверждений и операций на ленте стенда, как у места сборки (compose): wake — одно чтение ленты со своим
+  // курсором, событие — обоим слушателям; слушатель упал — курсор на месте, событие прочитается снова (Р34 п. 3)
   let cursor: string | null = null;
+  const wake = async () => {
+    const items = await c.platform.listEvents(cursor);
+    if (items.length === 0) await pause(20);
+    for (const item of items) {
+      await confirmations.listener(item);
+      await operations.listener(item);
+      cursor = item.kind === "event" ? item.event.eventId : item.eventId;
+    }
+  };
   const confirmations: Confirmations = new Confirmations({
     port: c.platform,
     journal: c.journal,
     params,
     ...(o.now && { now: o.now }),
     ...(o.confirmationTimer && { timer: o.confirmationTimer }),
-    wake: async () => {
-      const items = await c.platform.listEvents(cursor);
-      if (items.length === 0) await pause(20);
-      for (const item of items) {
-        cursor = item.kind === "event" ? item.event.eventId : item.eventId;
-        await confirmations.listener(item);
-      }
-    },
+    wake,
   });
-  const steps = o.contourPayment ? new ContourPayment({ platform, shop: shops, journal: c.journal, confirmations }) : payment;
+  const operations: Operations = new Operations({ port: c.platform, journal: c.journal, params, ...(o.now && { now: o.now }), wake });
+  const steps = o.contourPayment ? new ContourPayment({ platform, shop: shops, journal: c.journal, confirmations, operations, params }) : payment;
   const split = new SplitWindow(params, () => new Date());
   // пометка Д02 — одна на ядро, как у места сборки (Р48 п. 5): следующая покупка (next) видит расхождение прежней
   const orderMismatches = new OrderPriceMismatches();

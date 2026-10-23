@@ -22,8 +22,10 @@ afterEach(async () => {
 const NORMAL = shopBy("NORMAL");
 const CREDENTIALS = "pao POST /pao/v1/credentials";
 
+/** Без подмены до PS-11 продавец решает сам и до ADP стенда не доходит: операции у Платформы нет, события operation.* не
+ *  будет — итог стадии 5 по сроку (Р49 п. 5). Срок — 1 с вместо 30, чтобы тест не ждал. */
 async function run(o: StandPurchaseOptions = {}) {
-  const r = await standPurchase({ ...o, contourPayment: true });
+  const r = await standPurchase({ ...o, params: { operation_outcome_max_delay_sec: 1, ...o.params }, contourPayment: true });
   c = r.c;
   return r;
 }

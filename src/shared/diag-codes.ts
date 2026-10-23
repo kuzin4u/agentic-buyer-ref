@@ -73,6 +73,12 @@ export const AGENT_DIAG_CODES = [
   "OPERATION_RESULT_UNCONFIRMED",
   // стадии 5–6 (Р49 п. 4): операция, привязанная по order_ref, не сходится с заказом и CART (признак, продавец, сумма, канал)
   "OPERATION_REPLY_MISMATCH",
+  // стадия 6 (Р49 п. 6): ожидание расчёта прервал вызывающий — не остановка, покупка в SETTLING, settle() можно повторить
+  "SETTLEMENT_PENDING",
+  // стадия 6 (Р49 п. 7): уведомления оболочки по scope_check записи об исполнении — всё, кроме WITHIN_LIMITS
+  "SCOPE_EXCEEDS_AUTHORIZATION",
+  "SCOPE_NOT_RESERVED",
+  "SCOPE_CHECK_UNRECOGNIZED",
   // стадия 4 (Р47 п. 5, В3): уведомление оболочки — запрос подтверждения ждёт решения человека в приложении банка
   "CONFIRMATION_PENDING",
   // исходы стадии 4 (Р47 п. 4, 6): отклонено, истекло, одобрено без канала к продавцу (до AG-13 ч. 2), привязка неоднозначна

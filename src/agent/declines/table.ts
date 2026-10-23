@@ -175,6 +175,14 @@ export const PAYMENT_OUTCOME_CODES: ReadonlySet<DiagCode> = new Set<DiagCode>([
   "OPERATION_REPLY_MISMATCH",
 ]);
 
+/** Уведомления и ожидание после оплаты (Р49 п. 6–7): не остановка, но текст человеку — тоже по Р-298 (тест реестра). */
+export const PAYMENT_NOTICE_CODES: ReadonlySet<DiagCode> = new Set<DiagCode>([
+  "SETTLEMENT_PENDING",
+  "SCOPE_EXCEEDS_AUTHORIZATION",
+  "SCOPE_NOT_RESERVED",
+  "SCOPE_CHECK_UNRECOGNIZED",
+]);
+
 /** Код остановки после отправки пакета (Р49 п. 2): итоговый — как есть, иной — OPERATION_RESULT_UNCONFIRMED (пакет ушёл,
  *  итог операции неизвестен; совет повторить может привести ко второй оплате). */
 export function afterPayment(code: DiagCode): DiagCode {

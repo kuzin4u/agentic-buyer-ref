@@ -7,7 +7,7 @@ import { CATALOG_DIAG, CATALOG_DIAG_CODES } from "@kuzin4u/agentic-core/catalog"
 import { checkDiagRegistry, diagAction } from "@kuzin4u/agentic-core/diag";
 import { PAO_CLIENT_CODES, PAO_CLIENT_DIAG, PAO_DIAG, PAO_ERRORS, PAO_RETRY_ACTION } from "@kuzin4u/agentic-core/pao";
 import { DIAG } from "../../src/agent/compose.js";
-import { AGENT_DIAG, DECLINE_REASONS, FAILURE_RULES, PAYMENT_OUTCOME_CODES, afterPayment, mergeDiag, ruleForDeclineReason, type DiagAction, type ReasonAction } from "../../src/agent/declines/index.js";
+import { AGENT_DIAG, DECLINE_REASONS, FAILURE_RULES, PAYMENT_NOTICE_CODES, PAYMENT_OUTCOME_CODES, afterPayment, mergeDiag, ruleForDeclineReason, type DiagAction, type ReasonAction } from "../../src/agent/declines/index.js";
 import { REVOCATION_ORDER_MISSING_TEXT } from "../../src/agent/mandates/index.js";
 import { STOP_CAUSES } from "../../src/agent/pipeline/index.js";
 import { AGENT_DIAG_CODES } from "../../src/shared/diag-codes.js";
@@ -75,6 +75,13 @@ describe("реестр кодов агента (Р36)", () => {
 
   it("Р49 п. 2 (блокер Р-298): у итоговых кодов после отправки пакета — «итог проверьте в приложении банка», без совета повторить; иной код — OPERATION_RESULT_UNCONFIRMED", () => {
     expect(PAYMENT_OUTCOME_CODES.has("OPERATION_RESULT_UNCONFIRMED")).toBe(true);
+    expect(PAYMENT_OUTCOME_CODES.has("OPERATION_REPLY_MISMATCH")).toBe(true);
+    // уведомления и ожидание после оплаты — тексты по тому же правилу (условие владельца к Р49 п. 6–7)
+    for (const code of PAYMENT_NOTICE_CODES) {
+      const human = DIAG[code]!.human.ru;
+      expect(human, code).not.toMatch(/повтор|ещё раз|снова|попроб|позже|пополните|другой способ/i);
+      expect(human, code).toContain("итог проверьте в приложении банка");
+    }
     for (const code of PAYMENT_OUTCOME_CODES) {
       const human = DIAG[code]!.human.ru;
       expect(human, code).not.toMatch(/повтор|ещё раз|снова|попроб|позже|пополните|другой способ/i);

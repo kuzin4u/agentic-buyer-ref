@@ -122,6 +122,15 @@ describe("запрещённый переход — STOPPED и agent.refused (Р
       // из конечного состояния — только отказ, итог покупки не меняется
       expect(m.state).toBe("DONE");
       expect(journal.entries).toEqual([refused]);
+    } else if (from === "SETTLING") {
+      // операция одобрена — остановка только итоговым кодом, исходный — в payment.unconfirmed (Р49 п. 2; ревью КТ1 № 2)
+      expect(m.state).toBe("STOPPED");
+      expect(m.reason).toBe("OPERATION_RESULT_UNCONFIRMED");
+      expect(journal.entries).toEqual([
+        refused,
+        { at: AT.toISOString(), kind: "payment.unconfirmed", reason: "PIPELINE_TRANSITION_FORBIDDEN", mandate: "mnd_intent_1" },
+        { at: AT.toISOString(), kind: "purchase.stage", detail: "STOPPED", reason: "OPERATION_RESULT_UNCONFIRMED", mandate: "mnd_intent_1" },
+      ]);
     } else {
       expect(m.state).toBe("STOPPED");
       expect(m.reason).toBe("PIPELINE_TRANSITION_FORBIDDEN");

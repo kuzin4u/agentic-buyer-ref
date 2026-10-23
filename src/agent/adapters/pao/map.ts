@@ -309,9 +309,12 @@ function count(v: unknown, what: string): number {
   return v;
 }
 
-/** Запись об исполнении (#59 п. 5): нет — null; есть — все поля, ссылка по маске, время RFC 3339. */
+/** Запись об исполнении (#59 п. 5): нет или неполная (в YAML 1.4.0 поля необязательны) — null, статус операции от этого не
+ *  теряется (у SETTLED — уведомление SCOPE_CHECK_UNRECOGNIZED; ревью КТ1 № 12); полная — ссылка по маске, суммы целые,
+ *  время RFC 3339, иначе ответ не подтверждён. */
 function fulfilmentFromPao(f: Pao.Operation["fulfilment"]): OperationRecord["fulfilment"] {
   if (f === undefined || f === null) return null;
+  if ([f.fulfilment_ref, f.final_amount, f.scope_check, f.spent_position, f.at].some((v) => v === undefined || v === null)) return null;
   const ref = need(f.fulfilment_ref, "fulfilment.fulfilment_ref");
   if (!SAFE_ID.test(ref)) incomplete("fulfilment.fulfilment_ref — не по маске");
   const at = instant(f.at);

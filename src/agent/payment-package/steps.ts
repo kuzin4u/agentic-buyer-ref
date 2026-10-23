@@ -19,7 +19,8 @@ export interface ContourPaymentOptions {
   /** модуль подтверждений (Р47 п. 3–4): ожидание запроса ADP и решения человека; появление запроса — гонка стадии 5 */
   confirmations: {
     wait(o: { signal: AbortSignal; onPending?: () => void }): Promise<ConfirmationOutcome>;
-    arrival(signal: AbortSignal): Promise<void>;
+    mark(): number;
+    arrival(signal: AbortSignal, after: number): Promise<void>;
   };
   /** модуль операций (Р49 п. 3–6): итог по order_ref на стадии 5, расчёт по op_ref на стадии 6 */
   operations: {
@@ -75,8 +76,10 @@ export class ContourPayment implements PaymentSteps {
     // остановили, пока выдавался реквизит, — пакет не уходит; реквизит истечёт неиспользованным. Проверка и отметка
     // «пакет уходит» — синхронно, без ожидания между ними (Р45, Б2в)
     c.signal.throwIfAborted();
-    // ожидание итога — до отправки пакета: событие могут прочитать, пока продавец отвечает (Р49 п. 3)
+    // ожидание итога — до отправки пакета: событие могут прочитать, пока продавец отвечает (Р49 п. 3); отметка запросов
+    // подтверждения — тоже до отправки: в гонке стадии 5 — только пришедшие после (ревью КТ1 № 5)
     const wait = this.o.operations.expect(orderRef, c.cart);
+    const mark = this.o.confirmations.mark();
     try {
       c.sending();
       let reply: ShopPaymentReply | null = null;
@@ -87,25 +90,28 @@ export class ContourPayment implements PaymentSteps {
         // списывались» не говорим (Р45, Б1а; инвариант 8); код витрины — detail записи shop.call
         if (!(e instanceof ShopFailure)) throw e;
       }
-      return await this.#outcome(wait, reply, c.signal);
+      return await this.#outcome(wait, reply, mark, c.signal);
     } finally {
       wait.close();
     }
   }
 
-  /** Итог стадии 5 (Р49 п. 5): первое из — привязанная операция или (только при DECLINED продавца) запрос подтверждения. */
-  async #outcome(wait: OperationWait, reply: ShopPaymentReply | null, signal: AbortSignal): Promise<Operation> {
+  /** Итог стадии 5 (Р49 п. 5): первое из — привязанная операция или (только при DECLINED продавца) запрос подтверждения,
+   *  пришедший после отправки пакета. */
+  async #outcome(wait: OperationWait, reply: ShopPaymentReply | null, mark: number, signal: AbortSignal): Promise<Operation> {
     const delayMs = this.o.params.operation_outcome_max_delay_sec * 1000;
     let outcome: OperationOutcome | "CONFIRMATION";
     if (reply?.status === "DECLINED") {
-      // слова продавца не итог (инвариант 8): DECLINED — повод ждать и запрос подтверждения; гонка снимается вместе
+      // слова продавца не итог (инвариант 8): DECLINED — повод ждать и запрос подтверждения; гонка снимается вместе.
+      // Покупку остановили, пока продавец отвечал, — гонка не начинается (ревью КТ1 № 4)
       const race = new AbortController();
       const stop = () => race.abort(signal.reason);
-      signal.addEventListener("abort", stop, { once: true });
+      if (signal.aborted) stop();
+      else signal.addEventListener("abort", stop, { once: true });
       try {
         outcome = await Promise.race([
           wait.outcome(Math.max(delayMs, this.o.params.confirmation_wait_ms), race.signal),
-          this.o.confirmations.arrival(race.signal).then(() => "CONFIRMATION" as const),
+          this.o.confirmations.arrival(race.signal, mark).then(() => "CONFIRMATION" as const),
         ]);
       } finally {
         signal.removeEventListener("abort", stop);
@@ -124,6 +130,7 @@ export class ContourPayment implements PaymentSteps {
    *  SETTLEMENT_PENDING (ожидание, не остановка); операция не та — OPERATION_REPLY_MISMATCH; GET не подтверждён —
    *  OPERATION_RESULT_UNCONFIRMED. */
   async settle(op: Operation, signal?: AbortSignal): Promise<Operation> {
+    // без сигнала ждёт, пока расчёт не придёт; конвейер передаёт свой сигнал остановки покупки (ревью КТ1 № 7а)
     const r = await this.o.operations.settle(op, signal ?? new AbortController().signal);
     if (r.kind === "PENDING") throw new PaymentFailure("SETTLEMENT_PENDING");
     if (r.kind === "MISMATCH") throw new PaymentFailure("OPERATION_REPLY_MISMATCH");

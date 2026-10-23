@@ -3,6 +3,7 @@
 // продавца; в ответе Платформы нет ни мандата, ни order_ref, поэтому запрос относится к покупке, только если его ждёт
 // ровно одна покупка (4а): ошибка привязки денег не стоит — ADP сверяет ссылку с мандатом, продавцом, суммой и order_ref.
 // link и confirmation_ref дальше разбора ответа не идут: ни в журнал, ни в исход, ни человеку (инвариант 1, Р47 п. 5).
+import { poll } from "../events/poll.js";
 import type { FeedItem } from "../ports/events.js";
 import type { ConfirmationOutcome } from "../ports/shop.js";
 import { PlatformFailure, type Confirmation } from "../../shared/domain.js";
@@ -31,7 +32,8 @@ export type { ConfirmationOutcome };
 export interface ConfirmationsOptions {
   port: ConfirmationsPort;
   journal: ConfirmationsJournal;
-  params: { confirmation_wait_ms: number; signature_skew_sec: number };
+  /** event_poll_interval_ms — пауза опроса после отказа ленты (ревью КТ1 AG-11 ч. 2 № 3); нет — опрос прекращается */
+  params: { confirmation_wait_ms: number; signature_skew_sec: number; event_poll_interval_ms?: number };
   /** прочитать ленту (`EventFeed.signal`): ожидание будит её, пока не решится; частоту чтений ограничивает лента */
   wake?: () => Promise<void>;
   now?: () => Date;
@@ -76,13 +78,16 @@ export class Confirmations {
   /** запрос → покупка, ждущая решения */
   readonly #bound = new Map<string, Waiter>();
   /** невостребованные запросы (В1а): пришли без ожидающих, хранятся не дольше confirmation_wait_ms */
-  readonly #unclaimed = new Map<string, { read: Read; drop: () => void }>();
+  readonly #unclaimed = new Map<string, { read: Read; drop: () => void; seq: number }>();
   /** запросы, по которым решено (исход, чужой, неоднозначный, выброшен): события по ним больше ничего не делают */
   readonly #done = new Set<string>();
   /** запросы, о которых человеку уже сообщили */
   readonly #notified = new Set<string>();
-  /** ждущие появления невостребованного запроса (Р49 п. 5: гонка итога операции с запросом подтверждения) */
-  readonly #arrivals = new Set<() => void>();
+  /** ждущие появления невостребованного запроса (Р49 п. 5: гонка итога операции с запросом подтверждения): после — номер
+   *  отметки, раньше которой запросы не в счёт */
+  readonly #arrivals = new Set<{ after: number; arrived: () => void }>();
+  /** номер последнего невостребованного запроса (отметка для гонки стадии 5) */
+  #held = 0;
 
   constructor(o: ConfirmationsOptions) {
     this.#o = o;
@@ -158,18 +163,11 @@ export class Confirmations {
   }
 
   /** Лента читается, пока покупка ждёт: push может не прийти. Между чтениями — макрозадача: лента без своей паузы не
-   *  займёт процессор и не задержит таймеры исхода. Отказ ленты — опрос прекращается, исход — по таймерам. */
+   *  займёт процессор и не задержит таймеры исхода. Отказ ленты (слушатель упал — событие прочитается снова, Р34 п. 3) —
+   *  пауза event_poll_interval_ms и опрос дальше (ревью КТ1 AG-11 ч. 2 № 3); без параметра — опрос прекращается, исход — по
+   *  таймерам. */
   async #poll(w: Waiter): Promise<void> {
-    const wake = this.#o.wake;
-    if (wake === undefined) return;
-    while (!w.settled) {
-      try {
-        await wake();
-      } catch {
-        return;
-      }
-      await new Promise<void>((r) => setImmediate(r));
-    }
+    await poll(this.#o.wake, () => w.settled, this.#o.params.event_poll_interval_ms);
   }
 
   /** Событие по невостребованному запросу: GET; пока он шёл, запрос могла взять покупка — тогда исход ей (ревью
@@ -224,27 +222,33 @@ export class Confirmations {
       this.#done.add(id);
       this.#record({ kind: "confirmation.discarded", ref: id });
     }, this.#o.params.confirmation_wait_ms);
-    this.#unclaimed.set(id, { read, drop });
+    const seq = ++this.#held;
+    this.#unclaimed.set(id, { read, drop, seq });
     this.#record({ kind: "confirmation.unclaimed", ref: id });
-    for (const arrived of [...this.#arrivals]) arrived();
+    for (const a of [...this.#arrivals]) if (seq > a.after) a.arrived();
+  }
+
+  /** Отметка до отправки пакета (Р49 п. 5): запросы, невостребованные до неё, в гонке этой покупки не в счёт. */
+  mark(): number {
+    return this.#held;
   }
 
   /**
-   * Появился невостребованный запрос подтверждения (Р49 п. 5): уже есть — сразу. Не привязывает и не уведомляет: запрос
-   * берёт `wait` стадии 4 (В1а). Прерывание `signal` — отказ с его причиной.
+   * Появился невостребованный запрос подтверждения позже отметки `after` (Р49 п. 5; ревью КТ1 № 5): уже есть — сразу. Не
+   * привязывает и не уведомляет: запрос берёт `wait` стадии 4 (В1а). Прерывание `signal` — отказ с его причиной.
    */
-  arrival(signal: AbortSignal): Promise<void> {
+  arrival(signal: AbortSignal, after: number): Promise<void> {
     if (signal.aborted) return Promise.reject(signal.reason);
-    if (this.#unclaimed.size > 0) return Promise.resolve();
+    if ([...this.#unclaimed.values()].some((h) => h.seq > after)) return Promise.resolve();
     return new Promise<void>((resolve, reject) => {
       const end = (done: () => void) => {
-        this.#arrivals.delete(arrived);
+        this.#arrivals.delete(a);
         signal.removeEventListener("abort", onAbort);
         done();
       };
-      const arrived = () => end(resolve);
+      const a = { after, arrived: () => end(resolve) };
       const onAbort = () => end(() => reject(signal.reason));
-      this.#arrivals.add(arrived);
+      this.#arrivals.add(a);
       signal.addEventListener("abort", onAbort, { once: true });
     });
   }

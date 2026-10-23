@@ -73,6 +73,8 @@ export const AGENT_DIAG_CODES = [
   "OPERATION_RESULT_UNCONFIRMED",
   // стадии 5–6 (Р49 п. 4): операция, привязанная по order_ref, не сходится с заказом и CART (признак, продавец, сумма, канал)
   "OPERATION_REPLY_MISMATCH",
+  // стадии 5–6 (Р49 дополнение 1 п. 1, условие владельца 1): GET операции не подтверждён — запись operation.unread
+  "OPERATION_UNREAD",
   // стадия 6 (Р49 п. 6): ожидание расчёта прервал вызывающий — не остановка, покупка в SETTLING, settle() можно повторить
   "SETTLEMENT_PENDING",
   // стадия 6 (Р49 п. 7): уведомления оболочки по scope_check записи об исполнении — всё, кроме WITHIN_LIMITS

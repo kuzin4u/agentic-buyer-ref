@@ -152,6 +152,8 @@ export class PurchaseMachine {
     if (next === "AUTHORIZING" && !this.#gate5) this.forbid(next);
     this.#gate5 = false;
     this.#sending = false;
+    // операция одобрена — деньги в пути и без отметки «пакет уходит» (профиль без sending, ревью КТ1 № 2)
+    if (next === "SETTLING") this.#paid = true;
     this.#state = next;
     this.o.journal.record({ at: this.#at(), kind: "purchase.stage", detail: next, ...this.mandate });
   }
@@ -178,6 +180,11 @@ export class PurchaseMachine {
     if (this.#state !== "AUTHORIZING") this.forbid("AUTHORIZING");
     this.#sending = true;
     this.#paid = true;
+  }
+
+  /** Пакет уходил продавцу или операция уже одобрена (SETTLING): остановка — только итоговым кодом (Р49 п. 2). */
+  get paid(): boolean {
+    return this.#paid;
   }
 
   /** Код, с которым остановится покупка (Р49 п. 2): после отправки пакета неитоговый — OPERATION_RESULT_UNCONFIRMED. */

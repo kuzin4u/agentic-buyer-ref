@@ -154,8 +154,12 @@ export class OrderRefused extends Error {
 
 /** Покупка остановлена воротами конвейера; код — в журнале (purchase.stage) и здесь. */
 export class PurchaseStopped extends Error {
-  constructor(readonly code: DiagCode) {
-    super(`Покупка остановлена: ${code}`);
+  /** `cause` — исходная ошибка шага, если код заменён после отправки пакета (Р49 п. 2): для оператора, не для человека */
+  constructor(
+    readonly code: DiagCode,
+    options?: { cause: unknown },
+  ) {
+    super(`Покупка остановлена: ${code}`, options);
     this.name = "PurchaseStopped";
   }
 }
@@ -529,12 +533,15 @@ export class Purchase {
         }
         // отказ окно не занимает; сбой, неизвестный исход и CONFIRMATION_REQUIRED (дальше стадия 4, исход не известен —
         // Р47 п. 6, решение владельца по ревью К3 № 4) — занимают (fail-closed)
+        // SETTLED на стадии 5 — событие одобрения прочитано поздно или потеряно, итог уже после клиринга: одобрение
+        // подтверждено, расчёт заберёт settle (ревью КТ1 № 6, дополнение 1 к Р49)
+        const approved = reply.status === "AUTHORIZED" || reply.status === "SETTLED";
         if (reply.status === "DECLINED") slot.settle("REFUSED");
-        else if (reply.status === "AUTHORIZED") slot.settle("APPROVED");
+        else if (approved) slot.settle("APPROVED");
         else slot.settle("UNKNOWN");
         if (reply.status === "DECLINED") this.#halt(ruleForDeclineReason(reply.declineReason).code);
         if (reply.status === "CONFIRMATION_REQUIRED") return null;
-        if (reply.status !== "AUTHORIZED") this.#halt("UNKNOWN");
+        if (!approved) this.#halt("UNKNOWN");
         return reply;
       });
       if (op === null) return this.#confirm(c);
@@ -587,10 +594,14 @@ export class Purchase {
    *  STOPPED (после отправки пакета — OPERATION_RESULT_UNCONFIRMED, Р49 п. 2). scope_check не WITHIN_LIMITS —
    *  уведомление оболочки, покупка DONE. */
   settle(signal?: AbortSignal): Promise<Operation> {
+    // расчёт ждут днями: повторный вызов, пока первый ждёт, — то же ожидание, не запрещённый переход (ревью КТ1 № 7б)
+    if (this.#busy && this.#machine.state === "SETTLING") return Promise.reject(new PaymentFailure("SETTLEMENT_PENDING"));
     return this.#stage("DONE", async () => {
       const authorized = this.#need(this.#operation);
+      // остановка покупки прерывает ожидание расчёта так же, как сигнал вызывающего (ревью КТ1 № 7а)
+      const until = signal === undefined ? this.#machine.stopped : AbortSignal.any([signal, this.#machine.stopped]);
       const op = await this.#guard(async () => {
-        const reply = snapshot(await this.o.payment.settle(copy(authorized), signal));
+        const reply = snapshot(await this.o.payment.settle(copy(authorized), until));
         if (reply.status !== "SETTLED") this.#halt("UNKNOWN");
         return reply;
       }, WAITS_SETTLEMENT);
@@ -818,7 +829,11 @@ export class Purchase {
             : e instanceof ShopFailure || e instanceof PaymentFailure
               ? e.code
               : (this.o.failureCode?.(e) ?? "UNKNOWN");
-      if (!waits.has(code)) this.#machine.stop(code);
+      if (waits.has(code)) throw e;
+      this.#machine.stop(code);
+      // пакет уходил и код заменён: наружу — итоговый код машины, а не код шага с его текстом (Р49 п. 2, блокер Р-298;
+      // ревью КТ1 № 1); итоговый код шага — его же ошибка
+      if (this.#machine.paid && this.#machine.reason !== code) throw new PurchaseStopped(this.#machine.reason ?? "OPERATION_RESULT_UNCONFIRMED", { cause: e });
       throw e;
     }
     this.#alive();
@@ -841,6 +856,7 @@ export class Purchase {
       } catch {
         // журнал недоступен и для purchase.stage: состояние машины уже STOPPED
       }
+      if (this.#machine.paid) throw new PurchaseStopped(this.#machine.reason ?? "OPERATION_RESULT_UNCONFIRMED", { cause: err });
       throw err;
     }
   }

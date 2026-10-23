@@ -115,7 +115,8 @@ export function payments(
       if (outcome !== "NONE" && outcome !== "UNBOUND") notify();
       return outcome;
     },
-    authorize: async (c: PaymentContext): Promise<Operation> => (steps.calls.push("authorize"), seen(c), op(c, o.authorize ?? {})),
+    // пакет уходит продавцу до итога — как у настоящего порта (Р45 Б2в; ревью КТ1 AG-11 ч. 2 № 2)
+    authorize: async (c: PaymentContext): Promise<Operation> => (steps.calls.push("authorize"), seen(c), c.sending(), op(c, o.authorize ?? {})),
     // расчёт — с записью об исполнении в пределах одобренного (Р49 п. 7); функция — исход задаёт тест
     settle: async (x: Operation): Promise<Operation> => {
       steps.calls.push("settle");

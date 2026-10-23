@@ -557,3 +557,28 @@ describe("вход вызывающего и прерывание (Р47 п. 8, �
     await expect(done).resolves.toBe("NONE");
   });
 });
+
+describe("появление запроса для гонки стадии 5 (Р49 п. 5; ревью КТ1 AG-11 ч. 2 № 5)", () => {
+  it("в счёт — только запрос, невостребованный после отметки; прежний чужой запрос гонку не решает; прерывание — отказ", async () => {
+    const s = setup();
+    s.answers.set(ID1, confirmation("PENDING"));
+    await s.event("confirmation.required", ID1);
+    // запрос лежит до отправки пакета этой покупки — отметка его не считает
+    const mark = s.conf.mark();
+    const ac = new AbortController();
+    let arrived = false;
+    const waiting = s.conf.arrival(ac.signal, mark).then(() => (arrived = true));
+    await settle();
+    expect(arrived).toBe(false);
+    s.answers.set(ID2, confirmation("PENDING", { id: ID2 }));
+    await s.event("confirmation.required", ID2);
+    await waiting;
+    expect(arrived).toBe(true);
+    // уже пришедший после отметки — сразу; прерывание до появления — отказ с причиной
+    await expect(s.conf.arrival(new AbortController().signal, mark)).resolves.toBeUndefined();
+    const stop = new AbortController();
+    const later = s.conf.arrival(stop.signal, s.conf.mark());
+    stop.abort(new Error("стоп"));
+    await expect(later).rejects.toThrow("стоп");
+  });
+});

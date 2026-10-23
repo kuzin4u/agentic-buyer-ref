@@ -756,12 +756,13 @@ describe("стадии 4–6 — исходы из порта PaymentSteps (ин
     }
   });
 
-  it("расчёт не SETTLED — STOPPED UNKNOWN (инвариант 4)", async () => {
+  it("расчёт не SETTLED — STOPPED, после одобрения итоговым кодом OPERATION_RESULT_UNCONFIRMED (инвариант 4, Р49 п. 2)", async () => {
     const r = await setup({ payment: payments({ settle: "REVERSED" }) });
     await ordered(r);
     await r.purchase.authorize({ idempotencyKey: "idem-pay-1" });
-    await expect(r.purchase.settle()).rejects.toMatchObject({ code: "UNKNOWN" });
+    await expect(r.purchase.settle()).rejects.toMatchObject({ code: "OPERATION_RESULT_UNCONFIRMED" });
     expect(r.purchase.state).toBe("STOPPED");
+    expect(r.tail().filter((e) => e.kind === "payment.unconfirmed").map((e) => e.reason)).toEqual(["UNKNOWN"]);
   });
 
   it("сбой порта оплаты — STOPPED UNKNOWN, исходная ошибка наружу", async () => {
@@ -838,7 +839,7 @@ describe("ответ порта не той формы или сбой — STOPP
     }
   });
 
-  it("авторизация и расчёт: ответ null — STOPPED UNKNOWN", async () => {
+  it("авторизация и расчёт: ответ null — STOPPED UNKNOWN до отправки пакета; после одобрения — OPERATION_RESULT_UNCONFIRMED наружу (Р49 п. 2)", async () => {
     const auth = await setup({ payment: { ...payments(), authorize: async () => null as never } });
     await ordered(auth);
     await expect(auth.purchase.authorize({ idempotencyKey: "idem-pay-1" })).rejects.toThrow();
@@ -847,8 +848,54 @@ describe("ответ порта не той формы или сбой — STOPP
     const settle = await setup({ payment: { ...payments(), settle: async () => null as never } });
     await ordered(settle);
     await settle.purchase.authorize({ idempotencyKey: "idem-pay-1" });
-    await expect(settle.purchase.settle()).rejects.toThrow();
-    expect(stages(settle).at(-1)).toBe("STOPPED:UNKNOWN");
+    await expect(settle.purchase.settle()).rejects.toMatchObject({ code: "OPERATION_RESULT_UNCONFIRMED" });
+    expect(stages(settle).at(-1)).toBe("STOPPED:OPERATION_RESULT_UNCONFIRMED");
+  });
+
+  it("ревью КТ1 № 1: после отправки пакета сбой шага с кодом и без — наружу PurchaseStopped OPERATION_RESULT_UNCONFIRMED, исходная ошибка — в cause", async () => {
+    const failure = new PlatformFailure("STATE_UNAVAILABLE", "same_key", "STATE_UNAVAILABLE", 503, null);
+    for (const boom of [failure, new Error("журнал витрины недоступен")]) {
+      const r = await setup({ payment: { ...payments(), authorize: (c: PaymentContext) => (c.sending(), Promise.reject(boom)) } });
+      await ordered(r);
+      const err = await r.purchase.authorize({ idempotencyKey: "idem-pay-1" }).catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(PurchaseStopped);
+      expect(err).toMatchObject({ code: "OPERATION_RESULT_UNCONFIRMED", cause: boom });
+      expect(r.purchase.reason).toBe("OPERATION_RESULT_UNCONFIRMED");
+      await closeStand();
+    }
+  });
+
+  it("ревью КТ1 № 6: итог стадии 5 уже SETTLED (событие одобрения прочитано поздно) — как одобрение: SETTLING, расчёт заберёт settle", async () => {
+    const r = await setup({ payment: payments({ authorize: { status: "SETTLED" } }) });
+    await ordered(r);
+    await expect(r.purchase.authorize({ idempotencyKey: "idem-pay-1" })).resolves.toMatchObject({ status: "SETTLED" });
+    expect(r.purchase.state).toBe("SETTLING");
+    await expect(r.purchase.settle()).resolves.toMatchObject({ status: "SETTLED" });
+    expect(r.purchase.state).toBe("DONE");
+  });
+
+  it("ревью КТ1 № 7: второй settle(), пока первый ждёт, — SETTLEMENT_PENDING без остановки; остановка покупки прерывает ожидание расчёта", async () => {
+    let seen: AbortSignal | undefined;
+    let finish: (op: Operation) => void = () => {};
+    const steps = {
+      ...payments(),
+      settle: (x: Operation, signal?: AbortSignal) => {
+        seen = signal;
+        return new Promise<Operation>((res) => (finish = (op) => res(op)));
+      },
+    };
+    const r = await setup({ payment: steps });
+    await ordered(r);
+    const authorized = await r.purchase.authorize({ idempotencyKey: "idem-pay-1" });
+    const first = r.purchase.settle();
+    await expect(r.purchase.settle()).rejects.toMatchObject({ code: "SETTLEMENT_PENDING" });
+    expect(r.purchase.state).toBe("SETTLING");
+    // порту передан сигнал: остановка покупки его прерывает
+    expect(seen).toBeInstanceOf(AbortSignal);
+    expect(seen!.aborted).toBe(false);
+    finish({ ...authorized, status: "SETTLED", fulfilment: { ref: "ful_1", finalAmount: authorized.amount!, scopeCheck: "WITHIN_LIMITS", spentPosition: authorized.amount!, at: "2026-10-23T12:05:00.000Z" } });
+    await expect(first).resolves.toMatchObject({ status: "SETTLED" });
+    expect(r.purchase.state).toBe("DONE");
   });
 });
 

@@ -3,6 +3,7 @@
 // поэтому операция относится к покупке по order_ref — ссылке заказа, которую агент сам передал в реквизите и пакете;
 // покупка встаёт в ожидание до отправки пакета. Сверка с заказом и CART — bind.ts. Слова продавца сюда не попадают
 // (инвариант 8).
+import { poll } from "../events/poll.js";
 import type { FeedItem } from "../ports/events.js";
 import { PlatformFailure, type FailureCode, type Mandate, type Operation, type OperationRecord, type OperationStatus, type ScopeCheck } from "../../shared/domain.js";
 import type { DiagCode } from "../../shared/diag-codes.js";
@@ -24,7 +25,8 @@ export interface OperationsJournal {
     entry:
       | { at: string; kind: "operation.status"; ref: string; detail: OperationStatus }
       | { at: string; kind: "operation.foreign" | "operation.unclaimed"; ref: string }
-      | { at: string; kind: "operation.unread"; ref: string; reason: DiagCode }
+      /** reason — OPERATION_UNREAD (диагностика оператора, Р49 дополнение 1 п. 1), detail — код отказа GET */
+      | { at: string; kind: "operation.unread"; ref: string; reason: "OPERATION_UNREAD"; detail: DiagCode }
       | { at: string; kind: "operation.mismatch"; ref: string; detail: MismatchField; reason: "OPERATION_REPLY_MISMATCH"; mandate?: string }
       | { at: string; kind: "operation.settled"; ref: string; detail: ScopeCheckDetail },
   ): void;
@@ -33,7 +35,9 @@ export interface OperationsJournal {
 export interface OperationsOptions {
   port: OperationsPort;
   journal: OperationsJournal;
-  params: { operation_outcome_max_delay_sec: number };
+  /** registry_cache_ttl_sec — предел недоступности GET на стадии 6 (инвариант 4); event_poll_interval_ms — пауза опроса
+   *  ленты после её отказа (без него опрос прекращается) */
+  params: { operation_outcome_max_delay_sec: number; registry_cache_ttl_sec: number; event_poll_interval_ms?: number };
   /** прочитать ленту (`EventFeed.signal`): ожидание будит её, пока не решится; частоту чтений ограничивает лента */
   wake?: () => Promise<void>;
   now?: () => Date;
@@ -76,8 +80,8 @@ export class Operations {
   readonly #seen = new Set<string>();
   /** order_ref → покупка, ждущая итог стадии 5 */
   readonly #byOrder = new Map<string, Expectation>();
-  /** op_ref → ожидание расчёта (стадия 6): событие только будит его, GET делает ожидание */
-  readonly #settling = new Map<string, Set<() => void>>();
+  /** op_ref → ожидания расчёта (стадия 6): событие только будит их, GET делает ожидание */
+  readonly #settling = new Map<string, Set<Waker>>();
 
   constructor(o: OperationsOptions) {
     this.#o = o;
@@ -103,7 +107,7 @@ export class Operations {
       if (opRef === null || !SAFE_ID.test(opRef)) return;
       const settling = this.#settling.get(opRef);
       if (settling) {
-        for (const poke of [...settling]) poke();
+        for (const w of [...settling]) w.poke();
         return;
       }
       const r = await this.#read(opRef);
@@ -179,12 +183,17 @@ export class Operations {
   /**
    * Стадия 6 (Р49 п. 6): GET по известному op_ref; не SETTLED — ждать operation.settled, без события дольше
    * operation_outcome_max_delay_sec — снова GET (#59 п. 3), пока вызывающий не прервёт (`signal` → PENDING, не отказ).
-   * Отказ GET, после которого Платформа просит повторить, — повтор в тот же срок; иной — UNREAD.
+   * Отказ GET, после которого Платформа просит повторить, — запись operation.unread и повтор в тот же срок; Платформа
+   * недоступна дольше registry_cache_ttl_sec — UNREAD (инвариант 4; ревью КТ1 № 8); иной отказ — UNREAD сразу.
    */
   async settle(authorized: Operation, signal: AbortSignal): Promise<SettleOutcome> {
     const opRef = authorized.opRef;
-    const pokes = this.#settling.get(opRef) ?? new Set<() => void>();
-    this.#settling.set(opRef, pokes);
+    const wakers = this.#settling.get(opRef) ?? new Set<Waker>();
+    this.#settling.set(opRef, wakers);
+    // событие, пришедшее пока шёл GET, не теряется: флаг «разбужен» проверяет следующая пауза (ревью КТ1 № 10)
+    const waker = new Waker();
+    wakers.add(waker);
+    let unavailableSince: number | null = null;
     try {
       for (;;) {
         if (signal.aborted) return { kind: "PENDING" };
@@ -192,11 +201,16 @@ export class Operations {
         try {
           r = await this.#read(opRef);
         } catch (e) {
-          // Платформа просит повторить — после паузы; сбой журнала — наружу
+          // Платформа просит повторить — после паузы, но не дольше registry_cache_ttl_sec подряд; сбой журнала — наружу
           if (!(e instanceof PlatformFailure)) throw e;
-          if (!(await this.#pause(pokes, signal))) return { kind: "PENDING" };
+          this.#record({ kind: "operation.unread", ref: opRef, reason: "OPERATION_UNREAD", detail: e.code });
+          const now = this.#now().getTime();
+          unavailableSince ??= now;
+          if (now - unavailableSince >= this.#o.params.registry_cache_ttl_sec * 1000) return { kind: "UNREAD" };
+          if (!(await this.#pause(waker, signal))) return { kind: "PENDING" };
           continue;
         }
+        unavailableSince = null;
         if (r === null) return { kind: "UNREAD" };
         const op = settledOperation(r, authorized);
         if (typeof op === "string") {
@@ -209,49 +223,44 @@ export class Operations {
           return { kind: "OPERATION", operation: op };
         }
         if (op.status !== "AUTHORIZED") return { kind: "OPERATION", operation: op };
-        if (!(await this.#pause(pokes, signal))) return { kind: "PENDING" };
+        if (!(await this.#pause(waker, signal))) return { kind: "PENDING" };
       }
     } finally {
       // ожидание по op_ref снимается, когда его больше никто не ждёт
-      if (pokes.size === 0) this.#settling.delete(opRef);
+      wakers.delete(waker);
+      if (wakers.size === 0 && this.#settling.get(opRef) === wakers) this.#settling.delete(opRef);
     }
   }
 
-  /** Пауза стадии 6: до события по op_ref или operation_outcome_max_delay_sec; false — прервал вызывающий. */
-  #pause(pokes: Set<() => void>, signal: AbortSignal): Promise<boolean> {
+  /** Пауза стадии 6: до события по op_ref (в том числе пришедшего до паузы) или operation_outcome_max_delay_sec; false —
+   *  прервал вызывающий. */
+  #pause(waker: Waker, signal: AbortSignal): Promise<boolean> {
     if (signal.aborted) return Promise.resolve(false);
+    if (waker.take()) return Promise.resolve(true);
     return new Promise<boolean>((resolve) => {
       let settled = false;
       const end = (v: boolean) => {
         if (settled) return;
         settled = true;
         cancel();
-        pokes.delete(poke);
+        waker.listener = null;
         signal.removeEventListener("abort", onAbort);
         resolve(v);
       };
-      const poke = () => end(true);
       const onAbort = () => end(false);
       const cancel = this.#timer(() => end(true), Math.min(this.#o.params.operation_outcome_max_delay_sec * 1000, TIMER_MAX_MS));
-      pokes.add(poke);
+      waker.listener = () => {
+        waker.take();
+        end(true);
+      };
       signal.addEventListener("abort", onAbort, { once: true });
       void this.#poll(() => settled);
     });
   }
 
-  /** Лента читается, пока покупка ждёт: push может не прийти (как у модуля подтверждений). Отказ ленты — опрос
-   *  прекращается, исход — по таймерам. */
-  async #poll(done: () => boolean): Promise<void> {
-    const wake = this.#o.wake;
-    if (wake === undefined) return;
-    while (!done()) {
-      try {
-        await wake();
-      } catch {
-        return;
-      }
-      await new Promise<void>((r) => setImmediate(r));
-    }
+  /** Лента читается, пока покупка ждёт (events/poll.ts): отказ ленты — пауза event_poll_interval_ms и чтение дальше. */
+  #poll(done: () => boolean): Promise<void> {
+    return poll(this.#o.wake, done, this.#o.params.event_poll_interval_ms);
   }
 
   /**
@@ -269,11 +278,11 @@ export class Operations {
         return null;
       }
       if (e instanceof PlatformFailure && REREAD.has(e.code)) throw e;
-      this.#record({ kind: "operation.unread", ref: opRef, reason: e instanceof PlatformFailure ? e.code : "UNKNOWN" });
+      this.#record({ kind: "operation.unread", ref: opRef, reason: "OPERATION_UNREAD", detail: e instanceof PlatformFailure ? e.code : "UNKNOWN" });
       return null;
     }
     if (r.opRef !== opRef) {
-      this.#record({ kind: "operation.unread", ref: opRef, reason: "BAD_RESPONSE" });
+      this.#record({ kind: "operation.unread", ref: opRef, reason: "OPERATION_UNREAD", detail: "BAD_RESPONSE" });
       return null;
     }
     this.#record({ kind: "operation.status", ref: opRef, detail: r.status });
@@ -282,6 +291,22 @@ export class Operations {
 
   #record(e: WithoutAt<JournalEntry>): void {
     this.#o.journal.record({ at: this.#now().toISOString(), ...e } as JournalEntry);
+  }
+}
+
+/** Будильник ожидания расчёта: событие по op_ref до паузы — флаг, во время паузы — сразу. */
+class Waker {
+  #woken = false;
+  listener: (() => void) | null = null;
+  poke(): void {
+    this.#woken = true;
+    this.listener?.();
+  }
+  /** Был разбужен — снять флаг. */
+  take(): boolean {
+    const w = this.#woken;
+    this.#woken = false;
+    return w;
   }
 }
 

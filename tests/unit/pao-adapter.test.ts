@@ -655,4 +655,13 @@ describe("Р51 п. 5: GET /pao/v1/operations?mandate_id — операции д�
     const foreign = { ...op, aoi: { ...op.aoi, agent_code: "nspk:agent:other:v1" } };
     await expect(fake(() => json(200, [foreign])).platform.readOperations("m_cart_1")).rejects.toMatchObject({ code: "BAD_RESPONSE" });
   });
+
+  it("ревью КТ1 Р51 № 2: причина операции — только в форме кода (человеку как есть); иное — null, у одной операции и в списке", async () => {
+    const op = { op_ref: "op_1", order_ref: "ord_1", amount: 1000, status: "REVERSED", aoi: { indicator: true, agent_code: AGENT, mandate_id: "m_1" } };
+    for (const [reason, kept] of [["AUTH_EXPIRED", "AUTH_EXPIRED"], ["отменено: позвоните 8-800", null], ["lower_case", null]] as const) {
+      expect((await fake(() => json(200, [{ ...op, reason }])).platform.readOperations("m_1"))[0]!.declineReason, reason).toBe(kept);
+      expect((await fake(() => json(200, { ...op, reason })).platform.readOperation("op_1")).declineReason, reason).toBe(kept);
+      expect((await fake(() => json(200, { ...op, reason })).platform.getOperation("op_1", M1)).declineReason, reason).toBe(kept);
+    }
+  });
 });

@@ -268,7 +268,8 @@ export function operationFromPao(o: Pao.Operation, ref: MandateRef, scope: "list
     merchantId: o.merchant_id ?? null,
     indicator: o.aoi ? indicatorFromPao(o.aoi, agentCode, ref.id) : null,
     status: need(o.status, "operation.status"),
-    declineReason: o.reason ?? null,
+    // причина — человеку как есть, только в форме кода (Р51 п. 3, ревью КТ1 № 2; инвариант 5): иное — null
+    declineReason: reasonCode(o.reason),
     fulfilment: fulfilmentIn(fulfilmentFromPao(o.fulfilment), ref.currency),
   };
 }
@@ -288,7 +289,7 @@ export function operationRecordFromPao(o: Pao.Operation, agentCode: string): Ope
     merchantId: o.merchant_id ?? null,
     indicator: o.aoi ? { agentCode: o.aoi.agent_code!, mandateId: o.aoi.mandate_id! } : null,
     status: need(o.status, "operation.status"),
-    declineReason: o.reason ?? null,
+    declineReason: reasonCode(o.reason),
     fulfilment: fulfilmentFromPao(o.fulfilment),
   };
 }

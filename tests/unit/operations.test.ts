@@ -237,13 +237,13 @@ describe("стадия 5: итог операции по событию и GET (
     expect(s.gets).toEqual(["op_1", "op_1"]);
   });
 
-  it("две покупки ждут одну ссылку заказа — привязка неоднозначна: обе NONE", async () => {
+  it("две покупки ждут одну ссылку заказа — привязка неоднозначна: обе AMBIGUOUS (не NONE: поиск по CART её не снимает, ревью КТ1 Р51 № 3)", async () => {
     const s = setup();
     const a = s.waiting();
     const b = s.waiting();
     await tick();
-    expect(a.outcome()).toEqual({ kind: "NONE" });
-    expect(b.outcome()).toEqual({ kind: "NONE" });
+    expect(a.outcome()).toEqual({ kind: "AMBIGUOUS" });
+    expect(b.outcome()).toEqual({ kind: "AMBIGUOUS" });
   });
 
   it("после close() события по заказу — operation.unclaimed", async () => {
@@ -451,6 +451,28 @@ describe("стадия 6: расчёт по operation.settled и GET (Р49 п. 6
       expect(r.out()).toMatchObject({ kind: "OPERATION", operation: { fulfilment: { scopeCheck: { other: kept } } } });
       expect(kinds(s.journal).at(-1)).toBe("operation.settled:OTHER");
     }
+  });
+
+  it("ревью КТ1 Р51 № 1: граница не число (недействительная дата) — EXPIRED без GET и без таймеров; запись operation.unsettled", async () => {
+    const s = setup();
+    s.answers.set("op_1", record("AUTHORIZED"));
+    const r = settling(s, Number.NaN);
+    await tick();
+    expect(r.out()).toEqual({ kind: "EXPIRED" });
+    expect(s.gets).toEqual([]);
+    expect(kinds(s.journal)).toEqual(["operation.unsettled:"]);
+  });
+
+  it("ревью КТ1 Р51 № 7: граница прошла, пока GET отказывает с просьбой повторить, — EXPIRED и operation.unsettled, не UNREAD", async () => {
+    const s = setup();
+    s.answers.set("op_1", new PlatformFailure("STATE_UNAVAILABLE", "same_key", "STATE_UNAVAILABLE", 503, null));
+    // граница — раньше предела недоступности: по ней исход — граница, а не «Платформа недоступна»
+    const r = settling(s, T0 + DELAY_SEC * 1000);
+    await tick();
+    await s.c.advance(DELAY_SEC * 1000);
+    await tick();
+    expect(r.out()).toEqual({ kind: "EXPIRED" });
+    expect(kinds(s.journal).slice(-2)).toEqual(["operation.unread:STATE_UNAVAILABLE", "operation.unsettled:"]);
   });
 
   it("ревью КТ1 № 8: GET 503 подряд дольше registry_cache_ttl_sec — UNREAD; каждый отказ — запись operation.unread", async () => {

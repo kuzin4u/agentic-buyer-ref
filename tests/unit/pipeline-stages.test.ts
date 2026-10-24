@@ -987,15 +987,18 @@ describe("стадии 4–6 — исходы из порта PaymentSteps (ин
     // итоговый код — без замены на OPERATION_RESULT_UNCONFIRMED (Р49 п. 2)
     expect(r.tail().some((e) => e.kind === "payment.unconfirmed")).toBe(false);
     expect(notified).toEqual([]);
+    // снимок операции — REVERSED, не прежний AUTHORIZED: op_ref и причина для оболочки (ревью КТ1 Р51 № 2)
+    expect(r.purchase.operation).toMatchObject({ opRef: "op_1", status: "REVERSED" });
   });
 
-  it("Р51 п. 3: REVERSED на стадии 5 (реверсал до ответа эмитента, итог по GET) — STOPPED OPERATION_REVERSED, место в окне дробления занято", async () => {
+  it("Р51 п. 3: REVERSED на стадии 5 (реверсал до ответа эмитента, итог по GET) — STOPPED OPERATION_REVERSED; снимок операции — REVERSED с причиной (окно — в «окне дробления» ниже)", async () => {
     const r = await setup({ payment: payments({ authorize: { status: "REVERSED", declineReason: "REVERSAL" } }) });
     await ordered(r);
     await expect(r.purchase.authorize({ idempotencyKey: "idem-pay-1" })).rejects.toMatchObject({ code: "OPERATION_REVERSED" });
     expect(r.purchase.reason).toBe("OPERATION_REVERSED");
     expect(r.purchase.next).toBe("NOTIFY_HUMAN");
     expect(r.tail().some((e) => e.kind === "payment.unconfirmed")).toBe(false);
+    expect(r.purchase.operation).toMatchObject({ opRef: "op_1", status: "REVERSED", declineReason: "REVERSAL" });
   });
 
   it("Р51 п. 3: REFUNDED на GET стадии 6 (расчёт и возврат уже были) — DONE, уведомление OPERATION_REFUNDED с суммой списания и валютой", async () => {
@@ -1567,6 +1570,10 @@ describe("политика до стадий 4–5 (Р39): отказ — agent.
     [{ status: "CONFIRMATION_REQUIRED" }, true],
     // ответ не той формы для стадии 5 — неизвестный исход (STOPPED UNKNOWN), окно занято
     [{ status: "SETTLED" }, true],
+    // оплата отменена — окно занято: клиринг после реверсала возможен (Р51 п. 3, fail-closed; ревью КТ1 Р51 № 6)
+    [{ status: "REVERSED", declineReason: "REVERSAL" }, true],
+    // расчёт и возврат уже были — как одобрение (Р51 п. 3)
+    [{ status: "REFUNDED" }, true],
   ] as const) {
     it(`ответ стадии 5 ${reply.status} — операция ${counts ? "занимает" : "не занимает"} окно дробления (Р39 п. 4)`, async () => {
       const r = await setup({ payment: payments({ authorize: reply }) });

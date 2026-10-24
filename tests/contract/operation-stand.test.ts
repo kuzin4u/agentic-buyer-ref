@@ -7,10 +7,12 @@
 // GET и запись об исполнении — настоящие. Ответ продавца DECLINED — только слова (инвариант 8): итог — по событию.
 import { afterEach, describe, expect, it } from "vitest";
 import { DIAG } from "../../src/agent/compose.js";
+import { Operations } from "../../src/agent/operations/index.js";
+import type { Mandate } from "../../src/shared/domain.js";
 import { INTENT } from "../support/consents.js";
 import { shopBy, type Contour } from "../support/contour.js";
 import { one } from "../support/purchase.js";
-import { STAND_TIMEOUT_MS, standPurchase } from "../support/stand-purchase.js";
+import { SHORT_DELAY_SEC, STAND_TIMEOUT_MS, standPurchase } from "../support/stand-purchase.js";
 
 let c: Contour | undefined;
 afterEach(async () => {
@@ -116,16 +118,17 @@ describe("стадии 5–6 на стенде v0.20.0: итог из событ
 
   it("Р51 п. 5: реверсал до ответа эмитента — событий нет вовсе; итог находит поиск GET ?mandate_id по CART — STOPPED OPERATION_REVERSED, текст Р51 п. 3; бюджет CART освобождён", async () => {
     // сроки стадии 5 — короткие: событий не будет, ждать полный срок незачем (сравнение — с одним поиском после срока)
-    const r = await standPurchase({ contourPayment: true, adpUntilPs11: true, params: { operation_outcome_max_delay_sec: 1, confirmation_wait_ms: 1000 } });
+    const r = await standPurchase({ contourPayment: true, adpUntilPs11: true, params: { operation_outcome_max_delay_sec: SHORT_DELAY_SEC, confirmation_wait_ms: SHORT_DELAY_SEC * 1000 } });
     c = r.c;
     const intent = await r.purchase.intent({ ...INTENT, merchantScope: [NORMAL.merchant_id] }, { idempotencyKey: "idem-intent-rev" });
     await r.signWhileWaiting(intent.id, () => r.purchase.awaitIntent());
     const offer = (await r.purchase.search()).contour.find((o) => o.shopId === NORMAL.id)!;
     const cart = await r.purchase.cart(one(offer, 1), { idempotencyKey: "idem-cart-rev" });
     await r.signWhileWaiting(cart.id, () => r.purchase.awaitCart());
-    await r.purchase.placeOrder({ idempotencyKey: "idem-order-rev" });
+    const order = await r.purchase.placeOrder({ idempotencyKey: "idem-order-rev" });
     const total = cart.cart!.total;
 
+    const start = r.c.calls().length;
     const authorizing = r.purchase.authorize({ idempotencyKey: "idem-pay-rev" }).catch((e: unknown) => e);
     const d = await decided(r);
     expect(d.decision).toBe("APPROVE");
@@ -136,11 +139,42 @@ describe("стадии 5–6 на стенде v0.20.0: итог из событ
     expect(r.purchase.reason).toBe("OPERATION_REVERSED");
     expect(r.purchase.next).toBe("NOTIFY_HUMAN");
     expect(DIAG.OPERATION_REVERSED!.human.ru).toBe("Оплата отменена; списания быть не должно — если оно всё же придёт, сообщим отдельно. Покупка остановлена; итог проверьте в приложении банка.");
-    // поиск — одно обращение по CART; запись — CART и BOUND, без тела ответа
-    expect(r.c.calls().filter((x) => x.target === "pao" && x.route === "GET /pao/v1/operations")).toHaveLength(1);
+    // полный журнал обращений стадии 5 (ленту не считаем): ворота, реквизит, пакет и один поиск по CART — ни GET одной
+    // операции, ни второй выдачи (ревью КТ1 Р51 № 4)
+    const ids: Record<string, string> = { intent: intent.id, cart: cart.id, shop: NORMAL.id, order: order.orderId };
+    const shape = (x: { target: string; route: string; status: number }) =>
+      `${x.target} ${Object.entries(ids).reduce((route, [name, id]) => route.replaceAll(id, `{${name}}`), x.route)} ${x.status}`;
+    expect(r.c.calls().slice(start).filter((x) => !x.route.startsWith("GET /pao/v1/events")).map(shape)).toEqual([
+      "pao GET /pao/v1/mandates/{intent}/verify 200",
+      "pao GET /pao/v1/mandates/{cart}/verify 200",
+      "pao POST /pao/v1/credentials 201",
+      "merchants POST /v1/shops/{shop}/orders/{order}/payment 200",
+      // не обращения агента: копия сообщения эквайрера в ADP стенда (подмена до PS-11) и REVERSAL процессинга от теста (ПИ-3)
+      "pao POST /adp/v1/decide 200",
+      "pao POST /adp/v1/events 202",
+      "pao GET /pao/v1/operations 200",
+    ]);
+    expect(r.c.violations()).toEqual([]);
+    // запись поиска — CART и BOUND, без тела ответа
     expect(entries(r, "operation.lookup")).toEqual([[cart.id, "BOUND"]]);
     expect(entries(r, "operation.reversed")).toEqual([[d.op_ref, "REVERSAL"]]);
+    // снимок операции покупки — REVERSED с причиной (ревью КТ1 Р51 № 2)
+    expect(r.purchase.operation).toMatchObject({ opRef: d.op_ref, status: "REVERSED", declineReason: "REVERSAL" });
+    // реквизит нигде не встречается (инвариант 1)
+    const out = JSON.stringify([r.c.journal.entries, r.purchase.operation]);
+    for (const s of r.c.issuedSecrets!()) expect(out.includes(s)).toBe(false);
     // бюджет освободила Платформа — по verify (инвариант 6)
     expect((await r.c.platform.verifyMandate({ id: cart.id, currency: total.currency })).amountLeft).toEqual(total);
+  });
+
+  it("Р51 п. 5, ревью КТ1 Р51 № 9: поиск по неизвестному CART на стенде — 404 MANDATE_NOT_FOUND, исход NONE (дальше OPERATION_RESULT_UNCONFIRMED), код в operation.lookup, подпись не остановлена", async () => {
+    const r = await standPurchase({ contourPayment: true });
+    c = r.c;
+    await expect(r.c.platform.readOperations("m_cart_unknown")).rejects.toMatchObject({ code: "MANDATE_NOT_FOUND", httpStatus: 404 });
+    const ops = new Operations({ port: r.c.platform, journal: r.c.journal, params: r.params });
+    const unknown = { ...INTENT, id: "m_cart_unknown", kind: "CART", cart: { merchantId: NORMAL.merchant_id, lines: [], total: { amount: 1, currency: "RUB" } } } as unknown as Mandate;
+    expect(await ops.lookup("ord_unknown", unknown)).toEqual({ kind: "NONE" });
+    expect(entries(r, "operation.lookup")).toEqual([["m_cart_unknown", "MANDATE_NOT_FOUND"]]);
+    expect(r.c.admission()).toBeNull();
   });
 });

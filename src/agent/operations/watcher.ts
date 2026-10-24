@@ -38,7 +38,8 @@ export interface OperationsJournal {
       | { at: string; kind: "operation.reversed"; ref: string; detail: ReversalDetail }
       /** поиск операции по CART после итога без события (Р51 п. 5): ref — CART по маске, тела ответа нет */
       | { at: string; kind: "operation.lookup"; ref?: string; detail: LookupDetail }
-      /** граница reservation_ttl_sec прошла, последний GET — по-прежнему AUTHORIZED (Р51 п. 2 (б)) */
+      /** граница reservation_ttl_sec прошла: последний GET — по-прежнему AUTHORIZED или отказ с просьбой повторить; граница
+       *  не число — без GET (Р51 п. 2 (б), ревью КТ1 № 1, № 7) */
       | { at: string; kind: "operation.unsettled"; ref: string },
   ): void;
 }
@@ -70,8 +71,9 @@ export interface OperationsOptions {
 }
 
 /** Итог стадии 5: операция привязана и сверена; MISMATCH — привязана, но не сходится с покупкой (запись
- *  operation.mismatch); NONE — привязанной операции нет за срок или привязка неоднозначна. */
-export type OperationOutcome = { kind: "OPERATION"; operation: Operation } | { kind: "MISMATCH" } | { kind: "NONE" };
+ *  operation.mismatch); NONE — привязанной операции нет за срок; AMBIGUOUS — привязка неоднозначна (два ожидания одной
+ *  ссылки заказа): итога нет, и поиск по CART его не ищет (ревью КТ1 Р51 № 3). */
+export type OperationOutcome = { kind: "OPERATION"; operation: Operation } | { kind: "MISMATCH" } | { kind: "NONE" } | { kind: "AMBIGUOUS" };
 
 /** Итог стадии 6: SETTLED или иной статус — операция; MISMATCH — другая операция; PENDING — расчёта нет, ожидание прервал
  *  вызывающий; UNREAD — GET не подтверждён и не повторяется; EXPIRED — граница ожидания прошла, итога нет (Р51 п. 2 (б)). */
@@ -177,7 +179,7 @@ export class Operations {
         done();
       };
       const check = () => {
-        if (exp.ambiguous) return end(() => resolve({ kind: "NONE" }));
+        if (exp.ambiguous) return end(() => resolve({ kind: "AMBIGUOUS" }));
         if (exp.result !== null) {
           const r = exp.result;
           end(() => resolve(r));
@@ -254,7 +256,14 @@ export class Operations {
     const waker = new Waker();
     wakers.add(waker);
     let unavailableSince: number | null = null;
+    const expired = (): SettleOutcome => {
+      this.#record({ kind: "operation.unsettled", ref: opRef });
+      return { kind: "EXPIRED" };
+    };
     try {
+      // граница не число (недействительная дата от вызывающего) — fail-closed без чтения: иначе пауза NaN — GET без
+      // промежутка и без конца (ревью КТ1 Р51 № 1); +∞ — границы нет
+      if (Number.isNaN(deadline)) return expired();
       for (;;) {
         if (signal.aborted) return { kind: "PENDING" };
         let r: OperationRecord | null;
@@ -265,6 +274,8 @@ export class Operations {
           if (!(e instanceof PlatformFailure)) throw e;
           this.#record({ kind: "operation.unread", ref: opRef, reason: "OPERATION_UNREAD", detail: e.code });
           const now = this.#now().getTime();
+          // граница прошла, пока Платформа недоступна, — тот же исход, что по последнему GET (ревью КТ1 Р51 № 7)
+          if (now >= deadline) return expired();
           unavailableSince ??= now;
           if (now - unavailableSince >= this.#o.params.registry_cache_ttl_sec * 1000) return { kind: "UNREAD" };
           if (!(await this.#pause(waker, signal, this.#o.params.operation_outcome_max_delay_sec * 1000))) return { kind: "PENDING" };
@@ -286,10 +297,7 @@ export class Operations {
         if (op.status !== "AUTHORIZED") return { kind: "OPERATION", operation: op };
         // граница прошла, этот GET — последний (Р51 п. 2 (б)); до неё — пауза не дольше остатка срока
         const left = deadline - this.#now().getTime();
-        if (left <= 0) {
-          this.#record({ kind: "operation.unsettled", ref: opRef });
-          return { kind: "EXPIRED" };
-        }
+        if (left <= 0) return expired();
         if (!(await this.#pause(waker, signal, Math.min(this.#o.params.operation_reread_interval_sec * 1000, left)))) return { kind: "PENDING" };
       }
     } finally {

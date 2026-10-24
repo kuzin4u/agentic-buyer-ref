@@ -568,7 +568,7 @@ export class Purchase {
         else if (approved) slot.settle("APPROVED");
         else slot.settle("UNKNOWN");
         if (reply.status === "DECLINED") this.#halt(ruleForDeclineReason(reply.declineReason).code);
-        if (reply.status === "REVERSED") this.#halt("OPERATION_REVERSED");
+        if (reply.status === "REVERSED") this.#reversed(reply);
         if (reply.status === "CONFIRMATION_REQUIRED") return null;
         if (!approved) this.#halt("UNKNOWN");
         return reply;
@@ -635,7 +635,7 @@ export class Purchase {
       const authorizedAt = this.#authorizedAt === null ? undefined : new Date(this.#authorizedAt);
       const op = await this.#guard(async () => {
         const reply = snapshot(await this.o.payment.settle(copy(authorized), until, authorizedAt));
-        if (reply.status === "REVERSED") this.#halt("OPERATION_REVERSED");
+        if (reply.status === "REVERSED") this.#reversed(reply);
         if (reply.status !== "SETTLED" && reply.status !== "REFUNDED") this.#halt("UNKNOWN");
         return reply;
       }, WAITS_SETTLEMENT);
@@ -841,6 +841,13 @@ export class Purchase {
    *  id не по маске — запись без mandate, а не с id INTENT (ревью reviewer К3 № 2). */
   #abandon(detail: CartAbandoned): void {
     if (this.#cart !== null) this.#record({ kind: "cart.abandoned", detail, ...maskedMandate(this.#cart.id) }, false);
+  }
+
+  /** Оплата отменена (Р51 п. 3): снимок операции REVERSED — до остановки, чтобы `purchase.operation` отдал op_ref и
+   *  причину как есть (ревью КТ1 Р51 № 2); затем итоговая остановка OPERATION_REVERSED. */
+  #reversed(op: Operation): never {
+    this.#operation = op;
+    this.#halt("OPERATION_REVERSED");
   }
 
   #halt(code: DiagCode, cause?: StopCause): never {

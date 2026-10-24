@@ -62,6 +62,18 @@ describe("ContourPayment: итог стадии 5 (Р49 п. 5)", () => {
     expect(c.log.some((x) => x.startsWith("lookup"))).toBe(false);
   });
 
+  it("ревью КТ1 Р51 № 3, № 9: привязка неоднозначна — OPERATION_RESULT_UNCONFIRMED без поиска; покупку остановили до поиска — поиска нет", async () => {
+    const reversed: Operation = { ...DECLINED, status: "REVERSED", declineReason: "REVERSAL" };
+    const a = steps({ reply: "PAID", outcome: async () => ({ kind: "AMBIGUOUS" }), lookup: { kind: "OPERATION", operation: reversed } });
+    await expect(a.p.authorize(ctx(), { idempotencyKey: "k" })).rejects.toMatchObject({ code: "OPERATION_RESULT_UNCONFIRMED" });
+    expect(a.log.some((x) => x.startsWith("lookup"))).toBe(false);
+    // срок вышел (NONE) ровно тогда, когда покупку остановили: сигнал уже прерван — поиска нет
+    const ac = new AbortController();
+    const b = steps({ reply: "PAID", outcome: async () => (ac.abort(new Error("остановлена")), { kind: "NONE" }), lookup: { kind: "OPERATION", operation: reversed } });
+    await expect(b.p.authorize(ctx(ac.signal), { idempotencyKey: "k" })).rejects.toMatchObject({ code: "OPERATION_RESULT_UNCONFIRMED" });
+    expect(b.log.some((x) => x.startsWith("lookup"))).toBe(false);
+  });
+
   it("(а) DECLINED продавца, operation.declined раньше запроса подтверждения — операция (код §7б у конвейера), гонка снята", async () => {
     const { p, log } = steps({ reply: "DECLINED", outcome: async () => ({ kind: "OPERATION", operation: DECLINED }) });
     await expect(p.authorize(ctx(), { idempotencyKey: "k" })).resolves.toMatchObject({ status: "DECLINED", declineReason: "LIMIT_EXCEEDED" });

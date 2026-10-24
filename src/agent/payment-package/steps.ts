@@ -127,7 +127,8 @@ export class ContourPayment implements PaymentSteps {
     // остановили — поиска нет
     if (outcome.kind === "NONE" && !signal.aborted) outcome = await lookup();
     if (outcome.kind === "MISMATCH") throw new PaymentFailure("OPERATION_REPLY_MISMATCH");
-    if (outcome.kind === "NONE") throw new PaymentFailure("OPERATION_RESULT_UNCONFIRMED");
+    // неоднозначная привязка — итога нет, поиск её не снимает (Р49 п. 4–5; ревью КТ1 Р51 № 3)
+    if (outcome.kind === "NONE" || outcome.kind === "AMBIGUOUS") throw new PaymentFailure("OPERATION_RESULT_UNCONFIRMED");
     return outcome.operation;
   }
 

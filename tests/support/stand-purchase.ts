@@ -13,7 +13,7 @@ import { ContourPayment } from "../../src/agent/payment-package/index.js";
 import { Purchase } from "../../src/agent/pipeline/index.js";
 import { OrderPriceMismatches, SplitWindow } from "../../src/agent/policy/index.js";
 import type { FeedItem, HttpRequestSigning, NoticeAmount, PaymentPlatform, PurchaseNotice } from "../../src/agent/ports/index.js";
-import { parseParams, type StandParams } from "../../src/shared/config.js";
+import { loadParams, parseParams, type StandParams } from "../../src/shared/config.js";
 import type { Mandate } from "../../src/shared/domain.js";
 import { INTENT } from "./consents.js";
 import { createContour, type Contour } from "./contour.js";
@@ -22,6 +22,10 @@ import { standShops } from "./stand-shop.js";
 
 /** Стенд в процессе теста под параллельной нагрузкой прогона бывает медленнее 5 с (нюанс К2.3 Р38). */
 export const STAND_TIMEOUT_MS = 30_000;
+
+/** Срок стадии 5 в тестах, где события operation.* не будет: не больше 1 с от стендового, чтобы тест не ждал полный срок
+ *  (ревью КТ1 AG-11 ч. 2 № 13; ревью КТ1 Р51 № 5). Производное от конфигурации, не литерал. */
+export const SHORT_DELAY_SEC = Math.min(loadParams().operation_outcome_max_delay_sec, 1);
 
 export const pause = (ms: number) => new Promise((r) => setTimeout(r, ms));
 

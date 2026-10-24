@@ -85,9 +85,10 @@ describe("стадия 5 на стенде: реквизит по ПАО и па
     // вне полного журнала — только чтения ленты стенда, все успешные (ревью reviewer К2 № 13)
     expect(all.filter((s) => s.startsWith("pao GET /pao/v1/events")).every((s) => /^pao GET \/pao\/v1\/events(\?\S*)? 200$/.test(s))).toBe(true);
     expect(all.filter((s) => !s.startsWith("pao GET /pao/v1/events"))).toEqual([
-      // ворота стадии 5
+      // ворота стадии 5: verify INTENT и CART, знак готовности продавца корзины (Р53 п. 6)
       "pao GET /pao/v1/mandates/{intent}/verify 200",
       "pao GET /pao/v1/mandates/{cart}/verify 200",
+      `pao GET /pao/v1/merchants/${NORMAL.merchant_id}/readiness 200`,
       // реквизит по CART — витрина приняла пакет: order_ref и cart_mandate_id пакета совпали с заказом
       `${CREDENTIALS} 201`,
       "merchants POST /v1/shops/{shop}/orders/{order}/payment 200",
@@ -263,6 +264,7 @@ describe("стадия 5 на стенде: реквизит по ПАО и па
     expect(r.c.agentCalls().slice(start).filter((x) => !x.route.startsWith("GET /pao/v1/events")).map((x) => shape(x, ids))).toEqual([
       "pao GET /pao/v1/mandates/{intent}/verify 200",
       "pao GET /pao/v1/mandates/{cart}/verify 200",
+      `pao GET /pao/v1/merchants/${NORMAL.merchant_id}/readiness 200`,
       "pao POST /pao/v1/credentials 201",
       "merchants POST /v1/shops/{shop}/orders/{order}/payment 200",
       // итога нет — один поиск по CART (Р51 п. 5)
@@ -329,6 +331,7 @@ describe("стадия 5 на стенде: реквизит по ПАО и па
     ).toEqual([
       "pao GET /pao/v1/mandates/{intent}/verify 200",
       "pao GET /pao/v1/mandates/{cart}/verify 200",
+      `pao GET /pao/v1/merchants/${NORMAL.merchant_id}/readiness 200`,
       `${CREDENTIALS} 201`,
       "merchants POST /v1/shops/{shop}/orders/{order}/payment 200",
       // итога нет — один поиск по CART (Р51 п. 5)

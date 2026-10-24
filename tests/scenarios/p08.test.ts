@@ -4,13 +4,16 @@
 // или кодом агента, ни повтора не повторяемого кода; агент не останавливается.
 // Отказ — настоящий ответ эмулятора, код из MERCHANT_ERROR_CODES (ревью К1 Б2). С v0.23.0 `GET /v1/shops` опознаёт агента,
 // как каталог (#64 п. 2): ключ не из реестра стенда отсекается уже на списке; отказ каталога при принятом списке — отзыв
-// ключа после списка и сдвиг часов стенда за срок кэша каталога ключей у витрин (`merchant_jwks_max_age_sec`, #64 п. 1).
+// ключа после знака первой витрины и сдвиг часов стенда за срок кэша каталога ключей у витрин (`merchant_jwks_max_age_sec`,
+// #64 п. 1). С Р53 перед каталогом — знак готовности по ПАО: отзыв ПАО видит сразу (401 AGENT_KEY_REVOKED на знаке
+// следующей витрины) — общее правило обращений к ПАО (Р53 п. 5).
 // ЭМУЛЯЦИЯ СВЕРХ ЭМУЛЯТОРА (ответ подменён в fetch адаптера, остальные обращения — настоящие) — только то, чего эмулятор не
 // выдаёт: код вне перечня (MERCHANT_CODE_UNKNOWN) у одной витрины и 503 на список витрин (переход на `failShopList` —
 // STATUS «Открыто», к AG-09 ч. 2 / AG-10).
 import { afterEach, describe, expect, it } from "vitest";
 import { newEd25519Signer, signRequest } from "@kuzin4u/agentic-core";
 import { MERCHANT_ERROR_CODES, MERCHANT_FIXTURES } from "agentic-ps-platform/fixtures";
+import { startFailureCode } from "../../src/agent/compose.js";
 import { shopBy, type Contour } from "../support/contour.js";
 import { STAND_TIMEOUT_MS, standPurchase } from "../support/stand-purchase.js";
 
@@ -23,6 +26,7 @@ afterEach(async () => {
 
 const STRICT = shopBy("REJECTS_UNIDENTIFIED");
 const catalogOf = (id: string) => `/v1/shops/${id}/catalog`;
+const readinessOf = (merchant: string) => `/pao/v1/merchants/${merchant}/readiness`;
 const CODES = MERCHANT_ERROR_CODES.map((x) => x.code as string);
 /** ключ не из каталога ключей реестра — KEY_UNKNOWN эмулятора (STATUS «Передача для AG-04…»: отказы витрины по подписи) */
 const KEY_UNKNOWN = MERCHANT_ERROR_CODES.find((x) => x.code === "KEY_UNKNOWN")!;
@@ -72,39 +76,51 @@ describe("П08 — витрина отказывает неопознанным"
     expect(seen.every((s) => typeof s.headers["signature"] === "string" && s.headers["x-agent-code"] === r.c.agentCode)).toBe(true);
   });
 
-  it("ключ отозван после списка, часы стенда — за срок кэша ключей у витрин: каталоги отказали по-настоящему (KEY_UNKNOWN) — магазины недоступны; по одному подписанному обращению, без обхода; агент работает", async () => {
-    // без подмены ответов: после настоящего ответа списка ключи агента отзываются в реестре стенда, часы стенда сдвигаются
-    // на merchant_jwks_max_age_sec — витрина перечитывает каталог ключей и не находит ключ (кэш 1 с остаётся настоящим, #64 п. 1)
-    const hook: { afterList?: () => void } = {};
+  it("ключ отозван после знака первой витрины, часы стенда — за срок кэша ключей у витрин: каталог отказал по-настоящему (KEY_UNKNOWN), знак следующей — 401 AGENT_KEY_REVOKED от ПАО: смена ключа по общему правилу (Р53 п. 5), сделка остановлена; по одному подписанному обращению, без обхода", async () => {
+    // без подмены ответов: после настоящего ответа ПАО на знак первой витрины ключи агента отзываются в реестре стенда,
+    // часы стенда сдвигаются на merchant_jwks_max_age_sec — витрина перечитывает каталог ключей и не находит ключ (кэш 1 с
+    // остаётся настоящим, #64 п. 1); ПАО отзыв видит сразу — знак следующей витрины не проверяется
+    const [first, second] = MERCHANT_FIXTURES;
+    const hook: { afterMark?: () => void } = {};
     const seen: { url: string; headers: Record<string, string> }[] = [];
     const f: typeof fetch = async (input, init) => {
       seen.push({ url: String(input), headers: { ...(init?.headers as Record<string, string>) } });
       const res = await fetch(input, init);
-      if (new URL(String(input)).pathname === "/v1/shops") hook.afterList?.();
+      if (new URL(String(input)).pathname === readinessOf(first!.merchant_id)) hook.afterMark?.();
       return res;
     };
-    const r = await standPurchase({ fetch: f });
+    const r = await standPurchase({ fetch: f, failureCode: startFailureCode });
     c = r.c;
-    hook.afterList = () => {
+    hook.afterMark = () => {
+      hook.afterMark = undefined;
       for (const k of r.self.keys) r.stand.keys.revoke(r.c.agentCode, k.kid);
       r.stand.setClock(new Date(r.stand.now().getTime() + r.stand.params.merchant_jwks_max_age_sec * 1000));
     };
     await r.signedIntent();
-    const zones = await r.purchase.search();
-    expect(r.purchase.state).toBe("OFFERS");
-    expect(r.c.admission()).toBeNull();
-    expect([...zones.contour, ...zones.market]).toEqual([]);
-    // код отказа — из ответа эмулятора (журнал контура), из закрытого перечня витрин; у каждой витрины свой ответ
-    expect(r.c.calls().filter((x) => x.target === "merchants" && x.route === "GET /v1/shops").map((x) => x.status)).toEqual([200]);
-    const refusals = r.c.calls().filter((x) => x.target === "merchants" && x.route.endsWith("/catalog"));
-    expect(refusals.map((x) => x.route)).toEqual(MERCHANT_FIXTURES.map((m) => `GET ${catalogOf(m.id)}`));
-    expect(refusals.map((x) => [x.status, x.code])).toEqual(MERCHANT_FIXTURES.map(() => [KEY_UNKNOWN.http, KEY_UNKNOWN.code]));
-    expect(zones.unavailable).toEqual(MERCHANT_FIXTURES.map((m, i) => ({ shopId: m.id, merchantId: m.merchant_id, cause: { detail: refusals[i]!.code } })));
-    // по одному обращению к каждой витрине: ни повтора, ни запроса без подписи, ни другого кода агента
-    for (const m of MERCHANT_FIXTURES) expect(seen.filter((s) => s.url.endsWith(catalogOf(m.id)))).toHaveLength(1);
-    expect(seen.every((s) => typeof s.headers["signature"] === "string" && s.headers["x-agent-code"] === r.c.agentCode)).toBe(true);
-    expect(r.c.journal.entries.filter((e) => e.kind === "shop.unavailable").map((e) => e.merchant)).toEqual(MERCHANT_FIXTURES.map((m) => m.merchant_id));
-    expect(r.c.journal.entries.filter((e) => e.kind === "shop.call" && e.ref === STRICT.id).map((e) => [e.attempt, e.result])).toEqual([[1, "refused"]]);
+    const err = await r.purchase.search().catch((e: unknown) => e);
+    // ПАО: ключ отозван, другого действующего нет — ring.keyRevoked останавливает подпись (как у адаптера ПАО); сделка
+    // остановлена, агент — тоже (ключей нет): обходов нет
+    expect(err).toMatchObject({ name: "SignerStopped" });
+    expect(r.purchase.state).toBe("STOPPED");
+    // код остановки — как у места сборки (startFailureCode): отзыв последнего ключа — NO_ACTIVE_KEY, не код ПАО
+    expect(r.purchase.reason).toBe("NO_ACTIVE_KEY");
+    expect(r.c.admission()).toBe("NO_ACTIVE_KEY");
+    const agent = r.c.agentCalls().slice(r.c.agentCalls().findIndex((x) => x.route === "GET /v1/shops"));
+    expect(agent.map((x) => [x.target, x.route, x.status, x.code])).toEqual([
+      ["merchants", "GET /v1/shops", 200, undefined],
+      ["pao", `GET ${readinessOf(first!.merchant_id)}`, 200, undefined],
+      ["merchants", `GET ${catalogOf(first!.id)}`, KEY_UNKNOWN.http, KEY_UNKNOWN.code],
+      ["pao", `GET ${readinessOf(second!.merchant_id)}`, 401, "AGENT_KEY_REVOKED"],
+    ]);
+    // по одному подписанному обращению: ни повтора, ни запроса без подписи, ни другого кода агента
+    expect(seen.map((x) => new URL(x.url).pathname).filter((p) => p !== "/v1/shops")).toEqual([readinessOf(first!.merchant_id), catalogOf(first!.id), readinessOf(second!.merchant_id)]);
+    expect(seen.every((x) => typeof x.headers["signature"] === "string" && x.headers["x-agent-code"] === r.c.agentCode)).toBe(true);
+    expect(r.c.journal.entries.filter((e) => e.kind === "shop.call" && e.ref === first!.id).map((e) => [e.result, e.detail])).toEqual([["refused", KEY_UNKNOWN.code]]);
+    expect(r.c.journal.entries.filter((e) => e.kind === "shop.readiness").map((e) => [e.merchant, e.result, e.detail])).toEqual([
+      // знак у ПАО подаёт эквайрер стенда по readiness_mark фикстуры (#67): ACTIVE или NONE
+      [first!.merchant_id, "ok", first!.readiness_mark ? "ACTIVE" : "NONE"],
+      [second!.merchant_id, "refused", "AGENT_KEY_REVOKED"],
+    ]);
   });
 
   it("код вне перечня (эмуляция сверх эмулятора) — магазин недоступен (MERCHANT_CODE_UNKNOWN), сам код не в журнале; агент работает", async () => {

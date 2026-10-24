@@ -1,9 +1,9 @@
 // П07 (профиль contour): поиск по обеим зонам каталога. Т5; A5, A6 п. 3.1; Р3, Р42 п. 3. На стенде Платформы и витринах
-// эмулятора через адаптер витрин: зона контура — только при зоне CONTOUR и знаке готовности; у зоны рынка — ссылка
-// человеку, платежа нет (инвариант 10); пояснение различия в защите — код зоны и текст оболочки.
-// Решения каталога по фактам ТЕСТОВОГО ПРОФИЛЯ (stand-shop.ts) доказательством не считаются; зона, знак, sku и цена — из витрины.
-// Различие «зона CONTOUR без знака готовности» эмулятор не выдаёт: зону он выводит из знака (`zoneOf`) — оно проверено
-// модульным тестом адаптера (shops-adapter.test.ts); на стенде — что в контур попадают ровно витрины контура фикстур.
+// эмулятора через адаптер витрин: зона контура — только при знаке готовности ACTIVE по ПАО (Р53 п. 3); у зоны рынка —
+// ссылка человеку, платежа нет (инвариант 10); пояснение различия в защите — код зоны и текст оболочки.
+// Решения каталога по фактам ТЕСТОВОГО ПРОФИЛЯ (stand-shop.ts) доказательством не считаются; знак — из ПАО, sku и цена —
+// из витрины. Ожидаемая зона — по ответу знака стенда эквайреру; приостановление знака и расхождение со словами витрины —
+// readiness-stand.test.ts, модульно — shops-adapter.test.ts.
 import { afterEach, describe, expect, it } from "vitest";
 import { MERCHANT_FIXTURES } from "agentic-ps-platform/fixtures";
 import { PurchaseStopped } from "../../src/agent/pipeline/index.js";
@@ -52,9 +52,12 @@ describe("П07 — поиск по обеим зонам каталога", { ti
     c = r.c;
     const intent = await r.signedIntent();
     const zones = await r.purchase.search();
-    // зона контура — витрины фикстур с зоной CONTOUR и знаком, кроме витрины с неполными карточками (INCOMPLETE: все
-    // карточки не проходят модель, П09) — набор из фикстур, не из журнала агента (ревью К3 № 5); зона рынка — все прочие
-    const contourShops = new Set(MERCHANT_FIXTURES.filter((f) => f.zone === "CONTOUR" && f.readiness_mark).map((f) => f.id));
+    // зона контура — витрины, у которых знак готовности у стенда ACTIVE (ответ стенда эквайреру, ПИ-8; Р53 п. 3, ревью
+    // reviewer К2.1 № 13), кроме витрины с неполными карточками (INCOMPLETE: все карточки не проходят модель, П09) — не из
+    // слов витрины и не из журнала агента (ревью К3 № 5); зона рынка — все прочие
+    const marks = await Promise.all(MERCHANT_FIXTURES.map((f) => r.stand.acquirerParticipant.getReadiness(f.merchant_id)));
+    expect(marks.every((m, i) => m.statusCode === 200 && (m.body as { merchant_id?: unknown }).merchant_id === MERCHANT_FIXTURES[i]!.merchant_id)).toBe(true);
+    const contourShops = new Set(MERCHANT_FIXTURES.filter((_, i) => (marks[i]!.body as { status: string }).status === "ACTIVE").map((f) => f.id));
     const excluded = new Set(MERCHANT_FIXTURES.filter((f) => f.behaviour === "INCOMPLETE").map((f) => f.id));
     expect(new Set(zones.contour.map((o) => o.shopId))).toEqual(new Set([...contourShops].filter((id) => !excluded.has(id))));
     expect(zones.unavailable).toEqual([]);

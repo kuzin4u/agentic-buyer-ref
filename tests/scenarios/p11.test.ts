@@ -97,7 +97,8 @@ describe("П11 — цена изменилась после согласован
     const ids = (x: string) => x.replaceAll(intent.id, "{intent}").replaceAll(old.id, "{old}").replaceAll(fresh.id, "{fresh}");
     const all = r.c.calls().slice(before).filter((x) => !x.route.startsWith("GET /pao/v1/events")).map((x) => ids(`${x.target} ${x.route} ${x.status}`));
     const shop = (id: string) => `merchants GET /v1/shops/${id}/catalog 200`;
-    const search = ["merchants GET /v1/shops 200", ...MERCHANT_FIXTURES.map((m) => shop(m.id))];
+    // знак готовности по ПАО — перед каталогом каждой витрины (Р53 п. 3)
+    const search = ["merchants GET /v1/shops 200", ...MERCHANT_FIXTURES.flatMap((m) => [`pao GET /pao/v1/merchants/${m.merchant_id}/readiness 200`, shop(m.id)])];
     expect(all).toEqual([
       shop(NORMAL.id),
       shop(NORMAL.id),
@@ -117,9 +118,11 @@ describe("П11 — цена изменилась после согласован
       "pao GET /pao/v1/mandates/{intent}/verify 200",
       "pao GET /pao/v1/mandates/{fresh}/verify 200",
       `merchants POST /v1/shops/${NORMAL.id}/orders 201`,
-      // ворота стадии 5 — verify INTENT и нового CART (стадия 4 — после авторизации, по требованию ADP, Р47 п. 2)
+      // ворота стадии 5 — verify INTENT и нового CART, знак продавца корзины (Р53 п. 6; стадия 4 — после авторизации, по
+      // требованию ADP, Р47 п. 2)
       "pao GET /pao/v1/mandates/{intent}/verify 200",
       "pao GET /pao/v1/mandates/{fresh}/verify 200",
+      `pao GET /pao/v1/merchants/${NORMAL.merchant_id}/readiness 200`,
     ]);
     const secrets = r.c.calls().flatMap((x) => [x.nonce, x.idempotencyKey]).filter((v): v is string => typeof v === "string");
     expectJournalClean(r.c.journal.entries, null, [], secrets);

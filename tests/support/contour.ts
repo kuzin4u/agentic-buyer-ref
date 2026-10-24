@@ -36,7 +36,7 @@ import { createMerchants, createStand, type MerchantsStand, type Stand } from "a
 import { PaoPlatform } from "../../src/agent/adapters/pao/index.js";
 import { MemoryJournal } from "../../src/agent/journal/index.js";
 import type { PaymentPlatform } from "../../src/agent/ports/payment-platform.js";
-import type { HttpRequestSigning } from "../../src/agent/ports/request-signing.js";
+import type { HttpRequestSigning, RequestSigning } from "../../src/agent/ports/request-signing.js";
 import { KeyRing, generateKey } from "../../src/agent/signer/index.js";
 import { loadParams, type StandParams } from "../../src/shared/config.js";
 import type { DiagCode } from "../../src/shared/diag-codes.js";
@@ -116,6 +116,8 @@ export interface Contour {
   readonly merchants?: Merchants;
   /** только "stand": подпись обращений к витринам действующим ключом агента — как у места сборки (compose.shops, Р42) */
   readonly shopSigning?: HttpRequestSigning;
+  /** только "stand": адрес ПАО стенда и порт подписи агента — знак готовности продавца по ПАО (Р53 п. 1) */
+  readonly paoAccess?: { baseUrl: string; signing: RequestSigning };
   readonly stand?: Stand;
   /** только "stub" */
   readonly paoStand?: PaoStand;
@@ -360,6 +362,7 @@ async function standContour(paoNow?: () => Date, adpUntilPs11 = false): Promise<
       admission: a.admission,
       merchants,
       shopSigning: { sign: (req) => signRequest(req, signing.current()) },
+      paoAccess: { baseUrl, signing },
       stand,
       calls: () => log.map((c) => ({ ...c })),
       agentCalls: () => log.filter((c) => c.source !== "test").map((c) => ({ ...c })),

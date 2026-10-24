@@ -37,12 +37,13 @@ export function testProfile(clock: () => Date = () => new Date()): ShopProfile {
 /** `signing` — подпись не ключом агента контура (ключ не из реестра — настоящий отказ витрины, П08). */
 export function standShops(c: Contour, o: { profile?: (shopId: string) => ShopProfile | null; fetch?: typeof fetch; signing?: HttpRequestSigning } = {}): ShopsAdapter {
   const signing = o.signing ?? c.shopSigning;
-  if (!c.merchants || !signing) throw new Error("контур без витрин");
+  if (!c.merchants || !signing || !c.paoAccess) throw new Error("контур без витрин");
   const profile = testProfile();
   return new ShopsAdapter({
     baseUrl: c.merchants.baseUrl,
     agentCode: c.agentCode,
     signing,
+    platform: c.paoAccess,
     params: c.params,
     profile: o.profile ?? (() => profile),
     journal: c.journal,

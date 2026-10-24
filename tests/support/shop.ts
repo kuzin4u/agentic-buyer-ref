@@ -73,9 +73,13 @@ export function liveOffers(s: FeedShop, clock: () => Date, over: (req: LiveOffer
   return src;
 }
 
+/** Знак готовности продавца по ПАО для ворот стадии 5 — ACTIVE: ворота знака проверяются своими тестами (Р53 п. 6). */
+export const READY: Pick<ShopPort, "readiness"> = { readiness: async () => ({ status: "ACTIVE" }) };
+
 /** Витрина: сумму заказа считает «продавец» по цене фида — Σ по позициям; `total` — подмена суммы (дефект продавца). */
 export function shopOrders(s: FeedShop, total?: (req: ShopOrderRequest) => Money): ShopPort & { calls: ShopOrderRequest[] } {
   const port = {
+    ...READY,
     calls: [] as ShopOrderRequest[],
     order: async (req: ShopOrderRequest): Promise<ShopOrder> => {
       port.calls.push(req);

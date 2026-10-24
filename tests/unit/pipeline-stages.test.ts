@@ -11,10 +11,10 @@ import { INTENT, event } from "../support/consents.js";
 import { expectJournalClean } from "../support/journal.js";
 import { AGENT, type PaoStand } from "../support/pao-stand.js";
 import { SHOP, one, purchaseOn, signedIntent, stages, type PurchaseRun, type PurchaseSetup } from "../support/purchase.js";
-import { bakery, feedOffers, feedPrice, liveOffers, payments, shopOrders } from "../support/shop.js";
+import { READY, bakery, feedOffers, feedPrice, liveOffers, payments, shopOrders } from "../support/shop.js";
 import { humanA5Decision } from "../../src/agent/shell/index.js";
 import { startFailureCode } from "../../src/agent/compose.js";
-import { SignerSuspended } from "../../src/agent/signer/index.js";
+import { SignerStopped, SignerSuspended } from "../../src/agent/signer/index.js";
 
 let stand: PaoStand | undefined;
 afterEach(async () => {
@@ -366,7 +366,7 @@ describe("стадия 3 — отказ витрины на заказе (Р42 �
   for (const code of ["SHOP_ORDER_REFUSED", "SHOP_ORDER_STATE_UNKNOWN"] as const) {
     it(`${code} — STOPPED сделки, заказ не повторяется; агент работает: новый мандат запрашивается`, async () => {
       let orders = 0;
-      const r = await setup({ shop: { order: async () => (orders++, Promise.reject(new ShopFailure(code))) } });
+      const r = await setup({ shop: { ...READY, order: async () => (orders++, Promise.reject(new ShopFailure(code))) } });
       await signedCart(r, await offers(r));
       await expect(r.purchase.placeOrder({ idempotencyKey: "idem-order-1" })).rejects.toBeInstanceOf(ShopFailure);
       expect(r.purchase.state).toBe("STOPPED");
@@ -1020,7 +1020,7 @@ describe("стадии 4–6 — исходы из порта PaymentSteps (ин
 describe("ответ порта не той формы или сбой — STOPPED, а не промежуточное состояние (ревью К3 № 6, инвариант 4)", () => {
   it("заказ: исключение порта, ответ без суммы — STOPPED UNKNOWN", async () => {
     for (const order of [() => Promise.reject(new Error("витрина недоступна")), async () => ({ orderId: "ord_1" }) as never]) {
-      const r = await setup({ shop: { order } });
+      const r = await setup({ shop: { ...READY, order } });
       await signedCart(r, await offers(r));
       await expect(r.purchase.placeOrder({ idempotencyKey: "idem-order-1" })).rejects.toThrow();
       expect(stages(r).at(-1)).toBe("STOPPED:UNKNOWN");
@@ -1213,7 +1213,7 @@ describe("держимые после ожиданий (Р38 п. 3, ревью �
       await r.core.mandates.refreshHeld({ kind: "event", event: event("mandate.revoked", req.cartMandateId) });
       return inner.order(req, m);
     };
-    const r = (run.r = await setup({ shop: { order } }));
+    const r = (run.r = await setup({ shop: { ...READY, order } }));
     await signedCart(r, await offers(r));
     await expect(r.purchase.placeOrder({ idempotencyKey: "idem-order-1" })).rejects.toMatchObject({ code: "MANDATE_REVOKED" });
     expect(r.purchase.order).toBeNull();
@@ -1242,7 +1242,7 @@ describe("ворота перед стадией 5 (Р38 п. 3, К4): оба м�
       const log = r.stand.log().length;
       await r.purchase.authorize({ idempotencyKey: "idem-pay-1" });
       expect(verified(r).slice(before)).toEqual([r.purchase.intentMandate!.id, r.purchase.cartMandate!.id]);
-      // в воротах — только два verify, без иных обращений к контуру (ревью К4 № 4)
+      // в воротах к контуру — только два verify (ревью К4 № 4); знак готовности — тестовым портом READY, мимо PaoStub (Р53 п. 6)
       expect(r.stand.log().slice(log).map((c) => c.op)).toEqual(["GET /pao/v1/mandates/{id}/verify", "GET /pao/v1/mandates/{id}/verify"]);
       await closeStand();
     }
@@ -1279,6 +1279,43 @@ describe("ворота перед стадией 5 (Р38 п. 3, К4): оба м�
       expect(r.payment.calls).toEqual([]);
     });
   }
+
+  it("знак готовности продавца корзины перечитывается в воротах после обоих verify; ACTIVE — авторизация идёт (Р53 п. 6)", async () => {
+    const asked: [string, number][] = [];
+    const r = await setup({ shop: { ...shopOrders(SHOP), readiness: async (m) => (asked.push([m, verified(r).length]), { status: "ACTIVE" }) } });
+    await ordered(r);
+    const before = verified(r).length;
+    asked.length = 0;
+    await r.purchase.authorize({ idempotencyKey: "idem-pay-1" });
+    // продавец — из подписанного CART; знак — после verify INTENT и CART, до порта авторизации
+    expect(asked).toEqual([[r.purchase.cartMandate!.cart!.merchantId, before + 2]]);
+    expect(r.payment.calls).toEqual(["authorize"]);
+  });
+
+  for (const [answer, code] of [
+    [{ status: "SUSPENDED" }, "MERCHANT_NOT_READY"],
+    [{ status: "NONE" }, "MERCHANT_NOT_READY"],
+    [{ unverified: "STATE_UNAVAILABLE" }, "READINESS_UNAVAILABLE"],
+    [{ unverified: "NO_RESPONSE" }, "READINESS_UNAVAILABLE"],
+  ] as const) {
+    it(`знак в воротах ${answer.status ?? `не проверен (${answer.unverified})`} — STOPPED ${code} до реквизита (Р53 п. 6)`, async () => {
+      const r = await setup({ shop: { ...shopOrders(SHOP), readiness: async () => answer } });
+      await ordered(r);
+      await expect(r.purchase.authorize({ idempotencyKey: "idem-pay-1" })).rejects.toBeInstanceOf(PurchaseStopped);
+      expect(r.purchase.reason).toBe(code);
+      expect(stages(r).at(-1)).toBe(`STOPPED:${code}`);
+      expect(r.payment.calls).toEqual([]);
+    });
+  }
+
+  it("отказ по агенту на знаке в воротах (403 AGENT_SUSPENDED) — STOPPED тем же кодом, реквизита нет (Р53 п. 5)", async () => {
+    const refused = new PlatformFailure("AGENT_SUSPENDED", "never", "AGENT_SUSPENDED", 403, null);
+    const r = await setup({ shop: { ...shopOrders(SHOP), readiness: () => Promise.reject(refused) } });
+    await ordered(r);
+    await expect(r.purchase.authorize({ idempotencyKey: "idem-pay-1" })).rejects.toBe(refused);
+    expect(r.purchase.reason).toBe("AGENT_SUSPENDED");
+    expect(r.payment.calls).toEqual([]);
+  });
 
   for (const which of ["INTENT", "CART"] as const) {
     it(`мандат ${which} отозван у Платформы, события по ленте не было — verify OUT_OF_SCOPE, STOPPED до реквизита`, async () => {
@@ -1322,6 +1359,65 @@ describe("ворота перед стадией 5 (Р38 п. 3, К4): оба м�
     expect(r.tail().filter((e) => e.kind === "agent.refused").map((e) => [e.reason, e.mandate])).toEqual([["MANDATE_NOT_ACTIVE", cartId]]);
     expect(stages(r).at(-1)).toBe("STOPPED:MANDATE_REVOKED");
     expect(r.payment.calls).toEqual([]);
+  });
+
+  it("CART отозван по ленте, пока шёл знак в воротах, — STOPPED MANDATE_REVOKED, реквизита нет (ревью КТ1 № 1)", async () => {
+    const holder: { r?: PurchaseRun } = {};
+    const r = (holder.r = await setup({
+      shop: {
+        ...shopOrders(SHOP),
+        readiness: async () => {
+          const run = holder.r!;
+          const cartId = run.purchase.cartMandate!.id;
+          run.consents.mandates.get(cartId)!.status = "REVOKED";
+          await run.core.mandates.refreshHeld({ kind: "event", event: event("mandate.revoked", cartId) });
+          return { status: "ACTIVE" };
+        },
+      },
+    }));
+    await ordered(r);
+    const cartId = r.purchase.cartMandate!.id;
+    await expect(r.purchase.authorize({ idempotencyKey: "idem-pay-1" })).rejects.toMatchObject({ code: "MANDATE_REVOKED" });
+    expect(r.tail().filter((e) => e.kind === "agent.refused").map((e) => [e.reason, e.mandate])).toEqual([["MANDATE_NOT_ACTIVE", cartId]]);
+    expect(stages(r).at(-1)).toBe("STOPPED:MANDATE_REVOKED");
+    expect(r.payment.calls).toEqual([]);
+  });
+
+  it("покупку остановили, пока шёл знак в воротах (параллельный вызов), — наружу PurchaseStopped, реквизита нет (ревью КТ1 № 2)", async () => {
+    const holder: { r?: PurchaseRun; release?: () => void } = {};
+    const r = (holder.r = await setup({
+      shop: {
+        ...shopOrders(SHOP),
+        readiness: (_m, signal) =>
+          new Promise((_, reject) => {
+            signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+            holder.release?.();
+          }),
+      },
+    }));
+    await ordered(r);
+    const asking = new Promise<void>((resolve) => (holder.release = resolve));
+    const pay = r.purchase.authorize({ idempotencyKey: "idem-pay-1" });
+    await asking;
+    // параллельный вызов чужой стадии — запрещённый переход останавливает покупку
+    await expect(r.purchase.settle()).rejects.toBeInstanceOf(PurchaseTransitionForbidden);
+    await expect(pay).rejects.toBeInstanceOf(PurchaseStopped);
+    expect(r.purchase.state).toBe("STOPPED");
+    expect(r.payment.calls).toEqual([]);
+  });
+
+  it("отказ по агенту на знаке в воротах: 401 AGENT_KEY_REVOKED и SignerStopped NO_ACTIVE_KEY — STOPPED без повтора, реквизита нет (ревью КТ1 № 4)", async () => {
+    for (const [refusal, code] of [
+      [new PlatformFailure("AGENT_KEY_REVOKED", "new_key", "AGENT_KEY_REVOKED", 401, null), "AGENT_KEY_REVOKED"],
+      [new SignerStopped("NO_ACTIVE_KEY"), "NO_ACTIVE_KEY"],
+    ] as const) {
+      let asked = 0;
+      const r = await setup({ shop: { ...shopOrders(SHOP), readiness: () => (asked++, Promise.reject(refusal)) }, failureCode: startFailureCode });
+      await ordered(r);
+      await expect(r.purchase.authorize({ idempotencyKey: "idem-pay-1" })).rejects.toBe(refusal);
+      expect([r.purchase.reason, asked, r.payment.calls]).toEqual([code, 1, []]);
+      await closeStand();
+    }
   });
 
   for (const [which, left, stop] of [

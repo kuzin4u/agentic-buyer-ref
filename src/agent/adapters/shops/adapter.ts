@@ -8,12 +8,15 @@
 // Факты, которых витрина не отдаёт (ИНН, MCC, оплата, регионы, возврат, доставка, время обновления), — профиль магазина
 // от места сборки (Р42 п. 2; до kuzin4u/agentic-ps-platform#45). Время ответа продавца у витрины нет — `checkedAt`
 // живого предложения по часам агента (Р38 нюанс К6).
+// Знак готовности продавца — по ПАО, одной функцией `readiness` (Р53): зона контура — только при ACTIVE; поля витрины
+// `zone` и `readiness_mark` — сведения; знак не проверен — витрина недоступна (READINESS_UNAVAILABLE).
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
 import { readShop, type CatalogFacts, type CatalogIssueCode, type CatalogProduct, type CatalogShop } from "../../catalog/index.js";
 import type { Journal, JournalResult } from "../../journal/index.js";
 import type { LiveOffer, LiveOfferRequest, LiveOfferSource } from "../../ports/catalog.js";
-import type { HttpRequestSigning } from "../../ports/request-signing.js";
+import type { HttpRequestSigning, RequestSigning } from "../../ports/request-signing.js";
+import { AGENT_STOP_CODES, ruleForFailure } from "../../declines/index.js";
 import {
   ShopFailure,
   type OfferSource,
@@ -23,12 +26,14 @@ import {
   type ShopPaymentPort,
   type ShopPaymentReply,
   type ShopPaymentRequest,
+  type Readiness,
   type ShopPort,
   type ShopUnavailable,
   type ShopUnavailableCause,
 } from "../../ports/shop.js";
 import { openPackage } from "../../payment-package/package.js";
 import type { StandParams } from "../../../shared/config.js";
+import { PlatformFailure, type FailureCode } from "../../../shared/domain.js";
 import { SAFE_ID, SHOP_ID } from "../../../shared/ids.js";
 import { ORDER_REF } from "../../payment-package/order-ref.js";
 import { MERCHANT_RETRYABLE, isMerchantCode } from "./codes.js";
@@ -40,12 +45,19 @@ export interface ShopProfile {
   item(sku: string): Pick<CatalogProduct, "delivery" | "updatedAt"> | null;
 }
 
-export type ShopsParams = Pick<StandParams, "shop_request_timeout_ms" | "shop_retry_after_max_sec" | "shop_retry_default_ms" | "shop_search_deadline_ms">;
+export type ShopsParams = Pick<
+  StandParams,
+  "shop_request_timeout_ms" | "shop_retry_after_max_sec" | "shop_retry_default_ms" | "shop_search_deadline_ms" | "pao_request_timeout_ms"
+>;
 
 export interface ShopsAdapterOptions {
   baseUrl: string;
   agentCode: string;
   signing: HttpRequestSigning;
+  /** знак готовности по ПАО (Р53 п. 1, 5): адрес Платформы и порт подписи модуля signer — остановка подписи и смена ключа
+   *  по отказу Платформы (kid — у `current()`); сам запрос подписывает `signing` (тот же ключ и профиль ПАО §2);
+   *  `fetch` — по умолчанию `fetch` адаптера (тот же, что у витрин) */
+  platform: { baseUrl: string; signing: RequestSigning; fetch?: typeof fetch };
   params: ShopsParams;
   /** профиль магазина по id витрины; null — профиля нет, магазин исключён целиком (REQUIRED) */
   profile: (shopId: string) => ShopProfile | null;
@@ -84,6 +96,31 @@ const Order = z.object({ id: OrderId, total: z.number().int().nonnegative(), cur
 const Paid = z.object({ id: OrderId, status: z.enum(["PAID", "DECLINED", "REJECTED"]) });
 
 type Method = "GET /v1/shops" | "GET /v1/shops/{id}/catalog" | "POST /v1/shops/{id}/orders" | "POST /v1/shops/{id}/orders/{order_id}/payment";
+
+/** Путь знака готовности (Р53 п. 1): в YAML ПАО 1.4.0 его нет — описан вручную, с ПАО 1.5.0 — из YAML (#37 платформы). */
+const READINESS = "GET /pao/v1/merchants/{merchant_id}/readiness";
+const ReadinessReply = z.object({ merchant_id: z.string(), status: z.enum(["ACTIVE", "SUSPENDED", "NONE"]), since: z.string().nullable() });
+
+/** Отказы пути знака (ПАО §2 — подпись, допуск, частота и источник ключей; §4 — знак готовности; передача #67): код → HTTP-статус. Пути нет в YAML,
+ *  перечень `x-pao-errors` описан здесь вместе с путём (Р53 п. 1); типы ПАО ядра — только у адаптера pao (Р19). */
+const READINESS_ERRORS: Readonly<Partial<Record<FailureCode, number>>> = {
+  AGENT_UNKNOWN: 401,
+  AGENT_KEY_REVOKED: 401,
+  SIGNATURE_INVALID: 401,
+  AGENT_SUSPENDED: 403,
+  REQUEST_INVALID: 400,
+  STATE_UNAVAILABLE: 503,
+  // слой допуска ПАО на любом пути: сбой источника ключей и ограничение частоты
+  UPSTREAM_UNAVAILABLE: 503,
+  RATE_LIMITED: 429,
+};
+
+/** Код ПАО из тела отказа — только из перечня пути и с его HTTP-статусом; иначе null (как в адаптере pao: пара не по
+ *  контракту — не код). */
+function paoCode(status: number, body: unknown): FailureCode | null {
+  const raw = typeof body === "object" && body !== null ? (body as { code?: unknown }).code : undefined;
+  return typeof raw === "string" && Object.hasOwn(READINESS_ERRORS, raw) && READINESS_ERRORS[raw as FailureCode] === status ? (raw as FailureCode) : null;
+}
 
 /** Итог обращения: ответ с телом (JSON или нет) либо нет ответа в срок. */
 type Reply = { status: number; body: unknown; retryAfter: string | null } | null;
@@ -156,6 +193,26 @@ export class ShopsAdapter implements OfferSource, LiveOfferSource, ShopPort, Sho
         out.push({ shopId: s.id, merchantId: s.merchant_id, unavailable: DEADLINE });
         continue;
       }
+      // знак — до каталога (Р53 п. 3–4): не проверен — витрина недоступна, каталог не запрашивается; отказ по агенту
+      // (PlatformFailure) — наружу, поиск остановлен
+      let mark: Readiness;
+      try {
+        mark = await this.readiness(s.merchant_id, deadline.signal);
+      } catch (e) {
+        if (!deadline.signal.aborted || e !== deadline.signal.reason) throw e;
+        // запрос ушёл в сеть, ответа нет — в журнал обращений (Т15) с причиной срока
+        this.#record("shop.readiness", s.merchant_id, undefined, "unknown", "SHOP_SEARCH_DEADLINE");
+        out.push({ shopId: s.id, merchantId: s.merchant_id, unavailable: DEADLINE });
+        continue;
+      }
+      if (mark.unverified !== undefined) {
+        out.push({ shopId: s.id, merchantId: s.merchant_id, unavailable: { reason: "READINESS_UNAVAILABLE" } });
+        continue;
+      }
+      // зона контура — только при ACTIVE по ПАО; зона и знак витрины — сведения: расхождение — в журнал, без действия
+      const inContour = mark.status === "ACTIVE";
+      const says = Zone.safeParse(entry).success;
+      if (says !== inContour) this.#record("shop.readiness_mismatch", s.merchant_id, `${mark.status}:${says ? "CONTOUR" : "MARKET"}`);
       const catalog = await this.#get("GET /v1/shops/{id}/catalog", `/v1/shops/${s.id}/catalog`, Catalog, s.id, undefined, deadline);
       if (!catalog.ok) {
         out.push({ shopId: s.id, merchantId: s.merchant_id, unavailable: catalog.cause });
@@ -170,9 +227,6 @@ export class ShopsAdapter implements OfferSource, LiveOfferSource, ShopPort, Sho
       }
       // запись не стирается: sku, найденный у другой витрины в любой выдаче, становится неоднозначным навсегда
       for (const i of items) this.#shopOf.set(i.sku, this.#shopOf.has(i.sku) && this.#shopOf.get(i.sku) !== s.id ? null : s.id);
-      // зона контура — только при зоне CONTOUR и знаке готовности true (РП22 п. 7 платформы); нет полей, иное значение или
-      // тип — рынок (Р42 п. 3)
-      const inContour = Zone.safeParse(entry).success;
       out.push({
         merchantId: s.merchant_id,
         inContour,
@@ -181,6 +235,51 @@ export class ShopsAdapter implements OfferSource, LiveOfferSource, ShopPort, Sho
       });
     }
     return out;
+  }
+
+  /** Знак готовности продавца по ПАО (Р53) — единственное место, где агент его берёт: подписанный
+   *  `GET /pao/v1/merchants/{merchant_id}/readiness` (ПАО §2, пустое тело), без кэша у агента (ответ Платформы — `no-store`)
+   *  и без повтора, тайм-аут `pao_request_timeout_ms`. Подпись остановлена — исключение, обращения нет. Отказ по агенту —
+   *  общим правилом обращений к ПАО (Р53 п. 5): код из `AGENT_STOP_CODES` — остановка подписи, `AGENT_KEY_REVOKED` — смена
+   *  ключа; затем PlatformFailure наружу (сделка STOPPED тем же кодом); 401 без кода по перечню — BAD_RESPONSE. Другого
+   *  действующего ключа нет — `keyRevoked` сам бросает SignerStopped (`NO_ACTIVE_KEY`), он и уходит наружу. Нет ответа, прочий
+   *  отказ (400, 414, 503 …), ответ не по схеме, чужой merchant_id, merchant_id не по маске (без обращения) — «знак не
+   *  проверен» (Р53 п. 4). */
+  async readiness(merchantId: string, signal?: AbortSignal): Promise<Readiness> {
+    if (!SHOP_ID.test(merchantId)) {
+      this.#record("shop.readiness", undefined, "PATTERN", "refused");
+      return { unverified: "PATTERN" };
+    }
+    const path = `/pao/v1/merchants/${merchantId}/readiness`;
+    // подпись — тем же портом, что у витрин (действующий ключ, профиль ПАО §2; Р53 п. 1): остановлена — исключение,
+    // обращения нет; kid — для смены ключа по AGENT_KEY_REVOKED (Р53 п. 5)
+    const { kid } = this.o.platform.signing.current();
+    const signed = this.o.signing.sign({ method: "GET", path, query: "", headers: this.#headers(), body: "" });
+    const reply = await this.#request(this.o.platform.fetch ?? this.fetchImpl, `${this.o.platform.baseUrl}${path}`, "GET", signed.headers, undefined, this.o.params.pao_request_timeout_ms, signal);
+    if (reply === null) {
+      this.#record("shop.readiness", merchantId, "NO_RESPONSE", "unknown");
+      return { unverified: "NO_RESPONSE" };
+    }
+    if (reply.status === 200) {
+      const b = ReadinessReply.safeParse(reply.body);
+      if (!b.success || b.data.merchant_id !== merchantId) {
+        this.#record("shop.readiness", merchantId, "BAD_RESPONSE", "refused");
+        return { unverified: "BAD_RESPONSE" };
+      }
+      this.#record("shop.readiness", merchantId, b.data.status, "ok");
+      return { status: b.data.status };
+    }
+    const code = paoCode(reply.status, reply.body);
+    if (reply.status === 401 || (code !== null && AGENT_STOP_CODES.has(code))) {
+      const failure = new PlatformFailure(code ?? "BAD_RESPONSE", ruleForFailure(code ?? "BAD_RESPONSE").retry, code, reply.status, null, "знак готовности: отказ по агенту");
+      this.#record("shop.readiness", merchantId, code ?? "BAD_RESPONSE", "refused");
+      if (code !== null && AGENT_STOP_CODES.has(code)) this.o.platform.signing.stop(code);
+      else if (code !== null && ruleForFailure(code).action === "ROTATE_KEY") this.o.platform.signing.keyRevoked(kid, failure);
+      throw failure;
+    }
+    const detail = code ?? `HTTP_${reply.status}`;
+    this.#record("shop.readiness", merchantId, detail, "refused");
+    return { unverified: detail };
   }
 
   /** Живое предложение перед заказом: цена и наличие — из каталога витрины, `checkedAt` — часы агента (#45). Отказ —
@@ -335,19 +434,25 @@ export class ShopsAdapter implements OfferSource, LiveOfferSource, ShopPort, Sho
 
   /** Подписанное обращение; нет ответа в shop_request_timeout_ms или сбой сети — null. Перенаправлению не следует. */
   async #send(method: "GET" | "POST", path: string, body?: string, signal?: AbortSignal): Promise<Reply> {
-    const headers: Record<string, string> = {
-      ...(body !== undefined && { "content-type": "application/json" }),
-      "x-agent-code": this.o.agentCode,
-      "x-timestamp": this.now().toISOString().slice(0, 19) + "Z",
-      "x-nonce": randomUUID(),
-    };
+    const headers = { ...(body !== undefined && { "content-type": "application/json" }), ...this.#headers() };
     // подпись — до сети: остановленная подпись — исключение наружу, обращения нет; пустое тело подписывается как ""
     const signed = this.o.signing.sign({ method, path, query: "", headers, body: body ?? "" });
-    const timeout = AbortSignal.timeout(this.o.params.shop_request_timeout_ms);
+    return this.#request(this.fetchImpl, `${this.o.baseUrl}${path}`, method, signed.headers, body, this.o.params.shop_request_timeout_ms, signal);
+  }
+
+  /** Заголовки подписи агента (ПАО §2): код агента, время, одноразовый x-nonce. */
+  #headers(): Record<string, string> {
+    return { "x-agent-code": this.o.agentCode, "x-timestamp": this.now().toISOString().slice(0, 19) + "Z", "x-nonce": randomUUID() };
+  }
+
+  /** Обращение по сети; нет ответа в `timeoutMs` или сбой сети — null; прерывание вызывающим — его причина наружу.
+   *  Перенаправлению не следует. */
+  async #request(fetchImpl: typeof fetch, url: string, method: "GET" | "POST", headers: Record<string, string>, body: string | undefined, timeoutMs: number, signal?: AbortSignal): Promise<Reply> {
+    const timeout = AbortSignal.timeout(timeoutMs);
     try {
-      const res = await this.fetchImpl(`${this.o.baseUrl}${path}`, {
+      const res = await fetchImpl(url, {
         method,
-        headers: signed.headers,
+        headers,
         redirect: "manual",
         signal: signal ? AbortSignal.any([timeout, signal]) : timeout,
         ...(body !== undefined && { body }),
@@ -364,6 +469,20 @@ export class ShopsAdapter implements OfferSource, LiveOfferSource, ShopPort, Sho
       if (signal?.aborted) throw signal.reason;
       return null;
     }
+  }
+
+  /** shop.readiness и shop.readiness_mismatch (Р53): merchant — код продавца по маске, detail — значение перечня; тела
+   *  ответа нет. */
+  #record(kind: "shop.readiness" | "shop.readiness_mismatch", merchant: string | undefined, detail: string | undefined, result?: JournalResult, reason?: "SHOP_SEARCH_DEADLINE"): void {
+    this.o.journal.record({
+      at: this.now().toISOString(),
+      kind,
+      ...(kind === "shop.readiness" && { method: READINESS, attempt: 1 }),
+      ...(result !== undefined && { result }),
+      ...(merchant !== undefined && SHOP_ID.test(merchant) && { merchant }),
+      ...(detail !== undefined && { detail }),
+      ...(reason !== undefined && { reason }),
+    });
   }
 
   /** shop.call (Т15): тела, заголовков и x-nonce нет; ref — id витрины по маске (код продавца — поле merchant — у записей

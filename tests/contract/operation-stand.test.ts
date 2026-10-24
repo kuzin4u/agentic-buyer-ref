@@ -156,6 +156,7 @@ describe("стадии 5–6 на стенде v0.20.0: итог из событ
     expect(r.c.calls().slice(start).filter((x) => x.source === "agent" && !x.route.startsWith("GET /pao/v1/events")).map(shape)).toEqual([
       "pao GET /pao/v1/mandates/{intent}/verify 200",
       "pao GET /pao/v1/mandates/{cart}/verify 200",
+      `pao GET /pao/v1/merchants/${NORMAL.merchant_id}/readiness 200`,
       "pao POST /pao/v1/credentials 201",
       "merchants POST /v1/shops/{shop}/orders/{order}/payment 200",
       "pao GET /pao/v1/operations 200",

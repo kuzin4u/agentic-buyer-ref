@@ -6,7 +6,8 @@ import { afterEach, describe, expect, it } from "vitest";
 import { UNFINISHED_TEXT } from "../../src/agent/declines/index.js";
 import { PurchaseTransitionForbidden } from "../../src/agent/pipeline/index.js";
 import type { PaoStand } from "../support/pao-stand.js";
-import { one, purchaseOn, signedIntent, stages } from "../support/purchase.js";
+import { SHOP, one, purchaseOn, signedIntent, stages } from "../support/purchase.js";
+import { shopOrders } from "../support/shop.js";
 
 let stand: PaoStand | undefined;
 afterEach(async () => {
@@ -20,7 +21,11 @@ const CREDENTIALS = "POST /pao/v1/credentials" as const;
 describe("П22 — действие после отзыва мандата", () => {
   it("409 MANDATE_REVOKED на выдаче реквизита — STOP_ALL: начатое остановлено, мандаты не держатся, человеку — что не завершено", async () => {
     const paid: string[] = [];
-    const r = await purchaseOn({ payment: (core) => core.payment({ pay: async (req) => (paid.push(req.orderId), { status: "PAID" }) }) }, (s) => (stand = s));
+    // знак готовности в воротах — тестовый порт (пути нет ни в PaoStub, ни в YAML 1.4.0; на стенде — readiness-stand):
+    // считается, что он спрошен один раз, у продавца CART, до реквизита (Р53 п. 6; ревью КТ1 № 3)
+    const marks: string[] = [];
+    const shop = { ...shopOrders(SHOP), readiness: async (m: string) => (marks.push(m), { status: "ACTIVE" as const }) };
+    const r = await purchaseOn({ shop, payment: (core) => core.payment({ pay: async (req) => (paid.push(req.orderId), { status: "PAID" }) }) }, (s) => (stand = s));
     await signedIntent(r);
     const offer = (await r.purchase.search()).contour[0]!;
     const cart = await r.purchase.cart(one(offer, 1), { idempotencyKey: "idem-cart-p22" });
@@ -34,7 +39,9 @@ describe("П22 — действие после отзыва мандата", () 
     const from = r.stand.stub.calls.length;
     await expect(r.purchase.authorize({ idempotencyKey: "idem-pay-p22" })).rejects.toMatchObject({ code: "MANDATE_REVOKED" });
 
-    // полный журнал обращений стадии 5: ворота (verify INTENT, затем CART) и одна выдача реквизита — 409, больше ничего
+    expect(marks).toEqual([cart.cart!.merchantId]);
+    // полный журнал обращений стадии 5 к контуру: ворота (verify INTENT, затем CART; знак — тестовым портом выше) и одна
+    // выдача реквизита — 409, больше ничего
     expect(r.stand.stub.calls.slice(from).map((c) => [c.op, c.status, c.code])).toEqual([
       ["GET /pao/v1/mandates/{id}/verify", 200, undefined],
       ["GET /pao/v1/mandates/{id}/verify", 200, undefined],

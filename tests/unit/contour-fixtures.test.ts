@@ -9,6 +9,11 @@ import { createContour, shopBy, type Contour } from "../support/contour.js";
 
 const ROOT = resolve(".");
 
+/** `updated_at` у фикстуры — на момент загрузки модуля, у витрины — на момент ответа (#70): сравнивается по форме, не
+ *  по значению; карточки без поля (неполная витрина) — как есть. */
+const byForm = (items: readonly object[]) =>
+  items.map((i) => ("updated_at" in i ? { ...i, updated_at: expect.stringMatching(/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d+)?Z$/) } : i));
+
 function sourceFiles(dir: string): string[] {
   return readdirSync(dir, { withFileTypes: true }).flatMap((e) =>
     e.isDirectory() ? sourceFiles(join(dir, e.name)) : /\.([mc]?tsx?|[mc]?js)$/.test(e.name) ? [join(dir, e.name)] : [],
@@ -23,11 +28,11 @@ describe("эмулятор продавцов отдаёт фикстуры Пл
   });
   afterAll(() => c?.close());
 
-  it("список витрин = MERCHANT_FIXTURES (порядок по id, зона и знак готовности — из фикстур)", async () => {
+  it("список витрин = MERCHANT_FIXTURES (порядок по id; зона, знак готовности и факты магазина — из фикстур, #70)", async () => {
     const r = await c.merchants!.request("GET", "/v1/shops", { signed: false });
     const expected = [...MERCHANT_FIXTURES]
       .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
-      .map(({ id, merchant_id, name, category, zone, readiness_mark }) => ({ id, merchant_id, name, category, zone, readiness_mark }));
+      .map((f) => Object.fromEntries(Object.entries(f).filter(([k]) => !["behaviour", "items", "agent_items"].includes(k))));
     expect(expected.length).toBeGreaterThan(0);
     expect(r).toEqual({ status: 200, body: { shops: expected } });
   });
@@ -35,14 +40,14 @@ describe("эмулятор продавцов отдаёт фикстуры Пл
   it.each(MERCHANT_FIXTURES.map((f) => [f.id, f] as const))("каталог %s: агенту — agent_items, человеку — items", async (_id, f) => {
     const agent = await c.merchants!.request("GET", `/v1/shops/${f.id}/catalog`);
     expect(agent.status).toBe(200);
-    expect((agent.body as { items: unknown }).items).toEqual(f.agent_items);
+    expect((agent.body as { items: unknown }).items).toEqual(byForm(f.agent_items));
 
     const human = await c.merchants!.request("GET", `/v1/shops/${f.id}/catalog`, { signed: false });
     if (f.behaviour === "REJECTS_UNIDENTIFIED") {
       expect(human.status).toBe(403);
     } else {
       expect(human.status).toBe(200);
-      expect((human.body as { items: unknown }).items).toEqual(f.items);
+      expect((human.body as { items: unknown }).items).toEqual(byForm(f.items));
     }
   });
 

@@ -285,6 +285,8 @@ export function createAgentCore(o: AgentCoreOptions): AgentCore {
         ...(s.fetch !== undefined && { fetch: s.fetch }),
         agentCode: o.pao.agentCode,
         signing: { sign: (req) => signRequest(req, signing.current()) },
+        // знак готовности по ПАО (Р53 п. 1, 5): адрес Платформы и порт подписи — те же, что у адаптера ПАО
+        platform: { baseUrl: o.pao.baseUrl, signing, ...(o.pao.fetch !== undefined && { fetch: o.pao.fetch }) },
         params,
         journal,
         now,

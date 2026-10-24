@@ -84,14 +84,19 @@ describe("П09 — противоречивое описание товара", 
     await r.purchase.authorize({ idempotencyKey: "idem-pay-3302" });
     expect(r.payment.calls).toEqual(["authorize"]);
     expect(r.c.journal.entries.some((e) => e.kind === "purchase.stage" && e.detail === "CONFIRMING")).toBe(false);
-    // полный журнал обращений после заказа (ленту не считаем): только ворота стадии 5 — verify INTENT и CART
+    // полный журнал обращений после заказа (ленту не считаем): только ворота стадии 5 — verify INTENT и CART, знак
+    // продавца корзины (Р53 п. 6)
     expect(
       r.c
         .calls()
         .slice(before)
         .filter((x) => !x.route.startsWith("GET /pao/v1/events"))
         .map((x) => `${x.target} ${x.route} ${x.status}`),
-    ).toEqual([`pao GET /pao/v1/mandates/${r.purchase.intentMandate!.id}/verify 200`, `pao GET /pao/v1/mandates/${cart.id}/verify 200`]);
+    ).toEqual([
+      `pao GET /pao/v1/mandates/${r.purchase.intentMandate!.id}/verify 200`,
+      `pao GET /pao/v1/mandates/${cart.id}/verify 200`,
+      `pao GET /pao/v1/merchants/${cart.cart!.merchantId}/readiness 200`,
+    ]);
   });
 
   it("INJECTION: Платформа требует подтверждения — стадия 4, решение только человека; «без подтверждения» из текста ничего не меняет (Р47 п. 2, 6)", async () => {

@@ -3,10 +3,10 @@
 // operation.settled. Собирается в месте сборки из порта платформы, адаптера витрин и модулей подтверждений и операций.
 // Ответ продавца — только в журнале адаптера витрин и повод ждать запрос подтверждения (инвариант 8).
 import type { Journal } from "../journal/index.js";
-import type { OperationOutcome, OperationWait, SettleOutcome } from "../operations/index.js";
+import type { OperationOutcome, OperationWait, SettleOutcome, WatchAfter } from "../operations/index.js";
 import type { IssuedPackage } from "../ports/payment-platform.js";
 import type { Mutation } from "../ports/mutation.js";
-import { PaymentFailure, ShopFailure, type ConfirmationOutcome, type PaymentContext, type PaymentSteps, type ShopPaymentPort, type ShopPaymentReply } from "../ports/shop.js";
+import { PaymentFailure, ShopFailure, type ConfirmationOutcome, type LateNotice, type PaymentContext, type PaymentSteps, type ShopPaymentPort, type ShopPaymentReply } from "../ports/shop.js";
 import type { StandParams } from "../../shared/config.js";
 import type { CredentialDraft, Mandate, Operation } from "../../shared/domain.js";
 import { SAFE_ID } from "../../shared/ids.js";
@@ -25,9 +25,14 @@ export interface ContourPaymentOptions {
   /** модуль операций (Р49 п. 3–6): итог по order_ref на стадии 5, расчёт по op_ref на стадии 6 */
   operations: {
     expect(orderRef: string, cart: Mandate): OperationWait;
-    settle(authorized: Operation, signal: AbortSignal): Promise<SettleOutcome>;
+    /** поиск операции по CART, когда итога по событию нет (Р51 п. 5) */
+    lookup(orderRef: string, cart: Mandate, notice?: LateNotice): Promise<OperationOutcome>;
+    /** `notice` — под наблюдение после итога ставит сам модуль, в момент итога (Р51 п. 4) */
+    settle(authorized: Operation, signal: AbortSignal, deadline?: number, notice?: LateNotice): Promise<SettleOutcome>;
+    /** наблюдение после итога покупки (Р51 п. 4) */
+    watch(op: Operation, after: WatchAfter, notice: LateNotice): void;
   };
-  params: Pick<StandParams, "operation_outcome_max_delay_sec" | "confirmation_wait_ms">;
+  params: Pick<StandParams, "operation_outcome_max_delay_sec" | "confirmation_wait_ms" | "reservation_ttl_sec">;
   now?: () => Date;
 }
 
@@ -90,7 +95,11 @@ export class ContourPayment implements PaymentSteps {
         // списывались» не говорим (Р45, Б1а; инвариант 8); код витрины — detail записи shop.call
         if (!(e instanceof ShopFailure)) throw e;
       }
-      return await this.#outcome(wait, reply, mark, c.signal);
+      const op = await this.#outcome(wait, reply, mark, c.signal, () => this.o.operations.lookup(orderRef, c.cart, c.notice));
+      // оплата отменена — поздний клиринг или возврат сообщит наблюдение после итога (Р51 п. 4); итог поиска модуль уже
+      // поставил под наблюдение сам, здесь — итог по событию (повторная постановка ничего не теряет)
+      if (op.status === "REVERSED" && c.notice !== undefined) this.o.operations.watch(op, "REVERSED", c.notice);
+      return op;
     } finally {
       wait.close();
     }
@@ -98,7 +107,7 @@ export class ContourPayment implements PaymentSteps {
 
   /** Итог стадии 5 (Р49 п. 5): первое из — привязанная операция или (только при DECLINED продавца) запрос подтверждения,
    *  пришедший после отправки пакета. */
-  async #outcome(wait: OperationWait, reply: ShopPaymentReply | null, mark: number, signal: AbortSignal): Promise<Operation> {
+  async #outcome(wait: OperationWait, reply: ShopPaymentReply | null, mark: number, signal: AbortSignal, lookup: () => Promise<OperationOutcome>): Promise<Operation> {
     const delayMs = this.o.params.operation_outcome_max_delay_sec * 1000;
     let outcome: OperationOutcome | "CONFIRMATION";
     if (reply?.status === "DECLINED") {
@@ -121,20 +130,26 @@ export class ContourPayment implements PaymentSteps {
       outcome = await wait.outcome(delayMs, signal);
     }
     if (outcome === "CONFIRMATION") throw new PaymentFailure("CONFIRMATION_REQUIRED");
+    // итога по событию нет — один поиск по CART (Р51 п. 5): реверсал до ответа эмитента событий не даёт вовсе. Покупку
+    // остановили — поиска нет
+    if (outcome.kind === "NONE" && !signal.aborted) outcome = await lookup();
     if (outcome.kind === "MISMATCH") throw new PaymentFailure("OPERATION_REPLY_MISMATCH");
-    if (outcome.kind === "NONE") throw new PaymentFailure("OPERATION_RESULT_UNCONFIRMED");
+    // неоднозначная привязка — итога нет, поиск её не снимает (Р49 п. 4–5; ревью КТ1 Р51 № 3)
+    if (outcome.kind === "NONE" || outcome.kind === "AMBIGUOUS") throw new PaymentFailure("OPERATION_RESULT_UNCONFIRMED");
     return outcome.operation;
   }
 
-  /** Стадия 6 (Р49 п. 6): расчёт по operation.settled и GET; без `signal` — ждёт, пока расчёт не придёт. Прервано —
-   *  SETTLEMENT_PENDING (ожидание, не остановка); операция не та — OPERATION_REPLY_MISMATCH; GET не подтверждён —
-   *  OPERATION_RESULT_UNCONFIRMED. */
-  async settle(op: Operation, signal?: AbortSignal): Promise<Operation> {
-    // без сигнала ждёт, пока расчёт не придёт; конвейер передаёт свой сигнал остановки покупки (ревью КТ1 № 7а)
-    const r = await this.o.operations.settle(op, signal ?? new AbortController().signal);
+  /** Стадия 6 (Р49 п. 6, Р51 п. 2): расчёт по событию и GET; без `signal` — ждёт до расчёта или границы reservation_ttl_sec
+   *  от `authorizedAt` (нет — от начала ожидания). Прервано — SETTLEMENT_PENDING (ожидание, не остановка); операция не та —
+   *  OPERATION_REPLY_MISMATCH; GET не подтверждён или граница прошла без итога — OPERATION_RESULT_UNCONFIRMED. */
+  async settle(op: Operation, signal?: AbortSignal, authorizedAt?: Date, notice?: LateNotice): Promise<Operation> {
+    const deadline = (authorizedAt ?? this.now()).getTime() + this.o.params.reservation_ttl_sec * 1000;
+    // без сигнала ждёт до расчёта или границы; конвейер передаёт свой сигнал остановки покупки (ревью КТ1 № 7а)
+    // итог расчёта, REVERSED и граница (и при недоступном GET, правка 1) — под наблюдение ставит модуль в момент итога
+    const r = await this.o.operations.settle(op, signal ?? new AbortController().signal, deadline, notice);
     if (r.kind === "PENDING") throw new PaymentFailure("SETTLEMENT_PENDING");
     if (r.kind === "MISMATCH") throw new PaymentFailure("OPERATION_REPLY_MISMATCH");
-    if (r.kind === "UNREAD") throw new PaymentFailure("OPERATION_RESULT_UNCONFIRMED");
+    if (r.kind === "UNREAD" || r.kind === "EXPIRED") throw new PaymentFailure("OPERATION_RESULT_UNCONFIRMED");
     return r.operation;
   }
 }

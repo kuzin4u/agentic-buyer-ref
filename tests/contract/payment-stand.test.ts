@@ -7,12 +7,11 @@ import { PurchaseStopped, PurchaseTransitionForbidden } from "../../src/agent/pi
 import { PaymentFailure } from "../../src/agent/ports/index.js";
 import { SplitWindow } from "../../src/agent/policy/index.js";
 import { DIAG } from "../../src/agent/compose.js";
-import { loadParams } from "../../src/shared/config.js";
 import { INTENT } from "../support/consents.js";
 import { shopBy, type Contour, type ContourCall } from "../support/contour.js";
 import { luhnTail } from "../support/luhn.js";
 import { one } from "../support/purchase.js";
-import { STAND_TIMEOUT_MS, standPurchase, type StandPurchaseOptions } from "../support/stand-purchase.js";
+import { SHORT_DELAY_SEC, STAND_TIMEOUT_MS, standPurchase, type StandPurchaseOptions } from "../support/stand-purchase.js";
 
 let c: Contour | undefined;
 afterEach(async () => {
@@ -24,9 +23,7 @@ const NORMAL = shopBy("NORMAL");
 const CREDENTIALS = "pao POST /pao/v1/credentials";
 
 /** Без подмены до PS-11 продавец решает сам и до ADP стенда не доходит: операции у Платформы нет, события operation.* не
- *  будет — итог стадии 5 по сроку (Р49 п. 5). Срок — не больше 1 с от стендового, чтобы тест не ждал (ревью КТ1 № 13). */
-const SHORT_DELAY_SEC = Math.min(loadParams().operation_outcome_max_delay_sec, 1);
-
+ *  будет — итог стадии 5 по сроку (Р49 п. 5); срок — SHORT_DELAY_SEC (ревью КТ1 № 13). */
 async function run(o: StandPurchaseOptions = {}) {
   const r = await standPurchase({ ...o, params: { operation_outcome_max_delay_sec: SHORT_DELAY_SEC, ...o.params }, contourPayment: true });
   c = r.c;
@@ -93,6 +90,8 @@ describe("стадия 5 на стенде: реквизит по ПАО и па
       // реквизит по CART — витрина приняла пакет: order_ref и cart_mandate_id пакета совпали с заказом
       `${CREDENTIALS} 201`,
       "merchants POST /v1/shops/{shop}/orders/{order}/payment 200",
+      // итога по событию нет за срок — один поиск операции по CART (Р51 п. 5): операции с итогом нет
+      "pao GET /pao/v1/operations 200",
     ]);
     // реквизит — подписанным обращением с ключом вызывающего (инвариант 8, 9); пакет — подписан тем же ключом агента
     const kid = calls.find((x) => x.target === "pao" && x.kid)!.kid;
@@ -265,6 +264,8 @@ describe("стадия 5 на стенде: реквизит по ПАО и па
       "pao GET /pao/v1/mandates/{cart}/verify 200",
       "pao POST /pao/v1/credentials 201",
       "merchants POST /v1/shops/{shop}/orders/{order}/payment 200",
+      // итога нет — один поиск по CART (Р51 п. 5)
+      "pao GET /pao/v1/operations 200",
     ]);
   });
 
@@ -329,6 +330,8 @@ describe("стадия 5 на стенде: реквизит по ПАО и па
       "pao GET /pao/v1/mandates/{cart}/verify 200",
       `${CREDENTIALS} 201`,
       "merchants POST /v1/shops/{shop}/orders/{order}/payment 200",
+      // итога нет — один поиск по CART (Р51 п. 5)
+      "pao GET /pao/v1/operations 200",
     ]);
     expect(r.c.journal.entries.filter((e) => e.kind === "shop.call" && e.method?.endsWith("/payment")).map((e) => [e.mandate, e.detail])).toEqual([[cart.id, "PAID"]]);
     expect((await r.c.platform.getMandate(old.id)).status).toBe("ACTIVE");

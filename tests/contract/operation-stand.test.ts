@@ -5,11 +5,15 @@
 // ему отказом, копию сообщения эквайрера тестовая поддержка передаёт в настоящий ADP стенда (contour.ts, `adpUntilPs11`).
 // Ответ эмитента (ISSUER_RESPONSE) и клиринг (PRESENTMENT) шлёт тест как процессинг (ПИ-3); решение ADP, итог, события,
 // GET и запись об исполнении — настоящие. Ответ продавца DECLINED — только слова (инвариант 8): итог — по событию.
+import type { AddressInfo } from "node:net";
 import { afterEach, describe, expect, it } from "vitest";
+import { DIAG } from "../../src/agent/compose.js";
+import { Operations } from "../../src/agent/operations/index.js";
+import type { Mandate } from "../../src/shared/domain.js";
 import { INTENT } from "../support/consents.js";
 import { shopBy, type Contour } from "../support/contour.js";
 import { one } from "../support/purchase.js";
-import { STAND_TIMEOUT_MS, standPurchase } from "../support/stand-purchase.js";
+import { SHORT_DELAY_SEC, STAND_TIMEOUT_MS, standPurchase } from "../support/stand-purchase.js";
 
 let c: Contour | undefined;
 afterEach(async () => {
@@ -111,5 +115,99 @@ describe("стадии 5–6 на стенде v0.20.0: итог из событ
     // прежний CART — ACTIVE и с полным остатком: операция по нему не шла
     expect((await r.c.platform.getMandate(old.id)).status).toBe("ACTIVE");
     expect((await r.c.platform.verifyMandate({ id: old.id, currency: "RUB" })).amountLeft).toEqual(old.cart!.total);
+  });
+
+  it("Р51 п. 5: реверсал до ответа эмитента — событий нет вовсе; итог находит поиск GET ?mandate_id по CART — STOPPED OPERATION_REVERSED, текст Р51 п. 3; бюджет CART освобождён", async () => {
+    // сроки стадии 5 — короткие: событий не будет, ждать полный срок незачем (сравнение — с одним поиском после срока)
+    const notices: [string, unknown][] = [];
+    const r = await standPurchase({
+      contourPayment: true,
+      adpUntilPs11: true,
+      params: { operation_outcome_max_delay_sec: SHORT_DELAY_SEC, confirmation_wait_ms: SHORT_DELAY_SEC * 1000 },
+      notify: (code, amount) => void notices.push([code, amount]),
+    });
+    c = r.c;
+    const intent = await r.purchase.intent({ ...INTENT, merchantScope: [NORMAL.merchant_id] }, { idempotencyKey: "idem-intent-rev" });
+    await r.signWhileWaiting(intent.id, () => r.purchase.awaitIntent());
+    const offer = (await r.purchase.search()).contour.find((o) => o.shopId === NORMAL.id)!;
+    const cart = await r.purchase.cart(one(offer, 1), { idempotencyKey: "idem-cart-rev" });
+    await r.signWhileWaiting(cart.id, () => r.purchase.awaitCart());
+    const order = await r.purchase.placeOrder({ idempotencyKey: "idem-order-rev" });
+    const total = cart.cart!.total;
+
+    const start = r.c.calls().length;
+    const authorizing = r.purchase.authorize({ idempotencyKey: "idem-pay-rev" }).catch((e: unknown) => e);
+    const d = await decided(r);
+    expect(d.decision).toBe("APPROVE");
+    // процессинг отменил авторизацию до ответа эмитента: ни operation.authorized, ни operation.declined (передача #63 п. 3)
+    await processing(r, { op_ref: d.op_ref, msg_type: "REVERSAL", amount: total.amount, currency: total.currency });
+    const err = await authorizing;
+    expect(err).toMatchObject({ name: "PurchaseStopped", code: "OPERATION_REVERSED" });
+    expect(r.purchase.reason).toBe("OPERATION_REVERSED");
+    expect(r.purchase.next).toBe("NOTIFY_HUMAN");
+    expect(DIAG.OPERATION_REVERSED!.human.ru).toBe("Оплата отменена; списания быть не должно — если оно всё же придёт, сообщим отдельно. Покупка остановлена; итог проверьте в приложении банка.");
+    // полный журнал обращений стадии 5 (ленту не считаем): ворота, реквизит, пакет и один поиск по CART — ни GET одной
+    // операции, ни второй выдачи (ревью КТ1 Р51 № 4)
+    const ids: Record<string, string> = { intent: intent.id, cart: cart.id, shop: NORMAL.id, order: order.orderId };
+    const shape = (x: { target: string; route: string; status: number }) =>
+      `${x.target} ${Object.entries(ids).reduce((route, [name, id]) => route.replaceAll(id, `{${name}}`), x.route)} ${x.status}`;
+    // только обращения агента (по сети): копия сообщения эквайрера в ADP (подмена до PS-11) и REVERSAL процессинга — от
+    // тестовой поддержки (source "test"); обращение агента к /adp/* попало бы сюда и в violations (ревью чата К4)
+    expect(r.c.calls().slice(start).filter((x) => x.source === "agent" && !x.route.startsWith("GET /pao/v1/events")).map(shape)).toEqual([
+      "pao GET /pao/v1/mandates/{intent}/verify 200",
+      "pao GET /pao/v1/mandates/{cart}/verify 200",
+      "pao POST /pao/v1/credentials 201",
+      "merchants POST /v1/shops/{shop}/orders/{order}/payment 200",
+      "pao GET /pao/v1/operations 200",
+    ]);
+    expect(r.c.calls().slice(start).filter((x) => x.source === "test").map(shape)).toEqual(["pao POST /adp/v1/decide 200", "pao POST /adp/v1/events 202"]);
+    expect(r.c.violations()).toEqual([]);
+    // запись поиска — CART и BOUND, без тела ответа
+    expect(entries(r, "operation.lookup")).toEqual([[cart.id, "BOUND"]]);
+    expect(entries(r, "operation.reversed")).toEqual([[d.op_ref, "REVERSAL"]]);
+    // снимок операции покупки — REVERSED с причиной (ревью КТ1 Р51 № 2)
+    expect(r.purchase.operation).toMatchObject({ opRef: d.op_ref, status: "REVERSED", declineReason: "REVERSAL" });
+    // реквизит нигде не встречается (инвариант 1)
+    const out = JSON.stringify([r.c.journal.entries, r.purchase.operation]);
+    for (const s of r.c.issuedSecrets!()) expect(out.includes(s)).toBe(false);
+    // бюджет освободила Платформа — по verify (инвариант 6)
+    expect((await r.c.platform.verifyMandate({ id: cart.id, currency: total.currency })).amountLeft).toEqual(total);
+
+    // Р51 п. 4: клиринг старше реверсала (передача #63 п. 4) — operation.settled, GET SETTLED с NOT_RESERVED: наблюдение
+    // после итога — одно уведомление OPERATION_SETTLED_LATE с суммой и валютой; покупка остаётся STOPPED
+    expect(notices).toEqual([]);
+    await processing(r, { op_ref: d.op_ref, msg_type: "PRESENTMENT", amount: total.amount, currency: total.currency });
+    // после итога ленту читает оболочка или push, не конвейер (compose: events.items) — здесь тест
+    for (let i = 0; i < 50 && notices.length === 0; i++) await r.readFeed();
+    expect(notices).toEqual([["OPERATION_SETTLED_LATE", total]]);
+    expect(r.purchase.reason).toBe("OPERATION_REVERSED");
+  });
+
+  it("ревью чата К4: журнал обращений по источнику — /adp/* по сети (как клиент агента) — обращение агента и нарушение контура; через app.inject — тестовая поддержка", async () => {
+    const r = await standPurchase();
+    c = r.c;
+    const start = r.c.calls().length;
+    // по сети, как ходил бы клиент агента: в журнале агента и в violations
+    const { port } = r.c.stand!.app.server.address() as AddressInfo;
+    await fetch(`http://127.0.0.1:${port}/adp/v1/events`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+    // через inject — тестовая поддержка: не нарушение
+    await r.c.stand!.app.inject({ method: "POST", url: "/adp/v1/events", payload: {} });
+    const calls = r.c.calls().slice(start);
+    expect(calls.map((x) => [x.source, x.route])).toEqual([
+      ["agent", "POST /adp/v1/events"],
+      ["test", "POST /adp/v1/events"],
+    ]);
+    expect(r.c.violations()).toEqual(["агент обратился к пути участника: POST /adp/v1/events"]);
+  });
+
+  it("Р51 п. 5, ревью КТ1 Р51 № 9: поиск по неизвестному CART на стенде — 404 MANDATE_NOT_FOUND, исход NONE (дальше OPERATION_RESULT_UNCONFIRMED), код в operation.lookup, подпись не остановлена", async () => {
+    const r = await standPurchase({ contourPayment: true });
+    c = r.c;
+    await expect(r.c.platform.readOperations("m_cart_unknown")).rejects.toMatchObject({ code: "MANDATE_NOT_FOUND", httpStatus: 404 });
+    const ops = new Operations({ port: r.c.platform, journal: r.c.journal, params: r.params });
+    const unknown = { ...INTENT, id: "m_cart_unknown", kind: "CART", cart: { merchantId: NORMAL.merchant_id, lines: [], total: { amount: 1, currency: "RUB" } } } as unknown as Mandate;
+    expect(await ops.lookup("ord_unknown", unknown)).toEqual({ kind: "NONE" });
+    expect(entries(r, "operation.lookup")).toEqual([["m_cart_unknown", "MANDATE_NOT_FOUND"]]);
+    expect(r.c.admission()).toBeNull();
   });
 });

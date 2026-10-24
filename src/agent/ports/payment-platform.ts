@@ -81,6 +81,9 @@ export interface PaymentPlatform extends MandatePort, EventsPort {
   getOperation(opRef: string, ref: MandateRef): Promise<Operation>;
   /** Операция по `op_ref` из события, без привязки к мандату (Р49 п. 3): суммы — числом, признак — этого агента. */
   readOperation(opRef: string): Promise<OperationRecord>;
+  /** Операции этого агента по мандату с итогом (`GET /pao/v1/operations?mandate_id`, РП55 п. 6; Р51 п. 5): до привязки к
+   *  покупке, как `readOperation`; операции без итога в ответ не входят. */
+  readOperations(mandateId: string): Promise<OperationRecord[]>;
 
   openDispute(draft: DisputeDraft, m: Mutation): Promise<Dispute>;
   getDispute(id: string): Promise<Dispute>;

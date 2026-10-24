@@ -89,7 +89,7 @@ export function shopOrders(s: FeedShop, total?: (req: ShopOrderRequest) => Money
 /** Шаги оплаты (стадии 4–6) до AG-11 и AG-13: исходы задаёт тест; `calls` — какие шаги вызваны, `carts` — id CART и
  *  сумма заказа в контексте каждого `confirm` и `authorize` (Р44 п. 4: оплата только по CART, итог которого = заказу). */
 export function payments(
-  o: { confirm?: ConfirmationOutcome; authorize?: Partial<Operation>; settle?: Operation["status"] | ((x: Operation) => Promise<Operation>) } = {},
+  o: { confirm?: ConfirmationOutcome; authorize?: Partial<Operation>; settle?: Operation["status"] | ((x: Operation, authorizedAt?: Date) => Promise<Operation>) } = {},
 ): PaymentSteps & { calls: string[]; carts: { cart: string; total: Money | undefined; order: Money }[] } {
   const seen = (c: PaymentContext) => steps.carts.push({ cart: c.cart.id, total: c.cart.cart?.total, order: c.order.total });
   const op = (c: PaymentContext, over: Partial<Operation>): Operation => ({
@@ -118,9 +118,9 @@ export function payments(
     // пакет уходит продавцу до итога — как у настоящего порта (Р45 Б2в; ревью КТ1 AG-11 ч. 2 № 2)
     authorize: async (c: PaymentContext): Promise<Operation> => (steps.calls.push("authorize"), seen(c), c.sending(), op(c, o.authorize ?? {})),
     // расчёт — с записью об исполнении в пределах одобренного (Р49 п. 7); функция — исход задаёт тест
-    settle: async (x: Operation): Promise<Operation> => {
+    settle: async (x: Operation, _signal?: AbortSignal, authorizedAt?: Date): Promise<Operation> => {
       steps.calls.push("settle");
-      if (typeof o.settle === "function") return o.settle(x);
+      if (typeof o.settle === "function") return o.settle(x, authorizedAt);
       const status = o.settle ?? "SETTLED";
       const fulfilment = status === "SETTLED" && x.amount !== null ? { ref: "ful_1", finalAmount: x.amount, scopeCheck: "WITHIN_LIMITS" as const, spentPosition: x.amount, at: "2026-10-23T12:05:00.000Z" } : null;
       return { ...x, status, fulfilment };

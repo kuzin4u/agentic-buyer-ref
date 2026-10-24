@@ -1,8 +1,9 @@
 // Модуль операций (Р49 п. 3–7): событие operation.* — сигнал, итог — по GET; привязка к покупке по order_ref, сверка с
 // CART (признак, продавец, сумма, канал); дубли по event_id; GET, который Платформа просит повторить, — событие читается
-// снова; стадия 6 — GET по op_ref, без события — снова GET через operation_outcome_max_delay_sec, прерывание — PENDING.
+// снова; стадия 6 — GET по op_ref, без события — снова GET не чаще operation_reread_interval_sec, граница — reservation_ttl_sec
+// (Р51 п. 2), прерывание — PENDING.
 import { describe, expect, it } from "vitest";
-import { Operations, type OperationOutcome, type SettleOutcome } from "../../src/agent/operations/index.js";
+import { Operations, type OperationOutcome, type SettleOutcome, type WatchAfter } from "../../src/agent/operations/index.js";
 import type { FeedItem } from "../../src/agent/ports/events.js";
 import { DIAG } from "../../src/agent/compose.js";
 import { loadParams } from "../../src/shared/config.js";
@@ -12,6 +13,7 @@ const T0 = Date.parse("2026-10-23T12:00:00.000Z");
 const PARAMS = loadParams();
 const DELAY_SEC = PARAMS.operation_outcome_max_delay_sec;
 const TTL_SEC = PARAMS.registry_cache_ttl_sec;
+const REREAD_SEC = PARAMS.operation_reread_interval_sec;
 const AG = "nspk:agent:buyer:v1";
 const ORDER = "ord_1";
 const CART: Mandate = {
@@ -66,6 +68,8 @@ function record(status: OperationRecord["status"], over: Partial<OperationRecord
 function setup(wake?: (ops: Operations) => Promise<void>, pollMs?: number, seenMax = PARAMS.event_seen_max) {
   const c = clock();
   const answers = new Map<string, OperationRecord | Error>();
+  /** ответ GET /pao/v1/operations?mandate_id — по id мандата; нет — пустой список */
+  const lists = new Map<string, OperationRecord[] | Error>();
   const gets: string[] = [];
   const journal: Record<string, unknown>[] = [];
   const ops: Operations = new Operations({
@@ -77,9 +81,21 @@ function setup(wake?: (ops: Operations) => Promise<void>, pollMs?: number, seenM
         if (a instanceof Error) throw a;
         return structuredClone(a);
       },
+      readOperations: async (mandateId: string) => {
+        gets.push(`list ${mandateId}`);
+        const a = lists.get(mandateId) ?? [];
+        if (a instanceof Error) throw a;
+        return structuredClone(a);
+      },
     },
     journal: { record: (e) => void journal.push(e) },
-    params: { operation_outcome_max_delay_sec: DELAY_SEC, registry_cache_ttl_sec: TTL_SEC, event_seen_max: seenMax, ...(pollMs !== undefined && { event_poll_interval_ms: pollMs }) },
+    params: {
+      operation_outcome_max_delay_sec: DELAY_SEC,
+      operation_reread_interval_sec: REREAD_SEC,
+      registry_cache_ttl_sec: TTL_SEC,
+      event_seen_max: seenMax,
+      ...(pollMs !== undefined && { event_poll_interval_ms: pollMs }),
+    },
     ...(wake && { wake: (): Promise<void> => wake(ops) }),
     now: c.now,
     timer: c.timer,
@@ -98,7 +114,7 @@ function setup(wake?: (ops: Operations) => Promise<void>, pollMs?: number, seenM
     w.outcome(DELAY_SEC * 1000, ac.signal).then((o) => (outcome = o), (e: Error) => (outcome = e));
     return { ac, w, outcome: () => outcome };
   };
-  return { c, answers, gets, journal, ops, event, waiting };
+  return { c, answers, lists, gets, journal, ops, event, waiting };
 }
 
 const kinds = (journal: Record<string, unknown>[]) => journal.map((e) => `${String(e.kind)}:${String(e.detail ?? e.reason ?? "")}`);
@@ -221,13 +237,13 @@ describe("стадия 5: итог операции по событию и GET (
     expect(s.gets).toEqual(["op_1", "op_1"]);
   });
 
-  it("две покупки ждут одну ссылку заказа — привязка неоднозначна: обе NONE", async () => {
+  it("две покупки ждут одну ссылку заказа — привязка неоднозначна: обе AMBIGUOUS (не NONE: поиск по CART её не снимает, ревью КТ1 Р51 № 3)", async () => {
     const s = setup();
     const a = s.waiting();
     const b = s.waiting();
     await tick();
-    expect(a.outcome()).toEqual({ kind: "NONE" });
-    expect(b.outcome()).toEqual({ kind: "NONE" });
+    expect(a.outcome()).toEqual({ kind: "AMBIGUOUS" });
+    expect(b.outcome()).toEqual({ kind: "AMBIGUOUS" });
   });
 
   it("после close() события по заказу — operation.unclaimed", async () => {
@@ -237,6 +253,196 @@ describe("стадия 5: итог операции по событию и GET (
     s.answers.set("op_1", record("AUTHORIZED"));
     await s.event("operation.authorized", "op_1");
     expect(kinds(s.journal).at(-1)).toBe("operation.unclaimed:");
+  });
+});
+
+describe("восстановление op_ref: поиск по CART после итога без события (Р51 п. 5)", () => {
+  const lookups = (journal: Record<string, unknown>[]) => journal.filter((e) => e.kind === "operation.lookup").map((e) => [e.ref, e.detail]);
+
+  it("одна операция заказа — итог как из события, в валюте CART; запись operation.lookup BOUND с CART, без тела ответа", async () => {
+    const s = setup();
+    s.lists.set(CART.id, [record("AUTHORIZED"), record("DECLINED", { opRef: "op_other", orderRef: "ord_other" })]);
+    const out = await s.ops.lookup(ORDER, CART);
+    expect(out).toMatchObject({ kind: "OPERATION", operation: { opRef: "op_1", status: "AUTHORIZED", amount: { amount: 90_000, currency: "RUB" } } });
+    expect(s.gets).toEqual([`list ${CART.id}`]);
+    expect(lookups(s.journal)).toEqual([[CART.id, "BOUND"]]);
+    const entry = s.journal.find((e) => e.kind === "operation.lookup")!;
+    expect(Object.keys(entry).sort()).toEqual(["at", "detail", "kind", "ref"]);
+  });
+
+  it("реверсал до ответа эмитента (событий нет вовсе) — REVERSED по поиску, запись operation.reversed", async () => {
+    const s = setup();
+    s.lists.set(CART.id, [record("REVERSED", { declineReason: "REVERSAL" })]);
+    expect(await s.ops.lookup(ORDER, CART)).toMatchObject({ kind: "OPERATION", operation: { status: "REVERSED", declineReason: "REVERSAL" } });
+    expect(kinds(s.journal)).toContain("operation.reversed:REVERSAL");
+  });
+
+  it("ни одной операции заказа (операция без итога в ответ не входит) — NONE; две — AMBIGUOUS, тоже NONE (не первая)", async () => {
+    const s = setup();
+    s.lists.set(CART.id, [record("AUTHORIZED", { orderRef: "ord_other" })]);
+    expect(await s.ops.lookup(ORDER, CART)).toEqual({ kind: "NONE" });
+    s.lists.set(CART.id, [record("AUTHORIZED"), record("AUTHORIZED", { opRef: "op_2" })]);
+    expect(await s.ops.lookup(ORDER, CART)).toEqual({ kind: "NONE" });
+    expect(lookups(s.journal)).toEqual([[CART.id, "NONE"], [CART.id, "AMBIGUOUS"]]);
+  });
+
+  it("операция не сходится с CART — MISMATCH, запись operation.mismatch и operation.lookup MISMATCH", async () => {
+    const s = setup();
+    s.lists.set(CART.id, [record("AUTHORIZED", { amountMinor: 1 })]);
+    expect(await s.ops.lookup(ORDER, CART)).toEqual({ kind: "MISMATCH" });
+    expect(kinds(s.journal)).toEqual(["operation.mismatch:AMOUNT", "operation.lookup:MISMATCH"]);
+  });
+
+  it("отказ Платформы (404, 400, 403, ответ не по схеме) — NONE, код отказа в operation.lookup; повтора нет; иная ошибка — наружу", async () => {
+    for (const [code, status] of [["MANDATE_NOT_FOUND", 404], ["REQUEST_INVALID", 400], ["AGENT_SUSPENDED", 403], ["BAD_RESPONSE", 200]] as const) {
+      const s = setup();
+      s.lists.set(CART.id, new PlatformFailure(code, "never", code, status, null));
+      expect(await s.ops.lookup(ORDER, CART)).toEqual({ kind: "NONE" });
+      expect(lookups(s.journal)).toEqual([[CART.id, code]]);
+      expect(s.gets).toEqual([`list ${CART.id}`]);
+    }
+    const boom = new Error("журнал недоступен");
+    const s = setup();
+    s.lists.set(CART.id, boom);
+    await expect(s.ops.lookup(ORDER, CART)).rejects.toBe(boom);
+  });
+});
+
+describe("наблюдение после итога (Р51 п. 4; таблица К4 в PR #66)", () => {
+  const OP: Operation = {
+    opRef: "op_1",
+    orderRef: ORDER,
+    channel: "CARD",
+    amount: { amount: 90_000, currency: "RUB" },
+    merchantId: "MER-T1",
+    indicator: { agentCode: AG, mandateId: CART.id },
+    status: "AUTHORIZED",
+    declineReason: null,
+    fulfilment: null,
+  };
+  const ful = (scopeCheck: "WITHIN_LIMITS" | "EXCEEDS_AUTHORIZATION" | "NOT_RESERVED", finalMinor = 90_000) => ({ ref: "ful_0123456789abcdef01234567", finalMinor, scopeCheck, spentMinor: finalMinor, at: "2026-10-23T12:05:00.000Z" });
+  const observing = (after: WatchAfter, seenMax?: number) => {
+    const s = setup(undefined, undefined, seenMax);
+    const sent: [string, unknown][] = [];
+    s.ops.watch(OP, after, (code, amount) => void sent.push([code, amount]));
+    return { ...s, sent };
+  };
+  const RUB = (amount: number) => ({ amount, currency: "RUB" });
+
+  it("OPERATION_REVERSED × поздний SETTLED — одно уведомление OPERATION_SETTLED_LATE с суммой и валютой (не SCOPE_NOT_RESERVED); затем возврат — OPERATION_REFUNDED", async () => {
+    const s = observing("REVERSED");
+    s.answers.set("op_1", record("SETTLED", { fulfilment: ful("NOT_RESERVED", 85_000) }));
+    await s.event("operation.settled", "op_1");
+    expect(s.sent).toEqual([["OPERATION_SETTLED_LATE", RUB(85_000)]]);
+    s.answers.set("op_1", record("REFUNDED", { fulfilment: ful("NOT_RESERVED", 85_000) }));
+    await s.event("operation.refunded", "op_1");
+    expect(s.sent).toEqual([["OPERATION_SETTLED_LATE", RUB(85_000)], ["OPERATION_REFUNDED", RUB(85_000)]]);
+  });
+
+  it("граница (UNSETTLED) × поздний SETTLED — OPERATION_SETTLED_LATE; scope_check не WITHIN_LIMITS — ещё SCOPE_* с той же суммой", async () => {
+    for (const [scope, extra] of [["WITHIN_LIMITS", []], ["EXCEEDS_AUTHORIZATION", ["SCOPE_EXCEEDS_AUTHORIZATION"]]] as const) {
+      const s = observing("UNSETTLED");
+      s.answers.set("op_1", record("SETTLED", { fulfilment: ful(scope) }));
+      await s.event("operation.settled", "op_1");
+      expect(s.sent, scope).toEqual([["OPERATION_SETTLED_LATE", RUB(90_000)], ...extra.map((c) => [c, RUB(90_000)])]);
+    }
+  });
+
+  it("DONE по SETTLED × возврат — OPERATION_REFUNDED; повторный SETTLED — без уведомления; DONE по REFUNDED × возврат — без второго", async () => {
+    const s = observing("SETTLED");
+    s.answers.set("op_1", record("SETTLED", { fulfilment: ful("WITHIN_LIMITS") }));
+    await s.event("operation.settled", "op_1");
+    expect(s.sent).toEqual([]);
+    s.answers.set("op_1", record("REFUNDED", { fulfilment: ful("WITHIN_LIMITS") }));
+    await s.event("operation.refunded", "op_1");
+    expect(s.sent).toEqual([["OPERATION_REFUNDED", RUB(90_000)]]);
+    const r = observing("REFUNDED");
+    r.answers.set("op_1", record("REFUNDED", { fulfilment: ful("WITHIN_LIMITS") }));
+    await r.event("operation.refunded", "op_1");
+    expect(r.sent).toEqual([]);
+  });
+
+  it("условие 2 ревью чата: одно событие дважды (лента и push) — один GET и одно уведомление; второе событие с тем же итогом — без второго уведомления", async () => {
+    const s = observing("REVERSED");
+    s.answers.set("op_1", record("SETTLED", { fulfilment: ful("NOT_RESERVED") }));
+    await s.event("operation.settled", "op_1", "evt_dup");
+    await s.event("operation.settled", "op_1", "evt_dup");
+    expect(s.gets).toEqual(["op_1"]);
+    await s.event("operation.settled", "op_1", "evt_other");
+    expect(s.sent.map(([c]) => c)).toEqual(["OPERATION_SETTLED_LATE"]);
+  });
+
+  it("условие 2 ревью чата: вытеснение из окна event_seen_max — событие по вытесненной операции — operation.unclaimed без уведомления", async () => {
+    const s = observing("REVERSED", 2);
+    s.ops.watch({ ...OP, opRef: "op_2", orderRef: "ord_2" }, "REVERSED", () => void s.sent.push(["op_2", null]));
+    s.ops.watch({ ...OP, opRef: "op_3", orderRef: "ord_3" }, "REVERSED", () => void s.sent.push(["op_3", null]));
+    s.answers.set("op_1", record("SETTLED", { fulfilment: ful("NOT_RESERVED") }));
+    await s.event("operation.settled", "op_1");
+    expect(s.sent).toEqual([]);
+    expect(kinds(s.journal)).toEqual(["operation.status:SETTLED", "operation.unclaimed:"]);
+  });
+
+  it("ревью чата К5: settle с уведомлением покупки — под наблюдение ставит сам модуль в момент итога (SETTLED, REFUNDED, REVERSED, граница); событие сразу после выхода — не теряется", async () => {
+    for (const [answer, deadline, event, expected] of [
+      [record("SETTLED", { fulfilment: ful("WITHIN_LIMITS") }), undefined, record("REFUNDED", { fulfilment: ful("WITHIN_LIMITS") }), "OPERATION_REFUNDED"],
+      [record("REVERSED", { declineReason: "REVERSAL" }), undefined, record("SETTLED", { fulfilment: ful("NOT_RESERVED") }), "OPERATION_SETTLED_LATE"],
+      [record("AUTHORIZED"), T0, record("SETTLED", { fulfilment: ful("WITHIN_LIMITS") }), "OPERATION_SETTLED_LATE"],
+    ] as const) {
+      const s = setup();
+      const sent: string[] = [];
+      s.answers.set("op_1", answer);
+      const ac = new AbortController();
+      // событие обрабатывается первым продолжением после итога ожидания — раньше, чем вызывающий узнает исход
+      const done = s.ops.settle(OP, ac.signal, deadline, (code) => void sent.push(code)).then(async (out) => {
+        s.answers.set("op_1", event);
+        await s.event(event.status === "REFUNDED" ? "operation.refunded" : "operation.settled", "op_1");
+        return out;
+      });
+      await done;
+      expect(sent, answer.status).toEqual([expected]);
+    }
+  });
+
+  it("ревью чата К5: событие пришло, пока шёл последний GET ожидания (разбудило ожидание), а GET дал итог — наблюдение перечитывает и сообщает", async () => {
+    let release: (r: OperationRecord) => void = () => {};
+    let calls = 0;
+    const sent: string[] = [];
+    const c = clock();
+    const ops = new Operations({
+      port: {
+        readOperation: async () => (++calls === 1 ? new Promise<OperationRecord>((res) => (release = res)) : record("REFUNDED", { fulfilment: ful("WITHIN_LIMITS") })),
+        readOperations: async () => [],
+      },
+      journal: { record: () => {} },
+      params: { operation_outcome_max_delay_sec: DELAY_SEC, operation_reread_interval_sec: REREAD_SEC, registry_cache_ttl_sec: TTL_SEC, event_seen_max: PARAMS.event_seen_max },
+      now: c.now,
+      timer: c.timer,
+    });
+    const settled = ops.settle(OP, new AbortController().signal, undefined, (code) => void sent.push(code));
+    await tick();
+    // возврат — пока первый GET в пути: ожидание ещё числится за op_ref
+    await ops.listener({ kind: "event", event: { eventId: "evt_ref", type: "operation.refunded", at: "x", mandateId: null, opRef: "op_1", confirmationId: null, declineReason: null } });
+    release(record("SETTLED", { fulfilment: ful("WITHIN_LIMITS") }));
+    await expect(settled).resolves.toMatchObject({ kind: "OPERATION", operation: { status: "SETTLED" } });
+    await tick();
+    await tick();
+    expect(calls).toBe(2);
+    expect(sent).toEqual(["OPERATION_REFUNDED"]);
+  });
+
+  it("GET дал другой статус — без уведомления; отказ GET с просьбой повторить — наружу (событие прочитается снова); сбой уведомления — исход не меняется", async () => {
+    const s = observing("REVERSED");
+    s.answers.set("op_1", record("REVERSED", { declineReason: "REVERSAL" }));
+    await s.event("operation.settled", "op_1");
+    expect(s.sent).toEqual([]);
+    s.answers.set("op_1", new PlatformFailure("STATE_UNAVAILABLE", "same_key", "STATE_UNAVAILABLE", 503, null));
+    await expect(s.ops.listener({ kind: "event", event: { eventId: "evt_503", type: "operation.settled", at: "x", mandateId: null, opRef: "op_1", confirmationId: null, declineReason: null } })).rejects.toMatchObject({ code: "STATE_UNAVAILABLE" });
+    const t = setup();
+    t.ops.watch(OP, "REVERSED", () => {
+      throw new Error("оболочка упала");
+    });
+    t.answers.set("op_1", record("SETTLED", { fulfilment: ful("NOT_RESERVED") }));
+    await expect(t.event("operation.settled", "op_1")).resolves.toBeUndefined();
   });
 });
 
@@ -284,10 +490,10 @@ describe("стадия 6: расчёт по operation.settled и GET (Р49 п. 6
   };
   const SETTLED = record("SETTLED", { fulfilment: { ref: "ful_0123456789abcdef01234567", finalMinor: 90_000, scopeCheck: "WITHIN_LIMITS", spentMinor: 90_000, at: "2026-10-23T12:05:00.000Z" } });
 
-  const settling = (s: ReturnType<typeof setup>) => {
+  const settling = (s: ReturnType<typeof setup>, deadline?: number) => {
     const ac = new AbortController();
     let out: SettleOutcome | Error | undefined;
-    s.ops.settle(authorized, ac.signal).then((o) => (out = o), (e: Error) => (out = e));
+    s.ops.settle(authorized, ac.signal, deadline).then((o) => (out = o), (e: Error) => (out = e));
     return { ac, out: () => out };
   };
 
@@ -316,17 +522,62 @@ describe("стадия 6: расчёт по operation.settled и GET (Р49 п. 6
     expect(s.gets).toEqual(["op_1", "op_1"]);
   });
 
-  it("без события дольше operation_outcome_max_delay_sec — снова GET (#59 п. 3); прерывание вызывающим — PENDING", async () => {
+  it("Р51 п. 2 (а): без события — снова GET не чаще operation_reread_interval_sec (не через operation_outcome_max_delay_sec); прерывание вызывающим — PENDING", async () => {
+    expect(REREAD_SEC).toBeGreaterThan(DELAY_SEC);
     const s = setup();
     s.answers.set("op_1", record("AUTHORIZED"));
     const r = settling(s);
     await tick();
-    await s.c.advance(DELAY_SEC * 1000);
-    await s.c.advance(DELAY_SEC * 1000);
+    // до срока перечитывания — ни одного GET сверх первого, сколько бы ни прошло сроков задержки события
+    await s.c.advance(REREAD_SEC * 1000 - 1);
+    expect(s.gets).toEqual(["op_1"]);
+    await s.c.advance(1);
+    expect(s.gets).toEqual(["op_1", "op_1"]);
+    await s.c.advance(REREAD_SEC * 1000);
     expect(s.gets).toEqual(["op_1", "op_1", "op_1"]);
     r.ac.abort();
     await tick();
     expect(r.out()).toEqual({ kind: "PENDING" });
+  });
+
+  it("Р51 п. 2 (б): граница reservation_ttl_sec — последний GET в срок границы; по-прежнему AUTHORIZED — EXPIRED и запись operation.unsettled", async () => {
+    const s = setup();
+    s.answers.set("op_1", record("AUTHORIZED"));
+    // граница раньше второго планового чтения: пауза — до границы, не на полный срок перечитывания
+    const deadline = T0 + REREAD_SEC * 1000 + 500;
+    const r = settling(s, deadline);
+    await tick();
+    await s.c.advance(REREAD_SEC * 1000);
+    expect(r.out()).toBeUndefined();
+    expect(s.gets).toEqual(["op_1", "op_1"]);
+    await s.c.advance(499);
+    expect(r.out()).toBeUndefined();
+    await s.c.advance(1);
+    await tick();
+    expect(s.gets).toEqual(["op_1", "op_1", "op_1"]);
+    expect(r.out()).toEqual({ kind: "EXPIRED" });
+    expect(kinds(s.journal).at(-1)).toBe("operation.unsettled:");
+    // итог в последнем чтении — итог, не EXPIRED
+    const s2 = setup();
+    s2.answers.set("op_1", record("AUTHORIZED"));
+    const r2 = settling(s2, T0 + 1000);
+    await tick();
+    s2.answers.set("op_1", SETTLED);
+    await s2.c.advance(1000);
+    await tick();
+    expect(r2.out()).toMatchObject({ kind: "OPERATION", operation: { status: "SETTLED" } });
+  });
+
+  it("Р51 п. 3: REVERSED — итог-операция, запись operation.reversed с причиной закрытым перечнем (иное — OTHER, значение не в журнал)", async () => {
+    for (const [reason, detail] of [["REVERSAL", "REVERSAL"], ["AUTH_EXPIRED", "AUTH_EXPIRED"], ["CHARGE_CANCELLED_BY_X", "OTHER"], [null, "OTHER"]] as const) {
+      const s = setup();
+      s.answers.set("op_1", record("REVERSED", { declineReason: reason }));
+      const r = settling(s);
+      await tick();
+      expect(r.out()).toMatchObject({ kind: "OPERATION", operation: { status: "REVERSED", declineReason: reason } });
+      expect(kinds(s.journal).at(-1)).toBe(`operation.reversed:${detail}`);
+      if (reason !== null && detail === "OTHER") expect(JSON.stringify(s.journal)).not.toContain(reason);
+    }
   });
 
   it("scope_check вне перечня — в операции как есть, в журнале OTHER; не по форме кода — без значения", async () => {
@@ -338,6 +589,28 @@ describe("стадия 6: расчёт по operation.settled и GET (Р49 п. 6
       expect(r.out()).toMatchObject({ kind: "OPERATION", operation: { fulfilment: { scopeCheck: { other: kept } } } });
       expect(kinds(s.journal).at(-1)).toBe("operation.settled:OTHER");
     }
+  });
+
+  it("ревью КТ1 Р51 № 1: граница не число (недействительная дата) — EXPIRED без GET и без таймеров; запись operation.unsettled", async () => {
+    const s = setup();
+    s.answers.set("op_1", record("AUTHORIZED"));
+    const r = settling(s, Number.NaN);
+    await tick();
+    expect(r.out()).toEqual({ kind: "EXPIRED" });
+    expect(s.gets).toEqual([]);
+    expect(kinds(s.journal)).toEqual(["operation.unsettled:"]);
+  });
+
+  it("ревью КТ1 Р51 № 7: граница прошла, пока GET отказывает с просьбой повторить, — EXPIRED и operation.unsettled, не UNREAD", async () => {
+    const s = setup();
+    s.answers.set("op_1", new PlatformFailure("STATE_UNAVAILABLE", "same_key", "STATE_UNAVAILABLE", 503, null));
+    // граница — раньше предела недоступности: по ней исход — граница, а не «Платформа недоступна»
+    const r = settling(s, T0 + DELAY_SEC * 1000);
+    await tick();
+    await s.c.advance(DELAY_SEC * 1000);
+    await tick();
+    expect(r.out()).toEqual({ kind: "EXPIRED" });
+    expect(kinds(s.journal).slice(-2)).toEqual(["operation.unread:STATE_UNAVAILABLE", "operation.unsettled:"]);
   });
 
   it("ревью КТ1 № 8: GET 503 подряд дольше registry_cache_ttl_sec — UNREAD; каждый отказ — запись operation.unread", async () => {
@@ -363,9 +636,10 @@ describe("стадия 6: расчёт по operation.settled и GET (Р49 п. 6
           calls++;
           return calls === 1 ? new Promise<OperationRecord>((res) => (release = res)) : SETTLED;
         },
+        readOperations: async () => [],
       },
       journal: { record: () => {} },
-      params: { operation_outcome_max_delay_sec: DELAY_SEC, registry_cache_ttl_sec: TTL_SEC, event_seen_max: PARAMS.event_seen_max },
+      params: { operation_outcome_max_delay_sec: DELAY_SEC, operation_reread_interval_sec: REREAD_SEC, registry_cache_ttl_sec: TTL_SEC, event_seen_max: PARAMS.event_seen_max },
       now: c.now,
       timer: c.timer,
     });

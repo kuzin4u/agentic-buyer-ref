@@ -12,8 +12,8 @@ import { Operations } from "../../src/agent/operations/index.js";
 import { ContourPayment } from "../../src/agent/payment-package/index.js";
 import { Purchase } from "../../src/agent/pipeline/index.js";
 import { OrderPriceMismatches, SplitWindow } from "../../src/agent/policy/index.js";
-import type { FeedItem, HttpRequestSigning, PaymentPlatform, PurchaseNotice } from "../../src/agent/ports/index.js";
-import { parseParams, type StandParams } from "../../src/shared/config.js";
+import type { FeedItem, HttpRequestSigning, NoticeAmount, PaymentPlatform, PurchaseNotice } from "../../src/agent/ports/index.js";
+import { loadParams, parseParams, type StandParams } from "../../src/shared/config.js";
 import type { Mandate } from "../../src/shared/domain.js";
 import { INTENT } from "./consents.js";
 import { createContour, type Contour } from "./contour.js";
@@ -22,6 +22,10 @@ import { standShops } from "./stand-shop.js";
 
 /** Стенд в процессе теста под параллельной нагрузкой прогона бывает медленнее 5 с (нюанс К2.3 Р38). */
 export const STAND_TIMEOUT_MS = 30_000;
+
+/** Срок стадии 5 в тестах, где события operation.* не будет: не больше 1 с от стендового, чтобы тест не ждал полный срок
+ *  (ревью КТ1 AG-11 ч. 2 № 13; ревью КТ1 Р51 № 5). Производное от конфигурации, не литерал. */
+export const SHORT_DELAY_SEC = Math.min(loadParams().operation_outcome_max_delay_sec, 1);
 
 export const pause = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -54,7 +58,7 @@ export interface StandPurchaseOptions {
   /** выдача реквизита поверх настоящей платформы контура — действие теста посреди стадии 5 (параллельный вызов, Р45 Б2в) */
   issue?: (real: PaymentPlatform["issuePaymentPackage"]) => PaymentPlatform["issuePaymentPackage"];
   /** уведомление оболочки (Р47 п. 5, В3) */
-  notify?: (code: PurchaseNotice) => void | Promise<void>;
+  notify?: (code: PurchaseNotice, amount?: NoticeAmount) => void | Promise<void>;
   /** часы клиента ПАО и модуля подтверждений — тест двигает их вместе с часами стенда (истечение, РП51 п. 6) */
   now?: () => Date;
   /** таймер модуля подтверждений — тест срабатывает его сам (срок решения — минуты по order_hold_sec Платформы) */
@@ -137,5 +141,7 @@ export async function standPurchase(o: StandPurchaseOptions = {}) {
     await signWhileWaiting(intent.id, () => purchase.awaitIntent());
     return intent;
   }
-  return { c, self, stand, purchase, next, orderMismatches, payment, split, params, confirmations, signWhileWaiting, signedIntent };
+  // readFeed — одно чтение ленты тем же курсором, что у ожиданий: после итога покупки ленту читает оболочка (events.items)
+  // или push, а не конвейер — тест делает это сам (наблюдение после итога, Р51 п. 4)
+  return { c, self, stand, purchase, next, orderMismatches, payment, split, params, confirmations, signWhileWaiting, signedIntent, readFeed: wake };
 }

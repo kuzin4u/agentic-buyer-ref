@@ -2,7 +2,7 @@
 // стадий (shop.ts). Ленты у PaoStub нет — элементы ленты задаёт тест (`setFeed`) до ожидания подписи.
 import { Purchase, type CartChoice } from "../../src/agent/pipeline/index.js";
 import type { HumanA5Decision } from "../../src/agent/shell/index.js";
-import type { FeedItem, LiveOfferSource, OfferSource, PaymentSteps, PurchaseNotice, ShopPort } from "../../src/agent/ports/index.js";
+import type { FeedItem, LiveOfferSource, NoticeAmount, OfferSource, PaymentSteps, PurchaseNotice, ShopPort } from "../../src/agent/ports/index.js";
 import { OrderPriceMismatches, SplitWindow } from "../../src/agent/policy/index.js";
 import { loadParams } from "../../src/shared/config.js";
 import type { Journal } from "../../src/agent/journal/index.js";
@@ -41,7 +41,7 @@ export interface PurchaseSetup {
   /** окно дробления, общее с другой покупкой (как одно на ядро у места сборки); нет — своё */
   split?: SplitWindow;
   /** уведомление оболочки (Р47 п. 5, В3) */
-  notify?: (code: PurchaseNotice) => void | Promise<void>;
+  notify?: (code: PurchaseNotice, amount?: NoticeAmount) => void | Promise<void>;
   /** код остановки по ошибке вне ядра — как у места сборки (`startFailureCode`); нет — UNKNOWN */
   failureCode?: (e: unknown) => DiagCode | null;
 }

@@ -56,9 +56,15 @@ export const StandParamsSchema = z
   // Ожидание запроса подтверждения после ответа продавца DECLINED (Р47 п. 4): не пришёл — OPERATION_RESULT_UNCONFIRMED.
   confirmation_wait_ms: positive.max(TIMER_MAX_MS),
   // Предел задержки события итога операции (#57 п. 4, Р49 п. 1): на стадии 5 — ожидание operation.* после ответа продавца,
-  // на стадии 6 — промежуток перечитывания GET без события (#59 п. 3). Равен параметру стенда (тест стенда).
+  // на стадии 6 — пауза повтора GET после отказа с просьбой повторить (плановое перечитывание — operation_reread_interval_sec,
+  // Р51 п. 2). Равен параметру стенда (тест стенда).
   // × 1000 — срок таймера: не больше его предела (как shop_retry_after_max_sec); 0 — ожидания нет, не допускается
   operation_outcome_max_delay_sec: positive.max(Math.floor(TIMER_MAX_MS / 1000)),
+  // Стадия 6 (РП55, Р51 п. 2): плановое перечитывание GET операции — не чаще раза в operation_reread_interval_sec (срок
+  // таймера: не больше его предела); граница ожидания клиринга — reservation_ttl_sec от привязки AUTHORIZED (срок по часам,
+  // не таймер: × 1000 остаётся safe integer). Равны параметрам стенда Платформы.
+  operation_reread_interval_sec: positive.max(Math.floor(TIMER_MAX_MS / 1000)),
+  reservation_ttl_sec: positive.max(Math.floor(Number.MAX_SAFE_INTEGER / 1000)),
   // Окно обработанных event_id у модулей операций и подтверждений (Р50 п. 1): вытеснение старейшего, рост ограничен.
   event_seen_max: positive,
 })
@@ -83,6 +89,8 @@ export const StandParamsSchema = z
   .refine((p) => p.confirmation_wait_ms <= p.registry_cache_ttl_sec * 1000, { message: "confirmation_wait_ms больше registry_cache_ttl_sec" })
   // Ожидание итога операции — в пределах registry_cache_ttl_sec (Р49 п. 1, инвариант 4).
   .refine((p) => p.operation_outcome_max_delay_sec <= p.registry_cache_ttl_sec, { message: "operation_outcome_max_delay_sec больше registry_cache_ttl_sec" })
+  // Перечитывание укладывается в границу ожидания клиринга: хотя бы одно плановое чтение до границы (Р51 п. 2).
+  .refine((p) => p.operation_reread_interval_sec <= p.reservation_ttl_sec, { message: "operation_reread_interval_sec больше reservation_ttl_sec" })
   // Срок поиска вмещает хотя бы одно обращение к витрине (Р44 п. 6).
   .refine((p) => p.shop_search_deadline_ms >= p.shop_request_timeout_ms, { message: "shop_search_deadline_ms меньше shop_request_timeout_ms" });
 

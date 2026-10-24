@@ -6,16 +6,23 @@
 import { poll } from "../events/poll.js";
 import { SeenWindow } from "../events/seen.js";
 import type { FeedItem } from "../ports/events.js";
+import type { LateNotice, PurchaseNotice } from "../ports/shop.js";
 import { PlatformFailure, type FailureCode, type Mandate, type Operation, type OperationRecord, type OperationStatus, type ScopeCheck } from "../../shared/domain.js";
 import type { DiagCode } from "../../shared/diag-codes.js";
 import { TIMER_MAX_MS } from "../../shared/config.js";
 import { SAFE_ID } from "../../shared/ids.js";
 import { bindOperation, settledOperation, type MismatchField } from "./bind.js";
+import { chargedAmount, scopeNotice } from "./notice.js";
 
 /** Часть порта платформы, которую видит модуль. */
 export interface OperationsPort {
   readOperation(opRef: string): Promise<OperationRecord>;
+  /** операции по мандату с итогом (Р51 п. 5) */
+  readOperations(mandateId: string): Promise<OperationRecord[]>;
 }
+
+/** Исход поиска операции по CART (запись operation.lookup, Р51 п. 5) — закрытым перечнем; отказ — код отказа. */
+export type LookupDetail = "BOUND" | "NONE" | "AMBIGUOUS" | "MISMATCH" | FailureCode;
 
 /** scope_check в журнале — закрытым перечнем: значение вне перечня — OTHER, само значение не пишется (инвариант 5). */
 export type ScopeCheckDetail = Exclude<ScopeCheck, { other: string | null }> | "OTHER";
@@ -29,16 +36,35 @@ export interface OperationsJournal {
       /** reason — OPERATION_UNREAD (диагностика оператора, Р49 дополнение 1 п. 1), detail — код отказа GET */
       | { at: string; kind: "operation.unread"; ref: string; reason: "OPERATION_UNREAD"; detail: DiagCode }
       | { at: string; kind: "operation.mismatch"; ref: string; detail: MismatchField; reason: "OPERATION_REPLY_MISMATCH"; mandate?: string }
-      | { at: string; kind: "operation.settled"; ref: string; detail: ScopeCheckDetail },
+      | { at: string; kind: "operation.settled"; ref: string; detail: ScopeCheckDetail }
+      | { at: string; kind: "operation.reversed"; ref: string; detail: ReversalDetail }
+      /** поиск операции по CART после итога без события (Р51 п. 5): ref — CART по маске, тела ответа нет */
+      | { at: string; kind: "operation.lookup"; ref?: string; detail: LookupDetail }
+      /** граница reservation_ttl_sec прошла: последний GET — по-прежнему AUTHORIZED или отказ с просьбой повторить; граница
+       *  не число — без GET (Р51 п. 2 (б), ревью КТ1 № 1, № 7) */
+      | { at: string; kind: "operation.unsettled"; ref: string },
   ): void;
 }
+
+/** Причина REVERSED в журнале (Р51 п. 3, передача #63 п. 1, 7) — закрытым перечнем: иное значение — OTHER, само значение
+ *  не пишется (инвариант 5). */
+export type ReversalDetail = "REVERSAL" | "AUTH_EXPIRED" | "OTHER";
+
+const reversalDetail = (reason: string | null): ReversalDetail => (reason === "REVERSAL" || reason === "AUTH_EXPIRED" ? reason : "OTHER");
 
 export interface OperationsOptions {
   port: OperationsPort;
   journal: OperationsJournal;
-  /** registry_cache_ttl_sec — предел недоступности GET на стадии 6 (инвариант 4); event_poll_interval_ms — пауза опроса
-   *  ленты после её отказа (без него опрос прекращается) */
-  params: { operation_outcome_max_delay_sec: number; registry_cache_ttl_sec: number; event_seen_max: number; event_poll_interval_ms?: number };
+  /** registry_cache_ttl_sec — предел недоступности GET на стадии 6 (инвариант 4); operation_reread_interval_sec — плановое
+   *  перечитывание GET на стадии 6 (Р51 п. 2 (а)); event_poll_interval_ms — пауза опроса ленты после её отказа (без него
+   *  опрос прекращается) */
+  params: {
+    operation_outcome_max_delay_sec: number;
+    operation_reread_interval_sec: number;
+    registry_cache_ttl_sec: number;
+    event_seen_max: number;
+    event_poll_interval_ms?: number;
+  };
   /** прочитать ленту (`EventFeed.signal`): ожидание будит её, пока не решится; частоту чтений ограничивает лента */
   wake?: () => Promise<void>;
   now?: () => Date;
@@ -47,12 +73,25 @@ export interface OperationsOptions {
 }
 
 /** Итог стадии 5: операция привязана и сверена; MISMATCH — привязана, но не сходится с покупкой (запись
- *  operation.mismatch); NONE — привязанной операции нет за срок или привязка неоднозначна. */
-export type OperationOutcome = { kind: "OPERATION"; operation: Operation } | { kind: "MISMATCH" } | { kind: "NONE" };
+ *  operation.mismatch); NONE — привязанной операции нет за срок; AMBIGUOUS — привязка неоднозначна (два ожидания одной
+ *  ссылки заказа): итога нет, и поиск по CART его не ищет (ревью КТ1 Р51 № 3). */
+export type OperationOutcome = { kind: "OPERATION"; operation: Operation } | { kind: "MISMATCH" } | { kind: "NONE" } | { kind: "AMBIGUOUS" };
 
 /** Итог стадии 6: SETTLED или иной статус — операция; MISMATCH — другая операция; PENDING — расчёта нет, ожидание прервал
- *  вызывающий; UNREAD — GET не подтверждён и не повторяется. */
-export type SettleOutcome = { kind: "OPERATION"; operation: Operation } | { kind: "MISMATCH" } | { kind: "PENDING" } | { kind: "UNREAD" };
+ *  вызывающий; UNREAD — GET не подтверждён и не повторяется; EXPIRED — граница ожидания прошла, итога нет (Р51 п. 2 (б)). */
+export type SettleOutcome = { kind: "OPERATION"; operation: Operation } | { kind: "MISMATCH" } | { kind: "PENDING" } | { kind: "UNREAD" } | { kind: "EXPIRED" };
+
+/** Исход покупки, после которого операция под наблюдением (Р51 п. 4): расчёт был (SETTLED, REFUNDED), оплата отменена
+ *  (REVERSED), граница ожидания клиринга прошла без итога (UNSETTLED — в том числе при недоступном GET, правка 1). */
+export type WatchAfter = "SETTLED" | "REFUNDED" | "REVERSED" | "UNSETTLED";
+
+interface Watched {
+  op: Operation;
+  after: WatchAfter;
+  notice: LateNotice;
+  /** уже отправленные уведомления по операции: каждое — не больше раза */
+  readonly sent: Set<PurchaseNotice>;
+}
 
 /** Ожидание итога по заказу (стадия 5). */
 export interface OperationWait {
@@ -83,6 +122,8 @@ export class Operations {
   readonly #byOrder = new Map<string, Expectation>();
   /** op_ref → ожидания расчёта (стадия 6): событие только будит их, GET делает ожидание */
   readonly #settling = new Map<string, Set<Waker>>();
+  /** op_ref → операция под наблюдением после итога (Р51 п. 4); окно event_seen_max, старейшая вытесняется (порядок Map) */
+  readonly #watched = new Map<string, Watched>();
 
   constructor(o: OperationsOptions) {
     this.#o = o;
@@ -108,10 +149,13 @@ export class Operations {
       // op_ref уже по маске (разбор ленты); иначе событие пропущено как INVALID_DATA и сюда не дошло
       if (opRef === null || !SAFE_ID.test(opRef)) return;
       const settling = this.#settling.get(opRef);
+      const watched = this.#watched.get(opRef);
       if (settling) {
         for (const w of [...settling]) w.poke();
-        return;
+        // ожидание уже увидело итог и поставило операцию под наблюдение, но ещё не вышло — событие и наблюдению
+        if (!watched) return;
       }
+      if (watched) return await this.#late(watched);
       const r = await this.#read(opRef);
       if (r === null) return;
       const exp = r.orderRef === null ? undefined : this.#byOrder.get(r.orderRef);
@@ -154,7 +198,7 @@ export class Operations {
         done();
       };
       const check = () => {
-        if (exp.ambiguous) return end(() => resolve({ kind: "NONE" }));
+        if (exp.ambiguous) return end(() => resolve({ kind: "AMBIGUOUS" }));
         if (exp.result !== null) {
           const r = exp.result;
           end(() => resolve(r));
@@ -167,6 +211,86 @@ export class Operations {
       check();
       void this.#poll(() => settled);
     });
+  }
+
+  /**
+   * Восстановление op_ref (Р51 п. 5; РП55 п. 6): итога по событию нет за срок стадии 5 — один раз операции по CART покупки
+   * (только с итогом). Кандидаты — операции с её order_ref; ровно одна — сверка с CART той же привязкой, что у события
+   * (bind.ts): итог или MISMATCH (запись operation.mismatch). Ни одной или больше одной — NONE. Отказ Платформы — NONE,
+   * код — в записи operation.lookup (403 AGENT_SUSPENDED подпись уже остановил адаптер); сбой журнала — наружу. Повтора нет.
+   */
+  async lookup(orderRef: string, cart: Mandate, notice?: LateNotice): Promise<OperationOutcome> {
+    const ref = mandateRef(cart.id).mandate;
+    const done = (detail: LookupDetail, outcome: OperationOutcome): OperationOutcome => {
+      this.#record({ kind: "operation.lookup", ...(ref !== undefined && { ref }), detail });
+      return outcome;
+    };
+    let list: OperationRecord[];
+    try {
+      list = await this.#o.port.readOperations(cart.id);
+    } catch (e) {
+      if (!(e instanceof PlatformFailure)) throw e;
+      return done(e.code, { kind: "NONE" });
+    }
+    const mine = list.filter((r) => r.orderRef === orderRef);
+    if (mine.length === 0) return done("NONE", { kind: "NONE" });
+    if (mine.length > 1) return done("AMBIGUOUS", { kind: "NONE" });
+    const r = mine[0]!;
+    const bound = bindOperation(r, cart);
+    if (typeof bound === "string") {
+      this.#record({ kind: "operation.mismatch", ref: r.opRef, detail: bound, reason: "OPERATION_REPLY_MISMATCH", ...mandateRef(cart.id) });
+      return done("MISMATCH", { kind: "MISMATCH" });
+    }
+    this.#record({ kind: "operation.status", ref: r.opRef, detail: r.status });
+    if (bound.status === "REVERSED") {
+      this.#record({ kind: "operation.reversed", ref: r.opRef, detail: reversalDetail(bound.declineReason) });
+      // под наблюдение — сразу, до возврата итога (Р51 п. 4; ревью чата К5)
+      if (notice !== undefined) this.watch(bound, "REVERSED", notice);
+    }
+    return done("BOUND", { kind: "OPERATION", operation: bound });
+  }
+
+  /**
+   * Наблюдение после итога (Р51 п. 4): операция покупки с известным op_ref после её исхода `after`; по событию operation.*
+   * — GET и уведомление через `notice` той покупки. Повторный вызов по тому же op_ref обновляет исход, отправленное не
+   * повторяется. Окно — event_seen_max операций: старейшая вытесняется, событие по ней — operation.unclaimed.
+   */
+  watch(op: Operation, after: WatchAfter, notice: LateNotice): void {
+    const prior = this.#watched.get(op.opRef);
+    this.#watched.delete(op.opRef);
+    const sent = prior?.sent ?? new Set<PurchaseNotice>();
+    // возврат на стадии 6 уже сообщила сама покупка (Р51 п. 3)
+    if (after === "REFUNDED") sent.add("OPERATION_REFUNDED");
+    this.#watched.set(op.opRef, { op: structuredClone(op), after, notice, sent });
+    while (this.#watched.size > this.#o.params.event_seen_max) this.#watched.delete(this.#watched.keys().next().value!);
+  }
+
+  /** Событие по операции под наблюдением: уведомление решает статус по GET (таблица К4 в PR #66); каждое — не больше
+   *  раза; состояние покупки не меняется. Отказ GET с просьбой повторить — наружу (событие прочитается снова). */
+  async #late(w: Watched): Promise<void> {
+    const r = await this.#read(w.op.opRef);
+    if (r === null) return;
+    const op = settledOperation(r, w.op);
+    if (typeof op === "string") {
+      this.#record({ kind: "operation.mismatch", ref: w.op.opRef, detail: op, reason: "OPERATION_REPLY_MISMATCH", ...mandateRef(w.op.indicator?.mandateId ?? "") });
+      return;
+    }
+    const send = (code: PurchaseNotice) => {
+      if (w.sent.has(code)) return;
+      w.sent.add(code);
+      try {
+        w.notice(code, chargedAmount(op));
+      } catch {
+        // уведомление исход не меняет; сбой записывает покупка (notify.failed)
+      }
+    };
+    if (op.status === "SETTLED" && (w.after === "REVERSED" || w.after === "UNSETTLED")) {
+      // клиринг после реверсала — одно уведомление: NOT_RESERVED уже сказано текстом SETTLED_LATE (ревью чата К4)
+      send("OPERATION_SETTLED_LATE");
+      const scope = w.after === "UNSETTLED" ? scopeNotice(op) : null;
+      if (scope !== null) send(scope);
+    }
+    if (op.status === "REFUNDED") send("OPERATION_REFUNDED");
   }
 
   /** Первый привязанный итог — итог стадии 5; следующие события по заказу его не меняют. */
@@ -183,12 +307,14 @@ export class Operations {
   }
 
   /**
-   * Стадия 6 (Р49 п. 6): GET по известному op_ref; не SETTLED — ждать operation.settled, без события дольше
-   * operation_outcome_max_delay_sec — снова GET (#59 п. 3), пока вызывающий не прервёт (`signal` → PENDING, не отказ).
-   * Отказ GET, после которого Платформа просит повторить, — запись operation.unread и повтор в тот же срок; Платформа
-   * недоступна дольше registry_cache_ttl_sec — UNREAD (инвариант 4; ревью КТ1 № 8); иной отказ — UNREAD сразу.
+   * Стадия 6 (Р49 п. 6, Р51 п. 2): GET по известному op_ref; AUTHORIZED — ждать события по op_ref, без него — снова GET не
+   * чаще раза в operation_reread_interval_sec (РП55), пока вызывающий не прервёт (`signal` → PENDING, не отказ) или не
+   * пройдёт граница `deadline` (мс по часам модуля): по ней — последний GET, по-прежнему AUTHORIZED — запись
+   * operation.unsettled и EXPIRED. Отказ GET, после которого Платформа просит повторить, — запись operation.unread и повтор
+   * через operation_outcome_max_delay_sec; Платформа недоступна дольше registry_cache_ttl_sec — UNREAD (инвариант 4; ревью
+   * КТ1 № 8); иной отказ — UNREAD сразу. REVERSED — запись operation.reversed с причиной закрытым перечнем.
    */
-  async settle(authorized: Operation, signal: AbortSignal): Promise<SettleOutcome> {
+  async settle(authorized: Operation, signal: AbortSignal, deadline = Number.POSITIVE_INFINITY, notice?: LateNotice): Promise<SettleOutcome> {
     const opRef = authorized.opRef;
     const wakers = this.#settling.get(opRef) ?? new Set<Waker>();
     this.#settling.set(opRef, wakers);
@@ -196,7 +322,34 @@ export class Operations {
     const waker = new Waker();
     wakers.add(waker);
     let unavailableSince: number | null = null;
+    // под наблюдение — в момент итога, до выхода из ожидания: событие после этого не теряется (Р51 п. 4; ревью чата К5)
+    const final = (op: Operation, after: WatchAfter): SettleOutcome => {
+      if (notice !== undefined) {
+        this.watch(op, after, notice);
+        // событие пришло, пока шёл последний GET: оно только разбудило ожидание, а относится уже к наблюдению — перечитать
+        // (возврат или поздний клиринг сразу после итога; ревью чата К5). Повтора нет: отказ GET — запись operation.unread,
+        // событие уже отмечено обработанным; сбой журнала — некуда (ожидание вышло с итогом)
+        const w = this.#watched.get(op.opRef);
+        if (waker.take() && w !== undefined) {
+          void this.#late(w).catch((e: unknown) => {
+            try {
+              this.#record({ kind: "operation.unread", ref: op.opRef, reason: "OPERATION_UNREAD", detail: e instanceof PlatformFailure ? e.code : "UNKNOWN" });
+            } catch {
+              // журнал недоступен — уведомления нет; исход покупки уже есть
+            }
+          });
+        }
+      }
+      return after === "UNSETTLED" ? { kind: "EXPIRED" } : { kind: "OPERATION", operation: op };
+    };
+    const expired = (): SettleOutcome => {
+      this.#record({ kind: "operation.unsettled", ref: opRef });
+      return final(authorized, "UNSETTLED");
+    };
     try {
+      // граница не число (недействительная дата от вызывающего) — fail-closed без чтения: иначе пауза NaN — GET без
+      // промежутка и без конца (ревью КТ1 Р51 № 1); +∞ — границы нет
+      if (Number.isNaN(deadline)) return expired();
       for (;;) {
         if (signal.aborted) return { kind: "PENDING" };
         let r: OperationRecord | null;
@@ -207,9 +360,11 @@ export class Operations {
           if (!(e instanceof PlatformFailure)) throw e;
           this.#record({ kind: "operation.unread", ref: opRef, reason: "OPERATION_UNREAD", detail: e.code });
           const now = this.#now().getTime();
+          // граница прошла, пока Платформа недоступна, — тот же исход, что по последнему GET (ревью КТ1 Р51 № 7)
+          if (now >= deadline) return expired();
           unavailableSince ??= now;
           if (now - unavailableSince >= this.#o.params.registry_cache_ttl_sec * 1000) return { kind: "UNREAD" };
-          if (!(await this.#pause(waker, signal))) return { kind: "PENDING" };
+          if (!(await this.#pause(waker, signal, this.#o.params.operation_outcome_max_delay_sec * 1000))) return { kind: "PENDING" };
           continue;
         }
         unavailableSince = null;
@@ -222,10 +377,18 @@ export class Operations {
         if (op.status === "SETTLED") {
           const s = op.fulfilment?.scopeCheck;
           this.#record({ kind: "operation.settled", ref: opRef, detail: s === undefined || typeof s === "object" ? "OTHER" : s });
-          return { kind: "OPERATION", operation: op };
+          return final(op, "SETTLED");
         }
+        if (op.status === "REVERSED") {
+          this.#record({ kind: "operation.reversed", ref: opRef, detail: reversalDetail(op.declineReason) });
+          return final(op, "REVERSED");
+        }
+        if (op.status === "REFUNDED") return final(op, "REFUNDED");
         if (op.status !== "AUTHORIZED") return { kind: "OPERATION", operation: op };
-        if (!(await this.#pause(waker, signal))) return { kind: "PENDING" };
+        // граница прошла, этот GET — последний (Р51 п. 2 (б)); до неё — пауза не дольше остатка срока
+        const left = deadline - this.#now().getTime();
+        if (left <= 0) return expired();
+        if (!(await this.#pause(waker, signal, Math.min(this.#o.params.operation_reread_interval_sec * 1000, left)))) return { kind: "PENDING" };
       }
     } finally {
       // ожидание по op_ref снимается, когда его больше никто не ждёт
@@ -234,9 +397,8 @@ export class Operations {
     }
   }
 
-  /** Пауза стадии 6: до события по op_ref (в том числе пришедшего до паузы) или operation_outcome_max_delay_sec; false —
-   *  прервал вызывающий. */
-  #pause(waker: Waker, signal: AbortSignal): Promise<boolean> {
+  /** Пауза стадии 6: до события по op_ref (в том числе пришедшего до паузы) или `ms`; false — прервал вызывающий. */
+  #pause(waker: Waker, signal: AbortSignal, ms: number): Promise<boolean> {
     if (signal.aborted) return Promise.resolve(false);
     if (waker.take()) return Promise.resolve(true);
     return new Promise<boolean>((resolve) => {
@@ -250,7 +412,7 @@ export class Operations {
         resolve(v);
       };
       const onAbort = () => end(false);
-      const cancel = this.#timer(() => end(true), Math.min(this.#o.params.operation_outcome_max_delay_sec * 1000, TIMER_MAX_MS));
+      const cancel = this.#timer(() => end(true), Math.min(ms, TIMER_MAX_MS));
       waker.listener = () => {
         waker.take();
         end(true);

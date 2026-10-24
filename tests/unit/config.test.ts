@@ -50,6 +50,23 @@ describe("стендовые параметры", () => {
     expect(() => parseParams({ ...stand, operation_outcome_max_delay_sec: stand.registry_cache_ttl_sec })).not.toThrow();
   });
 
+  it("Р51 п. 2: operation_reread_interval_sec и reservation_ttl_sec — целые > 0, перечитывание — срок таймера и не больше границы; равны стенду Платформы", () => {
+    for (const key of ["operation_reread_interval_sec", "reservation_ttl_sec"]) {
+      const without = { ...stand };
+      delete without[key];
+      expect(() => parseParams(without)).toThrow(new RegExp(key));
+      expect(() => parseParams({ ...stand, [key]: 0 })).toThrow(ConfigError);
+      expect(() => parseParams({ ...stand, [key]: 1.5 })).toThrow(ConfigError);
+    }
+    expect(() => parseParams({ ...stand, operation_reread_interval_sec: Math.floor(2_147_483_647 / 1000) + 1, reservation_ttl_sec: 10 ** 9 })).toThrow(ConfigError);
+    expect(() => parseParams({ ...stand, reservation_ttl_sec: stand.operation_reread_interval_sec - 1 })).toThrow(/reservation_ttl_sec/);
+    expect(() => parseParams({ ...stand, reservation_ttl_sec: stand.operation_reread_interval_sec })).not.toThrow();
+    // правило РП55 задаёт Платформа: стендовые значения агента — те же, что у стенда (передача #63 п. 2)
+    const platform = JSON.parse(readFileSync("node_modules/agentic-ps-platform/config/params.stand.json", "utf8"));
+    expect(stand.operation_reread_interval_sec).toBe(platform.operation_reread_interval_sec);
+    expect(stand.reservation_ttl_sec).toBe(platform.reservation_ttl_sec);
+  });
+
   it("живая проверка (Р32 п. 7): три параметра обязательны, таймаут — целое 1…2^31 − 1 мс", () => {
     for (const k of ["live_check_timeout_ms", "live_check_max_age_sec", "live_check_clock_skew_sec"]) {
       const rest = { ...stand };

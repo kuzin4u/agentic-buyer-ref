@@ -72,6 +72,9 @@ export interface ContourCall {
   idempotencyKey?: string;
   /** PaoStub: ответ выдан повторно по прежнему Idempotency-Key (инвариант 9) */
   replayed?: boolean;
+  /** стенд: кто обратился — "agent" (по сети, как клиент агента) или "test" (тестовая поддержка через `app.inject`: копия
+   *  сообщения эквайрера до PS-11, сообщения процессинга ПИ-3, действия банка); полный журнал агента — только "agent" */
+  source?: "agent" | "test";
 }
 
 export interface MerchantResponse {
@@ -126,6 +129,10 @@ export interface Contour {
 
 const header = (v: string | string[] | undefined): string | undefined => (typeof v === "string" ? v : undefined);
 const KEYID = /;keyid="([^"]+)"/;
+/** user-agent запросов `app.inject` (light-my-request по умолчанию) */
+const INJECT_AGENT = "lightMyRequest";
+/** Пути участников Платформы (ADP, ПИ-3): агенту закрыты — его обращение туда — нарушение контура (ревью чата К4). */
+const PARTICIPANT_ONLY = /^\S+ \/adp\//;
 
 /** Журнал обращений к серверу Fastify: хук до listen; код отказа — только поле code тела ответа. */
 function record(app: Stand["app"], target: ContourCall["target"], log: ContourCall[]): void {
@@ -146,6 +153,8 @@ function record(app: Stand["app"], target: ContourCall["target"], log: ContourCa
       target,
       route: `${req.method} ${req.url.split("?")[0]}`,
       status: reply.statusCode,
+      // app.inject (light-my-request) — тестовая поддержка, не сеть: клиент агента ходит только по сети
+      source: header(req.headers["user-agent"]) === INJECT_AGENT ? "test" : "agent",
       ...(code !== undefined && { code }),
       ...(kid !== undefined && { kid }),
       ...(nonce !== undefined && { nonce }),
@@ -342,7 +351,8 @@ async function standContour(paoNow?: () => Date, adpUntilPs11 = false): Promise<
       shopSigning: { sign: (req) => signRequest(req, signing.current()) },
       stand,
       calls: () => log.map((c) => ({ ...c })),
-      violations: () => [],
+      // агент не обращается к путям участников (ADP, ПИ-3): копию сообщения эквайрера и ПИ-3 шлёт только тестовая поддержка
+      violations: () => log.filter((c) => c.source === "agent" && PARTICIPANT_ONLY.test(c.route)).map((c) => `агент обратился к пути участника: ${c.route}`),
       adpDecisions: () => Promise.all(adp),
       issuedSecrets: () => [...secrets],
       close: release,

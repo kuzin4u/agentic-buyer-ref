@@ -519,6 +519,13 @@ export class PaoPlatform implements PaymentPlatform {
     return this.call("GET /pao/v1/operations/{op_ref}", { path: { op_ref: opRef } }, (r) => map.operationRecordFromPao(r, this.o.agentCode));
   }
 
+  /** Операции по мандату до привязки к покупке (Р51 п. 5): восстановление `op_ref` после потерянного события. 404, 400 и
+   *  403 у пути объявятся в YAML 1.5.0 (#37) — разбираются общей моделью ошибок ПАО; 403 AGENT_SUSPENDED — остановка
+   *  подписи в `call`. Элемент не по форме — весь ответ BAD_RESPONSE (fail-closed). */
+  readOperations(mandateId: string) {
+    return this.call("GET /pao/v1/operations", { query: { mandate_id: mandateId } }, (r) => need(r).map((o) => map.operationRecordFromPao(o, this.o.agentCode)));
+  }
+
   async openDispute(draft: Parameters<PaymentPlatform["openDispute"]>[0], m: Mutation) {
     return this.call("POST /pao/v1/disputes", { body: map.disputeDraftToPao(draft), idempotencyKey: keyOf(m) }, map.disputeFromPao);
   }

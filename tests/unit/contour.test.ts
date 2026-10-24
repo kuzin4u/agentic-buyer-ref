@@ -26,7 +26,8 @@ const SELF = "GET /pao/v1/agent";
 const NORMAL = shopBy("NORMAL");
 /** Мандат корзины выдуман: только для проверки обёртки — эмулятор его не сверяет. В сценариях — CART из ПАО (AG-11). */
 const CART = "m_cart_1";
-const FIELDS = new Set<keyof ContourCall>(["target", "route", "status", "code", "kid", "nonce", "idempotencyKey"]);
+// source — кто обратился (сеть или app.inject тестовой поддержки), не данные запроса (ревью чата К4)
+const FIELDS = new Set<keyof ContourCall>(["target", "route", "status", "code", "kid", "nonce", "idempotencyKey", "source"]);
 
 describe("режим stub — ПАО на PaoStub, без витрин", () => {
   it("допуск: GET /pao/v1/agent — 200, ACTIVE; журнал обращений — одно обращение с x-nonce", async () => {
@@ -83,7 +84,7 @@ describe("режим stand — стенд Платформы и эмулятор
     // код и статус — из перечня эмулятора (MERCHANT_ERROR_CODES, Р26 п. 5, ревью #23 п. 7; ревью К2 № 6), не литералом агента
     const { code, http } = MERCHANT_ERROR_CODES.find((x) => x.code === "AGENT_UNIDENTIFIED")!;
     expect(r).toEqual({ status: http, body: { code } });
-    expect(c.calls()).toEqual([{ target: "merchants", route: `POST /v1/shops/${NORMAL.id}/orders`, status: http, code }]);
+    expect(c.calls()).toEqual([{ target: "merchants", route: `POST /v1/shops/${NORMAL.id}/orders`, status: http, code, source: "agent" }]);
   });
 });
 

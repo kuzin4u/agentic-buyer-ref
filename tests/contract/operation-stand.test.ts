@@ -6,6 +6,7 @@
 // Ответ эмитента (ISSUER_RESPONSE) и клиринг (PRESENTMENT) шлёт тест как процессинг (ПИ-3); решение ADP, итог, события,
 // GET и запись об исполнении — настоящие. Ответ продавца DECLINED — только слова (инвариант 8): итог — по событию.
 import { afterEach, describe, expect, it } from "vitest";
+import { DIAG } from "../../src/agent/compose.js";
 import { INTENT } from "../support/consents.js";
 import { shopBy, type Contour } from "../support/contour.js";
 import { one } from "../support/purchase.js";
@@ -111,5 +112,35 @@ describe("стадии 5–6 на стенде v0.20.0: итог из событ
     // прежний CART — ACTIVE и с полным остатком: операция по нему не шла
     expect((await r.c.platform.getMandate(old.id)).status).toBe("ACTIVE");
     expect((await r.c.platform.verifyMandate({ id: old.id, currency: "RUB" })).amountLeft).toEqual(old.cart!.total);
+  });
+
+  it("Р51 п. 5: реверсал до ответа эмитента — событий нет вовсе; итог находит поиск GET ?mandate_id по CART — STOPPED OPERATION_REVERSED, текст Р51 п. 3; бюджет CART освобождён", async () => {
+    // сроки стадии 5 — короткие: событий не будет, ждать полный срок незачем (сравнение — с одним поиском после срока)
+    const r = await standPurchase({ contourPayment: true, adpUntilPs11: true, params: { operation_outcome_max_delay_sec: 1, confirmation_wait_ms: 1000 } });
+    c = r.c;
+    const intent = await r.purchase.intent({ ...INTENT, merchantScope: [NORMAL.merchant_id] }, { idempotencyKey: "idem-intent-rev" });
+    await r.signWhileWaiting(intent.id, () => r.purchase.awaitIntent());
+    const offer = (await r.purchase.search()).contour.find((o) => o.shopId === NORMAL.id)!;
+    const cart = await r.purchase.cart(one(offer, 1), { idempotencyKey: "idem-cart-rev" });
+    await r.signWhileWaiting(cart.id, () => r.purchase.awaitCart());
+    await r.purchase.placeOrder({ idempotencyKey: "idem-order-rev" });
+    const total = cart.cart!.total;
+
+    const authorizing = r.purchase.authorize({ idempotencyKey: "idem-pay-rev" }).catch((e: unknown) => e);
+    const d = await decided(r);
+    expect(d.decision).toBe("APPROVE");
+    // процессинг отменил авторизацию до ответа эмитента: ни operation.authorized, ни operation.declined (передача #63 п. 3)
+    await processing(r, { op_ref: d.op_ref, msg_type: "REVERSAL", amount: total.amount, currency: total.currency });
+    const err = await authorizing;
+    expect(err).toMatchObject({ name: "PurchaseStopped", code: "OPERATION_REVERSED" });
+    expect(r.purchase.reason).toBe("OPERATION_REVERSED");
+    expect(r.purchase.next).toBe("NOTIFY_HUMAN");
+    expect(DIAG.OPERATION_REVERSED!.human.ru).toBe("Оплата отменена; списания быть не должно — если оно всё же придёт, сообщим отдельно. Покупка остановлена; итог проверьте в приложении банка.");
+    // поиск — одно обращение по CART; запись — CART и BOUND, без тела ответа
+    expect(r.c.calls().filter((x) => x.target === "pao" && x.route === "GET /pao/v1/operations")).toHaveLength(1);
+    expect(entries(r, "operation.lookup")).toEqual([[cart.id, "BOUND"]]);
+    expect(entries(r, "operation.reversed")).toEqual([[d.op_ref, "REVERSAL"]]);
+    // бюджет освободила Платформа — по verify (инвариант 6)
+    expect((await r.c.platform.verifyMandate({ id: cart.id, currency: total.currency })).amountLeft).toEqual(total);
   });
 });

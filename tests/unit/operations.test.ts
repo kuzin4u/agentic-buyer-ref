@@ -68,6 +68,8 @@ function record(status: OperationRecord["status"], over: Partial<OperationRecord
 function setup(wake?: (ops: Operations) => Promise<void>, pollMs?: number, seenMax = PARAMS.event_seen_max) {
   const c = clock();
   const answers = new Map<string, OperationRecord | Error>();
+  /** ответ GET /pao/v1/operations?mandate_id — по id мандата; нет — пустой список */
+  const lists = new Map<string, OperationRecord[] | Error>();
   const gets: string[] = [];
   const journal: Record<string, unknown>[] = [];
   const ops: Operations = new Operations({
@@ -76,6 +78,12 @@ function setup(wake?: (ops: Operations) => Promise<void>, pollMs?: number, seenM
         gets.push(opRef);
         const a = answers.get(opRef);
         if (a === undefined) throw new PlatformFailure("REQUEST_INVALID", "after_fix", "REQUEST_INVALID", 400, null);
+        if (a instanceof Error) throw a;
+        return structuredClone(a);
+      },
+      readOperations: async (mandateId: string) => {
+        gets.push(`list ${mandateId}`);
+        const a = lists.get(mandateId) ?? [];
         if (a instanceof Error) throw a;
         return structuredClone(a);
       },
@@ -106,7 +114,7 @@ function setup(wake?: (ops: Operations) => Promise<void>, pollMs?: number, seenM
     w.outcome(DELAY_SEC * 1000, ac.signal).then((o) => (outcome = o), (e: Error) => (outcome = e));
     return { ac, w, outcome: () => outcome };
   };
-  return { c, answers, gets, journal, ops, event, waiting };
+  return { c, answers, lists, gets, journal, ops, event, waiting };
 }
 
 const kinds = (journal: Record<string, unknown>[]) => journal.map((e) => `${String(e.kind)}:${String(e.detail ?? e.reason ?? "")}`);
@@ -245,6 +253,58 @@ describe("стадия 5: итог операции по событию и GET (
     s.answers.set("op_1", record("AUTHORIZED"));
     await s.event("operation.authorized", "op_1");
     expect(kinds(s.journal).at(-1)).toBe("operation.unclaimed:");
+  });
+});
+
+describe("восстановление op_ref: поиск по CART после итога без события (Р51 п. 5)", () => {
+  const lookups = (journal: Record<string, unknown>[]) => journal.filter((e) => e.kind === "operation.lookup").map((e) => [e.ref, e.detail]);
+
+  it("одна операция заказа — итог как из события, в валюте CART; запись operation.lookup BOUND с CART, без тела ответа", async () => {
+    const s = setup();
+    s.lists.set(CART.id, [record("AUTHORIZED"), record("DECLINED", { opRef: "op_other", orderRef: "ord_other" })]);
+    const out = await s.ops.lookup(ORDER, CART);
+    expect(out).toMatchObject({ kind: "OPERATION", operation: { opRef: "op_1", status: "AUTHORIZED", amount: { amount: 90_000, currency: "RUB" } } });
+    expect(s.gets).toEqual([`list ${CART.id}`]);
+    expect(lookups(s.journal)).toEqual([[CART.id, "BOUND"]]);
+    const entry = s.journal.find((e) => e.kind === "operation.lookup")!;
+    expect(Object.keys(entry).sort()).toEqual(["at", "detail", "kind", "ref"]);
+  });
+
+  it("реверсал до ответа эмитента (событий нет вовсе) — REVERSED по поиску, запись operation.reversed", async () => {
+    const s = setup();
+    s.lists.set(CART.id, [record("REVERSED", { declineReason: "REVERSAL" })]);
+    expect(await s.ops.lookup(ORDER, CART)).toMatchObject({ kind: "OPERATION", operation: { status: "REVERSED", declineReason: "REVERSAL" } });
+    expect(kinds(s.journal)).toContain("operation.reversed:REVERSAL");
+  });
+
+  it("ни одной операции заказа (операция без итога в ответ не входит) — NONE; две — AMBIGUOUS, тоже NONE (не первая)", async () => {
+    const s = setup();
+    s.lists.set(CART.id, [record("AUTHORIZED", { orderRef: "ord_other" })]);
+    expect(await s.ops.lookup(ORDER, CART)).toEqual({ kind: "NONE" });
+    s.lists.set(CART.id, [record("AUTHORIZED"), record("AUTHORIZED", { opRef: "op_2" })]);
+    expect(await s.ops.lookup(ORDER, CART)).toEqual({ kind: "NONE" });
+    expect(lookups(s.journal)).toEqual([[CART.id, "NONE"], [CART.id, "AMBIGUOUS"]]);
+  });
+
+  it("операция не сходится с CART — MISMATCH, запись operation.mismatch и operation.lookup MISMATCH", async () => {
+    const s = setup();
+    s.lists.set(CART.id, [record("AUTHORIZED", { amountMinor: 1 })]);
+    expect(await s.ops.lookup(ORDER, CART)).toEqual({ kind: "MISMATCH" });
+    expect(kinds(s.journal)).toEqual(["operation.mismatch:AMOUNT", "operation.lookup:MISMATCH"]);
+  });
+
+  it("отказ Платформы (404, 400, 403, ответ не по схеме) — NONE, код отказа в operation.lookup; повтора нет; иная ошибка — наружу", async () => {
+    for (const [code, status] of [["MANDATE_NOT_FOUND", 404], ["REQUEST_INVALID", 400], ["AGENT_SUSPENDED", 403], ["BAD_RESPONSE", 200]] as const) {
+      const s = setup();
+      s.lists.set(CART.id, new PlatformFailure(code, "never", code, status, null));
+      expect(await s.ops.lookup(ORDER, CART)).toEqual({ kind: "NONE" });
+      expect(lookups(s.journal)).toEqual([[CART.id, code]]);
+      expect(s.gets).toEqual([`list ${CART.id}`]);
+    }
+    const boom = new Error("журнал недоступен");
+    const s = setup();
+    s.lists.set(CART.id, boom);
+    await expect(s.ops.lookup(ORDER, CART)).rejects.toBe(boom);
   });
 });
 
@@ -416,6 +476,7 @@ describe("стадия 6: расчёт по operation.settled и GET (Р49 п. 6
           calls++;
           return calls === 1 ? new Promise<OperationRecord>((res) => (release = res)) : SETTLED;
         },
+        readOperations: async () => [],
       },
       journal: { record: () => {} },
       params: { operation_outcome_max_delay_sec: DELAY_SEC, operation_reread_interval_sec: REREAD_SEC, registry_cache_ttl_sec: TTL_SEC, event_seen_max: PARAMS.event_seen_max },

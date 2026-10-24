@@ -15,7 +15,12 @@ import { bindOperation, settledOperation, type MismatchField } from "./bind.js";
 /** Часть порта платформы, которую видит модуль. */
 export interface OperationsPort {
   readOperation(opRef: string): Promise<OperationRecord>;
+  /** операции по мандату с итогом (Р51 п. 5) */
+  readOperations(mandateId: string): Promise<OperationRecord[]>;
 }
+
+/** Исход поиска операции по CART (запись operation.lookup, Р51 п. 5) — закрытым перечнем; отказ — код отказа. */
+export type LookupDetail = "BOUND" | "NONE" | "AMBIGUOUS" | "MISMATCH" | FailureCode;
 
 /** scope_check в журнале — закрытым перечнем: значение вне перечня — OTHER, само значение не пишется (инвариант 5). */
 export type ScopeCheckDetail = Exclude<ScopeCheck, { other: string | null }> | "OTHER";
@@ -31,6 +36,8 @@ export interface OperationsJournal {
       | { at: string; kind: "operation.mismatch"; ref: string; detail: MismatchField; reason: "OPERATION_REPLY_MISMATCH"; mandate?: string }
       | { at: string; kind: "operation.settled"; ref: string; detail: ScopeCheckDetail }
       | { at: string; kind: "operation.reversed"; ref: string; detail: ReversalDetail }
+      /** поиск операции по CART после итога без события (Р51 п. 5): ref — CART по маске, тела ответа нет */
+      | { at: string; kind: "operation.lookup"; ref?: string; detail: LookupDetail }
       /** граница reservation_ttl_sec прошла, последний GET — по-прежнему AUTHORIZED (Р51 п. 2 (б)) */
       | { at: string; kind: "operation.unsettled"; ref: string },
   ): void;
@@ -183,6 +190,39 @@ export class Operations {
       check();
       void this.#poll(() => settled);
     });
+  }
+
+  /**
+   * Восстановление op_ref (Р51 п. 5; РП55 п. 6): итога по событию нет за срок стадии 5 — один раз операции по CART покупки
+   * (только с итогом). Кандидаты — операции с её order_ref; ровно одна — сверка с CART той же привязкой, что у события
+   * (bind.ts): итог или MISMATCH (запись operation.mismatch). Ни одной или больше одной — NONE. Отказ Платформы — NONE,
+   * код — в записи operation.lookup (403 AGENT_SUSPENDED подпись уже остановил адаптер); сбой журнала — наружу. Повтора нет.
+   */
+  async lookup(orderRef: string, cart: Mandate): Promise<OperationOutcome> {
+    const ref = mandateRef(cart.id).mandate;
+    const done = (detail: LookupDetail, outcome: OperationOutcome): OperationOutcome => {
+      this.#record({ kind: "operation.lookup", ...(ref !== undefined && { ref }), detail });
+      return outcome;
+    };
+    let list: OperationRecord[];
+    try {
+      list = await this.#o.port.readOperations(cart.id);
+    } catch (e) {
+      if (!(e instanceof PlatformFailure)) throw e;
+      return done(e.code, { kind: "NONE" });
+    }
+    const mine = list.filter((r) => r.orderRef === orderRef);
+    if (mine.length === 0) return done("NONE", { kind: "NONE" });
+    if (mine.length > 1) return done("AMBIGUOUS", { kind: "NONE" });
+    const r = mine[0]!;
+    const bound = bindOperation(r, cart);
+    if (typeof bound === "string") {
+      this.#record({ kind: "operation.mismatch", ref: r.opRef, detail: bound, reason: "OPERATION_REPLY_MISMATCH", ...mandateRef(cart.id) });
+      return done("MISMATCH", { kind: "MISMATCH" });
+    }
+    this.#record({ kind: "operation.status", ref: r.opRef, detail: r.status });
+    if (bound.status === "REVERSED") this.#record({ kind: "operation.reversed", ref: r.opRef, detail: reversalDetail(bound.declineReason) });
+    return done("BOUND", { kind: "OPERATION", operation: bound });
   }
 
   /** Первый привязанный итог — итог стадии 5; следующие события по заказу его не меняют. */

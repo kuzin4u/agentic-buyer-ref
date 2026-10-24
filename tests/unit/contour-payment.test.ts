@@ -14,7 +14,7 @@ const CART = { id: "m_cart", cart: { merchantId: "shop_1", lines: [], total: TOT
 const DECLINED: Operation = { opRef: "op_1", orderRef: "ORD-1", channel: "CARD", amount: TOTAL, merchantId: "shop_1", indicator: null, status: "DECLINED", declineReason: "LIMIT_EXCEEDED", fulfilment: null };
 
 /** Шаги с заглушками модулей: `outcome` — итог операции; `arrival` — появление запроса подтверждения (никогда — не задан). */
-function steps(o: { reply: ShopPaymentReply["status"]; outcome: (ms: number, signal: AbortSignal) => Promise<OperationOutcome>; arrival?: Promise<void> }) {
+function steps(o: { reply: ShopPaymentReply["status"]; outcome: (ms: number, signal: AbortSignal) => Promise<OperationOutcome>; arrival?: Promise<void>; lookup?: OperationOutcome }) {
   const log: string[] = [];
   const wait: OperationWait = {
     outcome: (ms, signal) => (log.push(`outcome ${ms}`), o.outcome(ms, signal)),
@@ -32,7 +32,11 @@ function steps(o: { reply: ShopPaymentReply["status"]; outcome: (ms: number, sig
         return o.arrival ?? new Promise<void>((_, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true }));
       },
     },
-    operations: { expect: () => (log.push("expect"), wait), settle: async () => ({ kind: "PENDING" }) },
+    operations: {
+      expect: () => (log.push("expect"), wait),
+      lookup: async (orderRef, cart) => (log.push(`lookup ${orderRef} ${cart.id}`), o.lookup ?? { kind: "NONE" }),
+      settle: async () => ({ kind: "PENDING" }),
+    },
     params: PARAMS,
   });
   return { p, log };
@@ -41,10 +45,21 @@ function steps(o: { reply: ShopPaymentReply["status"]; outcome: (ms: number, sig
 const ctx = (signal = new AbortController().signal): PaymentContext => ({ intent: { id: "m_intent" } as Mandate, cart: CART, shopId: "SHOP-1", merchantId: "shop_1", order: { orderId: "ORD-1", total: TOTAL }, signal, sending: () => {} });
 
 describe("ContourPayment: итог стадии 5 (Р49 п. 5)", () => {
-  it("PAID — ожидание по order_ref до отправки пакета, срок operation_outcome_max_delay_sec; NONE — OPERATION_RESULT_UNCONFIRMED; ожидание снято", async () => {
+  it("PAID — ожидание по order_ref до отправки пакета, срок operation_outcome_max_delay_sec; NONE — один поиск по CART (Р51 п. 5), ничего — OPERATION_RESULT_UNCONFIRMED; ожидание снято", async () => {
     const { p, log } = steps({ reply: "PAID", outcome: async () => ({ kind: "NONE" }) });
     await expect(p.authorize(ctx(), { idempotencyKey: "k" })).rejects.toMatchObject({ code: "OPERATION_RESULT_UNCONFIRMED" });
-    expect(log).toEqual(["expect", "mark", "pay", `outcome ${PARAMS.operation_outcome_max_delay_sec * 1000}`, "close"]);
+    expect(log).toEqual(["expect", "mark", "pay", `outcome ${PARAMS.operation_outcome_max_delay_sec * 1000}`, "lookup ORD-1 m_cart", "close"]);
+  });
+
+  it("Р51 п. 5: итог найден поиском по CART — итог стадии 5 (в том числе REVERSED до ответа эмитента); поиск не сходится — OPERATION_REPLY_MISMATCH; итог по событию — без поиска", async () => {
+    const reversed: Operation = { ...DECLINED, status: "REVERSED", declineReason: "REVERSAL" };
+    const a = steps({ reply: "PAID", outcome: async () => ({ kind: "NONE" }), lookup: { kind: "OPERATION", operation: reversed } });
+    await expect(a.p.authorize(ctx(), { idempotencyKey: "k" })).resolves.toMatchObject({ status: "REVERSED", declineReason: "REVERSAL" });
+    const b = steps({ reply: "PAID", outcome: async () => ({ kind: "NONE" }), lookup: { kind: "MISMATCH" } });
+    await expect(b.p.authorize(ctx(), { idempotencyKey: "k" })).rejects.toMatchObject({ code: "OPERATION_REPLY_MISMATCH" });
+    const c = steps({ reply: "PAID", outcome: async () => ({ kind: "OPERATION", operation: DECLINED }) });
+    await c.p.authorize(ctx(), { idempotencyKey: "k" });
+    expect(c.log.some((x) => x.startsWith("lookup"))).toBe(false);
   });
 
   it("(а) DECLINED продавца, operation.declined раньше запроса подтверждения — операция (код §7б у конвейера), гонка снята", async () => {
@@ -89,7 +104,7 @@ describe("стадия 6 в шагах contour (Р51 п. 2 (б)): граница
       shop: {} as never,
       journal: new MemoryJournal(),
       confirmations: {} as never,
-      operations: { expect: () => ({}) as never, settle: async (_op, _signal, deadline) => (deadlines.push(deadline), outcome) },
+      operations: { expect: () => ({}) as never, lookup: async () => ({ kind: "NONE" }), settle: async (_op, _signal, deadline) => (deadlines.push(deadline), outcome) },
       params: PARAMS,
       now: () => now,
     });

@@ -93,6 +93,8 @@ describe("стадия 5 на стенде: реквизит по ПАО и па
       // реквизит по CART — витрина приняла пакет: order_ref и cart_mandate_id пакета совпали с заказом
       `${CREDENTIALS} 201`,
       "merchants POST /v1/shops/{shop}/orders/{order}/payment 200",
+      // итога по событию нет за срок — один поиск операции по CART (Р51 п. 5): операции с итогом нет
+      "pao GET /pao/v1/operations 200",
     ]);
     // реквизит — подписанным обращением с ключом вызывающего (инвариант 8, 9); пакет — подписан тем же ключом агента
     const kid = calls.find((x) => x.target === "pao" && x.kid)!.kid;
@@ -265,6 +267,8 @@ describe("стадия 5 на стенде: реквизит по ПАО и па
       "pao GET /pao/v1/mandates/{cart}/verify 200",
       "pao POST /pao/v1/credentials 201",
       "merchants POST /v1/shops/{shop}/orders/{order}/payment 200",
+      // итога нет — один поиск по CART (Р51 п. 5)
+      "pao GET /pao/v1/operations 200",
     ]);
   });
 
@@ -329,6 +333,8 @@ describe("стадия 5 на стенде: реквизит по ПАО и па
       "pao GET /pao/v1/mandates/{cart}/verify 200",
       `${CREDENTIALS} 201`,
       "merchants POST /v1/shops/{shop}/orders/{order}/payment 200",
+      // итога нет — один поиск по CART (Р51 п. 5)
+      "pao GET /pao/v1/operations 200",
     ]);
     expect(r.c.journal.entries.filter((e) => e.kind === "shop.call" && e.method?.endsWith("/payment")).map((e) => [e.mandate, e.detail])).toEqual([[cart.id, "PAID"]]);
     expect((await r.c.platform.getMandate(old.id)).status).toBe("ACTIVE");

@@ -611,4 +611,48 @@ describe("Р50 п. 6 (а): 403 AGENT_SUSPENDED на GET операции — п�
     expect(stopped).toEqual(["AGENT_SUSPENDED"]);
     expect(stub.calls.filter((c) => c.op === "GET /pao/v1/operations/{op_ref}")).toHaveLength(1);
   });
+
+  it("Р51 п. 5: readOperations (поиск по CART) — 403 AGENT_SUSPENDED останавливает подпись, без повтора; 404 MANDATE_NOT_FOUND — отказ без остановки", async () => {
+    for (const [code, status, stops] of [["AGENT_SUSPENDED", 403, true], ["MANDATE_NOT_FOUND", 404, false]] as const) {
+      const stopped: string[] = [];
+      stub = new PaoStub({ agents: [{ agentCode: AGENT, keys: [{ kid: "kid_test", alg: "ed25519", publicKey, status: "ACTIVE" }] }] });
+      stub.fail("GET /pao/v1/operations", { code });
+      const platform = new PaoPlatform({
+        journal: new MemoryJournal(),
+        baseUrl: await stub.start(),
+        agentCode: AGENT,
+        signing: { ...signing, stop: (r: string) => void stopped.push(r) },
+        params,
+        sleep: async () => {},
+      });
+      await expect(platform.readOperations("m_cart_1")).rejects.toMatchObject({ code, httpStatus: status });
+      expect(stopped, code).toEqual(stops ? [code] : []);
+      expect(stub.calls.filter((c) => c.op === "GET /pao/v1/operations")).toHaveLength(1);
+      await stub.close();
+      stub = undefined;
+    }
+  });
+});
+
+describe("Р51 п. 5: GET /pao/v1/operations?mandate_id — операции до привязки", () => {
+  it("список — записи с признаком этого агента и суммой числом; запрос — с mandate_id; не список или чужой признак — BAD_RESPONSE", async () => {
+    const op = { op_ref: "op_1", order_ref: "ord_1", amount: 1000, channel: "CARD", merchant_id: "shop_1", status: "REVERSED", reason: "REVERSAL", aoi: { indicator: true, agent_code: AGENT, mandate_id: "m_cart_1" } };
+    const urls: string[] = [];
+    const ok = new PaoPlatform({
+      journal: new MemoryJournal(),
+      baseUrl: "http://pao.test",
+      agentCode: AGENT,
+      signing,
+      params,
+      sleep: async () => {},
+      fetch: async (url) => (urls.push(String(url)), json(200, [op])),
+    });
+    expect(await ok.readOperations("m_cart_1")).toEqual([
+      { opRef: "op_1", orderRef: "ord_1", channel: "CARD", amountMinor: 1000, merchantId: "shop_1", indicator: { agentCode: AGENT, mandateId: "m_cart_1" }, status: "REVERSED", declineReason: "REVERSAL", fulfilment: null },
+    ]);
+    expect(new URL(urls[0]!).searchParams.get("mandate_id")).toBe("m_cart_1");
+    await expect(fake(() => json(200, op)).platform.readOperations("m_cart_1")).rejects.toMatchObject({ code: "BAD_RESPONSE" });
+    const foreign = { ...op, aoi: { ...op.aoi, agent_code: "nspk:agent:other:v1" } };
+    await expect(fake(() => json(200, [foreign])).platform.readOperations("m_cart_1")).rejects.toMatchObject({ code: "BAD_RESPONSE" });
+  });
 });

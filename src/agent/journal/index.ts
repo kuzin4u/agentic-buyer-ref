@@ -142,6 +142,9 @@ export type JournalKind =
   /** GET операции — REVERSED (Р51 п. 3): ref — op_ref, detail — REVERSAL / AUTH_EXPIRED / OTHER (значение вне перечня в
    *  журнал не пишется, инвариант 5) */
   | "operation.reversed"
+  /** поиск операции по CART, когда итога по событию нет за срок стадии 5 (Р51 п. 5): ref — CART по маске, detail —
+   *  BOUND / NONE / AMBIGUOUS / MISMATCH или код отказа; тела ответа нет */
+  | "operation.lookup"
   /** граница ожидания клиринга reservation_ttl_sec прошла, последний GET — AUTHORIZED (Р51 п. 2 (б)): ref — op_ref; покупка
    *  остановлена с OPERATION_RESULT_UNCONFIRMED */
   | "operation.unsettled";

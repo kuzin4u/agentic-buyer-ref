@@ -25,6 +25,8 @@ export interface ContourPaymentOptions {
   /** модуль операций (Р49 п. 3–6): итог по order_ref на стадии 5, расчёт по op_ref на стадии 6 */
   operations: {
     expect(orderRef: string, cart: Mandate): OperationWait;
+    /** поиск операции по CART, когда итога по событию нет (Р51 п. 5) */
+    lookup(orderRef: string, cart: Mandate): Promise<OperationOutcome>;
     settle(authorized: Operation, signal: AbortSignal, deadline?: number): Promise<SettleOutcome>;
   };
   params: Pick<StandParams, "operation_outcome_max_delay_sec" | "confirmation_wait_ms" | "reservation_ttl_sec">;
@@ -90,7 +92,7 @@ export class ContourPayment implements PaymentSteps {
         // списывались» не говорим (Р45, Б1а; инвариант 8); код витрины — detail записи shop.call
         if (!(e instanceof ShopFailure)) throw e;
       }
-      return await this.#outcome(wait, reply, mark, c.signal);
+      return await this.#outcome(wait, reply, mark, c.signal, () => this.o.operations.lookup(orderRef, c.cart));
     } finally {
       wait.close();
     }
@@ -98,7 +100,7 @@ export class ContourPayment implements PaymentSteps {
 
   /** Итог стадии 5 (Р49 п. 5): первое из — привязанная операция или (только при DECLINED продавца) запрос подтверждения,
    *  пришедший после отправки пакета. */
-  async #outcome(wait: OperationWait, reply: ShopPaymentReply | null, mark: number, signal: AbortSignal): Promise<Operation> {
+  async #outcome(wait: OperationWait, reply: ShopPaymentReply | null, mark: number, signal: AbortSignal, lookup: () => Promise<OperationOutcome>): Promise<Operation> {
     const delayMs = this.o.params.operation_outcome_max_delay_sec * 1000;
     let outcome: OperationOutcome | "CONFIRMATION";
     if (reply?.status === "DECLINED") {
@@ -121,6 +123,9 @@ export class ContourPayment implements PaymentSteps {
       outcome = await wait.outcome(delayMs, signal);
     }
     if (outcome === "CONFIRMATION") throw new PaymentFailure("CONFIRMATION_REQUIRED");
+    // итога по событию нет — один поиск по CART (Р51 п. 5): реверсал до ответа эмитента событий не даёт вовсе. Покупку
+    // остановили — поиска нет
+    if (outcome.kind === "NONE" && !signal.aborted) outcome = await lookup();
     if (outcome.kind === "MISMATCH") throw new PaymentFailure("OPERATION_REPLY_MISMATCH");
     if (outcome.kind === "NONE") throw new PaymentFailure("OPERATION_RESULT_UNCONFIRMED");
     return outcome.operation;

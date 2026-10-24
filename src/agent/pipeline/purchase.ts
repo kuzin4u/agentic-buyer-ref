@@ -644,13 +644,24 @@ export class Purchase {
   /** Ворота перед стадией 5 (Р38 п. 3): проверка по мандату (`#scope`) непосредственно перед запросом реквизита, затем
    *  знак готовности продавца корзины по ПАО (Р53 п. 6): `ACTIVE` — дальше; `SUSPENDED` или `NONE` — STOPPED
    *  MERCHANT_NOT_READY; знак не проверен — STOPPED READINESS_UNAVAILABLE; отказ по агенту — код ПАО (или остановка
-   *  подписи); затем пропуск машины в AUTHORIZING. */
+   *  подписи); после знака — держимые ещё раз (отзыв по ленте во время запроса знака); затем пропуск машины в AUTHORIZING. */
   async #gate(intent: Mandate, cart: Mandate): Promise<void> {
     await this.#scope(intent, cart);
     // продавец — из подписанного CART, как в #scope; знак перечитывается: между поиском и оплатой его могли приостановить
-    const mark = await this.#guard(() => this.o.shop.readiness(cart.cart!.merchantId, this.#machine.stopped));
+    const mark = await this.#guard(async () => {
+      try {
+        return await this.o.shop.readiness(cart.cart!.merchantId, this.#machine.stopped);
+      } catch (e) {
+        // запрос прерван остановкой покупки (параллельный вызов) — наружу та же ошибка, что у остановленной стадии
+        if (e === this.#machine.stopped.reason) throw this.#stopped(this.#machine.reason ?? "UNKNOWN");
+        throw e;
+      }
+    });
     if (mark.unverified !== undefined) this.#halt("READINESS_UNAVAILABLE");
     if (mark.status !== "ACTIVE") this.#halt("MERCHANT_NOT_READY");
+    // знак — сетевое ожидание: мандат могли отозвать по ленте, пока он шёл (ревью КТ1 № 1) — без этого реквизит запрошен
+    // по отозванному CART
+    this.#held(intent, cart);
     // без пропуска машина не пустит в AUTHORIZING: запрещённый переход по К2.1, даже если таблица его разрешает
     this.#machine.passGate5();
   }

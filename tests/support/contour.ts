@@ -73,7 +73,9 @@ export interface ContourCall {
   /** PaoStub: ответ выдан повторно по прежнему Idempotency-Key (инвариант 9) */
   replayed?: boolean;
   /** стенд: кто обратился — "agent" (по сети, как клиент агента) или "test" (тестовая поддержка через `app.inject`: копия
-   *  сообщения эквайрера до PS-11, сообщения процессинга ПИ-3, действия банка); полный журнал агента — только "agent" */
+   *  сообщения эквайрера до PS-11, сообщения процессинга ПИ-3, действия банка; с v0.24.0 — и участники самого стенда:
+   *  подача знаков эквайрером при старте и метаданные пакета после авторизации, ПИ-8, #67); полный журнал агента — только
+   *  "agent" (agentCalls) */
   source?: "agent" | "test";
 }
 
@@ -119,6 +121,8 @@ export interface Contour {
   readonly paoStand?: PaoStand;
   /** полный журнал обращений по порядку */
   calls(): ContourCall[];
+  /** журнал обращений агента по порядку — без тестовой поддержки и участников стенда (source "test"); у PaoStub — весь */
+  agentCalls(): ContourCall[];
   /** нарушения схемы ПАО, найденные PaoStub; в режиме "stand" — всегда [] (схему проверяет стенд ответом) */
   violations(): string[];
   /** только "stand": `token_ref` и криптограммы из ответов стенда на POST /pao/v1/credentials — образцы для проверки, что
@@ -134,7 +138,11 @@ const INJECT_AGENT = "lightMyRequest";
 /** Пути участников Платформы (ADP, ПИ-3): агенту закрыты — его обращение туда — нарушение контура (ревью чата К4). */
 const PARTICIPANT_ONLY = /^\S+ \/adp\//;
 
-/** Журнал обращений к серверу Fastify: хук до listen; код отказа — только поле code тела ответа. */
+/** Журнал обращений к серверу Fastify: хук до listen; код отказа — только поле code тела ответа.
+ *  Нюанс К2 (Р52): с v0.24.0 createStand загружает приложение сразу, хук после создания стенд не поддерживает (#67).
+ *  addHook здесь проходит только потому, что createStand синхронный, а загрузка начинается первым app.inject подачи
+ *  знаков; станет стенд загружаться раньше — все тесты на стенде упадут на addHook. Просьба платформе — журнал обращений
+ *  от самого стенда с source agent / test (запасной вариант — createStand({ hooks })), STATUS «Открыто». */
 function record(app: Stand["app"], target: ContourCall["target"], log: ContourCall[]): void {
   app.addHook("onSend", async (req, reply, payload) => {
     let code: string | undefined;
@@ -224,6 +232,16 @@ async function stubContour(opts: StandOptions | undefined): Promise<Contour> {
     await paoStand.close().catch(() => {});
     throw e;
   }
+  // у PaoStub обращается только агент: полный журнал и журнал агента совпадают
+  const stubCalls = (): ContourCall[] =>
+    paoStand.stub.calls.map((c) => ({
+      target: "pao" as const,
+      route: c.op ?? "(нет операции)",
+      status: c.status,
+      ...(c.nonce !== undefined && { nonce: c.nonce }),
+      ...(c.idempotencyKey !== undefined && { idempotencyKey: c.idempotencyKey }),
+      replayed: c.replayed,
+    }));
   return {
     mode: "stub",
     agentCode: AGENT,
@@ -234,15 +252,8 @@ async function stubContour(opts: StandOptions | undefined): Promise<Contour> {
     start: a.start,
     admission: a.admission,
     paoStand,
-    calls: () =>
-      paoStand.stub.calls.map((c) => ({
-        target: "pao" as const,
-        route: c.op ?? "(нет операции)",
-        status: c.status,
-        ...(c.nonce !== undefined && { nonce: c.nonce }),
-        ...(c.idempotencyKey !== undefined && { idempotencyKey: c.idempotencyKey }),
-        replayed: c.replayed,
-      })),
+    calls: stubCalls,
+    agentCalls: stubCalls,
     violations: () => [...paoStand.stub.violations],
     issuedSecrets: () => [],
     async close() {
@@ -351,6 +362,7 @@ async function standContour(paoNow?: () => Date, adpUntilPs11 = false): Promise<
       shopSigning: { sign: (req) => signRequest(req, signing.current()) },
       stand,
       calls: () => log.map((c) => ({ ...c })),
+      agentCalls: () => log.filter((c) => c.source !== "test").map((c) => ({ ...c })),
       // агент не обращается к путям участников (ADP, ПИ-3): копию сообщения эквайрера и ПИ-3 шлёт только тестовая поддержка
       violations: () => log.filter((c) => c.source === "agent" && PARTICIPANT_ONLY.test(c.route)).map((c) => `агент обратился к пути участника: ${c.route}`),
       adpDecisions: () => Promise.all(adp),

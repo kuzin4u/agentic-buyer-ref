@@ -63,7 +63,8 @@ describe("стадия 5 на стенде: реквизит по ПАО и па
   it("реквизит по CART, пакет витрине принят, итог не подтверждён — STOPPED OPERATION_RESULT_UNCONFIRMED; реквизит нигде не встречается", async () => {
     const r = await run();
     const { intent, cart, order } = await ordered(r);
-    const start = r.c.calls().length;
+    // журнал агента: метаданные пакета эквайрером стенда после авторизации (ПИ-8, v0.24.0) — source "test" (Р52 К2)
+    const start = r.c.agentCalls().length;
     const err = await r.purchase.authorize({ idempotencyKey: "idem-pay-stand" }).catch((e: unknown) => e);
     expect(err).toBeInstanceOf(PaymentFailure);
     expect((err as PaymentFailure).code).toBe("OPERATION_RESULT_UNCONFIRMED");
@@ -78,7 +79,7 @@ describe("стадия 5 на стенде: реквизит по ПАО и па
     expect(r.split.isShare(intent.id, rest, T)).toBe(true);
     expect(new SplitWindow(r.params, () => new Date()).isShare(intent.id, rest, T)).toBe(false);
 
-    const calls = r.c.calls().slice(start);
+    const calls = r.c.agentCalls().slice(start);
     const ids = { intent: intent.id, cart: cart.id, shop: NORMAL.id, order: order.orderId };
     const all = calls.map((x) => shape(x, ids));
     // вне полного журнала — только чтения ленты стенда, все успешные (ревью reviewer К2 № 13)
@@ -254,12 +255,12 @@ describe("стадия 5 на стенде: реквизит по ПАО и па
     const { intent, cart, order } = await ordered(r);
     expect(r.purchase.needsConfirmation).toBe(true);
     expect(order.total.amount).toBeLessThanOrEqual(r.c.stand!.params.confirm_above_kop);
-    const start = r.c.calls().length;
+    const start = r.c.agentCalls().length;
     await expect(r.purchase.authorize({ idempotencyKey: "idem-pay-above" })).rejects.toMatchObject({ code: "OPERATION_RESULT_UNCONFIRMED" });
     expect(r.c.journal.entries.some((e) => e.kind === "purchase.stage" && e.detail === "CONFIRMING")).toBe(false);
     // полный журнал обращений после заказа (ленту не считаем): ворота, реквизит, пакет — и ничего о подтверждениях
     const ids = { intent: intent.id, cart: cart.id, shop: NORMAL.id, order: order.orderId };
-    expect(r.c.calls().slice(start).filter((x) => !x.route.startsWith("GET /pao/v1/events")).map((x) => shape(x, ids))).toEqual([
+    expect(r.c.agentCalls().slice(start).filter((x) => !x.route.startsWith("GET /pao/v1/events")).map((x) => shape(x, ids))).toEqual([
       "pao GET /pao/v1/mandates/{intent}/verify 200",
       "pao GET /pao/v1/mandates/{cart}/verify 200",
       "pao POST /pao/v1/credentials 201",
@@ -315,13 +316,13 @@ describe("стадия 5 на стенде: реквизит по ПАО и па
     await r.signWhileWaiting(cart.id, () => r.purchase.awaitCart());
     const order = await r.purchase.placeOrder({ idempotencyKey: "idem-order-4a" });
     expect((await r.c.platform.getMandate(old.id)).status).toBe("ACTIVE");
-    const start = r.c.calls().length;
+    const start = r.c.agentCalls().length;
     await expect(r.purchase.authorize({ idempotencyKey: "idem-pay-4a" })).rejects.toMatchObject({ code: "OPERATION_RESULT_UNCONFIRMED" });
     // ворота — по новому CART; реквизит выдан (201) при ACTIVE прежнем; витрина приняла пакет — cart_mandate_id пакета
     // совпал с мандатом заказа (новый CART)
     expect(
       r.c
-        .calls()
+        .agentCalls()
         .slice(start)
         .map((x) => shape(x, { intent: intent.id, cart: cart.id, old: old.id, shop: NORMAL.id, order: order.orderId }))
         .filter((s) => !s.startsWith("pao GET /pao/v1/events")),

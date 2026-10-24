@@ -1,12 +1,18 @@
 // Адаптер витрин (Р42) на подменённом fetch: подпись до сети, схема ответа, зона, повтор только 429 и 503 на GET (один
 // раз, новой подписью, Retry-After не больше предела), заказ без повтора, неизвестный код витрины, живая проверка.
+// Знак готовности по ПАО (Р53) — ответы ПАО подменены здесь же (`platform`): пути нет в YAML 1.4.0, у PaoStub его нет;
+// отказы — по перечню пути в адаптере. Против стенда: ACTIVE и NONE — П07, purchase-stand; 401 AGENT_KEY_REVOKED — П08;
+// SUSPENDED, 403, 400, 503 стенда — К2.3.
 import { describe, expect, it, vi } from "vitest";
 import { ShopsAdapter, type ShopProfile, type ShopsAdapterOptions } from "../../src/agent/adapters/shops/index.js";
 import { MemoryJournal } from "../../src/agent/journal/index.js";
 import { ShopFailure } from "../../src/agent/ports/index.js";
 import { sealPackage } from "../../src/agent/payment-package/index.js";
+import type { RequestSigning } from "../../src/agent/ports/request-signing.js";
 import { SignerStopped } from "../../src/agent/signer/index.js";
+import { newEd25519Signer } from "@kuzin4u/agentic-core";
 import { loadParams } from "../../src/shared/config.js";
+import { PlatformFailure } from "../../src/shared/domain.js";
 
 const params = loadParams();
 const BASE = "http://shops.test";
@@ -42,14 +48,46 @@ function vitrine(routes: Record<string, Answer[]>) {
   return { f, seen };
 }
 
-function adapter(routes: Record<string, Answer[]>, over: Partial<ShopsAdapterOptions> = {}) {
+const PAO = "http://pao.test";
+const { signer } = newEd25519Signer("kid_test");
+const READY = (id: string, status = "ACTIVE"): Answer => ({ status: 200, body: { merchant_id: id, status, since: "2026-10-24T09:00:00Z" } });
+
+/** ПАО-заглушка знака готовности (Р53): ответы по merchant_id очередью (последний повторяется), по умолчанию — ACTIVE;
+ *  `seen` — что ушло в сеть; порт подписи запоминает остановку и смену ключа (Р53 п. 5). */
+function platform(marks: Record<string, Answer[]>) {
+  const seen: Seen[] = [];
+  const stops: string[] = [];
+  const rotations: string[] = [];
+  const f: typeof fetch = async (input, init) => {
+    const url = new URL(String(input));
+    seen.push({ method: init?.method ?? "GET", path: url.pathname, headers: { ...(init?.headers as Record<string, string>) }, redirect: init?.redirect, body: typeof init?.body === "string" ? init.body : undefined });
+    const id = /^\/pao\/v1\/merchants\/([^/]+)\/readiness$/.exec(url.pathname)?.[1] ?? "";
+    const q = marks[id] ?? [READY(id)];
+    const a = q.length > 1 ? q.shift()! : q[0]!;
+    if (a === "fail") throw new TypeError("fetch failed");
+    if (a === "hang")
+      return new Promise<Response>((_, reject) => init?.signal?.addEventListener("abort", () => reject(init.signal!.reason)));
+    return new Response(a.body === undefined ? "" : JSON.stringify(a.body), { status: a.status, headers: a.headers ?? {} });
+  };
+  const signing: RequestSigning = {
+    current: () => signer,
+    keyRevoked: (kid) => (rotations.push(kid), signer),
+    stop: (r) => void stops.push(r),
+    suspend: () => {},
+  };
+  return { platform: { baseUrl: PAO, signing, fetch: f }, seen, stops, rotations };
+}
+
+function adapter(routes: Record<string, Answer[]>, over: Partial<ShopsAdapterOptions> = {}, marks: Record<string, Answer[]> = {}) {
   const v = vitrine(routes);
+  const p = platform(marks);
   const journal = new MemoryJournal();
   const sleeps: number[] = [];
   const a = new ShopsAdapter({
     baseUrl: BASE,
     agentCode: "nspk:agent:test:v1",
     signing: { sign: (req) => ({ ...req, headers: { ...req.headers, signature: `sig-${req.headers["x-nonce"]}`, "signature-input": "sig=()" } }) },
+    platform: p.platform,
     params,
     profile: () => profile,
     journal,
@@ -57,7 +95,7 @@ function adapter(routes: Record<string, Answer[]>, over: Partial<ShopsAdapterOpt
     sleep: async (ms) => void sleeps.push(ms),
     ...over,
   });
-  return { a, seen: v.seen, journal, sleeps };
+  return { a, seen: v.seen, journal, sleeps, pao: p };
 }
 
 const LIST = (...shops: unknown[]): Record<string, Answer[]> => ({ "GET /v1/shops": [{ status: 200, body: { shops } }] });
@@ -80,20 +118,32 @@ describe("адаптер витрин (Р42)", () => {
     expect(stopped.seen).toEqual([]);
   });
 
-  it("зона контура — только CONTOUR и знак готовности; иначе рынок со ссылкой витрины", async () => {
-    const { a } = adapter({
-      ...LIST(shop("S1"), shop("S2", { readiness_mark: false }), shop("S3", { zone: "OUTSIDE" }), shop("S4", { zone: "contour" })),
-      ...catalog("S1", ok(ITEM)),
-      ...catalog("S2", ok({ ...ITEM, sku: "B2" })),
-      ...catalog("S3", ok({ ...ITEM, sku: "B3" })),
-      ...catalog("S4", ok({ ...ITEM, sku: "B4" })),
-    });
+  it("зона контура — только при ACTIVE по ПАО; SUSPENDED и NONE — рынок со ссылкой витрины, зона и знак витрины — сведения (Р53 п. 3)", async () => {
+    const { a, journal } = adapter(
+      {
+        ...LIST(shop("S1"), shop("S2"), shop("S3"), shop("S4", { readiness_mark: false }), shop("S5", { zone: "OUTSIDE" })),
+        ...catalog("S1", ok(ITEM)),
+        ...catalog("S2", ok({ ...ITEM, sku: "B2" })),
+        ...catalog("S3", ok({ ...ITEM, sku: "B3" })),
+        ...catalog("S4", ok({ ...ITEM, sku: "B4" })),
+        ...catalog("S5", ok({ ...ITEM, sku: "B5" })),
+      },
+      {},
+      { "MER-S2": [READY("MER-S2", "SUSPENDED")], "MER-S3": [READY("MER-S3", "NONE")] },
+    );
     const out = await a.search();
     expect(out.map((s) => ("unavailable" in s ? null : [s.merchantId, s.inContour, s.link]))).toEqual([
       ["MER-S1", true, undefined],
       ["MER-S2", false, `${BASE}/v1/shops/S2/catalog`],
       ["MER-S3", false, `${BASE}/v1/shops/S3/catalog`],
-      ["MER-S4", false, `${BASE}/v1/shops/S4/catalog`],
+      ["MER-S4", true, undefined],
+      ["MER-S5", true, undefined],
+    ]);
+    expect(journal.entries.filter((e) => e.kind === "shop.readiness_mismatch").map((e) => [e.merchant, e.detail])).toEqual([
+      ["MER-S2", "SUSPENDED:CONTOUR"],
+      ["MER-S3", "NONE:CONTOUR"],
+      ["MER-S4", "ACTIVE:MARKET"],
+      ["MER-S5", "ACTIVE:MARKET"],
     ]);
   });
 
@@ -240,8 +290,8 @@ describe("адаптер витрин (Р42)", () => {
     expect(seen.map((s) => s.path)).toEqual(["/v1/shops", "/v1/shops/S1/catalog"]);
   });
 
-  it("у одной витрины нет readiness_mark или он не true — она в зоне рынка, вторая в выдаче как была (ревью КТ1 п. 1)", async () => {
-    const { a } = adapter({
+  it("слова витрины без знака (нет readiness_mark, «true» строкой) при ACTIVE по ПАО — контур; расхождение — в журнал (Р53 п. 3; ревью КТ1 п. 1)", async () => {
+    const { a, journal } = adapter({
       ...LIST({ id: "S1", merchant_id: "MER-S1", zone: "CONTOUR" }, shop("S2"), shop("S3", { readiness_mark: "true" })),
       ...catalog("S1", ok({ ...ITEM, sku: "B1" })),
       ...catalog("S2", ok({ ...ITEM, sku: "B2" })),
@@ -249,9 +299,13 @@ describe("адаптер витрин (Р42)", () => {
     });
     const out = await a.search();
     expect(out.map((s) => ("unavailable" in s ? null : [s.merchantId, s.inContour]))).toEqual([
-      ["MER-S1", false],
+      ["MER-S1", true],
       ["MER-S2", true],
-      ["MER-S3", false],
+      ["MER-S3", true],
+    ]);
+    expect(journal.entries.filter((e) => e.kind === "shop.readiness_mismatch").map((e) => [e.merchant, e.detail])).toEqual([
+      ["MER-S1", "ACTIVE:MARKET"],
+      ["MER-S3", "ACTIVE:MARKET"],
     ]);
   });
 
@@ -332,5 +386,114 @@ describe("адаптер витрин (Р42)", () => {
     const before = seen.length;
     await expect(a.fetch({ sku: "BRD-1", quantity: 1 }, new AbortController().signal)).rejects.toThrow();
     expect(seen.length).toBe(before);
+  });
+});
+
+describe("знак готовности продавца по ПАО (Р53)", () => {
+  const readiness = (j: MemoryJournal) => j.entries.filter((e) => e.kind === "shop.readiness").map((e) => [e.method, e.merchant, e.result, e.detail]);
+
+  it("подписанный GET /pao/v1/merchants/{merchant_id}/readiness к Платформе до каталога, без тела и перенаправлений; в журнале — статус", async () => {
+    const { a, seen, journal, pao } = adapter({ ...LIST(shop("S1")), ...catalog("S1", ok(ITEM)) });
+    await a.search();
+    expect(pao.seen.map((s) => [s.method, s.path, typeof s.headers.signature, s.headers["x-agent-code"], s.redirect, s.body])).toEqual([
+      ["GET", "/pao/v1/merchants/MER-S1/readiness", "string", "nspk:agent:test:v1", "manual", undefined],
+    ]);
+    // подписан тем же портом, что витрины (действующий ключ, профиль ПАО §2), с одноразовым x-nonce
+    expect(pao.seen[0]!.headers.signature).toBe(`sig-${pao.seen[0]!.headers["x-nonce"]}`);
+    expect(seen.map((s) => s.path)).toEqual(["/v1/shops", "/v1/shops/S1/catalog"]);
+    expect(readiness(journal)).toEqual([["GET /pao/v1/merchants/{merchant_id}/readiness", "MER-S1", "ok", "ACTIVE"]]);
+  });
+
+  it("знак не проверен (503, 400, 414, нет ответа, не по схеме, чужой merchant_id) — витрина недоступна READINESS_UNAVAILABLE, не рынок; каталог не запрашивается, подпись не тронута (Р53 п. 4)", async () => {
+    const cases: [Answer, string][] = [
+      [{ status: 503, body: { code: "STATE_UNAVAILABLE", retry: "same_key" } }, "STATE_UNAVAILABLE"],
+      [{ status: 400, body: { code: "REQUEST_INVALID", retry: "after_fix" } }, "REQUEST_INVALID"],
+      [{ status: 414 }, "HTTP_414"],
+      [{ status: 403, body: { code: "REQUEST_INVALID" } }, "HTTP_403"],
+      [{ status: 503, body: { code: "UPSTREAM_UNAVAILABLE", retry: "same_key" } }, "UPSTREAM_UNAVAILABLE"],
+      [{ status: 429, body: { code: "RATE_LIMITED", retry: "same_key" }, headers: { "retry-after": "1" } }, "RATE_LIMITED"],
+      ["fail", "NO_RESPONSE"],
+      [{ status: 200, body: { merchant_id: "MER-S1", status: "READY", since: null } }, "BAD_RESPONSE"],
+      [READY("MER-S2"), "BAD_RESPONSE"],
+    ];
+    for (const [answer, detail] of cases) {
+      const { a, seen, journal, pao } = adapter({ ...LIST(shop("S1")), ...catalog("S1", ok(ITEM)) }, {}, { "MER-S1": [answer] });
+      expect(await a.search()).toEqual([{ shopId: "S1", merchantId: "MER-S1", unavailable: { reason: "READINESS_UNAVAILABLE" } }]);
+      expect(seen.map((s) => s.path)).toEqual(["/v1/shops"]);
+      expect(readiness(journal).map((r) => r[3])).toEqual([detail]);
+      expect([pao.stops, pao.rotations]).toEqual([[], []]);
+    }
+  });
+
+  it("merchant_id не по маске — без обращения к Платформе, знак не проверен (Р53 п. 2)", async () => {
+    const { a, journal, pao } = adapter({});
+    expect(await a.readiness("MER/../x")).toEqual({ unverified: "PATTERN" });
+    // маска SHOP_ID — до 64 знаков (строже 128 у Платформы, нюанс К2.1): 65 — уже без обращения
+    expect(await a.readiness("M".repeat(65))).toEqual({ unverified: "PATTERN" });
+    expect(pao.seen).toEqual([]);
+    expect(readiness(journal)).toEqual([
+      ["GET /pao/v1/merchants/{merchant_id}/readiness", undefined, "refused", "PATTERN"],
+      ["GET /pao/v1/merchants/{merchant_id}/readiness", undefined, "refused", "PATTERN"],
+    ]);
+  });
+
+  it("403 AGENT_SUSPENDED — остановка подписи и PlatformFailure тем же кодом; к следующим витринам не обращаются (Р53 п. 5)", async () => {
+    const { a, seen, pao, journal } = adapter(
+      { ...LIST(shop("S1"), shop("S2")), ...catalog("S1", ok(ITEM)), ...catalog("S2", ok(ITEM)) },
+      {},
+      { "MER-S1": [{ status: 403, body: { code: "AGENT_SUSPENDED", retry: "never" } }] },
+    );
+    const err = await a.search().catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(PlatformFailure);
+    expect((err as PlatformFailure).code).toBe("AGENT_SUSPENDED");
+    expect(pao.stops).toEqual(["AGENT_SUSPENDED"]);
+    expect(readiness(journal)).toEqual([["GET /pao/v1/merchants/{merchant_id}/readiness", "MER-S1", "refused", "AGENT_SUSPENDED"]]);
+    expect(pao.seen.map((s) => s.path)).toEqual(["/pao/v1/merchants/MER-S1/readiness"]);
+    expect(seen.map((s) => s.path)).toEqual(["/v1/shops"]);
+  });
+
+  it("401 — как после допуска (Р53 п. 5): AGENT_KEY_REVOKED — смена ключа, SIGNATURE_INVALID — без остановки; без кода по перечню — BAD_RESPONSE; повтора нет", async () => {
+    for (const [answer, code, stops, rotations] of [
+      [{ status: 401, body: { code: "AGENT_KEY_REVOKED", retry: "new_key" } }, "AGENT_KEY_REVOKED", [], ["kid_test"]],
+      [{ status: 401, body: { code: "SIGNATURE_INVALID", retry: "after_fix" } }, "SIGNATURE_INVALID", [], []],
+      [{ status: 401, body: { code: "AGENT_UNKNOWN", retry: "never" } }, "AGENT_UNKNOWN", ["AGENT_UNKNOWN"], []],
+      [{ status: 401 }, "BAD_RESPONSE", [], []],
+    ] as [Answer, string, string[], string[]][]) {
+      const { a, pao } = adapter({}, {}, { "MER-S1": [answer] });
+      await expect(a.readiness("MER-S1")).rejects.toMatchObject({ name: "PlatformFailure", code, httpStatus: 401 });
+      expect([pao.stops, pao.rotations, pao.seen.length]).toEqual([stops, rotations, 1]);
+    }
+    // через поиск — так же: отказ наружу, каталогов нет
+    const s = adapter({ ...LIST(shop("S1")), ...catalog("S1", ok(ITEM)) }, {}, { "MER-S1": [{ status: 401, body: { code: "SIGNATURE_INVALID", retry: "after_fix" } }] });
+    await expect(s.a.search()).rejects.toMatchObject({ name: "PlatformFailure", code: "SIGNATURE_INVALID" });
+    expect(s.seen.map((x) => x.path)).toEqual(["/v1/shops"]);
+  });
+
+  it("нет ответа в pao_request_timeout_ms (не shop_request_timeout_ms) — знак не проверен NO_RESPONSE", async () => {
+    const quick = { ...params, pao_request_timeout_ms: 30, shop_request_timeout_ms: 60_000 };
+    const { a, journal } = adapter({}, { params: quick }, { "MER-S1": ["hang"] });
+    expect(await a.readiness("MER-S1")).toEqual({ unverified: "NO_RESPONSE" });
+    expect(readiness(journal).map((r) => [r[2], r[3]])).toEqual([["unknown", "NO_RESPONSE"]]);
+  });
+
+  it("общий срок поиска истёк во время запроса знака — SHOP_SEARCH_DEADLINE у этой и следующих витрин, каталогов нет; обращение — в журнале (Р44 п. 6, Т15)", async () => {
+    const short = { ...params, shop_search_deadline_ms: 40, pao_request_timeout_ms: 60_000, shop_request_timeout_ms: 30 };
+    const { a, seen, journal, pao } = adapter({ ...LIST(shop("S1"), shop("S2")), ...catalog("S1", ok(ITEM)) }, { params: short }, { "MER-S1": ["hang"] });
+    const out = await a.search();
+    expect(out).toEqual([
+      { shopId: "S1", merchantId: "MER-S1", unavailable: { reason: "SHOP_SEARCH_DEADLINE" } },
+      { shopId: "S2", merchantId: "MER-S2", unavailable: { reason: "SHOP_SEARCH_DEADLINE" } },
+    ]);
+    expect(seen.map((x) => x.path)).toEqual(["/v1/shops"]);
+    expect(pao.seen.map((x) => x.path)).toEqual(["/pao/v1/merchants/MER-S1/readiness"]);
+    expect(journal.entries.filter((e) => e.kind === "shop.readiness").map((e) => [e.merchant, e.result, e.reason])).toEqual([["MER-S1", "unknown", "SHOP_SEARCH_DEADLINE"]]);
+  });
+
+  it("подпись остановлена — исключение наружу, к Платформе не обращаются", async () => {
+    const { pao } = adapter({});
+    const stopped = adapter({}, { platform: { ...pao.platform, signing: { ...pao.platform.signing, current: () => { throw new SignerStopped("NO_ACTIVE_KEY"); } } } });
+    await expect(stopped.a.readiness("MER-S1")).rejects.toBeInstanceOf(SignerStopped);
+    expect(stopped.pao.seen).toEqual([]);
+    expect(pao.seen).toEqual([]);
   });
 });

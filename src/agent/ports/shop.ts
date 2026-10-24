@@ -19,8 +19,10 @@ export interface ShopOffers {
 
 /** Почему магазин недоступен (Т4, Р42 п. 4): `detail` — код витрины из перечня, BAD_RESPONSE (ответ не по схеме) или
  *  NO_RESPONSE (нет ответа в срок); `reason` — код вне перечня (сам код не переносится, инвариант 5) или истёк общий срок
- *  поиска (Р44 п. 6). */
-export type ShopUnavailableCause = { detail: string; reason?: undefined } | { reason: Extract<AgentDiagCode, "MERCHANT_CODE_UNKNOWN" | "SHOP_SEARCH_DEADLINE">; detail?: undefined };
+ *  поиска (Р44 п. 6) или знак готовности продавца по ПАО не проверен (Р53 п. 4). */
+export type ShopUnavailableCause =
+  | { detail: string; reason?: undefined }
+  | { reason: Extract<AgentDiagCode, "MERCHANT_CODE_UNKNOWN" | "SHOP_SEARCH_DEADLINE" | "READINESS_UNAVAILABLE">; detail?: undefined };
 
 /** Магазин, отказавший на стадии 2 (Т4): товаров нет, поиск по остальным идёт дальше; обходов нет. */
 export interface ShopUnavailable {

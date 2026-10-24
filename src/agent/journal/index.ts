@@ -109,6 +109,13 @@ export type JournalKind =
    *  обращения (shop.call нет) или повтор не начат, потому что Retry-After не меньше остатка (у shop.call — detail кода
    *  витрины) */
   | "shop.unavailable"
+  /** запрос знака готовности продавца по ПАО (Р53 п. 1–5): method — шаблон пути, merchant — код продавца по маске; при ok
+   *  detail — ACTIVE / SUSPENDED / NONE, иначе — код ПАО из перечня, HTTP_<статус>, BAD_RESPONSE, NO_RESPONSE или
+   *  PATTERN (обращения не было); прервано общим сроком поиска — result unknown, reason SHOP_SEARCH_DEADLINE; тела ответа
+   *  нет */
+  | "shop.readiness"
+  /** зона по ПАО и слова витрины расходятся (Р53 п. 3): merchant, detail — «статус ПАО:CONTOUR|MARKET витрины»; действий нет */
+  | "shop.readiness_mismatch"
   /** статус запроса подтверждения по GET (Р47 п. 3): ref — confirmation_id, detail — PENDING / APPROVED / REJECTED /
    *  EXPIRED; ни link, ни confirmation_ref в журнал не попадают */
   | "confirmation.status"

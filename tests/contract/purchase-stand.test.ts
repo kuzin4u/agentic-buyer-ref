@@ -73,8 +73,12 @@ describe("конвейер на стенде Платформы (Р38 п. 8, К6
     const seq = all.filter((s) => !s.startsWith("pao GET /pao/v1/events"));
     // исключённые записи — только чтения ленты стенда, все успешные (ревью К6 М1)
     expect(all.filter((s) => s.startsWith("pao GET /pao/v1/events")).every((s) => /^pao GET \/pao\/v1\/events(\?\S*)? 200$/.test(s))).toBe(true);
-    // поиск — каталог каждой витрины эмулятора по одному, в порядке фикстур; живая проверка — ещё раз каталог витрины заказа
-    const search = MERCHANT_FIXTURES.map((f) => `merchants GET /v1/shops/${f.id === NORMAL.id ? "{shop}" : f.id}/catalog 200`);
+    // поиск — знак и каталог каждой витрины эмулятора по одному, в порядке фикстур; живая проверка — ещё раз каталог витрины заказа
+    // перед каталогом — знак готовности витрины по ПАО (Р53 п. 3)
+    const search = MERCHANT_FIXTURES.flatMap((f) => [
+      `pao GET /pao/v1/merchants/${f.merchant_id}/readiness 200`,
+      `merchants GET /v1/shops/${f.id === NORMAL.id ? "{shop}" : f.id}/catalog 200`,
+    ]);
     expect(seq).toEqual([
       "pao POST /pao/v1/mandates 201",
       // GET до ожидания, подпись эмулятором банка во время ожидания, GET по событию mandate.signed

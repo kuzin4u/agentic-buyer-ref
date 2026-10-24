@@ -97,7 +97,8 @@ describe("П11 — цена изменилась после согласован
     const ids = (x: string) => x.replaceAll(intent.id, "{intent}").replaceAll(old.id, "{old}").replaceAll(fresh.id, "{fresh}");
     const all = r.c.calls().slice(before).filter((x) => !x.route.startsWith("GET /pao/v1/events")).map((x) => ids(`${x.target} ${x.route} ${x.status}`));
     const shop = (id: string) => `merchants GET /v1/shops/${id}/catalog 200`;
-    const search = ["merchants GET /v1/shops 200", ...MERCHANT_FIXTURES.map((m) => shop(m.id))];
+    // знак готовности по ПАО — перед каталогом каждой витрины (Р53 п. 3)
+    const search = ["merchants GET /v1/shops 200", ...MERCHANT_FIXTURES.flatMap((m) => [`pao GET /pao/v1/merchants/${m.merchant_id}/readiness 200`, shop(m.id)])];
     expect(all).toEqual([
       shop(NORMAL.id),
       shop(NORMAL.id),

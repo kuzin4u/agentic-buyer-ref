@@ -1,6 +1,7 @@
 // Конвейер стадии 2 с настоящим адаптером витрин на подменённом fetch (Р46 п. 2): сбой списка витрин —
 // STOPPED SHOP_LIST_UNAVAILABLE; запись списка без id по маске — магазин недоступен без id в журнале и выдаче (Р42 К2 № 8);
 // общий срок поиска при допустимой конфигурации — SHOP_SEARCH_DEADLINE в выдаче конвейера и журнале (Р44 К2 № 8).
+import { newEd25519Signer } from "@kuzin4u/agentic-core";
 import { afterEach, describe, expect, it } from "vitest";
 import { ShopsAdapter, type ShopProfile } from "../../src/agent/adapters/shops/index.js";
 import { MemoryJournal } from "../../src/agent/journal/index.js";
@@ -10,6 +11,7 @@ import { loadParams, parseParams } from "../../src/shared/config.js";
 import { PaoStand } from "../support/pao-stand.js";
 import { purchaseOn, signedIntent, stages } from "../support/purchase.js";
 
+const { signer } = newEd25519Signer("kid_test");
 let stand: PaoStand | undefined;
 afterEach(async () => {
   expect(stand?.stub.violations ?? []).toEqual([]);
@@ -50,6 +52,15 @@ async function setup(routes: Record<string, Answer>, over: Partial<ReturnType<ty
     baseUrl: "http://shops.test",
     agentCode: "nspk:agent:test:v1",
     signing: { sign: (req) => (sign?.(), { ...req, headers: { ...req.headers, signature: "sig", "signature-input": "sig=()" } }) },
+    // знак готовности по ПАО (Р53): здесь всегда ACTIVE — стадия 2 проверяется на витринах; знак — shops-adapter.test
+    platform: {
+      baseUrl: "http://pao.test",
+      signing: { current: () => signer, keyRevoked: () => signer, stop: () => {}, suspend: () => {} },
+      fetch: async (input) => {
+        const id = /\/pao\/v1\/merchants\/([^/]+)\/readiness$/.exec(new URL(String(input)).pathname)?.[1];
+        return new Response(JSON.stringify({ merchant_id: id, status: "ACTIVE", since: null }), { status: 200 });
+      },
+    },
     params,
     profile: () => profile,
     journal: shopLog,

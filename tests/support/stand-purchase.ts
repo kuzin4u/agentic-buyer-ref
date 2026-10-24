@@ -14,6 +14,7 @@ import { Purchase } from "../../src/agent/pipeline/index.js";
 import { OrderPriceMismatches, SplitWindow } from "../../src/agent/policy/index.js";
 import type { FeedItem, HttpRequestSigning, NoticeAmount, PaymentPlatform, PurchaseNotice } from "../../src/agent/ports/index.js";
 import { loadParams, parseParams, type StandParams } from "../../src/shared/config.js";
+import type { DiagCode } from "../../src/shared/diag-codes.js";
 import type { Mandate } from "../../src/shared/domain.js";
 import { INTENT } from "./consents.js";
 import { createContour, type Contour } from "./contour.js";
@@ -65,6 +66,8 @@ export interface StandPurchaseOptions {
   confirmationTimer?: (fn: () => void, ms: number) => () => void;
   /** ПОДМЕНА ДО PS-11: авторизация продавца доходит до ADP стенда копией сообщения (createContour, `adpUntilPs11`) */
   adpUntilPs11?: boolean;
+  /** код остановки сделки по исключению шага — как у места сборки (`startFailureCode`, compose.ts); без него — UNKNOWN */
+  failureCode?: (e: unknown) => DiagCode | null;
 }
 
 /** Контур со стендом и витринами после start(), покупка на адаптере витрин. Закрыть — `c.close()` у вызывающего. */
@@ -120,6 +123,7 @@ export async function standPurchase(o: StandPurchaseOptions = {}) {
       admission: () => c.admission(),
       region: "77",
       ...(o.notify !== undefined && { notify: o.notify }),
+      ...(o.failureCode !== undefined && { failureCode: o.failureCode }),
     });
   const purchase = next();
   /** обращений к ПАО за мандатом id — GET мандата */

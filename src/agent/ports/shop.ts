@@ -100,6 +100,8 @@ export interface PaymentContext {
   signal: AbortSignal;
   /** пакет уходит продавцу — вызвать синхронно сразу после последней проверки `signal` и до отправки (Р45, Б2в (б)) */
   sending(): void;
+  /** уведомление этой покупки для наблюдения после итога (Р51 п. 4): итог стадии 5 — OPERATION_REVERSED */
+  notice?: LateNotice;
 }
 
 /** Исход стадии 4 (Р47 п. 3–4): решение по GET; UNBOUND — привязка неоднозначна; NONE — запроса нет за
@@ -111,12 +113,21 @@ export type ConfirmationOutcome = "APPROVED" | "REJECTED" | "EXPIRED" | "UNBOUND
  *  `purchase.operation`; сумма — вторым аргументом уведомления (`NoticeAmount`), в тексте подстановок нет. */
 export type PurchaseNotice = Extract<
   AgentDiagCode,
-  "CONFIRMATION_PENDING" | "SCOPE_EXCEEDS_AUTHORIZATION" | "SCOPE_NOT_RESERVED" | "SCOPE_CHECK_UNRECOGNIZED" | "OPERATION_REFUNDED"
+  | "CONFIRMATION_PENDING"
+  | "SCOPE_EXCEEDS_AUTHORIZATION"
+  | "SCOPE_NOT_RESERVED"
+  | "SCOPE_CHECK_UNRECOGNIZED"
+  | "OPERATION_REFUNDED"
+  | "OPERATION_SETTLED_LATE"
 >;
 
-/** Сумма к уведомлению (Р51 п. 3–4): у SCOPE_* и OPERATION_REFUNDED — сумма списания по операции в валюте её мандата
- *  (до ПАО 1.5.0 и у возврата — сумма списания, не возврата); у прочих уведомлений — нет. */
+/** Сумма к уведомлению (Р51 п. 3–4): у SCOPE_*, OPERATION_REFUNDED и OPERATION_SETTLED_LATE — сумма списания по операции в
+ *  валюте её мандата (до ПАО 1.5.0 и у возврата — сумма списания, не возврата); у прочих уведомлений — нет. */
 export type NoticeAmount = Money;
+
+/** Уведомление покупки после её итога (Р51 п. 4): наблюдение за операцией шлёт его через уведомление той покупки;
+ *  исход покупки не меняется. */
+export type LateNotice = (code: PurchaseNotice, amount?: NoticeAmount) => void;
 
 /** Стадии 4–6. Исход каждого шага — из подписанного события Платформы, не со слов продавца (инвариант 8, Р14). */
 export interface PaymentSteps {
@@ -130,6 +141,7 @@ export interface PaymentSteps {
   authorize(c: PaymentContext, m: Mutation): Promise<Operation>;
   /** Стадия 6 (Р49 п. 6, Р51 п. 2): итог расчёта по операции. Расчёта ещё нет, ожидание прервано `signal` — PaymentFailure
    *  SETTLEMENT_PENDING (ожидание, не остановка); операция не та — OPERATION_REPLY_MISMATCH. `authorizedAt` — когда
-   *  конвейер получил AUTHORIZED: от него граница ожидания reservation_ttl_sec (нет — с начала ожидания). */
-  settle(op: Operation, signal?: AbortSignal, authorizedAt?: Date): Promise<Operation>;
+   *  конвейер получил AUTHORIZED: от него граница ожидания reservation_ttl_sec (нет — с начала ожидания). `notice` —
+   *  уведомление покупки для наблюдения после итога (Р51 п. 4): итог расчёта, REVERSED, граница. */
+  settle(op: Operation, signal?: AbortSignal, authorizedAt?: Date, notice?: LateNotice): Promise<Operation>;
 }

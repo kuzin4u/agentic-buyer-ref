@@ -118,7 +118,13 @@ describe("стадии 5–6 на стенде v0.20.0: итог из событ
 
   it("Р51 п. 5: реверсал до ответа эмитента — событий нет вовсе; итог находит поиск GET ?mandate_id по CART — STOPPED OPERATION_REVERSED, текст Р51 п. 3; бюджет CART освобождён", async () => {
     // сроки стадии 5 — короткие: событий не будет, ждать полный срок незачем (сравнение — с одним поиском после срока)
-    const r = await standPurchase({ contourPayment: true, adpUntilPs11: true, params: { operation_outcome_max_delay_sec: SHORT_DELAY_SEC, confirmation_wait_ms: SHORT_DELAY_SEC * 1000 } });
+    const notices: [string, unknown][] = [];
+    const r = await standPurchase({
+      contourPayment: true,
+      adpUntilPs11: true,
+      params: { operation_outcome_max_delay_sec: SHORT_DELAY_SEC, confirmation_wait_ms: SHORT_DELAY_SEC * 1000 },
+      notify: (code, amount) => void notices.push([code, amount]),
+    });
     c = r.c;
     const intent = await r.purchase.intent({ ...INTENT, merchantScope: [NORMAL.merchant_id] }, { idempotencyKey: "idem-intent-rev" });
     await r.signWhileWaiting(intent.id, () => r.purchase.awaitIntent());
@@ -165,6 +171,15 @@ describe("стадии 5–6 на стенде v0.20.0: итог из событ
     for (const s of r.c.issuedSecrets!()) expect(out.includes(s)).toBe(false);
     // бюджет освободила Платформа — по verify (инвариант 6)
     expect((await r.c.platform.verifyMandate({ id: cart.id, currency: total.currency })).amountLeft).toEqual(total);
+
+    // Р51 п. 4: клиринг старше реверсала (передача #63 п. 4) — operation.settled, GET SETTLED с NOT_RESERVED: наблюдение
+    // после итога — одно уведомление OPERATION_SETTLED_LATE с суммой и валютой; покупка остаётся STOPPED
+    expect(notices).toEqual([]);
+    await processing(r, { op_ref: d.op_ref, msg_type: "PRESENTMENT", amount: total.amount, currency: total.currency });
+    // после итога ленту читает оболочка или push, не конвейер (compose: events.items) — здесь тест
+    for (let i = 0; i < 50 && notices.length === 0; i++) await r.readFeed();
+    expect(notices).toEqual([["OPERATION_SETTLED_LATE", total]]);
+    expect(r.purchase.reason).toBe("OPERATION_REVERSED");
   });
 
   it("Р51 п. 5, ревью КТ1 Р51 № 9: поиск по неизвестному CART на стенде — 404 MANDATE_NOT_FOUND, исход NONE (дальше OPERATION_RESULT_UNCONFIRMED), код в operation.lookup, подпись не остановлена", async () => {

@@ -3,7 +3,7 @@
 // снова; стадия 6 — GET по op_ref, без события — снова GET не чаще operation_reread_interval_sec, граница — reservation_ttl_sec
 // (Р51 п. 2), прерывание — PENDING.
 import { describe, expect, it } from "vitest";
-import { Operations, type OperationOutcome, type SettleOutcome } from "../../src/agent/operations/index.js";
+import { Operations, type OperationOutcome, type SettleOutcome, type WatchAfter } from "../../src/agent/operations/index.js";
 import type { FeedItem } from "../../src/agent/ports/events.js";
 import { DIAG } from "../../src/agent/compose.js";
 import { loadParams } from "../../src/shared/config.js";
@@ -305,6 +305,96 @@ describe("восстановление op_ref: поиск по CART после �
     const s = setup();
     s.lists.set(CART.id, boom);
     await expect(s.ops.lookup(ORDER, CART)).rejects.toBe(boom);
+  });
+});
+
+describe("наблюдение после итога (Р51 п. 4; таблица К4 в PR #66)", () => {
+  const OP: Operation = {
+    opRef: "op_1",
+    orderRef: ORDER,
+    channel: "CARD",
+    amount: { amount: 90_000, currency: "RUB" },
+    merchantId: "MER-T1",
+    indicator: { agentCode: AG, mandateId: CART.id },
+    status: "AUTHORIZED",
+    declineReason: null,
+    fulfilment: null,
+  };
+  const ful = (scopeCheck: "WITHIN_LIMITS" | "EXCEEDS_AUTHORIZATION" | "NOT_RESERVED", finalMinor = 90_000) => ({ ref: "ful_0123456789abcdef01234567", finalMinor, scopeCheck, spentMinor: finalMinor, at: "2026-10-23T12:05:00.000Z" });
+  const observing = (after: WatchAfter, seenMax?: number) => {
+    const s = setup(undefined, undefined, seenMax);
+    const sent: [string, unknown][] = [];
+    s.ops.watch(OP, after, (code, amount) => void sent.push([code, amount]));
+    return { ...s, sent };
+  };
+  const RUB = (amount: number) => ({ amount, currency: "RUB" });
+
+  it("OPERATION_REVERSED × поздний SETTLED — одно уведомление OPERATION_SETTLED_LATE с суммой и валютой (не SCOPE_NOT_RESERVED); затем возврат — OPERATION_REFUNDED", async () => {
+    const s = observing("REVERSED");
+    s.answers.set("op_1", record("SETTLED", { fulfilment: ful("NOT_RESERVED", 85_000) }));
+    await s.event("operation.settled", "op_1");
+    expect(s.sent).toEqual([["OPERATION_SETTLED_LATE", RUB(85_000)]]);
+    s.answers.set("op_1", record("REFUNDED", { fulfilment: ful("NOT_RESERVED", 85_000) }));
+    await s.event("operation.refunded", "op_1");
+    expect(s.sent).toEqual([["OPERATION_SETTLED_LATE", RUB(85_000)], ["OPERATION_REFUNDED", RUB(85_000)]]);
+  });
+
+  it("граница (UNSETTLED) × поздний SETTLED — OPERATION_SETTLED_LATE; scope_check не WITHIN_LIMITS — ещё SCOPE_* с той же суммой", async () => {
+    for (const [scope, extra] of [["WITHIN_LIMITS", []], ["EXCEEDS_AUTHORIZATION", ["SCOPE_EXCEEDS_AUTHORIZATION"]]] as const) {
+      const s = observing("UNSETTLED");
+      s.answers.set("op_1", record("SETTLED", { fulfilment: ful(scope) }));
+      await s.event("operation.settled", "op_1");
+      expect(s.sent, scope).toEqual([["OPERATION_SETTLED_LATE", RUB(90_000)], ...extra.map((c) => [c, RUB(90_000)])]);
+    }
+  });
+
+  it("DONE по SETTLED × возврат — OPERATION_REFUNDED; повторный SETTLED — без уведомления; DONE по REFUNDED × возврат — без второго", async () => {
+    const s = observing("SETTLED");
+    s.answers.set("op_1", record("SETTLED", { fulfilment: ful("WITHIN_LIMITS") }));
+    await s.event("operation.settled", "op_1");
+    expect(s.sent).toEqual([]);
+    s.answers.set("op_1", record("REFUNDED", { fulfilment: ful("WITHIN_LIMITS") }));
+    await s.event("operation.refunded", "op_1");
+    expect(s.sent).toEqual([["OPERATION_REFUNDED", RUB(90_000)]]);
+    const r = observing("REFUNDED");
+    r.answers.set("op_1", record("REFUNDED", { fulfilment: ful("WITHIN_LIMITS") }));
+    await r.event("operation.refunded", "op_1");
+    expect(r.sent).toEqual([]);
+  });
+
+  it("условие 2 ревью чата: одно событие дважды (лента и push) — один GET и одно уведомление; второе событие с тем же итогом — без второго уведомления", async () => {
+    const s = observing("REVERSED");
+    s.answers.set("op_1", record("SETTLED", { fulfilment: ful("NOT_RESERVED") }));
+    await s.event("operation.settled", "op_1", "evt_dup");
+    await s.event("operation.settled", "op_1", "evt_dup");
+    expect(s.gets).toEqual(["op_1"]);
+    await s.event("operation.settled", "op_1", "evt_other");
+    expect(s.sent.map(([c]) => c)).toEqual(["OPERATION_SETTLED_LATE"]);
+  });
+
+  it("условие 2 ревью чата: вытеснение из окна event_seen_max — событие по вытесненной операции — operation.unclaimed без уведомления", async () => {
+    const s = observing("REVERSED", 2);
+    s.ops.watch({ ...OP, opRef: "op_2", orderRef: "ord_2" }, "REVERSED", () => void s.sent.push(["op_2", null]));
+    s.ops.watch({ ...OP, opRef: "op_3", orderRef: "ord_3" }, "REVERSED", () => void s.sent.push(["op_3", null]));
+    s.answers.set("op_1", record("SETTLED", { fulfilment: ful("NOT_RESERVED") }));
+    await s.event("operation.settled", "op_1");
+    expect(s.sent).toEqual([]);
+    expect(kinds(s.journal)).toEqual(["operation.status:SETTLED", "operation.unclaimed:"]);
+  });
+
+  it("GET дал другой статус — без уведомления; отказ GET с просьбой повторить — наружу (событие прочитается снова); сбой уведомления — исход не меняется", async () => {
+    const s = observing("REVERSED");
+    s.answers.set("op_1", record("REVERSED", { declineReason: "REVERSAL" }));
+    await s.event("operation.settled", "op_1");
+    expect(s.sent).toEqual([]);
+    s.answers.set("op_1", new PlatformFailure("STATE_UNAVAILABLE", "same_key", "STATE_UNAVAILABLE", 503, null));
+    await expect(s.ops.listener({ kind: "event", event: { eventId: "evt_503", type: "operation.settled", at: "x", mandateId: null, opRef: "op_1", confirmationId: null, declineReason: null } })).rejects.toMatchObject({ code: "STATE_UNAVAILABLE" });
+    const t = setup();
+    t.ops.watch(OP, "REVERSED", () => {
+      throw new Error("оболочка упала");
+    });
+    t.answers.set("op_1", record("SETTLED", { fulfilment: ful("NOT_RESERVED") }));
+    await expect(t.event("operation.settled", "op_1")).resolves.toBeUndefined();
   });
 });
 

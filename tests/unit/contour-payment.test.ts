@@ -36,6 +36,7 @@ function steps(o: { reply: ShopPaymentReply["status"]; outcome: (ms: number, sig
       expect: () => (log.push("expect"), wait),
       lookup: async (orderRef, cart) => (log.push(`lookup ${orderRef} ${cart.id}`), o.lookup ?? { kind: "NONE" }),
       settle: async () => ({ kind: "PENDING" }),
+      watch: (op, after) => void log.push(`watch ${op.opRef} ${after}`),
     },
     params: PARAMS,
   });
@@ -54,7 +55,9 @@ describe("ContourPayment: итог стадии 5 (Р49 п. 5)", () => {
   it("Р51 п. 5: итог найден поиском по CART — итог стадии 5 (в том числе REVERSED до ответа эмитента); поиск не сходится — OPERATION_REPLY_MISMATCH; итог по событию — без поиска", async () => {
     const reversed: Operation = { ...DECLINED, status: "REVERSED", declineReason: "REVERSAL" };
     const a = steps({ reply: "PAID", outcome: async () => ({ kind: "NONE" }), lookup: { kind: "OPERATION", operation: reversed } });
-    await expect(a.p.authorize(ctx(), { idempotencyKey: "k" })).resolves.toMatchObject({ status: "REVERSED", declineReason: "REVERSAL" });
+    await expect(a.p.authorize({ ...ctx(), notice: () => {} }, { idempotencyKey: "k" })).resolves.toMatchObject({ status: "REVERSED", declineReason: "REVERSAL" });
+    // оплата отменена — под наблюдением после итога (Р51 п. 4)
+    expect(a.log).toContain("watch op_1 REVERSED");
     const b = steps({ reply: "PAID", outcome: async () => ({ kind: "NONE" }), lookup: { kind: "MISMATCH" } });
     await expect(b.p.authorize(ctx(), { idempotencyKey: "k" })).rejects.toMatchObject({ code: "OPERATION_REPLY_MISMATCH" });
     const c = steps({ reply: "PAID", outcome: async () => ({ kind: "OPERATION", operation: DECLINED }) });
@@ -111,17 +114,43 @@ describe("стадия 6 в шагах contour (Р51 п. 2 (б)): граница
   const AUTHORIZED: Operation = { ...DECLINED, status: "AUTHORIZED", declineReason: null };
   function settling(outcome: SettleOutcome, now = new Date("2026-10-24T10:00:00.000Z")) {
     const deadlines: (number | undefined)[] = [];
+    const watched: string[] = [];
     const p = new ContourPayment({
       platform: {} as never,
       shop: {} as never,
       journal: new MemoryJournal(),
       confirmations: {} as never,
-      operations: { expect: () => ({}) as never, lookup: async () => ({ kind: "NONE" }), settle: async (_op, _signal, deadline) => (deadlines.push(deadline), outcome) },
+      operations: {
+        expect: () => ({}) as never,
+        lookup: async () => ({ kind: "NONE" }),
+        settle: async (_op, _signal, deadline) => (deadlines.push(deadline), outcome),
+        watch: (op, after) => void watched.push(`${op.opRef} ${op.status} ${after}`),
+      },
       params: PARAMS,
       now: () => now,
     });
-    return { p, deadlines, now };
+    return { p, deadlines, now, watched };
   }
+
+  it("Р51 п. 4: итог расчёта SETTLED / REFUNDED / REVERSED и граница (EXPIRED) — операция под наблюдением после итога; PENDING, MISMATCH, UNREAD и без уведомления покупки — нет", async () => {
+    const notice = () => {};
+    for (const status of ["SETTLED", "REFUNDED", "REVERSED"] as const) {
+      const s = settling({ kind: "OPERATION", operation: { ...AUTHORIZED, status } });
+      await s.p.settle(AUTHORIZED, undefined, undefined, notice);
+      expect(s.watched).toEqual([`op_1 ${status} ${status}`]);
+    }
+    const e = settling({ kind: "EXPIRED" });
+    await expect(e.p.settle(AUTHORIZED, undefined, undefined, notice)).rejects.toMatchObject({ code: "OPERATION_RESULT_UNCONFIRMED" });
+    expect(e.watched).toEqual(["op_1 AUTHORIZED UNSETTLED"]);
+    for (const outcome of [{ kind: "PENDING" }, { kind: "MISMATCH" }, { kind: "UNREAD" }] as const) {
+      const s = settling(outcome);
+      await s.p.settle(AUTHORIZED, undefined, undefined, notice).catch(() => undefined);
+      expect(s.watched, outcome.kind).toEqual([]);
+    }
+    const quiet = settling({ kind: "OPERATION", operation: { ...AUTHORIZED, status: "SETTLED" } });
+    await quiet.p.settle(AUTHORIZED);
+    expect(quiet.watched).toEqual([]);
+  });
 
   it("граница — от момента AUTHORIZED, переданного конвейером; без него — от начала ожидания", async () => {
     const at = new Date("2026-10-20T08:00:00.000Z");

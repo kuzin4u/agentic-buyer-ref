@@ -6,11 +6,13 @@
 import { poll } from "../events/poll.js";
 import { SeenWindow } from "../events/seen.js";
 import type { FeedItem } from "../ports/events.js";
+import type { LateNotice, PurchaseNotice } from "../ports/shop.js";
 import { PlatformFailure, type FailureCode, type Mandate, type Operation, type OperationRecord, type OperationStatus, type ScopeCheck } from "../../shared/domain.js";
 import type { DiagCode } from "../../shared/diag-codes.js";
 import { TIMER_MAX_MS } from "../../shared/config.js";
 import { SAFE_ID } from "../../shared/ids.js";
 import { bindOperation, settledOperation, type MismatchField } from "./bind.js";
+import { chargedAmount, scopeNotice } from "./notice.js";
 
 /** Часть порта платформы, которую видит модуль. */
 export interface OperationsPort {
@@ -79,6 +81,18 @@ export type OperationOutcome = { kind: "OPERATION"; operation: Operation } | { k
  *  вызывающий; UNREAD — GET не подтверждён и не повторяется; EXPIRED — граница ожидания прошла, итога нет (Р51 п. 2 (б)). */
 export type SettleOutcome = { kind: "OPERATION"; operation: Operation } | { kind: "MISMATCH" } | { kind: "PENDING" } | { kind: "UNREAD" } | { kind: "EXPIRED" };
 
+/** Исход покупки, после которого операция под наблюдением (Р51 п. 4): расчёт был (SETTLED, REFUNDED), оплата отменена
+ *  (REVERSED), граница ожидания клиринга прошла без итога (UNSETTLED — в том числе при недоступном GET, правка 1). */
+export type WatchAfter = "SETTLED" | "REFUNDED" | "REVERSED" | "UNSETTLED";
+
+interface Watched {
+  op: Operation;
+  after: WatchAfter;
+  notice: LateNotice;
+  /** уже отправленные уведомления по операции: каждое — не больше раза */
+  readonly sent: Set<PurchaseNotice>;
+}
+
 /** Ожидание итога по заказу (стадия 5). */
 export interface OperationWait {
   /** Первый привязанный итог; нет за `ms` — NONE. Итог уже есть — сразу. Прерывание `signal` — отказ с его причиной. */
@@ -108,6 +122,8 @@ export class Operations {
   readonly #byOrder = new Map<string, Expectation>();
   /** op_ref → ожидания расчёта (стадия 6): событие только будит их, GET делает ожидание */
   readonly #settling = new Map<string, Set<Waker>>();
+  /** op_ref → операция под наблюдением после итога (Р51 п. 4); окно event_seen_max, старейшая вытесняется (порядок Map) */
+  readonly #watched = new Map<string, Watched>();
 
   constructor(o: OperationsOptions) {
     this.#o = o;
@@ -137,6 +153,8 @@ export class Operations {
         for (const w of [...settling]) w.poke();
         return;
       }
+      const watched = this.#watched.get(opRef);
+      if (watched) return await this.#late(watched);
       const r = await this.#read(opRef);
       if (r === null) return;
       const exp = r.orderRef === null ? undefined : this.#byOrder.get(r.orderRef);
@@ -225,6 +243,49 @@ export class Operations {
     this.#record({ kind: "operation.status", ref: r.opRef, detail: r.status });
     if (bound.status === "REVERSED") this.#record({ kind: "operation.reversed", ref: r.opRef, detail: reversalDetail(bound.declineReason) });
     return done("BOUND", { kind: "OPERATION", operation: bound });
+  }
+
+  /**
+   * Наблюдение после итога (Р51 п. 4): операция покупки с известным op_ref после её исхода `after`; по событию operation.*
+   * — GET и уведомление через `notice` той покупки. Повторный вызов по тому же op_ref обновляет исход, отправленное не
+   * повторяется. Окно — event_seen_max операций: старейшая вытесняется, событие по ней — operation.unclaimed.
+   */
+  watch(op: Operation, after: WatchAfter, notice: LateNotice): void {
+    const prior = this.#watched.get(op.opRef);
+    this.#watched.delete(op.opRef);
+    const sent = prior?.sent ?? new Set<PurchaseNotice>();
+    // возврат на стадии 6 уже сообщила сама покупка (Р51 п. 3)
+    if (after === "REFUNDED") sent.add("OPERATION_REFUNDED");
+    this.#watched.set(op.opRef, { op: structuredClone(op), after, notice, sent });
+    while (this.#watched.size > this.#o.params.event_seen_max) this.#watched.delete(this.#watched.keys().next().value!);
+  }
+
+  /** Событие по операции под наблюдением: уведомление решает статус по GET (таблица К4 в PR #66); каждое — не больше
+   *  раза; состояние покупки не меняется. Отказ GET с просьбой повторить — наружу (событие прочитается снова). */
+  async #late(w: Watched): Promise<void> {
+    const r = await this.#read(w.op.opRef);
+    if (r === null) return;
+    const op = settledOperation(r, w.op);
+    if (typeof op === "string") {
+      this.#record({ kind: "operation.mismatch", ref: w.op.opRef, detail: op, reason: "OPERATION_REPLY_MISMATCH", ...mandateRef(w.op.indicator?.mandateId ?? "") });
+      return;
+    }
+    const send = (code: PurchaseNotice) => {
+      if (w.sent.has(code)) return;
+      w.sent.add(code);
+      try {
+        w.notice(code, chargedAmount(op));
+      } catch {
+        // уведомление исход не меняет; сбой записывает покупка (notify.failed)
+      }
+    };
+    if (op.status === "SETTLED" && (w.after === "REVERSED" || w.after === "UNSETTLED")) {
+      // клиринг после реверсала — одно уведомление: NOT_RESERVED уже сказано текстом SETTLED_LATE (ревью чата К4)
+      send("OPERATION_SETTLED_LATE");
+      const scope = w.after === "UNSETTLED" ? scopeNotice(op) : null;
+      if (scope !== null) send(scope);
+    }
+    if (op.status === "REFUNDED") send("OPERATION_REFUNDED");
   }
 
   /** Первый привязанный итог — итог стадии 5; следующие события по заказу его не меняют. */

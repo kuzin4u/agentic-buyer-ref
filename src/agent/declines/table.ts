@@ -184,6 +184,7 @@ export const PAYMENT_NOTICE_CODES: ReadonlySet<DiagCode> = new Set<DiagCode>([
   "SCOPE_NOT_RESERVED",
   "SCOPE_CHECK_UNRECOGNIZED",
   "OPERATION_REFUNDED",
+  "OPERATION_SETTLED_LATE",
 ]);
 
 /** Что делать оболочке после остановки покупки (Р50 п. 4) — из действия таблиц §7а и §7б, а не из текста:

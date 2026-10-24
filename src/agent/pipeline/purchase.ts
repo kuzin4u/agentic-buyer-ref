@@ -9,6 +9,7 @@ import { SAFE_ID, SHOP_ID } from "../../shared/ids.js";
 import { liveCheck, type A5SignalCode, type CatalogIssueCode, type CatalogProduct, type LiveCheckParams, type LiveFactCode } from "../catalog/index.js";
 import { ruleForDeclineReason, stopNext, type StopNext, type Unfinished } from "../declines/index.js";
 import { MandateRefused, type MandateClient } from "../mandates/index.js";
+import { chargedAmount, scopeNotice } from "../operations/notice.js";
 import { issuedByShell, spend } from "../policy/a5-issued.js";
 import { acceptedA5, cartTotal, classifyOffer, mayDraftCart, mayOrder, type CartPurchase, type HumanA5Decision, type OfferVerdict, type OrderDecision, type OrderNext } from "../policy/catalog.js";
 import { confirmThreshold, currencySupported, mandateRefusal, mayAuthorize, needsConfirmation, type PaymentDecision, type Thresholds } from "../policy/payment.js";
@@ -222,17 +223,6 @@ const WAITS_HUMAN: ReadonlySet<DiagCode> = new Set(["MANDATE_SIGNATURE_PENDING"]
 const WAITS_SETTLEMENT: ReadonlySet<DiagCode> = new Set(["SETTLEMENT_PENDING"]);
 const NONE: ReadonlySet<DiagCode> = new Set();
 
-/** Уведомление по записи об исполнении (Р49 п. 7): всё, кроме WITHIN_LIMITS; записи нет у SETTLED — не распознано. */
-function scopeNotice(op: Operation): PurchaseNotice | null {
-  const s = op.fulfilment?.scopeCheck;
-  if (s === "WITHIN_LIMITS") return null;
-  if (s === "EXCEEDS_AUTHORIZATION") return "SCOPE_EXCEEDS_AUTHORIZATION";
-  if (s === "NOT_RESERVED") return "SCOPE_NOT_RESERVED";
-  return "SCOPE_CHECK_UNRECOGNIZED";
-}
-
-/** Сумма к уведомлению (Р51 п. 3–4): сумма списания из записи об исполнении; записи нет — сумма операции. */
-const chargedAmount = (op: Operation): NoticeAmount | undefined => op.fulfilment?.finalAmount ?? op.amount ?? undefined;
 
 export class Purchase {
   // машина — только у конвейера: вызывающему — чтение состояния и кода (ревью К3 повторное Н2: переход в обход стадии)
@@ -602,6 +592,9 @@ export class Purchase {
     this.#halt(Object.hasOwn(CONFIRMATION_STOP, outcome) ? CONFIRMATION_STOP[outcome] : "UNKNOWN");
   }
 
+  /** Уведомление покупки после её итога (Р51 п. 4) — для наблюдения модуля операций: то же уведомление оболочки. */
+  readonly #late = (code: PurchaseNotice, amount?: NoticeAmount): void => this.#notify(code, amount);
+
   /** Уведомление оболочки (В3): не ждётся; исключение и отказ обещания — запись notify.failed, исход не меняется. */
   #notify(code: PurchaseNotice, amount?: NoticeAmount): void {
     const failed = () => {
@@ -634,7 +627,7 @@ export class Purchase {
       const until = signal === undefined ? this.#machine.stopped : AbortSignal.any([signal, this.#machine.stopped]);
       const authorizedAt = this.#authorizedAt === null ? undefined : new Date(this.#authorizedAt);
       const op = await this.#guard(async () => {
-        const reply = snapshot(await this.o.payment.settle(copy(authorized), until, authorizedAt));
+        const reply = snapshot(await this.o.payment.settle(copy(authorized), until, authorizedAt, this.#late));
         if (reply.status === "REVERSED") this.#reversed(reply);
         if (reply.status !== "SETTLED" && reply.status !== "REFUNDED") this.#halt("UNKNOWN");
         return reply;
@@ -749,7 +742,7 @@ export class Purchase {
 
   /** Контекст шагу оплаты: копия снимков и связь с машиной — сигнал остановки и отметка «пакет уходит» (Р45, Б2в). */
   #forPayment(c: Omit<PaymentContext, "signal" | "sending">): PaymentContext {
-    return { ...copy(c), signal: this.#machine.stopped, sending: () => this.#machine.sending() };
+    return { ...copy(c), signal: this.#machine.stopped, sending: () => this.#machine.sending(), notice: this.#late };
   }
 
   /** Стадия: переход не разрешён таблицей или идёт другая стадия — отказ машины до работы стадии (без обращений). */

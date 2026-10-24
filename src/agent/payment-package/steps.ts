@@ -3,10 +3,10 @@
 // operation.settled. Собирается в месте сборки из порта платформы, адаптера витрин и модулей подтверждений и операций.
 // Ответ продавца — только в журнале адаптера витрин и повод ждать запрос подтверждения (инвариант 8).
 import type { Journal } from "../journal/index.js";
-import type { OperationOutcome, OperationWait, SettleOutcome } from "../operations/index.js";
+import type { OperationOutcome, OperationWait, SettleOutcome, WatchAfter } from "../operations/index.js";
 import type { IssuedPackage } from "../ports/payment-platform.js";
 import type { Mutation } from "../ports/mutation.js";
-import { PaymentFailure, ShopFailure, type ConfirmationOutcome, type PaymentContext, type PaymentSteps, type ShopPaymentPort, type ShopPaymentReply } from "../ports/shop.js";
+import { PaymentFailure, ShopFailure, type ConfirmationOutcome, type LateNotice, type PaymentContext, type PaymentSteps, type ShopPaymentPort, type ShopPaymentReply } from "../ports/shop.js";
 import type { StandParams } from "../../shared/config.js";
 import type { CredentialDraft, Mandate, Operation } from "../../shared/domain.js";
 import { SAFE_ID } from "../../shared/ids.js";
@@ -28,6 +28,8 @@ export interface ContourPaymentOptions {
     /** поиск операции по CART, когда итога по событию нет (Р51 п. 5) */
     lookup(orderRef: string, cart: Mandate): Promise<OperationOutcome>;
     settle(authorized: Operation, signal: AbortSignal, deadline?: number): Promise<SettleOutcome>;
+    /** наблюдение после итога покупки (Р51 п. 4) */
+    watch(op: Operation, after: WatchAfter, notice: LateNotice): void;
   };
   params: Pick<StandParams, "operation_outcome_max_delay_sec" | "confirmation_wait_ms" | "reservation_ttl_sec">;
   now?: () => Date;
@@ -92,7 +94,10 @@ export class ContourPayment implements PaymentSteps {
         // списывались» не говорим (Р45, Б1а; инвариант 8); код витрины — detail записи shop.call
         if (!(e instanceof ShopFailure)) throw e;
       }
-      return await this.#outcome(wait, reply, mark, c.signal, () => this.o.operations.lookup(orderRef, c.cart));
+      const op = await this.#outcome(wait, reply, mark, c.signal, () => this.o.operations.lookup(orderRef, c.cart));
+      // оплата отменена — поздний клиринг или возврат сообщит наблюдение после итога (Р51 п. 4)
+      if (op.status === "REVERSED" && c.notice !== undefined) this.o.operations.watch(op, "REVERSED", c.notice);
+      return op;
     } finally {
       wait.close();
     }
@@ -135,13 +140,17 @@ export class ContourPayment implements PaymentSteps {
   /** Стадия 6 (Р49 п. 6, Р51 п. 2): расчёт по событию и GET; без `signal` — ждёт до расчёта или границы reservation_ttl_sec
    *  от `authorizedAt` (нет — от начала ожидания). Прервано — SETTLEMENT_PENDING (ожидание, не остановка); операция не та —
    *  OPERATION_REPLY_MISMATCH; GET не подтверждён или граница прошла без итога — OPERATION_RESULT_UNCONFIRMED. */
-  async settle(op: Operation, signal?: AbortSignal, authorizedAt?: Date): Promise<Operation> {
+  async settle(op: Operation, signal?: AbortSignal, authorizedAt?: Date, notice?: LateNotice): Promise<Operation> {
     const deadline = (authorizedAt ?? this.now()).getTime() + this.o.params.reservation_ttl_sec * 1000;
     // без сигнала ждёт до расчёта или границы; конвейер передаёт свой сигнал остановки покупки (ревью КТ1 № 7а)
     const r = await this.o.operations.settle(op, signal ?? new AbortController().signal, deadline);
     if (r.kind === "PENDING") throw new PaymentFailure("SETTLEMENT_PENDING");
     if (r.kind === "MISMATCH") throw new PaymentFailure("OPERATION_REPLY_MISMATCH");
+    // граница прошла (и при недоступном GET, правка 1) — op_ref известен: поздний клиринг сообщит наблюдение (Р51 п. 4)
+    if (r.kind === "EXPIRED" && notice !== undefined) this.o.operations.watch(op, "UNSETTLED", notice);
     if (r.kind === "UNREAD" || r.kind === "EXPIRED") throw new PaymentFailure("OPERATION_RESULT_UNCONFIRMED");
+    const s = r.operation.status;
+    if (notice !== undefined && (s === "SETTLED" || s === "REFUNDED" || s === "REVERSED")) this.o.operations.watch(r.operation, s, notice);
     return r.operation;
   }
 }

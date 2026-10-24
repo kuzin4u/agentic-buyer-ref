@@ -107,8 +107,16 @@ export interface PaymentContext {
 export type ConfirmationOutcome = "APPROVED" | "REJECTED" | "EXPIRED" | "UNBOUND" | "NONE" | "UNKNOWN";
 
 /** Уведомление оболочки — не исход покупки (Р47 п. 5, Р49 п. 7): запрос подтверждения ждёт человека; запись об исполнении
- *  с scope_check не WITHIN_LIMITS. Текст — из реестра по коду; значение вне перечня — из `purchase.operation`. */
-export type PurchaseNotice = Extract<AgentDiagCode, "CONFIRMATION_PENDING" | "SCOPE_EXCEEDS_AUTHORIZATION" | "SCOPE_NOT_RESERVED" | "SCOPE_CHECK_UNRECOGNIZED">;
+ *  с scope_check не WITHIN_LIMITS; возврат по операции (Р51 п. 3). Текст — из реестра по коду; значение вне перечня — из
+ *  `purchase.operation`; сумма — вторым аргументом уведомления (`NoticeAmount`), в тексте подстановок нет. */
+export type PurchaseNotice = Extract<
+  AgentDiagCode,
+  "CONFIRMATION_PENDING" | "SCOPE_EXCEEDS_AUTHORIZATION" | "SCOPE_NOT_RESERVED" | "SCOPE_CHECK_UNRECOGNIZED" | "OPERATION_REFUNDED"
+>;
+
+/** Сумма к уведомлению (Р51 п. 3–4): у SCOPE_* и OPERATION_REFUNDED — сумма списания по операции в валюте её мандата
+ *  (до ПАО 1.5.0 и у возврата — сумма списания, не возврата); у прочих уведомлений — нет. */
+export type NoticeAmount = Money;
 
 /** Стадии 4–6. Исход каждого шага — из подписанного события Платформы, не со слов продавца (инвариант 8, Р14). */
 export interface PaymentSteps {
@@ -120,7 +128,8 @@ export interface PaymentSteps {
    *  требует подтверждения — PaymentFailure CONFIRMATION_REQUIRED (профиль contour — ответ продавца DECLINED, Р47 п. 4)
    *  или ответ со статусом CONFIRMATION_REQUIRED: дальше стадия 4. */
   authorize(c: PaymentContext, m: Mutation): Promise<Operation>;
-  /** Стадия 6 (Р49 п. 6): итог расчёта по операции. Расчёта ещё нет, ожидание прервано `signal` — PaymentFailure
-   *  SETTLEMENT_PENDING (ожидание, не остановка); операция не та — OPERATION_REPLY_MISMATCH. */
-  settle(op: Operation, signal?: AbortSignal): Promise<Operation>;
+  /** Стадия 6 (Р49 п. 6, Р51 п. 2): итог расчёта по операции. Расчёта ещё нет, ожидание прервано `signal` — PaymentFailure
+   *  SETTLEMENT_PENDING (ожидание, не остановка); операция не та — OPERATION_REPLY_MISMATCH. `authorizedAt` — когда
+   *  конвейер получил AUTHORIZED: от него граница ожидания reservation_ttl_sec (нет — с начала ожидания). */
+  settle(op: Operation, signal?: AbortSignal, authorizedAt?: Date): Promise<Operation>;
 }

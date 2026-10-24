@@ -1,6 +1,7 @@
 // Модуль операций (Р49 п. 3–7): событие operation.* — сигнал, итог — по GET; привязка к покупке по order_ref, сверка с
 // CART (признак, продавец, сумма, канал); дубли по event_id; GET, который Платформа просит повторить, — событие читается
-// снова; стадия 6 — GET по op_ref, без события — снова GET через operation_outcome_max_delay_sec, прерывание — PENDING.
+// снова; стадия 6 — GET по op_ref, без события — снова GET не чаще operation_reread_interval_sec, граница — reservation_ttl_sec
+// (Р51 п. 2), прерывание — PENDING.
 import { describe, expect, it } from "vitest";
 import { Operations, type OperationOutcome, type SettleOutcome } from "../../src/agent/operations/index.js";
 import type { FeedItem } from "../../src/agent/ports/events.js";
@@ -12,6 +13,7 @@ const T0 = Date.parse("2026-10-23T12:00:00.000Z");
 const PARAMS = loadParams();
 const DELAY_SEC = PARAMS.operation_outcome_max_delay_sec;
 const TTL_SEC = PARAMS.registry_cache_ttl_sec;
+const REREAD_SEC = PARAMS.operation_reread_interval_sec;
 const AG = "nspk:agent:buyer:v1";
 const ORDER = "ord_1";
 const CART: Mandate = {
@@ -79,7 +81,13 @@ function setup(wake?: (ops: Operations) => Promise<void>, pollMs?: number, seenM
       },
     },
     journal: { record: (e) => void journal.push(e) },
-    params: { operation_outcome_max_delay_sec: DELAY_SEC, registry_cache_ttl_sec: TTL_SEC, event_seen_max: seenMax, ...(pollMs !== undefined && { event_poll_interval_ms: pollMs }) },
+    params: {
+      operation_outcome_max_delay_sec: DELAY_SEC,
+      operation_reread_interval_sec: REREAD_SEC,
+      registry_cache_ttl_sec: TTL_SEC,
+      event_seen_max: seenMax,
+      ...(pollMs !== undefined && { event_poll_interval_ms: pollMs }),
+    },
     ...(wake && { wake: (): Promise<void> => wake(ops) }),
     now: c.now,
     timer: c.timer,
@@ -284,10 +292,10 @@ describe("стадия 6: расчёт по operation.settled и GET (Р49 п. 6
   };
   const SETTLED = record("SETTLED", { fulfilment: { ref: "ful_0123456789abcdef01234567", finalMinor: 90_000, scopeCheck: "WITHIN_LIMITS", spentMinor: 90_000, at: "2026-10-23T12:05:00.000Z" } });
 
-  const settling = (s: ReturnType<typeof setup>) => {
+  const settling = (s: ReturnType<typeof setup>, deadline?: number) => {
     const ac = new AbortController();
     let out: SettleOutcome | Error | undefined;
-    s.ops.settle(authorized, ac.signal).then((o) => (out = o), (e: Error) => (out = e));
+    s.ops.settle(authorized, ac.signal, deadline).then((o) => (out = o), (e: Error) => (out = e));
     return { ac, out: () => out };
   };
 
@@ -316,17 +324,62 @@ describe("стадия 6: расчёт по operation.settled и GET (Р49 п. 6
     expect(s.gets).toEqual(["op_1", "op_1"]);
   });
 
-  it("без события дольше operation_outcome_max_delay_sec — снова GET (#59 п. 3); прерывание вызывающим — PENDING", async () => {
+  it("Р51 п. 2 (а): без события — снова GET не чаще operation_reread_interval_sec (не через operation_outcome_max_delay_sec); прерывание вызывающим — PENDING", async () => {
+    expect(REREAD_SEC).toBeGreaterThan(DELAY_SEC);
     const s = setup();
     s.answers.set("op_1", record("AUTHORIZED"));
     const r = settling(s);
     await tick();
-    await s.c.advance(DELAY_SEC * 1000);
-    await s.c.advance(DELAY_SEC * 1000);
+    // до срока перечитывания — ни одного GET сверх первого, сколько бы ни прошло сроков задержки события
+    await s.c.advance(REREAD_SEC * 1000 - 1);
+    expect(s.gets).toEqual(["op_1"]);
+    await s.c.advance(1);
+    expect(s.gets).toEqual(["op_1", "op_1"]);
+    await s.c.advance(REREAD_SEC * 1000);
     expect(s.gets).toEqual(["op_1", "op_1", "op_1"]);
     r.ac.abort();
     await tick();
     expect(r.out()).toEqual({ kind: "PENDING" });
+  });
+
+  it("Р51 п. 2 (б): граница reservation_ttl_sec — последний GET в срок границы; по-прежнему AUTHORIZED — EXPIRED и запись operation.unsettled", async () => {
+    const s = setup();
+    s.answers.set("op_1", record("AUTHORIZED"));
+    // граница раньше второго планового чтения: пауза — до границы, не на полный срок перечитывания
+    const deadline = T0 + REREAD_SEC * 1000 + 500;
+    const r = settling(s, deadline);
+    await tick();
+    await s.c.advance(REREAD_SEC * 1000);
+    expect(r.out()).toBeUndefined();
+    expect(s.gets).toEqual(["op_1", "op_1"]);
+    await s.c.advance(499);
+    expect(r.out()).toBeUndefined();
+    await s.c.advance(1);
+    await tick();
+    expect(s.gets).toEqual(["op_1", "op_1", "op_1"]);
+    expect(r.out()).toEqual({ kind: "EXPIRED" });
+    expect(kinds(s.journal).at(-1)).toBe("operation.unsettled:");
+    // итог в последнем чтении — итог, не EXPIRED
+    const s2 = setup();
+    s2.answers.set("op_1", record("AUTHORIZED"));
+    const r2 = settling(s2, T0 + 1000);
+    await tick();
+    s2.answers.set("op_1", SETTLED);
+    await s2.c.advance(1000);
+    await tick();
+    expect(r2.out()).toMatchObject({ kind: "OPERATION", operation: { status: "SETTLED" } });
+  });
+
+  it("Р51 п. 3: REVERSED — итог-операция, запись operation.reversed с причиной закрытым перечнем (иное — OTHER, значение не в журнал)", async () => {
+    for (const [reason, detail] of [["REVERSAL", "REVERSAL"], ["AUTH_EXPIRED", "AUTH_EXPIRED"], ["CHARGE_CANCELLED_BY_X", "OTHER"], [null, "OTHER"]] as const) {
+      const s = setup();
+      s.answers.set("op_1", record("REVERSED", { declineReason: reason }));
+      const r = settling(s);
+      await tick();
+      expect(r.out()).toMatchObject({ kind: "OPERATION", operation: { status: "REVERSED", declineReason: reason } });
+      expect(kinds(s.journal).at(-1)).toBe(`operation.reversed:${detail}`);
+      if (reason !== null && detail === "OTHER") expect(JSON.stringify(s.journal)).not.toContain(reason);
+    }
   });
 
   it("scope_check вне перечня — в операции как есть, в журнале OTHER; не по форме кода — без значения", async () => {
@@ -365,7 +418,7 @@ describe("стадия 6: расчёт по operation.settled и GET (Р49 п. 6
         },
       },
       journal: { record: () => {} },
-      params: { operation_outcome_max_delay_sec: DELAY_SEC, registry_cache_ttl_sec: TTL_SEC, event_seen_max: PARAMS.event_seen_max },
+      params: { operation_outcome_max_delay_sec: DELAY_SEC, operation_reread_interval_sec: REREAD_SEC, registry_cache_ttl_sec: TTL_SEC, event_seen_max: PARAMS.event_seen_max },
       now: c.now,
       timer: c.timer,
     });

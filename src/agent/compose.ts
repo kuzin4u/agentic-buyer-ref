@@ -17,7 +17,7 @@ import { KeyRing, SignerKeyRejected, SignerStopped, SignerSuspended } from "./si
 import { Purchase } from "./pipeline/index.js";
 import { OrderPriceMismatches, SplitWindow } from "./policy/index.js";
 import type { LiveOfferSource } from "./ports/catalog.js";
-import type { OfferSource, PaymentSteps, PurchaseNotice, ShopPaymentPort, ShopPort } from "./ports/shop.js";
+import type { NoticeAmount, OfferSource, PaymentSteps, PurchaseNotice, ShopPaymentPort, ShopPort } from "./ports/shop.js";
 import { ContourPayment } from "./payment-package/index.js";
 import { Confirmations } from "./confirmations/index.js";
 import { Operations } from "./operations/index.js";
@@ -100,8 +100,9 @@ export interface PurchasePorts {
   payment: PaymentSteps;
   region?: string;
   /** уведомление оболочки (Р47 п. 5, В3; Р49 п. 7): CONFIRMATION_PENDING — нужно подтверждение в приложении банка; SCOPE_*
-   *  — запись об исполнении не WITHIN_LIMITS (значение вне перечня — из `purchase.operation`) */
-  notify?: (code: PurchaseNotice) => void | Promise<void>;
+   *  — запись об исполнении не WITHIN_LIMITS (значение вне перечня — из `purchase.operation`); OPERATION_REFUNDED — возврат
+   *  (Р51 п. 3); `amount` — сумма списания по операции у SCOPE_* и OPERATION_REFUNDED */
+  notify?: (code: PurchaseNotice, amount?: NoticeAmount) => void | Promise<void>;
 }
 
 export interface AgentCoreOptions {

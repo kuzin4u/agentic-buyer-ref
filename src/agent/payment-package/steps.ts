@@ -25,9 +25,9 @@ export interface ContourPaymentOptions {
   /** модуль операций (Р49 п. 3–6): итог по order_ref на стадии 5, расчёт по op_ref на стадии 6 */
   operations: {
     expect(orderRef: string, cart: Mandate): OperationWait;
-    settle(authorized: Operation, signal: AbortSignal): Promise<SettleOutcome>;
+    settle(authorized: Operation, signal: AbortSignal, deadline?: number): Promise<SettleOutcome>;
   };
-  params: Pick<StandParams, "operation_outcome_max_delay_sec" | "confirmation_wait_ms">;
+  params: Pick<StandParams, "operation_outcome_max_delay_sec" | "confirmation_wait_ms" | "reservation_ttl_sec">;
   now?: () => Date;
 }
 
@@ -126,15 +126,16 @@ export class ContourPayment implements PaymentSteps {
     return outcome.operation;
   }
 
-  /** Стадия 6 (Р49 п. 6): расчёт по operation.settled и GET; без `signal` — ждёт, пока расчёт не придёт. Прервано —
-   *  SETTLEMENT_PENDING (ожидание, не остановка); операция не та — OPERATION_REPLY_MISMATCH; GET не подтверждён —
-   *  OPERATION_RESULT_UNCONFIRMED. */
-  async settle(op: Operation, signal?: AbortSignal): Promise<Operation> {
-    // без сигнала ждёт, пока расчёт не придёт; конвейер передаёт свой сигнал остановки покупки (ревью КТ1 № 7а)
-    const r = await this.o.operations.settle(op, signal ?? new AbortController().signal);
+  /** Стадия 6 (Р49 п. 6, Р51 п. 2): расчёт по событию и GET; без `signal` — ждёт до расчёта или границы reservation_ttl_sec
+   *  от `authorizedAt` (нет — от начала ожидания). Прервано — SETTLEMENT_PENDING (ожидание, не остановка); операция не та —
+   *  OPERATION_REPLY_MISMATCH; GET не подтверждён или граница прошла без итога — OPERATION_RESULT_UNCONFIRMED. */
+  async settle(op: Operation, signal?: AbortSignal, authorizedAt?: Date): Promise<Operation> {
+    const deadline = (authorizedAt ?? this.now()).getTime() + this.o.params.reservation_ttl_sec * 1000;
+    // без сигнала ждёт до расчёта или границы; конвейер передаёт свой сигнал остановки покупки (ревью КТ1 № 7а)
+    const r = await this.o.operations.settle(op, signal ?? new AbortController().signal, deadline);
     if (r.kind === "PENDING") throw new PaymentFailure("SETTLEMENT_PENDING");
     if (r.kind === "MISMATCH") throw new PaymentFailure("OPERATION_REPLY_MISMATCH");
-    if (r.kind === "UNREAD") throw new PaymentFailure("OPERATION_RESULT_UNCONFIRMED");
+    if (r.kind === "UNREAD" || r.kind === "EXPIRED") throw new PaymentFailure("OPERATION_RESULT_UNCONFIRMED");
     return r.operation;
   }
 }

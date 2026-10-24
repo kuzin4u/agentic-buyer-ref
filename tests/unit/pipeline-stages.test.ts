@@ -868,8 +868,8 @@ describe("стадии 4–6 — исходы из порта PaymentSteps (ин
     expect(stages(r).at(-1)).toBe("STOPPED:EVENTS_UNAVAILABLE");
   });
 
-  it("расчёт не SETTLED — STOPPED, после одобрения итоговым кодом OPERATION_RESULT_UNCONFIRMED (инвариант 4, Р49 п. 2)", async () => {
-    const r = await setup({ payment: payments({ settle: "REVERSED" }) });
+  it("расчёт не SETTLED, не REFUNDED и не REVERSED — STOPPED, после одобрения итоговым кодом OPERATION_RESULT_UNCONFIRMED (инвариант 4, Р49 п. 2; REVERSED — Р51 п. 3)", async () => {
+    const r = await setup({ payment: payments({ settle: "DECLINED" }) });
     await ordered(r);
     await r.purchase.authorize({ idempotencyKey: "idem-pay-1" });
     await expect(r.purchase.settle()).rejects.toMatchObject({ code: "OPERATION_RESULT_UNCONFIRMED" });
@@ -927,16 +927,90 @@ describe("стадии 4–6 — исходы из порта PaymentSteps (ин
         fulfilment: scopeCheck === null ? null : { ref: "ful_1", finalAmount: x.amount!, scopeCheck, spentPosition: x.amount!, at: "2026-10-23T12:05:00.000Z" },
       });
       const notified: string[] = [];
-      const r = await setup({ payment: payments({ settle }), notify: (c) => void notified.push(c) });
+      const amounts: unknown[] = [];
+      const r = await setup({ payment: payments({ settle }), notify: (c, a) => void (notified.push(c), amounts.push(a)) });
       await ordered(r);
       await r.purchase.authorize({ idempotencyKey: "idem-pay-1" });
       const op = await r.purchase.settle();
       expect(r.purchase.state).toBe("DONE");
       expect(notified, JSON.stringify(scopeCheck)).toEqual(expected);
+      // сумма списания с валютой — вторым аргументом (Р51 п. 3; ревью чата): из записи об исполнении, без неё — сумма операции
+      expect(amounts).toEqual(expected.map(() => op.fulfilment?.finalAmount ?? op.amount));
+      if (expected.length > 0) expect(amounts[0]).toEqual({ amount: expect.any(Number), currency: "RUB" });
       // значение вне перечня — человеку как есть из операции покупки (#59 п. 6)
       if (typeof scopeCheck === "object" && scopeCheck !== null) expect(op.fulfilment?.scopeCheck).toEqual({ other: "PARTIAL" });
       await closeStand();
     }
+  });
+
+  it("Р51 п. 2 (б): граница ожидания — от получения AUTHORIZED на стадии 5: порт расчёта получает этот момент при каждом settle()", async () => {
+    const seen: (Date | undefined)[] = [];
+    let pending = true;
+    const settle = async (x: Operation, at?: Date): Promise<Operation> => {
+      seen.push(at);
+      if (pending) throw new PaymentFailure("SETTLEMENT_PENDING");
+      return { ...x, status: "SETTLED", fulfilment: { ref: "ful_1", finalAmount: x.amount!, scopeCheck: "WITHIN_LIMITS", spentPosition: x.amount!, at: "2026-10-23T12:05:00.000Z" } };
+    };
+    const r = await setup({ payment: payments({ settle }) });
+    await ordered(r);
+    await r.purchase.authorize({ idempotencyKey: "idem-pay-1" });
+    await expect(r.purchase.settle()).rejects.toMatchObject({ code: "SETTLEMENT_PENDING" });
+    pending = false;
+    await r.purchase.settle();
+    expect(seen).toHaveLength(2);
+    expect(seen[0]).toBeInstanceOf(Date);
+    // повторный settle() — тот же момент, граница не сдвигается
+    expect(seen[1]!.getTime()).toBe(seen[0]!.getTime());
+  });
+
+  it("Р51 п. 2 (б): граница прошла без итога (порт — OPERATION_RESULT_UNCONFIRMED) — STOPPED, next NOTIFY_HUMAN; unfinished — только при STOP_ALL (Р50 п. 4)", async () => {
+    const r = await setup({ payment: payments({ settle: () => Promise.reject(new PaymentFailure("OPERATION_RESULT_UNCONFIRMED")) }) });
+    await ordered(r);
+    await r.purchase.authorize({ idempotencyKey: "idem-pay-1" });
+    await expect(r.purchase.settle()).rejects.toMatchObject({ code: "OPERATION_RESULT_UNCONFIRMED" });
+    expect(r.purchase.reason).toBe("OPERATION_RESULT_UNCONFIRMED");
+    expect(r.purchase.next).toBe("NOTIFY_HUMAN");
+    expect(r.purchase.unfinished).toBeNull();
+  });
+
+  it("Р51 п. 3: REVERSED на стадии 6 — STOPPED OPERATION_REVERSED (итоговый код), next NOTIFY_HUMAN; уведомлений нет", async () => {
+    const notified: string[] = [];
+    const r = await setup({ payment: payments({ settle: "REVERSED" }), notify: (c) => void notified.push(c) });
+    await ordered(r);
+    await r.purchase.authorize({ idempotencyKey: "idem-pay-1" });
+    const err = await r.purchase.settle().catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(PurchaseStopped);
+    expect(err).toMatchObject({ code: "OPERATION_REVERSED" });
+    expect(r.purchase.reason).toBe("OPERATION_REVERSED");
+    expect(r.purchase.next).toBe("NOTIFY_HUMAN");
+    expect(r.purchase.unfinished).toBeNull();
+    // итоговый код — без замены на OPERATION_RESULT_UNCONFIRMED (Р49 п. 2)
+    expect(r.tail().some((e) => e.kind === "payment.unconfirmed")).toBe(false);
+    expect(notified).toEqual([]);
+  });
+
+  it("Р51 п. 3: REVERSED на стадии 5 (реверсал до ответа эмитента, итог по GET) — STOPPED OPERATION_REVERSED, место в окне дробления занято", async () => {
+    const r = await setup({ payment: payments({ authorize: { status: "REVERSED", declineReason: "REVERSAL" } }) });
+    await ordered(r);
+    await expect(r.purchase.authorize({ idempotencyKey: "idem-pay-1" })).rejects.toMatchObject({ code: "OPERATION_REVERSED" });
+    expect(r.purchase.reason).toBe("OPERATION_REVERSED");
+    expect(r.purchase.next).toBe("NOTIFY_HUMAN");
+    expect(r.tail().some((e) => e.kind === "payment.unconfirmed")).toBe(false);
+  });
+
+  it("Р51 п. 3: REFUNDED на GET стадии 6 (расчёт и возврат уже были) — DONE, уведомление OPERATION_REFUNDED с суммой списания и валютой", async () => {
+    const settle = async (x: Operation): Promise<Operation> => ({
+      ...x,
+      status: "REFUNDED",
+      fulfilment: { ref: "ful_1", finalAmount: x.amount!, scopeCheck: "WITHIN_LIMITS", spentPosition: x.amount!, at: "2026-10-23T12:05:00.000Z" },
+    });
+    const notified: [string, unknown][] = [];
+    const r = await setup({ payment: payments({ settle }), notify: (c, a) => void notified.push([c, a]) });
+    await ordered(r);
+    const authorized = await r.purchase.authorize({ idempotencyKey: "idem-pay-1" });
+    await expect(r.purchase.settle()).resolves.toMatchObject({ status: "REFUNDED" });
+    expect(r.purchase.state).toBe("DONE");
+    expect(notified).toEqual([["OPERATION_REFUNDED", authorized.amount]]);
   });
 });
 

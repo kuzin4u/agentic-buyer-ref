@@ -12,7 +12,7 @@ import { Operations } from "../../src/agent/operations/index.js";
 import { ContourPayment } from "../../src/agent/payment-package/index.js";
 import { Purchase } from "../../src/agent/pipeline/index.js";
 import { OrderPriceMismatches, SplitWindow } from "../../src/agent/policy/index.js";
-import type { FeedItem, HttpRequestSigning, PaymentPlatform, PurchaseNotice } from "../../src/agent/ports/index.js";
+import type { FeedItem, HttpRequestSigning, NoticeAmount, PaymentPlatform, PurchaseNotice } from "../../src/agent/ports/index.js";
 import { parseParams, type StandParams } from "../../src/shared/config.js";
 import type { Mandate } from "../../src/shared/domain.js";
 import { INTENT } from "./consents.js";
@@ -54,7 +54,7 @@ export interface StandPurchaseOptions {
   /** выдача реквизита поверх настоящей платформы контура — действие теста посреди стадии 5 (параллельный вызов, Р45 Б2в) */
   issue?: (real: PaymentPlatform["issuePaymentPackage"]) => PaymentPlatform["issuePaymentPackage"];
   /** уведомление оболочки (Р47 п. 5, В3) */
-  notify?: (code: PurchaseNotice) => void | Promise<void>;
+  notify?: (code: PurchaseNotice, amount?: NoticeAmount) => void | Promise<void>;
   /** часы клиента ПАО и модуля подтверждений — тест двигает их вместе с часами стенда (истечение, РП51 п. 6) */
   now?: () => Date;
   /** таймер модуля подтверждений — тест срабатывает его сам (срок решения — минуты по order_hold_sec Платформы) */

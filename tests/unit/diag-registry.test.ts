@@ -124,6 +124,23 @@ describe("реестр кодов агента (Р36)", () => {
     }
   });
 
+  it("Р51 п. 3–4: OPERATION_REVERSED — итоговый, NOTIFY_HUMAN; текст без «деньги не списаны» (клиринг после реверсала возможен); уведомления с суммой — без подстановок в тексте", () => {
+    expect(PAYMENT_OUTCOME_CODES.has("OPERATION_REVERSED")).toBe(true);
+    expect(stopNext("OPERATION_REVERSED")).toBe("NOTIFY_HUMAN");
+    const reversed = DIAG.OPERATION_REVERSED!.human.ru;
+    expect(reversed).toContain("Оплата отменена; списания быть не должно — если оно всё же придёт, сообщим отдельно.");
+    expect(reversed).not.toMatch(/не списан|деньги не/i);
+    expect(PAYMENT_NOTICE_CODES.has("OPERATION_REFUNDED")).toBe(true);
+    const refunded = DIAG.OPERATION_REFUNDED!.human.ru;
+    // до ПАО 1.5.0 сумма — списания по операции, не возврата (ревью чата п. 3); бюджет — правило Платформы
+    expect(refunded).toContain("сумма списания по операции, не сумма возврата");
+    expect(refunded).toContain("по правилу Платформы");
+    for (const code of ["SCOPE_NOT_RESERVED", "OPERATION_REFUNDED"] as const) {
+      expect(DIAG[code]!.human.ru, code).toContain("уведомлении");
+      expect(DIAG[code]!.human.ru, code).not.toMatch(/[{}$]/);
+    }
+  });
+
   it("Р48 п. 1: перечень §7б — закрытый перечень Платформы v0.19.0 (передача #57) плюс AOI_MISSING и INSUFFICIENT_FUNDS", () => {
     // Перечень стенда не экспортируется (exports пакета — stand и fixtures): читается текст объявления из dist; до ПАО 1.5.0
     // enum в YAML нет (#37). Сломается при переносе файла на стороне платформы — тогда сверка по CHANGELOG и #57.

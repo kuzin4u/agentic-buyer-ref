@@ -26,5 +26,7 @@
   "shop_search_deadline_ms": 15000,
   "confirmation_wait_ms": 30000,
   "operation_outcome_max_delay_sec": 30,
+  "operation_reread_interval_sec": 3600,
+  "reservation_ttl_sec": 604800,
   "event_seen_max": 10000
 }

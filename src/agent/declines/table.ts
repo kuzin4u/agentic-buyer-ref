@@ -173,6 +173,8 @@ export const PAYMENT_OUTCOME_CODES: ReadonlySet<DiagCode> = new Set<DiagCode>([
   "CONFIRMATION_NOT_DELIVERED",
   "OPERATION_RESULT_UNCONFIRMED",
   "OPERATION_REPLY_MISMATCH",
+  // реверсал или истечение авторизации (Р51 п. 3): итог известен — оплата отменена
+  "OPERATION_REVERSED",
 ]);
 
 /** Уведомления и ожидание после оплаты (Р49 п. 6–7): не остановка, но текст человеку — тоже по Р-298 (тест реестра). */
@@ -181,6 +183,7 @@ export const PAYMENT_NOTICE_CODES: ReadonlySet<DiagCode> = new Set<DiagCode>([
   "SCOPE_EXCEEDS_AUTHORIZATION",
   "SCOPE_NOT_RESERVED",
   "SCOPE_CHECK_UNRECOGNIZED",
+  "OPERATION_REFUNDED",
 ]);
 
 /** Что делать оболочке после остановки покупки (Р50 п. 4) — из действия таблиц §7а и §7б, а не из текста:
@@ -207,7 +210,7 @@ const REASON_NEXT: Partial<Record<ReasonAction, StopNext>> = {
  *  null, просто остановка. */
 export function stopNext(code: DiagCode): StopNext | null {
   if (Object.hasOwn(FAILURE_RULES, code)) return FAILURE_NEXT[FAILURE_RULES[code as FailureCode].action] ?? null;
-  if (code === "DECLINE_REASON_UNKNOWN" || code === "OPERATION_RESULT_UNCONFIRMED") return "NOTIFY_HUMAN";
+  if (code === "DECLINE_REASON_UNKNOWN" || code === "OPERATION_RESULT_UNCONFIRMED" || code === "OPERATION_REVERSED") return "NOTIFY_HUMAN";
   const r = Object.values(DECLINE_REASONS).find((x) => x.code === code);
   return r === undefined ? null : (REASON_NEXT[r.action] ?? null);
 }

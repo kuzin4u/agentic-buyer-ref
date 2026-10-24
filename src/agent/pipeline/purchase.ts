@@ -18,7 +18,7 @@ import type { LiveOfferSource } from "../ports/catalog.js";
 import type { FeedItem } from "../ports/events.js";
 import type { Mutation } from "../ports/mutation.js";
 import { orderRefIssue, type OrderRefIssue } from "../payment-package/order-ref.js";
-import { PaymentFailure, ShopFailure, type ConfirmationOutcome, type OfferSource, type PaymentContext, type PaymentSteps, type PurchaseNotice, type ShopOffers, type ShopOrder, type ShopPort, type ShopUnavailable, type ShopUnavailableCause } from "../ports/shop.js";
+import { PaymentFailure, ShopFailure, type ConfirmationOutcome, type OfferSource, type PaymentContext, type NoticeAmount, type PaymentSteps, type PurchaseNotice, type ShopOffers, type ShopOrder, type ShopPort, type ShopUnavailable, type ShopUnavailableCause } from "../ports/shop.js";
 import { PurchaseMachine, PurchaseTransitionForbidden, allowed, type PurchaseJournal, type PurchaseState, type StopCause } from "./machine.js";
 
 /** Почему оставлен CART (Р46 п. 3): новый поиск из CART_ACTIVE или отказ живой проверки перед заказом. */
@@ -195,8 +195,9 @@ export interface PurchaseOptions {
   /** регион человека из профиля; нет — доступен только самовывоз (Р32 п. 5) */
   region?: string;
   /** уведомление оболочки (Р47 п. 5, В3; Р49 п. 7): CONFIRMATION_PENDING — один раз на запрос подтверждения, без link;
-   *  SCOPE_* — запись об исполнении не WITHIN_LIMITS; конвейер его не ждёт, сбой — запись notify.failed, исход не меняется */
-  notify?: (code: PurchaseNotice) => void | Promise<void>;
+   *  SCOPE_* — запись об исполнении не WITHIN_LIMITS; OPERATION_REFUNDED — возврат (Р51 п. 3); `amount` — сумма списания
+   *  по операции у SCOPE_* и OPERATION_REFUNDED; конвейер его не ждёт, сбой — запись notify.failed, исход не меняется */
+  notify?: (code: PurchaseNotice, amount?: NoticeAmount) => void | Promise<void>;
   now?: () => Date;
 }
 
@@ -230,6 +231,9 @@ function scopeNotice(op: Operation): PurchaseNotice | null {
   return "SCOPE_CHECK_UNRECOGNIZED";
 }
 
+/** Сумма к уведомлению (Р51 п. 3–4): сумма списания из записи об исполнении; записи нет — сумма операции. */
+const chargedAmount = (op: Operation): NoticeAmount | undefined => op.fulfilment?.finalAmount ?? op.amount ?? undefined;
+
 export class Purchase {
   // машина — только у конвейера: вызывающему — чтение состояния и кода (ревью К3 повторное Н2: переход в обход стадии)
   readonly #machine: PurchaseMachine;
@@ -243,6 +247,8 @@ export class Purchase {
   #cart: Mandate | null = null;
   #order: ShopOrder | null = null;
   #operation: Operation | null = null;
+  /** когда стадия 5 дала AUTHORIZED (мс, часы конвейера): от него граница ожидания клиринга (Р51 п. 2 (б)) */
+  #authorizedAt: number | null = null;
   /** стадия идёт: повторный вход до её окончания — запрещённый переход (ревью К3 № 4) */
   #busy = false;
 
@@ -555,17 +561,21 @@ export class Purchase {
         // Р47 п. 6, решение владельца по ревью К3 № 4) — занимают (fail-closed)
         // SETTLED на стадии 5 — событие одобрения прочитано поздно или потеряно, итог уже после клиринга: одобрение
         // подтверждено, расчёт заберёт settle (ревью КТ1 № 6, дополнение 1 к Р49)
-        const approved = reply.status === "AUTHORIZED" || reply.status === "SETTLED";
+        // REFUNDED — так же: одобрение, клиринг и возврат уже были, итог заберёт settle (Р51 п. 3). REVERSED — итог известен
+        // (оплата отменена), но место в окне занято: клиринг после реверсала возможен (РП55, fail-closed)
+        const approved = reply.status === "AUTHORIZED" || reply.status === "SETTLED" || reply.status === "REFUNDED";
         if (reply.status === "DECLINED") slot.settle("REFUSED");
         else if (approved) slot.settle("APPROVED");
         else slot.settle("UNKNOWN");
         if (reply.status === "DECLINED") this.#halt(ruleForDeclineReason(reply.declineReason).code);
+        if (reply.status === "REVERSED") this.#halt("OPERATION_REVERSED");
         if (reply.status === "CONFIRMATION_REQUIRED") return null;
         if (!approved) this.#halt("UNKNOWN");
         return reply;
       });
       if (op === null) return this.#confirm(c);
       this.#operation = op;
+      this.#authorizedAt = this.now().getTime();
       this.#held(c.intent, c.cart);
       this.#machine.to("SETTLING");
       return copy(op);
@@ -593,7 +603,7 @@ export class Purchase {
   }
 
   /** Уведомление оболочки (В3): не ждётся; исключение и отказ обещания — запись notify.failed, исход не меняется. */
-  #notify(code: PurchaseNotice): void {
+  #notify(code: PurchaseNotice, amount?: NoticeAmount): void {
     const failed = () => {
       try {
         this.#record({ kind: "notify.failed", reason: code });
@@ -602,17 +612,19 @@ export class Purchase {
       }
     };
     try {
-      const r = this.o.notify?.(code);
+      // сумма — копией: оболочка не меняет снимок операции покупки
+      const r = amount === undefined ? this.o.notify?.(code) : this.o.notify?.(code, { ...amount });
       if (r !== undefined) Promise.resolve(r).catch(failed);
     } catch {
       failed();
     }
   }
 
-  /** Стадия 6 (Р49 п. 6–7): итог расчёта через порт — из события Платформы и GET. Расчёта ещё нет, ожидание прервал
-   *  вызывающий — SETTLEMENT_PENDING наружу, покупка остаётся SETTLING (settle() можно вызвать снова). Не SETTLED —
-   *  STOPPED (после отправки пакета — OPERATION_RESULT_UNCONFIRMED, Р49 п. 2). scope_check не WITHIN_LIMITS —
-   *  уведомление оболочки, покупка DONE. */
+  /** Стадия 6 (Р49 п. 6–7, Р51 п. 2–3): итог расчёта через порт — из события Платформы и GET; граница ожидания — от
+   *  получения AUTHORIZED (`#authorizedAt`). Расчёта ещё нет, ожидание прервал вызывающий — SETTLEMENT_PENDING наружу,
+   *  покупка остаётся SETTLING (settle() можно вызвать снова). SETTLED — DONE; REFUNDED (расчёт и возврат уже были) — DONE и
+   *  уведомление OPERATION_REFUNDED; REVERSED — STOPPED с OPERATION_REVERSED; иное — STOPPED (после отправки пакета —
+   *  OPERATION_RESULT_UNCONFIRMED, Р49 п. 2). scope_check не WITHIN_LIMITS — уведомление оболочки с суммой списания. */
   settle(signal?: AbortSignal): Promise<Operation> {
     // расчёт ждут днями: повторный вызов, пока первый ждёт, — то же ожидание, не запрещённый переход (ревью КТ1 № 7б)
     if (this.#busy && this.#machine.state === "SETTLING") return Promise.reject(new PaymentFailure("SETTLEMENT_PENDING"));
@@ -620,15 +632,18 @@ export class Purchase {
       const authorized = this.#need(this.#operation);
       // остановка покупки прерывает ожидание расчёта так же, как сигнал вызывающего (ревью КТ1 № 7а)
       const until = signal === undefined ? this.#machine.stopped : AbortSignal.any([signal, this.#machine.stopped]);
+      const authorizedAt = this.#authorizedAt === null ? undefined : new Date(this.#authorizedAt);
       const op = await this.#guard(async () => {
-        const reply = snapshot(await this.o.payment.settle(copy(authorized), until));
-        if (reply.status !== "SETTLED") this.#halt("UNKNOWN");
+        const reply = snapshot(await this.o.payment.settle(copy(authorized), until, authorizedAt));
+        if (reply.status === "REVERSED") this.#halt("OPERATION_REVERSED");
+        if (reply.status !== "SETTLED" && reply.status !== "REFUNDED") this.#halt("UNKNOWN");
         return reply;
       }, WAITS_SETTLEMENT);
       this.#operation = op;
       this.#machine.to("DONE");
       const notice = scopeNotice(op);
-      if (notice !== null) this.#notify(notice);
+      if (notice !== null) this.#notify(notice, chargedAmount(op));
+      if (op.status === "REFUNDED") this.#notify("OPERATION_REFUNDED", chargedAmount(op));
       return copy(op);
     });
   }

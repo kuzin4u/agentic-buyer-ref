@@ -29,16 +29,32 @@ export interface OperationsJournal {
       /** reason — OPERATION_UNREAD (диагностика оператора, Р49 дополнение 1 п. 1), detail — код отказа GET */
       | { at: string; kind: "operation.unread"; ref: string; reason: "OPERATION_UNREAD"; detail: DiagCode }
       | { at: string; kind: "operation.mismatch"; ref: string; detail: MismatchField; reason: "OPERATION_REPLY_MISMATCH"; mandate?: string }
-      | { at: string; kind: "operation.settled"; ref: string; detail: ScopeCheckDetail },
+      | { at: string; kind: "operation.settled"; ref: string; detail: ScopeCheckDetail }
+      | { at: string; kind: "operation.reversed"; ref: string; detail: ReversalDetail }
+      /** граница reservation_ttl_sec прошла, последний GET — по-прежнему AUTHORIZED (Р51 п. 2 (б)) */
+      | { at: string; kind: "operation.unsettled"; ref: string },
   ): void;
 }
+
+/** Причина REVERSED в журнале (Р51 п. 3, передача #63 п. 1, 7) — закрытым перечнем: иное значение — OTHER, само значение
+ *  не пишется (инвариант 5). */
+export type ReversalDetail = "REVERSAL" | "AUTH_EXPIRED" | "OTHER";
+
+const reversalDetail = (reason: string | null): ReversalDetail => (reason === "REVERSAL" || reason === "AUTH_EXPIRED" ? reason : "OTHER");
 
 export interface OperationsOptions {
   port: OperationsPort;
   journal: OperationsJournal;
-  /** registry_cache_ttl_sec — предел недоступности GET на стадии 6 (инвариант 4); event_poll_interval_ms — пауза опроса
-   *  ленты после её отказа (без него опрос прекращается) */
-  params: { operation_outcome_max_delay_sec: number; registry_cache_ttl_sec: number; event_seen_max: number; event_poll_interval_ms?: number };
+  /** registry_cache_ttl_sec — предел недоступности GET на стадии 6 (инвариант 4); operation_reread_interval_sec — плановое
+   *  перечитывание GET на стадии 6 (Р51 п. 2 (а)); event_poll_interval_ms — пауза опроса ленты после её отказа (без него
+   *  опрос прекращается) */
+  params: {
+    operation_outcome_max_delay_sec: number;
+    operation_reread_interval_sec: number;
+    registry_cache_ttl_sec: number;
+    event_seen_max: number;
+    event_poll_interval_ms?: number;
+  };
   /** прочитать ленту (`EventFeed.signal`): ожидание будит её, пока не решится; частоту чтений ограничивает лента */
   wake?: () => Promise<void>;
   now?: () => Date;
@@ -51,8 +67,8 @@ export interface OperationsOptions {
 export type OperationOutcome = { kind: "OPERATION"; operation: Operation } | { kind: "MISMATCH" } | { kind: "NONE" };
 
 /** Итог стадии 6: SETTLED или иной статус — операция; MISMATCH — другая операция; PENDING — расчёта нет, ожидание прервал
- *  вызывающий; UNREAD — GET не подтверждён и не повторяется. */
-export type SettleOutcome = { kind: "OPERATION"; operation: Operation } | { kind: "MISMATCH" } | { kind: "PENDING" } | { kind: "UNREAD" };
+ *  вызывающий; UNREAD — GET не подтверждён и не повторяется; EXPIRED — граница ожидания прошла, итога нет (Р51 п. 2 (б)). */
+export type SettleOutcome = { kind: "OPERATION"; operation: Operation } | { kind: "MISMATCH" } | { kind: "PENDING" } | { kind: "UNREAD" } | { kind: "EXPIRED" };
 
 /** Ожидание итога по заказу (стадия 5). */
 export interface OperationWait {
@@ -183,12 +199,14 @@ export class Operations {
   }
 
   /**
-   * Стадия 6 (Р49 п. 6): GET по известному op_ref; не SETTLED — ждать operation.settled, без события дольше
-   * operation_outcome_max_delay_sec — снова GET (#59 п. 3), пока вызывающий не прервёт (`signal` → PENDING, не отказ).
-   * Отказ GET, после которого Платформа просит повторить, — запись operation.unread и повтор в тот же срок; Платформа
-   * недоступна дольше registry_cache_ttl_sec — UNREAD (инвариант 4; ревью КТ1 № 8); иной отказ — UNREAD сразу.
+   * Стадия 6 (Р49 п. 6, Р51 п. 2): GET по известному op_ref; AUTHORIZED — ждать события по op_ref, без него — снова GET не
+   * чаще раза в operation_reread_interval_sec (РП55), пока вызывающий не прервёт (`signal` → PENDING, не отказ) или не
+   * пройдёт граница `deadline` (мс по часам модуля): по ней — последний GET, по-прежнему AUTHORIZED — запись
+   * operation.unsettled и EXPIRED. Отказ GET, после которого Платформа просит повторить, — запись operation.unread и повтор
+   * через operation_outcome_max_delay_sec; Платформа недоступна дольше registry_cache_ttl_sec — UNREAD (инвариант 4; ревью
+   * КТ1 № 8); иной отказ — UNREAD сразу. REVERSED — запись operation.reversed с причиной закрытым перечнем.
    */
-  async settle(authorized: Operation, signal: AbortSignal): Promise<SettleOutcome> {
+  async settle(authorized: Operation, signal: AbortSignal, deadline = Number.POSITIVE_INFINITY): Promise<SettleOutcome> {
     const opRef = authorized.opRef;
     const wakers = this.#settling.get(opRef) ?? new Set<Waker>();
     this.#settling.set(opRef, wakers);
@@ -209,7 +227,7 @@ export class Operations {
           const now = this.#now().getTime();
           unavailableSince ??= now;
           if (now - unavailableSince >= this.#o.params.registry_cache_ttl_sec * 1000) return { kind: "UNREAD" };
-          if (!(await this.#pause(waker, signal))) return { kind: "PENDING" };
+          if (!(await this.#pause(waker, signal, this.#o.params.operation_outcome_max_delay_sec * 1000))) return { kind: "PENDING" };
           continue;
         }
         unavailableSince = null;
@@ -224,8 +242,15 @@ export class Operations {
           this.#record({ kind: "operation.settled", ref: opRef, detail: s === undefined || typeof s === "object" ? "OTHER" : s });
           return { kind: "OPERATION", operation: op };
         }
+        if (op.status === "REVERSED") this.#record({ kind: "operation.reversed", ref: opRef, detail: reversalDetail(op.declineReason) });
         if (op.status !== "AUTHORIZED") return { kind: "OPERATION", operation: op };
-        if (!(await this.#pause(waker, signal))) return { kind: "PENDING" };
+        // граница прошла, этот GET — последний (Р51 п. 2 (б)); до неё — пауза не дольше остатка срока
+        const left = deadline - this.#now().getTime();
+        if (left <= 0) {
+          this.#record({ kind: "operation.unsettled", ref: opRef });
+          return { kind: "EXPIRED" };
+        }
+        if (!(await this.#pause(waker, signal, Math.min(this.#o.params.operation_reread_interval_sec * 1000, left)))) return { kind: "PENDING" };
       }
     } finally {
       // ожидание по op_ref снимается, когда его больше никто не ждёт
@@ -234,9 +259,8 @@ export class Operations {
     }
   }
 
-  /** Пауза стадии 6: до события по op_ref (в том числе пришедшего до паузы) или operation_outcome_max_delay_sec; false —
-   *  прервал вызывающий. */
-  #pause(waker: Waker, signal: AbortSignal): Promise<boolean> {
+  /** Пауза стадии 6: до события по op_ref (в том числе пришедшего до паузы) или `ms`; false — прервал вызывающий. */
+  #pause(waker: Waker, signal: AbortSignal, ms: number): Promise<boolean> {
     if (signal.aborted) return Promise.resolve(false);
     if (waker.take()) return Promise.resolve(true);
     return new Promise<boolean>((resolve) => {
@@ -250,7 +274,7 @@ export class Operations {
         resolve(v);
       };
       const onAbort = () => end(false);
-      const cancel = this.#timer(() => end(true), Math.min(this.#o.params.operation_outcome_max_delay_sec * 1000, TIMER_MAX_MS));
+      const cancel = this.#timer(() => end(true), Math.min(ms, TIMER_MAX_MS));
       waker.listener = () => {
         waker.take();
         end(true);

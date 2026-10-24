@@ -1,7 +1,7 @@
 // Итог стадии 5 в шагах профиля contour (Р49 п. 5; ревью КТ1 AG-11 ч. 2 № 4, 5, 14): ожидание по order_ref — до отправки
 // пакета; после DECLINED продавца — гонка операции с запросом подтверждения, пришедшим после отметки; сроки — из параметров.
 import { describe, expect, it } from "vitest";
-import type { OperationOutcome, OperationWait } from "../../src/agent/operations/index.js";
+import type { OperationOutcome, OperationWait, SettleOutcome } from "../../src/agent/operations/index.js";
 import { ContourPayment } from "../../src/agent/payment-package/index.js";
 import type { PaymentContext, ShopPaymentReply } from "../../src/agent/ports/index.js";
 import { MemoryJournal } from "../../src/agent/journal/index.js";
@@ -77,5 +77,34 @@ describe("ContourPayment: итог стадии 5 (Р49 п. 5)", () => {
     const c = ctx(ac.signal);
     const paying = p.authorize({ ...c, sending: () => ac.abort(reason) }, { idempotencyKey: "k" });
     await expect(paying).rejects.toBe(reason);
+  });
+});
+
+describe("стадия 6 в шагах contour (Р51 п. 2 (б)): граница reservation_ttl_sec", () => {
+  const AUTHORIZED: Operation = { ...DECLINED, status: "AUTHORIZED", declineReason: null };
+  function settling(outcome: SettleOutcome, now = new Date("2026-10-24T10:00:00.000Z")) {
+    const deadlines: (number | undefined)[] = [];
+    const p = new ContourPayment({
+      platform: {} as never,
+      shop: {} as never,
+      journal: new MemoryJournal(),
+      confirmations: {} as never,
+      operations: { expect: () => ({}) as never, settle: async (_op, _signal, deadline) => (deadlines.push(deadline), outcome) },
+      params: PARAMS,
+      now: () => now,
+    });
+    return { p, deadlines, now };
+  }
+
+  it("граница — от момента AUTHORIZED, переданного конвейером; без него — от начала ожидания", async () => {
+    const at = new Date("2026-10-20T08:00:00.000Z");
+    const s = settling({ kind: "OPERATION", operation: { ...AUTHORIZED, status: "SETTLED" } });
+    await s.p.settle(AUTHORIZED, undefined, at);
+    await s.p.settle(AUTHORIZED);
+    expect(s.deadlines).toEqual([at.getTime() + PARAMS.reservation_ttl_sec * 1000, s.now.getTime() + PARAMS.reservation_ttl_sec * 1000]);
+  });
+
+  it("граница прошла без итога (EXPIRED) — OPERATION_RESULT_UNCONFIRMED", async () => {
+    await expect(settling({ kind: "EXPIRED" }).p.settle(AUTHORIZED)).rejects.toMatchObject({ code: "OPERATION_RESULT_UNCONFIRMED" });
   });
 });

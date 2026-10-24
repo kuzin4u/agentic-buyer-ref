@@ -160,7 +160,12 @@ describe("стадии 5–6 на стенде v0.20.0: итог из событ
       "merchants POST /v1/shops/{shop}/orders/{order}/payment 200",
       "pao GET /pao/v1/operations 200",
     ]);
-    expect(r.c.calls().slice(start).filter((x) => x.source === "test").map(shape)).toEqual(["pao POST /adp/v1/decide 200", "pao POST /adp/v1/events 202"]);
+    expect(r.c.calls().slice(start).filter((x) => x.source === "test").map(shape)).toEqual([
+      "pao POST /adp/v1/decide 200",
+      // метаданные пакета эквайрером стенда после авторизации (ПИ-8, v0.24.0, #67; Р52 К2)
+      `pao POST /participants/v1/merchants/${NORMAL.merchant_id}/payments 200`,
+      "pao POST /adp/v1/events 202",
+    ]);
     expect(r.c.violations()).toEqual([]);
     // запись поиска — CART и BOUND, без тела ответа
     expect(entries(r, "operation.lookup")).toEqual([[cart.id, "BOUND"]]);

@@ -48,12 +48,15 @@ interface Call {
   nonce: string | undefined;
 }
 
-/** Стенд с журналом всех обращений (хук Fastify до listen): маршрут, статус, x-nonce; тела не сохраняются.
- *  Полный список — чтобы видеть и обход: обращение агента к любому другому методу (ревью 3d № 1). */
+/** Стенд с журналом всех обращений по сети (хук Fastify до listen): маршрут, статус, x-nonce; тела не сохраняются.
+ *  Полный список — чтобы видеть и обход: обращение агента к любому другому методу (ревью 3d № 1). Клиент агента ходит
+ *  только по сети; `app.inject` (light-my-request) — участники самого стенда: с v0.24.0 эквайрер подаёт знаки при старте
+ *  (ПИ-8, #67) — в журнал не идут, как source "test" в tests/support/contour.ts (Р52 К2). */
 async function platform() {
   const s = createStand();
   const log: Call[] = [];
   s.app.addHook("onResponse", async (req, reply) => {
+    if (req.headers["user-agent"] === "lightMyRequest") return;
     const nonce = req.headers["x-nonce"];
     log.push({ route: `${req.method} ${req.url.split("?")[0]}`, status: reply.statusCode, nonce: typeof nonce === "string" ? nonce : undefined });
   });

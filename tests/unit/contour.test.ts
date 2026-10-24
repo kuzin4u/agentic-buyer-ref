@@ -55,7 +55,8 @@ describe("режим stand — стенд Платформы и эмулятор
     });
     expect(order).toMatchObject({ status: 201, body: { status: "CREATED", agent_code: c.agentCode } });
 
-    const calls = c.calls();
+    // журнал агента: подача знаков эквайрером стенда при старте (ПИ-8, v0.24.0) — source "test" (Р52 К2)
+    const calls = c.agentCalls();
     expect(calls.map(({ target, route, status }) => ({ target, route, status }))).toEqual([
       { target: "pao", route: SELF, status: 200 },
       { target: "merchants", route: "GET /v1/shops", status: 200 },
@@ -72,7 +73,7 @@ describe("режим stand — стенд Платформы и эмулятор
   it("до допуска порт подписи закрыт: SignerStopped, обращения к витрине нет", async () => {
     const c = await contour("stand");
     await expect(c.merchants!.request("GET", `/v1/shops/${NORMAL.id}/catalog`)).rejects.toThrow(SignerStopped);
-    expect(c.calls()).toEqual([]);
+    expect(c.agentCalls()).toEqual([]);
   });
 
   it("код отказа витрины — в журнале из поля code: заказ без подписи — 403 AGENT_UNIDENTIFIED", async () => {
@@ -84,7 +85,7 @@ describe("режим stand — стенд Платформы и эмулятор
     // код и статус — из перечня эмулятора (MERCHANT_ERROR_CODES, Р26 п. 5, ревью #23 п. 7; ревью К2 № 6), не литералом агента
     const { code, http } = MERCHANT_ERROR_CODES.find((x) => x.code === "AGENT_UNIDENTIFIED")!;
     expect(r).toEqual({ status: http, body: { code } });
-    expect(c.calls()).toEqual([{ target: "merchants", route: `POST /v1/shops/${NORMAL.id}/orders`, status: http, code, source: "agent" }]);
+    expect(c.agentCalls()).toEqual([{ target: "merchants", route: `POST /v1/shops/${NORMAL.id}/orders`, status: http, code, source: "agent" }]);
   });
 });
 

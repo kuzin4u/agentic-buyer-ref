@@ -26,7 +26,7 @@ describe("П05 — действие без действующего мандат
     const mandates = new MandateClient({ port: contour.platform, params: contour.params, journal: contour.journal });
     await expect(mandates.requireActive(null)).rejects.toMatchObject({ reason: "MANDATE_NONE" });
     expect(contour.calls().filter((c) => c.target === "merchants")).toEqual([]);
-    expect(contour.calls().map((c) => c.route)).toEqual(["GET /pao/v1/agent"]);
+    expect(contour.agentCalls().map((c) => c.route)).toEqual(["GET /pao/v1/agent"]);
     expect(contour.violations()).toEqual([]);
   });
 

@@ -14,13 +14,15 @@ import { AGENT } from "./pao-stand.js";
 
 export const RUB = (amount: number): Money => ({ amount, currency: "RUB" });
 
-/** Поручение П04: хлеб, до 5 000 ₽, 30 дней от часов стенда (2026-10-12). */
+/** Поручение П04: хлеб, до 5 000 ₽, срок — 15 дней от настоящих часов при загрузке модуля (меньше
+ *  qualified_signature_above_days стенда). Не дата литералом: стенд и агент сравнивают validTo с настоящими часами —
+ *  прежняя 2026-11-11 после этого дня роняла все тесты на стенде (Р52 К3, проверка сдвигом часов на 30 и 400 дней). */
 export const INTENT: MandateDraft = {
   kind: "INTENT",
   parentId: null,
   subject: "хлеб",
   amountLimit: RUB(500000),
-  validTo: "2026-11-11T09:00:00Z",
+  validTo: new Date(Date.now() + 15 * 86_400_000).toISOString(),
   merchantScope: ["shop_1"],
   principalRef: "pr_1",
   confirmationMode: "IMMEDIATE",

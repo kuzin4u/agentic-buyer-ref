@@ -34,7 +34,7 @@ function steps(o: { reply: ShopPaymentReply["status"]; outcome: (ms: number, sig
     },
     operations: {
       expect: () => (log.push("expect"), wait),
-      lookup: async (orderRef, cart) => (log.push(`lookup ${orderRef} ${cart.id}`), o.lookup ?? { kind: "NONE" }),
+      lookup: async (orderRef, cart, notice) => (log.push(`lookup ${orderRef} ${cart.id}${notice ? " notice" : ""}`), o.lookup ?? { kind: "NONE" }),
       settle: async () => ({ kind: "PENDING" }),
       watch: (op, after) => void log.push(`watch ${op.opRef} ${after}`),
     },
@@ -57,6 +57,8 @@ describe("ContourPayment: итог стадии 5 (Р49 п. 5)", () => {
     const a = steps({ reply: "PAID", outcome: async () => ({ kind: "NONE" }), lookup: { kind: "OPERATION", operation: reversed } });
     await expect(a.p.authorize({ ...ctx(), notice: () => {} }, { idempotencyKey: "k" })).resolves.toMatchObject({ status: "REVERSED", declineReason: "REVERSAL" });
     // оплата отменена — под наблюдением после итога (Р51 п. 4)
+    // уведомление покупки — поиску (под наблюдение ставит модуль, ревью чата К5) и постановка по итогу шага
+    expect(a.log).toContain("lookup ORD-1 m_cart notice");
     expect(a.log).toContain("watch op_1 REVERSED");
     const b = steps({ reply: "PAID", outcome: async () => ({ kind: "NONE" }), lookup: { kind: "MISMATCH" } });
     await expect(b.p.authorize(ctx(), { idempotencyKey: "k" })).rejects.toMatchObject({ code: "OPERATION_REPLY_MISMATCH" });
@@ -123,33 +125,22 @@ describe("стадия 6 в шагах contour (Р51 п. 2 (б)): граница
       operations: {
         expect: () => ({}) as never,
         lookup: async () => ({ kind: "NONE" }),
-        settle: async (_op, _signal, deadline) => (deadlines.push(deadline), outcome),
+        settle: async (_op, _signal, deadline, notice) => (deadlines.push(deadline), notices.push(notice), outcome),
         watch: (op, after) => void watched.push(`${op.opRef} ${op.status} ${after}`),
       },
       params: PARAMS,
       now: () => now,
     });
-    return { p, deadlines, now, watched };
+    const notices: unknown[] = [];
+    return { p, deadlines, now, watched, notices };
   }
 
-  it("Р51 п. 4: итог расчёта SETTLED / REFUNDED / REVERSED и граница (EXPIRED) — операция под наблюдением после итога; PENDING, MISMATCH, UNREAD и без уведомления покупки — нет", async () => {
+  it("Р51 п. 4, ревью чата К5: уведомление покупки — модулю операций в settle (под наблюдение он ставит сам, в момент итога); шаги сами не ставят", async () => {
     const notice = () => {};
-    for (const status of ["SETTLED", "REFUNDED", "REVERSED"] as const) {
-      const s = settling({ kind: "OPERATION", operation: { ...AUTHORIZED, status } });
-      await s.p.settle(AUTHORIZED, undefined, undefined, notice);
-      expect(s.watched).toEqual([`op_1 ${status} ${status}`]);
-    }
-    const e = settling({ kind: "EXPIRED" });
-    await expect(e.p.settle(AUTHORIZED, undefined, undefined, notice)).rejects.toMatchObject({ code: "OPERATION_RESULT_UNCONFIRMED" });
-    expect(e.watched).toEqual(["op_1 AUTHORIZED UNSETTLED"]);
-    for (const outcome of [{ kind: "PENDING" }, { kind: "MISMATCH" }, { kind: "UNREAD" }] as const) {
-      const s = settling(outcome);
-      await s.p.settle(AUTHORIZED, undefined, undefined, notice).catch(() => undefined);
-      expect(s.watched, outcome.kind).toEqual([]);
-    }
-    const quiet = settling({ kind: "OPERATION", operation: { ...AUTHORIZED, status: "SETTLED" } });
-    await quiet.p.settle(AUTHORIZED);
-    expect(quiet.watched).toEqual([]);
+    const s = settling({ kind: "OPERATION", operation: { ...AUTHORIZED, status: "SETTLED" } });
+    await s.p.settle(AUTHORIZED, undefined, undefined, notice);
+    expect(s.notices).toEqual([notice]);
+    expect(s.watched).toEqual([]);
   });
 
   it("граница — от момента AUTHORIZED, переданного конвейером; без него — от начала ожидания", async () => {

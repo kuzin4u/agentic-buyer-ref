@@ -382,6 +382,54 @@ describe("наблюдение после итога (Р51 п. 4; таблица
     expect(kinds(s.journal)).toEqual(["operation.status:SETTLED", "operation.unclaimed:"]);
   });
 
+  it("ревью чата К5: settle с уведомлением покупки — под наблюдение ставит сам модуль в момент итога (SETTLED, REFUNDED, REVERSED, граница); событие сразу после выхода — не теряется", async () => {
+    for (const [answer, deadline, event, expected] of [
+      [record("SETTLED", { fulfilment: ful("WITHIN_LIMITS") }), undefined, record("REFUNDED", { fulfilment: ful("WITHIN_LIMITS") }), "OPERATION_REFUNDED"],
+      [record("REVERSED", { declineReason: "REVERSAL" }), undefined, record("SETTLED", { fulfilment: ful("NOT_RESERVED") }), "OPERATION_SETTLED_LATE"],
+      [record("AUTHORIZED"), T0, record("SETTLED", { fulfilment: ful("WITHIN_LIMITS") }), "OPERATION_SETTLED_LATE"],
+    ] as const) {
+      const s = setup();
+      const sent: string[] = [];
+      s.answers.set("op_1", answer);
+      const ac = new AbortController();
+      // событие обрабатывается первым продолжением после итога ожидания — раньше, чем вызывающий узнает исход
+      const done = s.ops.settle(OP, ac.signal, deadline, (code) => void sent.push(code)).then(async (out) => {
+        s.answers.set("op_1", event);
+        await s.event(event.status === "REFUNDED" ? "operation.refunded" : "operation.settled", "op_1");
+        return out;
+      });
+      await done;
+      expect(sent, answer.status).toEqual([expected]);
+    }
+  });
+
+  it("ревью чата К5: событие пришло, пока шёл последний GET ожидания (разбудило ожидание), а GET дал итог — наблюдение перечитывает и сообщает", async () => {
+    let release: (r: OperationRecord) => void = () => {};
+    let calls = 0;
+    const sent: string[] = [];
+    const c = clock();
+    const ops = new Operations({
+      port: {
+        readOperation: async () => (++calls === 1 ? new Promise<OperationRecord>((res) => (release = res)) : record("REFUNDED", { fulfilment: ful("WITHIN_LIMITS") })),
+        readOperations: async () => [],
+      },
+      journal: { record: () => {} },
+      params: { operation_outcome_max_delay_sec: DELAY_SEC, operation_reread_interval_sec: REREAD_SEC, registry_cache_ttl_sec: TTL_SEC, event_seen_max: PARAMS.event_seen_max },
+      now: c.now,
+      timer: c.timer,
+    });
+    const settled = ops.settle(OP, new AbortController().signal, undefined, (code) => void sent.push(code));
+    await tick();
+    // возврат — пока первый GET в пути: ожидание ещё числится за op_ref
+    await ops.listener({ kind: "event", event: { eventId: "evt_ref", type: "operation.refunded", at: "x", mandateId: null, opRef: "op_1", confirmationId: null, declineReason: null } });
+    release(record("SETTLED", { fulfilment: ful("WITHIN_LIMITS") }));
+    await expect(settled).resolves.toMatchObject({ kind: "OPERATION", operation: { status: "SETTLED" } });
+    await tick();
+    await tick();
+    expect(calls).toBe(2);
+    expect(sent).toEqual(["OPERATION_REFUNDED"]);
+  });
+
   it("GET дал другой статус — без уведомления; отказ GET с просьбой повторить — наружу (событие прочитается снова); сбой уведомления — исход не меняется", async () => {
     const s = observing("REVERSED");
     s.answers.set("op_1", record("REVERSED", { declineReason: "REVERSAL" }));

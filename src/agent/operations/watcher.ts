@@ -149,11 +149,12 @@ export class Operations {
       // op_ref уже по маске (разбор ленты); иначе событие пропущено как INVALID_DATA и сюда не дошло
       if (opRef === null || !SAFE_ID.test(opRef)) return;
       const settling = this.#settling.get(opRef);
+      const watched = this.#watched.get(opRef);
       if (settling) {
         for (const w of [...settling]) w.poke();
-        return;
+        // ожидание уже увидело итог и поставило операцию под наблюдение, но ещё не вышло — событие и наблюдению
+        if (!watched) return;
       }
-      const watched = this.#watched.get(opRef);
       if (watched) return await this.#late(watched);
       const r = await this.#read(opRef);
       if (r === null) return;
@@ -218,7 +219,7 @@ export class Operations {
    * (bind.ts): итог или MISMATCH (запись operation.mismatch). Ни одной или больше одной — NONE. Отказ Платформы — NONE,
    * код — в записи operation.lookup (403 AGENT_SUSPENDED подпись уже остановил адаптер); сбой журнала — наружу. Повтора нет.
    */
-  async lookup(orderRef: string, cart: Mandate): Promise<OperationOutcome> {
+  async lookup(orderRef: string, cart: Mandate, notice?: LateNotice): Promise<OperationOutcome> {
     const ref = mandateRef(cart.id).mandate;
     const done = (detail: LookupDetail, outcome: OperationOutcome): OperationOutcome => {
       this.#record({ kind: "operation.lookup", ...(ref !== undefined && { ref }), detail });
@@ -241,7 +242,11 @@ export class Operations {
       return done("MISMATCH", { kind: "MISMATCH" });
     }
     this.#record({ kind: "operation.status", ref: r.opRef, detail: r.status });
-    if (bound.status === "REVERSED") this.#record({ kind: "operation.reversed", ref: r.opRef, detail: reversalDetail(bound.declineReason) });
+    if (bound.status === "REVERSED") {
+      this.#record({ kind: "operation.reversed", ref: r.opRef, detail: reversalDetail(bound.declineReason) });
+      // под наблюдение — сразу, до возврата итога (Р51 п. 4; ревью чата К5)
+      if (notice !== undefined) this.watch(bound, "REVERSED", notice);
+    }
     return done("BOUND", { kind: "OPERATION", operation: bound });
   }
 
@@ -309,7 +314,7 @@ export class Operations {
    * через operation_outcome_max_delay_sec; Платформа недоступна дольше registry_cache_ttl_sec — UNREAD (инвариант 4; ревью
    * КТ1 № 8); иной отказ — UNREAD сразу. REVERSED — запись operation.reversed с причиной закрытым перечнем.
    */
-  async settle(authorized: Operation, signal: AbortSignal, deadline = Number.POSITIVE_INFINITY): Promise<SettleOutcome> {
+  async settle(authorized: Operation, signal: AbortSignal, deadline = Number.POSITIVE_INFINITY, notice?: LateNotice): Promise<SettleOutcome> {
     const opRef = authorized.opRef;
     const wakers = this.#settling.get(opRef) ?? new Set<Waker>();
     this.#settling.set(opRef, wakers);
@@ -317,9 +322,29 @@ export class Operations {
     const waker = new Waker();
     wakers.add(waker);
     let unavailableSince: number | null = null;
+    // под наблюдение — в момент итога, до выхода из ожидания: событие после этого не теряется (Р51 п. 4; ревью чата К5)
+    const final = (op: Operation, after: WatchAfter): SettleOutcome => {
+      if (notice !== undefined) {
+        this.watch(op, after, notice);
+        // событие пришло, пока шёл последний GET: оно только разбудило ожидание, а относится уже к наблюдению — перечитать
+        // (возврат или поздний клиринг сразу после итога; ревью чата К5). Повтора нет: отказ GET — запись operation.unread,
+        // событие уже отмечено обработанным; сбой журнала — некуда (ожидание вышло с итогом)
+        const w = this.#watched.get(op.opRef);
+        if (waker.take() && w !== undefined) {
+          void this.#late(w).catch((e: unknown) => {
+            try {
+              this.#record({ kind: "operation.unread", ref: op.opRef, reason: "OPERATION_UNREAD", detail: e instanceof PlatformFailure ? e.code : "UNKNOWN" });
+            } catch {
+              // журнал недоступен — уведомления нет; исход покупки уже есть
+            }
+          });
+        }
+      }
+      return after === "UNSETTLED" ? { kind: "EXPIRED" } : { kind: "OPERATION", operation: op };
+    };
     const expired = (): SettleOutcome => {
       this.#record({ kind: "operation.unsettled", ref: opRef });
-      return { kind: "EXPIRED" };
+      return final(authorized, "UNSETTLED");
     };
     try {
       // граница не число (недействительная дата от вызывающего) — fail-closed без чтения: иначе пауза NaN — GET без
@@ -352,9 +377,13 @@ export class Operations {
         if (op.status === "SETTLED") {
           const s = op.fulfilment?.scopeCheck;
           this.#record({ kind: "operation.settled", ref: opRef, detail: s === undefined || typeof s === "object" ? "OTHER" : s });
-          return { kind: "OPERATION", operation: op };
+          return final(op, "SETTLED");
         }
-        if (op.status === "REVERSED") this.#record({ kind: "operation.reversed", ref: opRef, detail: reversalDetail(op.declineReason) });
+        if (op.status === "REVERSED") {
+          this.#record({ kind: "operation.reversed", ref: opRef, detail: reversalDetail(op.declineReason) });
+          return final(op, "REVERSED");
+        }
+        if (op.status === "REFUNDED") return final(op, "REFUNDED");
         if (op.status !== "AUTHORIZED") return { kind: "OPERATION", operation: op };
         // граница прошла, этот GET — последний (Р51 п. 2 (б)); до неё — пауза не дольше остатка срока
         const left = deadline - this.#now().getTime();

@@ -26,8 +26,9 @@ export interface ContourPaymentOptions {
   operations: {
     expect(orderRef: string, cart: Mandate): OperationWait;
     /** поиск операции по CART, когда итога по событию нет (Р51 п. 5) */
-    lookup(orderRef: string, cart: Mandate): Promise<OperationOutcome>;
-    settle(authorized: Operation, signal: AbortSignal, deadline?: number): Promise<SettleOutcome>;
+    lookup(orderRef: string, cart: Mandate, notice?: LateNotice): Promise<OperationOutcome>;
+    /** `notice` — под наблюдение после итога ставит сам модуль, в момент итога (Р51 п. 4) */
+    settle(authorized: Operation, signal: AbortSignal, deadline?: number, notice?: LateNotice): Promise<SettleOutcome>;
     /** наблюдение после итога покупки (Р51 п. 4) */
     watch(op: Operation, after: WatchAfter, notice: LateNotice): void;
   };
@@ -94,8 +95,9 @@ export class ContourPayment implements PaymentSteps {
         // списывались» не говорим (Р45, Б1а; инвариант 8); код витрины — detail записи shop.call
         if (!(e instanceof ShopFailure)) throw e;
       }
-      const op = await this.#outcome(wait, reply, mark, c.signal, () => this.o.operations.lookup(orderRef, c.cart));
-      // оплата отменена — поздний клиринг или возврат сообщит наблюдение после итога (Р51 п. 4)
+      const op = await this.#outcome(wait, reply, mark, c.signal, () => this.o.operations.lookup(orderRef, c.cart, c.notice));
+      // оплата отменена — поздний клиринг или возврат сообщит наблюдение после итога (Р51 п. 4); итог поиска модуль уже
+      // поставил под наблюдение сам, здесь — итог по событию (повторная постановка ничего не теряет)
       if (op.status === "REVERSED" && c.notice !== undefined) this.o.operations.watch(op, "REVERSED", c.notice);
       return op;
     } finally {
@@ -143,14 +145,11 @@ export class ContourPayment implements PaymentSteps {
   async settle(op: Operation, signal?: AbortSignal, authorizedAt?: Date, notice?: LateNotice): Promise<Operation> {
     const deadline = (authorizedAt ?? this.now()).getTime() + this.o.params.reservation_ttl_sec * 1000;
     // без сигнала ждёт до расчёта или границы; конвейер передаёт свой сигнал остановки покупки (ревью КТ1 № 7а)
-    const r = await this.o.operations.settle(op, signal ?? new AbortController().signal, deadline);
+    // итог расчёта, REVERSED и граница (и при недоступном GET, правка 1) — под наблюдение ставит модуль в момент итога
+    const r = await this.o.operations.settle(op, signal ?? new AbortController().signal, deadline, notice);
     if (r.kind === "PENDING") throw new PaymentFailure("SETTLEMENT_PENDING");
     if (r.kind === "MISMATCH") throw new PaymentFailure("OPERATION_REPLY_MISMATCH");
-    // граница прошла (и при недоступном GET, правка 1) — op_ref известен: поздний клиринг сообщит наблюдение (Р51 п. 4)
-    if (r.kind === "EXPIRED" && notice !== undefined) this.o.operations.watch(op, "UNSETTLED", notice);
     if (r.kind === "UNREAD" || r.kind === "EXPIRED") throw new PaymentFailure("OPERATION_RESULT_UNCONFIRMED");
-    const s = r.operation.status;
-    if (notice !== undefined && (s === "SETTLED" || s === "REFUNDED" || s === "REVERSED")) this.o.operations.watch(r.operation, s, notice);
     return r.operation;
   }
 }

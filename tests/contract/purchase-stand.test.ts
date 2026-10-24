@@ -100,8 +100,10 @@ describe("конвейер на стенде Платформы (Р38 п. 8, К6
       "pao GET /pao/v1/mandates/{intent}/verify 200",
       "pao GET /pao/v1/mandates/{cart}/verify 200",
       "merchants POST /v1/shops/{shop}/orders 201",
+      // ворота стадии 5: verify INTENT и CART, знак готовности продавца корзины (Р53 п. 6)
       "pao GET /pao/v1/mandates/{intent}/verify 200",
       "pao GET /pao/v1/mandates/{cart}/verify 200",
+      `pao GET /pao/v1/merchants/${NORMAL.merchant_id}/readiness 200`,
     ]);
     // изменяющие обращения к ПАО — подписаны ключом агента, с x-nonce и прежним Idempotency-Key (инвариант 8)
     // ключ подписи — действующий ключ агента по реестру стенда (GET /pao/v1/agent при допуске; ревью К6 М2)

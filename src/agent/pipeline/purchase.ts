@@ -642,9 +642,15 @@ export class Purchase {
   }
 
   /** Ворота перед стадией 5 (Р38 п. 3): проверка по мандату (`#scope`) непосредственно перед запросом реквизита, затем
-   *  пропуск машины в AUTHORIZING. */
+   *  знак готовности продавца корзины по ПАО (Р53 п. 6): `ACTIVE` — дальше; `SUSPENDED` или `NONE` — STOPPED
+   *  MERCHANT_NOT_READY; знак не проверен — STOPPED READINESS_UNAVAILABLE; отказ по агенту — код ПАО (или остановка
+   *  подписи); затем пропуск машины в AUTHORIZING. */
   async #gate(intent: Mandate, cart: Mandate): Promise<void> {
     await this.#scope(intent, cart);
+    // продавец — из подписанного CART, как в #scope; знак перечитывается: между поиском и оплатой его могли приостановить
+    const mark = await this.#guard(() => this.o.shop.readiness(cart.cart!.merchantId, this.#machine.stopped));
+    if (mark.unverified !== undefined) this.#halt("READINESS_UNAVAILABLE");
+    if (mark.status !== "ACTIVE") this.#halt("MERCHANT_NOT_READY");
     // без пропуска машина не пустит в AUTHORIZING: запрещённый переход по К2.1, даже если таблица его разрешает
     this.#machine.passGate5();
   }

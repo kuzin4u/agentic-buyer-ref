@@ -10,7 +10,7 @@ import { expectJournalClean } from "../support/journal.js";
 import { loadParams } from "../../src/shared/config.js";
 import { AGENT, type PaoStand } from "../support/pao-stand.js";
 import { SHOP, purchaseOn, signedIntent, stages, type PurchaseRun, type PurchaseSetup } from "../support/purchase.js";
-import { bakery, feedPrice, liveOffers, payments, shopOrders, type FeedShop } from "../support/shop.js";
+import { READY, bakery, feedPrice, liveOffers, payments, shopOrders, type FeedShop } from "../support/shop.js";
 
 let stand: PaoStand | undefined;
 afterEach(async () => {
@@ -424,7 +424,7 @@ describe("Р44 п. 5 — проверка по мандату непосредс
     const real = shopOrders(shop);
     const checks = liveOffers(shop, () => stand!.clock);
     const live = { fetch: (req: Parameters<typeof checks.fetch>[0], signal: AbortSignal) => (at.live.push(at.r?.stand.stub.calls.length ?? -1), checks.fetch(req, signal)) };
-    const r = await setup({ shops: [shop], live, shop: { order: (req, m) => ((at.before = at.r!.stand.stub.calls.slice(-2).map((c) => c.op)), real.order(req, m)) } });
+    const r = await setup({ shops: [shop], live, shop: { ...READY, order: (req, m) => ((at.before = at.r!.stand.stub.calls.slice(-2).map((c) => c.op)), real.order(req, m)) } });
     at.r = r;
     await signedIntent(r);
     await r.purchase.search();

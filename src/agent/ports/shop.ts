@@ -66,10 +66,15 @@ export interface ShopOrder {
   total: Money;
 }
 
+/** Знак готовности продавца по ПАО (Р53 п. 2–4): статус или «знак не проверен» с уточнением для журнала. */
+export type Readiness = { status: "ACTIVE" | "SUSPENDED" | "NONE"; unverified?: undefined } | { unverified: string; status?: undefined };
+
 /** Стадия 3: заказ подписанным обращением к витрине (Р42). Отказ витрины или неизвестное состояние заказа — ShopFailure;
- *  иная ошибка вызова — отказ стадии (инвариант 4). Заказ не повторяется. */
+ *  иная ошибка вызова — отказ стадии (инвариант 4). Заказ не повторяется. `readiness` — знак продавца по ПАО для ворот
+ *  стадии 5 (Р53 п. 6): отказ по агенту — PlatformFailure или SignerStopped, иная ошибка — отказ стадии. */
 export interface ShopPort {
   order(req: ShopOrderRequest, m: Mutation): Promise<ShopOrder>;
+  readiness(merchantId: string, signal?: AbortSignal): Promise<Readiness>;
 }
 
 /** Пакет агентской оплаты продавцу по заказу (Р45 п. 4): `orderId` — `Order.id` продавца, он же `order_ref` пакета. */

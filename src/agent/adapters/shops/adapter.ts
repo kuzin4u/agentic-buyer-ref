@@ -26,6 +26,7 @@ import {
   type ShopPaymentPort,
   type ShopPaymentReply,
   type ShopPaymentRequest,
+  type Readiness,
   type ShopPort,
   type ShopUnavailable,
   type ShopUnavailableCause,
@@ -48,9 +49,6 @@ export type ShopsParams = Pick<
   StandParams,
   "shop_request_timeout_ms" | "shop_retry_after_max_sec" | "shop_retry_default_ms" | "shop_search_deadline_ms" | "pao_request_timeout_ms"
 >;
-
-/** Знак готовности продавца по ПАО (Р53 п. 2–4): статус или «знак не проверен» с уточнением для журнала. */
-export type Readiness = { status: "ACTIVE" | "SUSPENDED" | "NONE"; unverified?: undefined } | { unverified: string; status?: undefined };
 
 export interface ShopsAdapterOptions {
   baseUrl: string;

@@ -118,9 +118,11 @@ describe("П11 — цена изменилась после согласован
       "pao GET /pao/v1/mandates/{intent}/verify 200",
       "pao GET /pao/v1/mandates/{fresh}/verify 200",
       `merchants POST /v1/shops/${NORMAL.id}/orders 201`,
-      // ворота стадии 5 — verify INTENT и нового CART (стадия 4 — после авторизации, по требованию ADP, Р47 п. 2)
+      // ворота стадии 5 — verify INTENT и нового CART, знак продавца корзины (Р53 п. 6; стадия 4 — после авторизации, по
+      // требованию ADP, Р47 п. 2)
       "pao GET /pao/v1/mandates/{intent}/verify 200",
       "pao GET /pao/v1/mandates/{fresh}/verify 200",
+      `pao GET /pao/v1/merchants/${NORMAL.merchant_id}/readiness 200`,
     ]);
     const secrets = r.c.calls().flatMap((x) => [x.nonce, x.idempotencyKey]).filter((v): v is string => typeof v === "string");
     expectJournalClean(r.c.journal.entries, null, [], secrets);

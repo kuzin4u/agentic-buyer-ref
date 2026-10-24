@@ -22,6 +22,7 @@ export const MERCHANT_CODES = [
   "PACKAGE_INVALID",
   "PACKAGE_MISMATCH",
   "ORDER_NOT_PAYABLE",
+  "QUERY_INVALID",
   "UPSTREAM_UNAVAILABLE",
   "RATE_LIMITED",
 ] as const;
@@ -80,6 +81,9 @@ export const MERCHANT_DIAG: Readonly<Record<MerchantCode, DiagEntry>> = {
   ORDER_NOT_PAYABLE: e("ORDER_NOT_PAYABLE", ["merchant"], "after_human", ORDER,
     "Заказ у витрины нельзя оплатить (уже оплачивается, оплачен или отклонён). Без повтора (AG-11).",
     "Р42 п. 4; инвариант 9"),
+  QUERY_INVALID: e("QUERY_INVALID", ["agent", "merchant"], "after_fix", "Не удалось узнать у продавца состояние заказа. Деньги не списывались; заказ не повторяется.",
+    "Чтение заказов витрины без cart_mandate_id, с пустым или повторённым (422, РП58 платформы, передача #70) — дефект запроса агента. Без повтора; чтение заказа — AG-09 ч. 2г.",
+    "Р42 п. 4, 7; Р49 п. 9; Р53 п. 9"),
   UPSTREAM_UNAVAILABLE: e("UPSTREAM_UNAVAILABLE", ["merchant", "environment"], "after_fix", UNAVAILABLE,
     "Витрине недоступен её источник (каталог ключей и т. п.). Повторяемый: один повтор GET после Retry-After не больше shop_retry_after_max_sec; заказ не повторяется.",
     "Р42 п. 4; инвариант 9"),

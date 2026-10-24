@@ -2,10 +2,12 @@
 // витринах эмулятора: каждое обращение адаптера подписано действующим ключом агента; витрина REJECTS_UNIDENTIFIED
 // обслуживает опознанного агента. Отказ витрины — магазин недоступен, без обходов: ни запроса без подписи, ни другим ключом
 // или кодом агента, ни повтора не повторяемого кода; агент не останавливается.
-// Отказ — настоящий ответ эмулятора: подпись ключом не из реестра стенда → код из MERCHANT_ERROR_CODES (ревью К1 Б2).
+// Отказ — настоящий ответ эмулятора, код из MERCHANT_ERROR_CODES (ревью К1 Б2). С v0.23.0 `GET /v1/shops` опознаёт агента,
+// как каталог (#64 п. 2): ключ не из реестра стенда отсекается уже на списке; отказ каталога при принятом списке — отзыв
+// ключа после списка и сдвиг часов стенда за срок кэша каталога ключей у витрин (`merchant_jwks_max_age_sec`, #64 п. 1).
 // ЭМУЛЯЦИЯ СВЕРХ ЭМУЛЯТОРА (ответ подменён в fetch адаптера, остальные обращения — настоящие) — только то, чего эмулятор не
-// выдаёт: код вне перечня (MERCHANT_CODE_UNKNOWN) у одной витрины и 503 на список витрин (`GET /v1/shops` у эмулятора
-// без отказов: опознания и лимита на нём нет — STATUS «Открыто», к платформе).
+// выдаёт: код вне перечня (MERCHANT_CODE_UNKNOWN) у одной витрины и 503 на список витрин (переход на `failShopList` —
+// STATUS «Открыто», к AG-09 ч. 2 / AG-10).
 import { afterEach, describe, expect, it } from "vitest";
 import { newEd25519Signer, signRequest } from "@kuzin4u/agentic-core";
 import { MERCHANT_ERROR_CODES, MERCHANT_FIXTURES } from "agentic-ps-platform/fixtures";
@@ -52,18 +54,48 @@ describe("П08 — витрина отказывает неопознанным"
     expect(r.c.journal.entries.filter((e) => e.kind === "shop.unavailable")).toEqual([]);
   });
 
-  it("витрины отказали по-настоящему (ключ не из реестра) — магазины недоступны; по одному подписанному обращению, без обхода; агент работает", async () => {
+  it("ключ не из реестра — список витрин отказал по-настоящему (KEY_UNKNOWN, #64 п. 2): STOPPED сделки с SHOP_LIST_UNAVAILABLE; одно подписанное обращение, без повтора и обхода; к каталогам ни одного обращения; агент работает", async () => {
     const { f, seen } = recording();
-    // ключ, которого нет в реестре стенда: витрины не опознают агента — настоящий отказ эмулятора
+    // ключ, которого нет в реестре стенда: эмулятор не опознаёт агента уже на списке витрин
     const { signer } = newEd25519Signer("kid-not-in-registry");
     const r = await standPurchase({ fetch: f, signing: { sign: (req) => signRequest(req, signer) } });
     c = r.c;
+    await r.signedIntent();
+    await expect(r.purchase.search()).rejects.toMatchObject({ name: "ShopFailure", code: "SHOP_LIST_UNAVAILABLE" });
+    expect(r.purchase.state).toBe("STOPPED");
+    expect(r.purchase.reason).toBe("SHOP_LIST_UNAVAILABLE");
+    expect(r.c.admission()).toBeNull();
+    // код отказа — из ответа эмулятора (журнал контура), из закрытого перечня витрин; не повторяемый — одно обращение
+    const merchants = r.c.calls().filter((x) => x.target === "merchants");
+    expect(merchants.map((x) => [x.route, x.status, x.code])).toEqual([["GET /v1/shops", KEY_UNKNOWN.http, KEY_UNKNOWN.code]]);
+    expect(seen.map((s) => new URL(s.url).pathname)).toEqual(["/v1/shops"]);
+    expect(seen.every((s) => typeof s.headers["signature"] === "string" && s.headers["x-agent-code"] === r.c.agentCode)).toBe(true);
+  });
+
+  it("ключ отозван после списка, часы стенда — за срок кэша ключей у витрин: каталоги отказали по-настоящему (KEY_UNKNOWN) — магазины недоступны; по одному подписанному обращению, без обхода; агент работает", async () => {
+    // без подмены ответов: после настоящего ответа списка ключи агента отзываются в реестре стенда, часы стенда сдвигаются
+    // на merchant_jwks_max_age_sec — витрина перечитывает каталог ключей и не находит ключ (кэш 1 с остаётся настоящим, #64 п. 1)
+    const hook: { afterList?: () => void } = {};
+    const seen: { url: string; headers: Record<string, string> }[] = [];
+    const f: typeof fetch = async (input, init) => {
+      seen.push({ url: String(input), headers: { ...(init?.headers as Record<string, string>) } });
+      const res = await fetch(input, init);
+      if (new URL(String(input)).pathname === "/v1/shops") hook.afterList?.();
+      return res;
+    };
+    const r = await standPurchase({ fetch: f });
+    c = r.c;
+    hook.afterList = () => {
+      for (const k of r.self.keys) r.stand.keys.revoke(r.c.agentCode, k.kid);
+      r.stand.setClock(new Date(r.stand.now().getTime() + r.stand.params.merchant_jwks_max_age_sec * 1000));
+    };
     await r.signedIntent();
     const zones = await r.purchase.search();
     expect(r.purchase.state).toBe("OFFERS");
     expect(r.c.admission()).toBeNull();
     expect([...zones.contour, ...zones.market]).toEqual([]);
     // код отказа — из ответа эмулятора (журнал контура), из закрытого перечня витрин; у каждой витрины свой ответ
+    expect(r.c.calls().filter((x) => x.target === "merchants" && x.route === "GET /v1/shops").map((x) => x.status)).toEqual([200]);
     const refusals = r.c.calls().filter((x) => x.target === "merchants" && x.route.endsWith("/catalog"));
     expect(refusals.map((x) => x.route)).toEqual(MERCHANT_FIXTURES.map((m) => `GET ${catalogOf(m.id)}`));
     expect(refusals.map((x) => [x.status, x.code])).toEqual(MERCHANT_FIXTURES.map(() => [KEY_UNKNOWN.http, KEY_UNKNOWN.code]));

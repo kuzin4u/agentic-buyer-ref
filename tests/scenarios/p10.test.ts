@@ -30,8 +30,8 @@ describe("П10 — корзина и мандат корзины", { timeout: ST
   // свежесть — по responded_at витрины (часы стенда), сравнивает ядро с часами конвейера (Р54 п. 6); даты — от часов теста
   // и стенда (setClock), не литералы. Ответ из будущего — часы стенда спешат только на время ответа витрины на живую
   // проверку (стенд общий с ПАО: verify INTENT перед ней сверяет срок мандата с его часами). Старый ответ — часы конвейера
-  // спешат: витрина с отставшими на live_check_max_age_sec часами отвергла бы уже подпись агента (окно x-timestamp) —
-  // LIVE_UNAVAILABLE, а не LIVE_STALE
+  // спешат: на стенде с отставшими на live_check_max_age_sec часами витрина отвечает 401 KEY_EXPIRED — ключ агента в тесте
+  // моложе сдвига часов стенда (ревью КТ1б № 2)
   it.each([
     ["ответ витрины старше live_check_max_age_sec (часы конвейера спешат)", "purchase", (p: { live_check_max_age_sec: number }) => (p.live_check_max_age_sec + 5) * 1000],
     ["responded_at в будущем дальше live_check_clock_skew_sec (часы стенда спешат)", "stand", (p: { live_check_clock_skew_sec: number }) => (p.live_check_clock_skew_sec + 5) * 1000],
@@ -68,6 +68,33 @@ describe("П10 — корзина и мандат корзины", { timeout: ST
     skew.ms = null;
     const cart = await r.purchase.cart(one(offer, QTY), { idempotencyKey: "idem-cart-p10-fresh" });
     expect(cart).toMatchObject({ kind: "CART", status: "PENDING_SIGNATURE" });
+  });
+
+  it("ответ витрины на живую проверку без responded_at (эмуляция сверх эмулятора: поле убрано из настоящего ответа) — источник отказал: LIVE_UNAVAILABLE перед CART, мандата корзины нет (Р54 п. 6, ревью КТ1б № 1)", async () => {
+    const strip = { on: false };
+    const f: typeof fetch = async (input, init) => {
+      const res = await fetch(input, init);
+      if (!strip.on || !String(input).endsWith(`/v1/shops/${NORMAL.id}/catalog`)) return res;
+      const body = (await res.json()) as Record<string, unknown>;
+      delete body.responded_at;
+      return new Response(JSON.stringify(body), { status: res.status });
+    };
+    const r = await standPurchase({ fetch: f });
+    c = r.c;
+    await r.signedIntent();
+    const zones = await r.purchase.search();
+    const offer = zones.contour.find((o) => o.shopId === NORMAL.id && o.sku === BREAD.sku)!;
+
+    const before = r.c.calls().length;
+    strip.on = true;
+    const err = await r.purchase.cart(one(offer, QTY), { idempotencyKey: "idem-cart-p10-noat" }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(CartLiveRefused);
+    expect((err as CartLiveRefused).codes).toEqual(["LIVE_UNAVAILABLE"]);
+    expect(r.purchase.state).toBe("OFFERS");
+    expect(r.c.calls().slice(before).filter((x) => x.route.startsWith("POST /pao/v1/mandates"))).toEqual([]);
+    // ответ не по схеме — в журнале обращений BAD_RESPONSE, без повтора
+    expect(r.c.journal.entries.filter((e) => e.kind === "shop.call" && e.ref === NORMAL.id).map((e) => [e.result, e.detail]).at(-1)).toEqual(["refused", "BAD_RESPONSE"]);
+    expect(r.c.journal.entries.filter((e) => e.kind === "cart.live_refused").map((e) => [e.reason, e.ref])).toEqual([["LIVE_UNAVAILABLE", BREAD.sku]]);
   });
 
   it("2 шт. хлеба: CART с parent_id INTENT, итог — по живой цене продавца; заказ создан, Order.total = итогу CART", async () => {

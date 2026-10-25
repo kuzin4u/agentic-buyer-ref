@@ -10,7 +10,8 @@
 // модель — здесь, проверки значений — ядро (`validateShop` / `validateProduct`). Факты магазина не по схеме — магазин
 // исключён целиком. GTIN — данные модели: в журнал не пишется и через сканер номеров карт (`order_ref`) не проходит.
 // `checkedAt` живого предложения — `responded_at` ответа каталога (часы витрины, Р54 п. 6): свежесть сравнивает ядро
-// (`checkLiveOffer`); `responded_at` нет или не дата-время с поясом — отказ источника (LIVE_CALL_ERROR), не «свежо».
+// (`checkLiveOffer`); `responded_at` нет или не дата-время с поясом (не больше ±14:00) — ответ не по схеме, источник
+// отказал: у ядра LIVE_UNAVAILABLE, не «свежо».
 // Знак готовности продавца — по ПАО, одной функцией `readiness` (Р53): зона контура — только при ACTIVE; поля витрины
 // `zone` и `readiness_mark` — сведения; знак не проверен — витрина недоступна (READINESS_UNAVAILABLE).
 import { randomUUID } from "node:crypto";
@@ -86,9 +87,16 @@ const ShopFacts = z.object({
   returns: z.object({ days: z.number().int().nonnegative(), text: z.string() }),
 });
 const Catalog = z.object({ items: z.array(z.unknown()) });
+/** Пояс — не больше ±14:00, как у ядра (`isCalendarDateTime`): иначе ответ прошёл бы схему, а ядро дало бы LIVE_INVALID
+ *  (ревью КТ1б № 3). `Z` — пояс 00:00. */
+const ZONE_MAX_MIN = 14 * 60;
+const zoneWithin = (s: string): boolean => {
+  const m = /([+-])(\d{2}):(\d{2})$/.exec(s);
+  return m === null || Number(m[2]) * 60 + Number(m[3]) <= ZONE_MAX_MIN;
+};
 /** Каталог живой проверки: `responded_at` — время ответа по часам витрины, дата-время с поясом (Р54 п. 6). В поиске не
  *  проверяется: поиск — снимок, свежесть — у живой проверки перед заказом. */
-const LiveCatalog = Catalog.extend({ responded_at: z.iso.datetime({ offset: true }) });
+const LiveCatalog = Catalog.extend({ responded_at: z.iso.datetime({ offset: true }).refine(zoneWithin) });
 /** Вариант доставки: `method` — строкой, перечень проверяет ядро (`BAD_METHOD`, как у фида; ревью КТ1 № 1). */
 const Delivery = z.object({
   method: z.string(),
@@ -310,8 +318,8 @@ export class ShopsAdapter implements OfferSource, LiveOfferSource, ShopPort, Sho
   }
 
   /** Живое предложение перед заказом: цена и наличие — из каталога витрины, `checkedAt` — `responded_at` ответа (часы
-   *  витрины, Р54 п. 6; свежесть сравнивает ядро). Отказ — исключение: у конвейера это LIVE_CALL_ERROR или
-   *  LIVE_UNAVAILABLE, заказа нет; `responded_at` нет или не по форме — ответ не по схеме, тоже отказ. */
+   *  витрины, Р54 п. 6; свежесть сравнивает ядро). Отказ — исключение: `checkLiveOffer` ядра даёт LIVE_UNAVAILABLE
+   *  (источник отказал), заказа нет; `responded_at` нет или не по форме — ответ не по схеме, тоже отказ (ревью КТ1б № 1). */
   async fetch(req: LiveOfferRequest, signal: AbortSignal): Promise<LiveOffer> {
     const shop = this.#shopOf.get(req.sku);
     if (shop === undefined || shop === null) throw new Error("sku нет в выдаче или он у двух витрин");

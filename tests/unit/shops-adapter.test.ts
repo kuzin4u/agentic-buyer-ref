@@ -300,11 +300,19 @@ describe("адаптер витрин (Р42)", () => {
 
   it("живая проверка: responded_at нет, не дата-время или без пояса — отказ источника, не «свежо» (Р54 п. 6; Date.parse = NaN ядро пропустило бы)", async () => {
     const at = new Date().toISOString();
-    for (const responded of [undefined, "вчера", at.slice(0, 19), at.slice(0, 10), 1761400000000]) {
+    // пояс больше ±14:00 — не по схеме, как у ядра (ревью КТ1б № 3)
+    for (const responded of [undefined, "вчера", at.slice(0, 19), at.slice(0, 10), 1761400000000, `${at.slice(0, 19)}+14:01`, `${at.slice(0, 19)}-14:01`]) {
       const { a, journal } = adapter({ ...LIST(shop("S1")), ...catalog("S1", ok(ITEM), { status: 200, body: { items: [ITEM], ...(responded !== undefined && { responded_at: responded }) } }) });
       await a.search();
       await expect(a.fetch({ sku: ITEM.sku, quantity: 1 }, new AbortController().signal)).rejects.toThrow();
       expect(calls(journal).at(-1)).toEqual(["GET /v1/shops/{id}/catalog", 1, "refused", "BAD_RESPONSE"]);
+    }
+    // пояс ±14:00 — ещё по схеме: checkedAt — как прислала витрина
+    for (const zone of ["+14:00", "-14:00", "+03:00"]) {
+      const responded = `${at.slice(0, 19)}${zone}`;
+      const { a } = adapter({ ...LIST(shop("S1")), ...catalog("S1", ok(ITEM), { status: 200, body: { items: [ITEM], responded_at: responded } }) });
+      await a.search();
+      expect((await a.fetch({ sku: ITEM.sku, quantity: 1 }, new AbortController().signal)).checkedAt).toBe(responded);
     }
     // в поиске responded_at не проверяется — снимок (Р54 п. 6)
     const { a } = adapter({ ...LIST(shop("S1")), ...catalog("S1", { status: 200, body: { items: [ITEM] } }) });

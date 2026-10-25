@@ -10,10 +10,11 @@ import { INTENT, RUB } from "../support/consents.js";
 import { shopBy, type Contour } from "../support/contour.js";
 import { unkeyedPost } from "../support/pao-unkeyed.js";
 import { one } from "../support/purchase.js";
-import { STAND_TIMEOUT_MS, adpDecision, processing, standPurchase } from "../support/stand-purchase.js";
+import { STAND_TIMEOUT_MS, adpDecision, processing, routesFrom, standPurchase } from "../support/stand-purchase.js";
 
 let c: Contour | undefined;
 afterEach(async () => {
+  expect(c?.violations() ?? []).toEqual([]);
   await c?.close();
   c = undefined;
 });
@@ -38,7 +39,8 @@ describe("П24 — повтор операции без ключа идемпо�
     const offer = (await r.purchase.search()).contour.find((o) => o.shopId === NORMAL.id)!;
     const cart = await r.purchase.cart(one(offer, 1), { idempotencyKey: "idem-cart-p24" });
     await r.signWhileWaiting(cart.id, () => r.purchase.awaitCart());
-    await r.purchase.placeOrder({ idempotencyKey: "idem-order-p24" });
+    const order = await r.purchase.placeOrder({ idempotencyKey: "idem-order-p24" });
+    const payFrom = r.c.calls().length;
     const authorizing = r.purchase.authorize({ idempotencyKey: "idem-pay-p24" });
     const d = await adpDecision(r.c);
     await processing(r.c, { op_ref: d.op_ref, msg_type: "ISSUER_RESPONSE", issuer_approved: true });
@@ -56,9 +58,12 @@ describe("П24 — повтор операции без ключа идемпо�
     expect(r.c.calls().slice(from)).toEqual([]);
 
     // повтор той же операции без ключа — Платформа отказывает до захвата ключа (РП30 п. 3)
-    const res = await unkeyedPost(r.c, "/pao/v1/credentials", credentialDraftToPao(draft!, new Set(["RUB"])));
+    // часы подписи — системные: контур без подставленных часов, стенд сверяет с ними же
+    const res = await unkeyedPost(r.c, "/pao/v1/credentials", credentialDraftToPao(draft!, new Set(["RUB"])), new Date());
     expect(res).toMatchObject({ status: 400, body: { code: "IDEMPOTENCY_REQUIRED" } });
-    expect(r.c.calls().slice(from).map((x) => `${x.route} ${x.status} ${x.code ?? ""}`)).toEqual([`${CREDENTIALS} 400 IDEMPOTENCY_REQUIRED`]);
+    expect(r.c.calls().slice(from).map((x) => `${x.source} ${x.route} ${x.status} ${x.code ?? ""}`)).toEqual([`test ${CREDENTIALS} 400 IDEMPOTENCY_REQUIRED`]);
+    // обращение без ключа — тестовой поддержки, не агента: у агента таких обращений нет (ревью КТ1 Р56 № 4)
+    expect(routesFrom(r.c, from, "agent", {})).toEqual([]);
 
     // двойного списания нет: второго реквизита нет, остаток CART и INTENT по verify прежний
     expect(r.c.issuedSecrets!().length).toBe(secrets);
@@ -66,5 +71,19 @@ describe("П24 — повтор операции без ключа идемпо�
     const leftAfter = [await r.c.platform.verifyMandate({ id: cart.id, currency: "RUB" }), await r.c.platform.verifyMandate({ id: intent.id, currency: "RUB" })].map((v) => v.amountLeft);
     expect(leftAfter).toEqual(leftBefore);
     expect(r.purchase.state).toBe("SETTLING");
+    // полный журнал обращений агента от оплаты, без ленты (ревью КТ1 Р56 № 1): одна выдача; verify — проверки теста
+    const ids = { intent: intent.id, cart: cart.id, shop: NORMAL.id, merchant: NORMAL.merchant_id, order: order.orderId, op: d.op_ref };
+    expect(routesFrom(r.c, payFrom, "agent", ids)).toEqual([
+      "pao GET /pao/v1/mandates/{intent}/verify 200",
+      "pao GET /pao/v1/mandates/{cart}/verify 200",
+      "pao GET /pao/v1/merchants/{merchant}/readiness 200",
+      "pao POST /pao/v1/credentials 201",
+      "merchants POST /v1/shops/{shop}/orders/{order}/payment 200",
+      "pao GET /pao/v1/operations/{op} 200",
+      "pao GET /pao/v1/mandates/{cart}/verify 200",
+      "pao GET /pao/v1/mandates/{intent}/verify 200",
+      "pao GET /pao/v1/mandates/{cart}/verify 200",
+      "pao GET /pao/v1/mandates/{intent}/verify 200",
+    ]);
   });
 });

@@ -56,6 +56,16 @@ export async function processing(c: Contour, payload: Record<string, unknown>): 
   expect(res.statusCode, JSON.stringify(payload)).toBe(202);
 }
 
+/** Обращения с номера `from` по источнику, без чтения ленты событий; id — шаблоном `{имя}` (ревью КТ1 Р56 № 1, как в
+ *  operation-stand.test.ts). */
+export function routesFrom(c: Contour, from: number, source: "agent" | "test", ids: Record<string, string>): string[] {
+  return c
+    .calls()
+    .slice(from)
+    .filter((x) => x.source === source && !x.route.startsWith("GET /pao/v1/events"))
+    .map((x) => `${x.target} ${Object.entries(ids).reduce((route, [name, id]) => route.replaceAll(id, `{${name}}`), x.route)} ${x.status}`);
+}
+
 /** Уведомление клиента через банк стенда (ПИ-8, РП46 (б) п. 3). */
 export interface BankNotice {
   type: string;

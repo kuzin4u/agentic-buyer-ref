@@ -137,8 +137,9 @@ export interface Contour {
 
 const header = (v: string | string[] | undefined): string | undefined => (typeof v === "string" ? v : undefined);
 const KEYID = /;keyid="([^"]+)"/;
-/** user-agent запросов `app.inject` (light-my-request по умолчанию) */
-const INJECT_AGENT = "lightMyRequest";
+/** user-agent запросов `app.inject` (light-my-request по умолчанию); его же ставит сетевой запрос тестовой поддержки без
+ *  ключа идемпотентности (pao-unkeyed.ts, П24) — в журнале он "test", а не обращение агента (ревью КТ1 Р56 № 4) */
+export const INJECT_AGENT = "lightMyRequest";
 /** Пути участников Платформы (ADP, ПИ-3): агенту закрыты — его обращение туда — нарушение контура (ревью чата К4). */
 const PARTICIPANT_ONLY = /^\S+ \/adp\//;
 

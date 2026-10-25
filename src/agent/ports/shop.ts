@@ -70,7 +70,8 @@ export interface ShopOrder {
 export type Readiness = { status: "ACTIVE" | "SUSPENDED" | "NONE"; unverified?: undefined } | { unverified: string; status?: undefined };
 
 /** Стадия 3: заказ подписанным обращением к витрине (Р42). Отказ витрины или неизвестное состояние заказа — ShopFailure;
- *  иная ошибка вызова — отказ стадии (инвариант 4). Заказ не повторяется. `readiness` — знак продавца по ПАО для ворот
+ *  иная ошибка вызова — отказ стадии (инвариант 4). Заказ — не больше одного нового и только после чтения «заказа нет»
+ *  (Р55 п. 4). `readiness` — знак продавца по ПАО для ворот
  *  стадии 5 (Р53 п. 6): отказ по агенту — PlatformFailure или SignerStopped, иная ошибка — отказ стадии. */
 export interface ShopPort {
   order(req: ShopOrderRequest, m: Mutation): Promise<ShopOrder>;

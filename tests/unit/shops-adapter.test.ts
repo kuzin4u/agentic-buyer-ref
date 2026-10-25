@@ -494,10 +494,13 @@ describe("адаптер витрин (Р42)", () => {
 
   it("отказ витрины на заказ — SHOP_ORDER_REFUSED без чтения и без повтора; исход неизвестен, чтение не удалось — SHOP_ORDER_STATE_UNKNOWN без второго POST (Р55 п. 2, 4)", async () => {
     const req = { shopId: "S1", items: [{ sku: "BRD-1", qty: 1 }], cartMandateId: "mnd_1" };
+    // 4xx — отказ и с кодом вне перечня; 5xx — отказ только с кодом витрины (Р55 п. 2, ревью КТ1 № 1)
     for (const answer of [
       { status: 503, body: { code: "UPSTREAM_UNAVAILABLE" } },
       { status: 429, body: { code: "RATE_LIMITED" }, headers: { "retry-after": "1" } },
       { status: 422, body: { code: "ITEM_INCOMPLETE" } },
+      { status: 409, body: { code: "SOMETHING_ELSE" } },
+      { status: 400 },
     ] as Answer[]) {
       const { a, seen, sleeps } = adapter({ "POST /v1/shops/S1/orders": [answer, { status: 201, body: { id: "ord_2", total: 39000, currency: "RUB" } }] });
       const err = await a.order(req).catch((e: unknown) => e);
@@ -506,8 +509,15 @@ describe("адаптер витрин (Р42)", () => {
       expect(seen.map((s) => s.method)).toEqual(["POST"]);
       expect(sleeps).toEqual([]);
     }
-    // исход неизвестен: 201 не по схеме, 200 вместо 201, нет ответа — чтение; витрина отказала в чтении (QUERY_INVALID)
-    for (const answer of [{ status: 201, body: { id: "ord_1" } }, { status: 200, body: { id: "ord_1", total: 39000, currency: "RUB" } }, "fail"] as Answer[]) {
+    // исход неизвестен: 201 не по схеме, 200 вместо 201, нет ответа, 5xx без кода витрины (504 без тела, 502 с чужим
+    // кодом — прокси) — чтение; витрина отказала в чтении (QUERY_INVALID)
+    for (const answer of [
+      { status: 201, body: { id: "ord_1" } },
+      { status: 200, body: { id: "ord_1", total: 39000, currency: "RUB" } },
+      "fail",
+      { status: 504 },
+      { status: 502, body: { code: "BAD_GATEWAY" } },
+    ] as Answer[]) {
       const { a, seen, sleeps, journal } = adapter({
         "POST /v1/shops/S1/orders": [answer, { status: 201, body: { id: "ord_2", total: 39000, currency: "RUB" } }],
         "GET /v1/shops/S1/orders": [{ status: 422, body: { code: "QUERY_INVALID" } }],
@@ -586,23 +596,72 @@ describe("адаптер витрин (Р42)", () => {
     });
 
     it.each([
-      ["два заказа", read(ORD(), ORD({ id: "ord_2" }))],
-      ["заказ PAYING", read(ORD({ status: "PAYING" }))],
-      ["заказ PAID", read(ORD({ status: "PAID" }))],
-      ["заказ с чужим cart_mandate_id", read(ORD({ cart_mandate_id: "mnd_other" }))],
-      ["заказ без статуса — не по схеме", read(ORD({ status: undefined }))],
-      ["заказ без cart_mandate_id — не по схеме", read(ORD({ cart_mandate_id: undefined }))],
-      ["статус вне перечня — не по схеме", read(ORD({ status: "SHIPPED" }))],
-      ["номер заказа не по маске", read(ORD({ id: "o".repeat(129) }))],
-      ["ответ без orders", { status: 200, body: {} }],
-      ["нет ответа", "fail"],
-      ["404 ORDER_NOT_FOUND", { status: 404, body: { code: "ORDER_NOT_FOUND" } }],
-    ] as [string, Answer][])("%s — SHOP_ORDER_STATE_UNKNOWN, второго POST нет (инвариант 4)", async (_, answer) => {
-      const { a, seen } = adapter({ "POST /v1/shops/S1/orders": ["fail"], "GET /v1/shops/S1/orders": [answer] });
+      ["два заказа", read(ORD(), ORD({ id: "ord_2" })), "unknown", "MULTIPLE"],
+      ["заказ PAYING", read(ORD({ status: "PAYING" })), "unknown", "NOT_CREATED"],
+      ["заказ PAID", read(ORD({ status: "PAID" })), "unknown", "NOT_CREATED"],
+      ["заказ с чужим cart_mandate_id", read(ORD({ cart_mandate_id: "mnd_other" })), "unknown", "FOREIGN_MANDATE"],
+      ["заказ без статуса — не по схеме", read(ORD({ status: undefined })), "refused", "BAD_RESPONSE"],
+      ["заказ без cart_mandate_id — не по схеме", read(ORD({ cart_mandate_id: undefined })), "refused", "BAD_RESPONSE"],
+      ["статус вне перечня — не по схеме", read(ORD({ status: "SHIPPED" })), "refused", "BAD_RESPONSE"],
+      ["номер заказа не по маске", read(ORD({ id: "o".repeat(129) })), "refused", "BAD_RESPONSE"],
+      ["ответ без orders", { status: 200, body: {} }, "refused", "BAD_RESPONSE"],
+      ["нет ответа", "fail", "unknown", "NO_RESPONSE"],
+      ["404 ORDER_NOT_FOUND", { status: 404, body: { code: "ORDER_NOT_FOUND" } }, "refused", "ORDER_NOT_FOUND"],
+    ] as [string, Answer, string, string][])("%s — SHOP_ORDER_STATE_UNKNOWN, второго POST нет (инвариант 4); причина — в записи чтения (ревью КТ1 № 7)", async (_, answer, result, detail) => {
+      const { a, seen, journal } = adapter({ "POST /v1/shops/S1/orders": ["fail"], "GET /v1/shops/S1/orders": [answer] });
       const err = await a.order(req).catch((e: unknown) => e);
       expect(err).toBeInstanceOf(ShopFailure);
       expect((err as ShopFailure).code).toBe("SHOP_ORDER_STATE_UNKNOWN");
       expect(seen.map((s) => s.method)).toEqual(["POST", "GET"]);
+      expect(calls(journal).at(-1)).toEqual(["GET /v1/shops/{id}/orders", 1, result, detail]);
+    });
+
+    it("пусто — второй POST получил отказ витрины: SHOP_ORDER_REFUSED, второго чтения нет (ревью КТ1 № 4а)", async () => {
+      const { a, seen } = adapter({
+        "POST /v1/shops/S1/orders": ["fail", { status: 422, body: { code: "ITEM_INCOMPLETE" } }],
+        "GET /v1/shops/S1/orders": [read()],
+      });
+      const err = await a.order(req).catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(ShopFailure);
+      expect((err as ShopFailure).code).toBe("SHOP_ORDER_REFUSED");
+      expect(seen.map((s) => s.method)).toEqual(["POST", "GET", "POST"]);
+    });
+
+    it("второе чтение — два заказа (запись первого видна с задержкой): SHOP_ORDER_STATE_UNKNOWN, MULTIPLE (ревью КТ1 № 4б; Р55 нюанс)", async () => {
+      const { a, seen, journal } = adapter({ "POST /v1/shops/S1/orders": ["fail"], "GET /v1/shops/S1/orders": [read(), read(ORD(), ORD({ id: "ord_2" }))] });
+      const err = await a.order(req).catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(ShopFailure);
+      expect((err as ShopFailure).code).toBe("SHOP_ORDER_STATE_UNKNOWN");
+      expect(seen.map((s) => s.method)).toEqual(["POST", "GET", "POST", "GET"]);
+      expect(calls(journal).at(-1)).toEqual(["GET /v1/shops/{id}/orders", 1, "unknown", "MULTIPLE"]);
+    });
+
+    it("подпись остановлена на чтении — исключение наружу, второго POST нет (ревью КТ1 № 4в)", async () => {
+      let n = 0;
+      const { a, seen } = adapter(
+        { "POST /v1/shops/S1/orders": ["fail"], "GET /v1/shops/S1/orders": [read()] },
+        {
+          signing: {
+            sign: (r) => {
+              if (++n > 1) throw new SignerStopped("NO_ACTIVE_KEY");
+              return { ...r, headers: { ...r.headers, signature: "sig", "signature-input": "sig=()" } };
+            },
+          },
+        },
+      );
+      await expect(a.order(req)).rejects.toBeInstanceOf(SignerStopped);
+      expect(seen.map((s) => s.method)).toEqual(["POST"]);
+    });
+
+    it("полный журнал пути «нет ответа → пусто → нет ответа → пусто» (ревью КТ1 № 4г)", async () => {
+      const { a, journal } = adapter({ "POST /v1/shops/S1/orders": ["fail"], "GET /v1/shops/S1/orders": [read()] });
+      await a.order(req).catch(() => undefined);
+      expect(journal.entries.filter((e) => e.kind === "shop.call").map((e) => [e.method, e.attempt, e.result, e.detail, e.ref, e.mandate])).toEqual([
+        ["POST /v1/shops/{id}/orders", 1, "unknown", "NO_RESPONSE", "S1", "mnd_1"],
+        ["GET /v1/shops/{id}/orders", 1, "ok", undefined, "S1", "mnd_1"],
+        ["POST /v1/shops/{id}/orders", 2, "unknown", "NO_RESPONSE", "S1", "mnd_1"],
+        ["GET /v1/shops/{id}/orders", 1, "ok", undefined, "S1", "mnd_1"],
+      ]);
     });
 
     it("чтение 503 с Retry-After — один повтор чтения по Р42 п. 4, затем заказ", async () => {
@@ -623,10 +682,21 @@ describe("адаптер витрин (Р42)", () => {
       const { a } = adapter({ "POST /v1/shops/S1/orders": [{ status: 201, body: { id, total: 39000, currency: "RUB" } }] });
       expect((await a.order(req)).orderId).toBe(id);
     }
-    const { a } = adapter({ "POST /v1/shops/S1/orders": [{ status: 201, body: { id: "o".repeat(129), total: 39000, currency: "RUB" } }] });
+    // 129 — ответ не по схеме: сверка чтением (Р55); чтение пусто — второй POST с тем же ответом, снова пусто (ревью КТ1 № 3)
+    const { a, seen, journal } = adapter({
+      "POST /v1/shops/S1/orders": [{ status: 201, body: { id: "o".repeat(129), total: 39000, currency: "RUB" } }],
+      "GET /v1/shops/S1/orders": [{ status: 200, body: { orders: [] } }],
+    });
     const err = await a.order(req).catch((e: unknown) => e);
     expect(err).toBeInstanceOf(ShopFailure);
     expect((err as ShopFailure).code).toBe("SHOP_ORDER_STATE_UNKNOWN");
+    expect(seen.map((s) => s.method)).toEqual(["POST", "GET", "POST", "GET"]);
+    expect(calls(journal)).toEqual([
+      ["POST /v1/shops/{id}/orders", 1, "unknown", "BAD_RESPONSE"],
+      ["GET /v1/shops/{id}/orders", 1, "ok", undefined],
+      ["POST /v1/shops/{id}/orders", 2, "unknown", "BAD_RESPONSE"],
+      ["GET /v1/shops/{id}/orders", 1, "ok", undefined],
+    ]);
   });
 
   it("оплата: номер заказа 65 и 128 знаков — в путь и ответ по той же маске; 129 — исключение до обращения (Р46 п. 1, выбор 1а; ревью reviewer К1 № 2)", async () => {

@@ -43,6 +43,17 @@ describe("граф импортов src (Р24)", { timeout: 60_000 }, () => {
     expect(users.map(rel).sort()).toEqual(["tests/contract/purchase-stand.test.ts", "tests/support/stand-purchase.ts"]);
   });
 
+  // Второй рубеж: тест видит только импорт модуля. Первый — `keyOf` адаптера ПАО: без ключа изменяющее обращение не
+  // отправляется (AGENT_REQUEST_DEFECT, pao-adapter.test.ts) — своя копия отправки в src его не обойдёт (ревью КТ1 Р56 № 6).
+  it("обращение к ПАО без Idempotency-Key (tests/support/pao-unkeyed.ts) подключает только П24; в src его нет (Р56 п. 1, решение владельца к КТ1)", () => {
+    const rel = (f: string) => f.slice(ROOT.length + 1);
+    const SPEC = /(?:from\s+|import\s*\(\s*|import\s+|require\s*\(\s*|export\s+\*\s+from\s+)["']([^"']+)["']/g;
+    const users = [...allFiles(join(ROOT, "src")), ...allFiles(join(ROOT, "tests"))].filter(
+      (f) => /\.[cm]?tsx?$/.test(f) && [...readFileSync(f, "utf8").matchAll(SPEC)].some(([, spec]) => /pao-unkeyed(\.js|\.ts)?$/.test(spec!)),
+    );
+    expect(users.map(rel)).toEqual(["tests/scenarios/p24.test.ts"]);
+  });
+
   it("настоящий src: транзитивных нарушений нет", () => {
     const files = allFiles(join(ROOT, "src"));
     expect(files.length).toBeGreaterThan(20);

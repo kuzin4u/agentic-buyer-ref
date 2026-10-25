@@ -49,6 +49,12 @@ export function mandateRefusal(m: Mandate, c: MandateCheck, total: Money): Extra
   return null;
 }
 
+/** Р56 п. 2 (Т16): продавец корзины — в области INTENT, до проекта CART и любых обращений. Вне области — отказ по INTENT
+ *  (Платформа такой CART отклонила бы: 409 MANDATE_SCOPE, SCOPE_WIDENED). */
+export function mayCartMerchant(intent: Mandate, merchantId: string): PaymentDecision {
+  return intent.merchantScope.includes(merchantId) ? { allow: true } : { allow: false, code: "MANDATE_OUT_OF_SCOPE", mandate: intent };
+}
+
 /** Р39 п. 1.1–1.3, по порядку и по полному набору фактов: проверки 1–2 по каждому мандату (INTENT раньше CART), затем
  *  продавец и валюта итога — в пределах обоих (как MANDATE_SCOPE у ADP). Первый отказ — ответ. */
 export function mayAuthorize(f: PaymentFacts, checks: { intent: MandateCheck; cart: MandateCheck }): PaymentDecision {

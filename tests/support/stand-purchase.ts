@@ -36,6 +36,60 @@ export const SHORT_DELAY_SEC = Math.min(loadParams().operation_outcome_max_delay
 
 export const pause = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+/** Решение ADP стенда по n-й копии сообщения эквайрера (`adpUntilPs11`): ждать, пока продавец его запросит. */
+export async function adpDecision(c: Contour, n = 1): Promise<{ op_ref: string; decision: string; reason?: string }> {
+  for (let i = 0; i < 200; i++) {
+    const all = (await c.adpDecisions!()) as { op_ref?: string; decision?: string; reason?: string }[];
+    if (all.length >= n) {
+      const d = all[n - 1]!;
+      expect(d.op_ref).toEqual(expect.any(String));
+      return d as { op_ref: string; decision: string; reason?: string };
+    }
+    await pause(20);
+  }
+  throw new Error("продавец не дошёл до ADP стенда");
+}
+
+/** Сообщение процессинга ПИ-3 на стенд (ответ эмитента, клиринг): 202 — принято. */
+export async function processing(c: Contour, payload: Record<string, unknown>): Promise<void> {
+  const res = await c.stand!.app.inject({ method: "POST", url: "/adp/v1/events", payload });
+  expect(res.statusCode, JSON.stringify(payload)).toBe(202);
+}
+
+/** Обращения с номера `from` по источнику, без чтения ленты событий; id — шаблоном `{имя}` (ревью КТ1 Р56 № 1, как в
+ *  operation-stand.test.ts). */
+export function routesFrom(c: Contour, from: number, source: "agent" | "test", ids: Record<string, string>): string[] {
+  return c
+    .calls()
+    .slice(from)
+    .filter((x) => x.source === source && !x.route.startsWith("GET /pao/v1/events"))
+    .map((x) => `${x.target} ${Object.entries(ids).reduce((route, [name, id]) => route.replaceAll(id, `{${name}}`), x.route)} ${x.status}`);
+}
+
+/** Уведомление клиента через банк стенда (ПИ-8, РП46 (б) п. 3). */
+export interface BankNotice {
+  type: string;
+  data: { principal_ref: string; mandate_id?: string; agent_code?: string; op_ref?: string; reason?: string };
+}
+
+/** Проход уведомителя стенда и доставка вебхука банку; итог — лента банка: каждое уведомление дошло сигналом (2xx). */
+export async function bankNotices(c: Contour): Promise<BankNotice[]> {
+  const s = c.stand!;
+  await s.notifyParticipants();
+  await s.deliverParticipantNotifications();
+  const res = await s.issuer.getNotifications();
+  expect(res.statusCode).toBe(200);
+  const { notifications } = res.body as { notifications: (BankNotice & { notification_id: string })[] };
+  expect([...s.issuerWebhook.handled].sort()).toEqual(notifications.map((n) => n.notification_id).sort());
+  return notifications.map(({ type, data }) => ({ type, data }));
+}
+
+/** Лимиты клиента в приложении банка стенда (ПИ-8, PS-20): запись версии 1 принята. */
+export async function clientLimits(c: Contour, principalRef: string, limits: Record<string, unknown>): Promise<void> {
+  const res = await c.stand!.issuer.setLimits(principalRef, limits, 1);
+  expect(res.statusCode, JSON.stringify(res.body)).toBe(200);
+}
+
 /** Лента стенда с курсором: читает, пока ожидание не завершится; пустой ответ — пауза и снова (не больше `polls` раз). */
 export function feedOf(platform: PaymentPlatform, polls = 100) {
   return async function* events(signal?: AbortSignal): AsyncIterable<FeedItem> {
@@ -73,13 +127,15 @@ export interface StandPurchaseOptions {
   confirmationTimer?: (fn: () => void, ms: number) => () => void;
   /** ПОДМЕНА ДО PS-11: авторизация продавца доходит до ADP стенда копией сообщения (createContour, `adpUntilPs11`) */
   adpUntilPs11?: boolean;
+  /** эквайрер эмулятора без поддержки aoi (П14, Р56 п. 1) */
+  aoiSupport?: false;
   /** код остановки сделки по исключению шага — как у места сборки (`startFailureCode`, compose.ts); без него — UNKNOWN */
   failureCode?: (e: unknown) => DiagCode | null;
 }
 
 /** Контур со стендом и витринами после start(), покупка на адаптере витрин. Закрыть — `c.close()` у вызывающего. */
 export async function standPurchase(o: StandPurchaseOptions = {}) {
-  const c: Contour = await createContour({ pao: "stand", ...(o.now && { now: o.now }), ...(o.adpUntilPs11 && { adpUntilPs11: true }) });
+  const c: Contour = await createContour({ pao: "stand", ...(o.now && { now: o.now }), ...(o.adpUntilPs11 && { adpUntilPs11: true }), ...(o.aoiSupport === false && { aoiSupport: false as const }) });
   const self = await c.start();
   const { stand } = c;
   if (!stand) throw new Error("контур без стенда");

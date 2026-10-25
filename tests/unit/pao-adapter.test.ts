@@ -289,6 +289,15 @@ describe("fail-closed без заглушки", () => {
     }
   });
 
+  it("П14: ответ выдачи без признака (нет aoi, aoi: null, indicator: false) — BAD_RESPONSE, пакета агентской оплаты нет (Т8; ревью КТ1 Р56 № 2)", async () => {
+    const base = { credential_ref: "cr_1", kind: "CARD", payload: {}, status: "ISSUED" };
+    for (const body of [base, { ...base, aoi: null }, { ...base, aoi: { indicator: false, agent_code: AGENT, mandate_id: "m_1" } }]) {
+      const { platform, calls } = fake(() => json(201, body));
+      await expect(platform.issuePaymentPackage(draft, { idempotencyKey: "idem_no_aoi" }), JSON.stringify(body)).rejects.toMatchObject({ code: "BAD_RESPONSE" });
+      expect(calls).toHaveLength(1);
+    }
+  });
+
   it("неизвестный код с retry same_key — ровно одно обращение, UNKNOWN, never", async () => {
     const { platform, calls } = fake(() => json(409, { code: "NEW_CODE", message: "m", retry: "same_key" }, { "retry-after": "0" }));
     await expect(platform.verifyMandate(M1)).rejects.toMatchObject({ code: "UNKNOWN", retry: "never", platformCode: "NEW_CODE" });

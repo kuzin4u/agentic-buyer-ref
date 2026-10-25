@@ -214,7 +214,12 @@
         "AOI_MISSING"
       ],
       "norms": "A1 п. 3.2",
-      "requirements": "Т8"
+      "requirements": "Т8",
+      "contour": {
+        "action": "Пакет агентской оплаты продавцу-эквайреру без поддержки aoi (createMerchants aoiSupport: false), aoi_rollout_phase 3; авторизация продавца (Р56 п. 1)",
+        "expected": "Агент передал пакет с aoi{agent_code, mandate_id}, подписанный агентом (Т8); ADP — AOI_MISSING; события агенту нет (#57 п. 3, SPEC §7б) — STOPPED OPERATION_RESULT_UNCONFIRMED, повтора нет; без aoi пакет не формируется",
+        "codes": []
+      }
     },
     {
       "id": "П15",
@@ -226,7 +231,12 @@
       "expected": "200 AUTHORIZED; остаток бюджета в К3 уменьшен; уведомление о первом использовании; запись об исполнении сформирована К5",
       "codes": [],
       "norms": "A3 п. 5",
-      "requirements": "Т10"
+      "requirements": "Т10",
+      "contour": {
+        "action": "Реквизит по CART 1 890 ₽ под INTENT 5 000 ₽ (POST /pao/v1/credentials), пакет продавцу, авторизация продавца; проход уведомителя стенда (Р56 п. 1)",
+        "expected": "operation.authorized → GET → SETTLING; остаток CART по verify меньше на 1 890 ₽; в вебхуке банка — одно client.mandate_first_use с mandate_id CART и кодом агента; operation.settled → DONE, запись об исполнении WITHIN_LIMITS; реквизита нет в журнале",
+        "codes": []
+      }
     },
     {
       "id": "П16",
@@ -240,7 +250,12 @@
         "LIMIT_EXCEEDED"
       ],
       "norms": "A3 п. 5.2",
-      "requirements": "Т10"
+      "requirements": "Т10",
+      "contour": {
+        "action": "Лимит клиента в банке per_operation 4 000 ₽ (ПИ-8, PS-20); CART 4 500 ₽ в пределах INTENT; реквизит, пакет, авторизация продавца (Р56 п. 1)",
+        "expected": "ADP LIMIT_EXCEEDED (CLIENT) → operation.declined → STOPPED DECLINED_LIMIT_EXCEEDED, next NOTIFY_HUMAN; в вебхуке банка — client.limit_declined с reason CLIENT; повтора нет — одна выдача реквизита, без дробления",
+        "codes": ["LIMIT_EXCEEDED"]
+      }
     },
     {
       "id": "П17",
@@ -254,7 +269,12 @@
         "MANDATE_SCOPE"
       ],
       "norms": "A7",
-      "requirements": "Т10, Т16"
+      "requirements": "Т10, Т16",
+      "contour": {
+        "action": "Лимит клиента в банке merchant_categories — MCC пекарен из фактов витрин («мандат на хлеб»); SHOP-5003 (MCC 5732) в области INTENT; реквизит, пакет, авторизация продавца (Р56 п. 1, путь (а))",
+        "expected": "ADP MANDATE_SCOPE по MCC → operation.declined → STOPPED DECLINED_MANDATE_SCOPE, повтора нет. Самоостановка (продавец вне merchantScope INTENT — agent.refused MANDATE_OUT_OF_SCOPE до POST /pao/v1/mandates, Р56 п. 2) — модульный тест, сценарий по ней не засчитывается",
+        "codes": ["MANDATE_SCOPE"]
+      }
     },
     {
       "id": "П18",
@@ -346,7 +366,12 @@
         "IDEMPOTENCY_REQUIRED"
       ],
       "norms": "A1",
-      "requirements": "Т10"
+      "requirements": "Т10",
+      "contour": {
+        "action": "После успешной выдачи по CART — тот же POST /pao/v1/credentials, подписанный портом подписи агента, без Idempotency-Key (Р56 п. 1)",
+        "expected": "400 IDEMPOTENCY_REQUIRED; второго реквизита нет, остаток CART по verify прежний; клиент ПАО агента изменяющий запрос без ключа не отправляет",
+        "codes": ["IDEMPOTENCY_REQUIRED"]
+      }
     },
     {
       "id": "Д01",

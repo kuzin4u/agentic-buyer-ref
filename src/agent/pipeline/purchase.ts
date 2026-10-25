@@ -12,7 +12,7 @@ import { MandateRefused, type MandateClient } from "../mandates/index.js";
 import { chargedAmount, scopeNotice } from "../operations/notice.js";
 import { issuedByShell, spend } from "../policy/a5-issued.js";
 import { acceptedA5, cartTotal, classifyOffer, mayDraftCart, mayOrder, type CartPurchase, type HumanA5Decision, type OfferVerdict, type OrderDecision, type OrderNext } from "../policy/catalog.js";
-import { confirmThreshold, currencySupported, mandateRefusal, mayAuthorize, needsConfirmation, type PaymentDecision, type Thresholds } from "../policy/payment.js";
+import { confirmThreshold, currencySupported, mandateRefusal, mayAuthorize, mayCartMerchant, needsConfirmation, type PaymentDecision, type Thresholds } from "../policy/payment.js";
 import type { OrderPriceMismatches } from "../policy/order-mismatch.js";
 import type { SplitWindow } from "../policy/split.js";
 import type { LiveOfferSource } from "../ports/catalog.js";
@@ -53,7 +53,7 @@ export interface PipelineJournal extends PurchaseJournal {
       /** ворота: остатка Платформы по мандату не хватает на итог CART (Р38 п. 3, К4а) */
       | { at: string; kind: "agent.refused"; reason: "MANDATE_AMOUNT_LEFT_INSUFFICIENT"; mandate?: string }
       /** политика в воротах: verify CONFIRMED, но остаток 0 или в чужой валюте, продавец или валюта итога вне пределов
-       *  мандата (Р39 п. 1.1, 1.3; К2а) */
+       *  мандата (Р39 п. 1.1, 1.3; К2а); в cart() — продавец выбора вне области INTENT, до обращений (Р56 п. 2) */
       | { at: string; kind: "agent.refused"; reason: "MANDATE_OUT_OF_SCOPE"; mandate?: string }
       /** политика до стадий 4–5: итог не в RUB; доля в окне дробления (Р39 п. 1.4, п. 4) */
       | { at: string; kind: "agent.refused"; reason: "CURRENCY_NOT_SUPPORTED" | "SPLIT_WINDOW"; mandate?: string }
@@ -373,6 +373,9 @@ export class Purchase {
       });
       // количество и итог — до обращений: неверное предложение вызывающего, не решение политики (Р43 п. 3)
       if (cartTotal(offers.map((o, i) => ({ price: o.product.price, qty: choice.lines[i]!.qty }))) === null) this.#invalidQty(offers, choice);
+      // продавец выбора — в области INTENT, до обращений: действие вне мандата останавливает политика, а не контур (Р56 п. 2,
+      // Т16, инвариант 3)
+      this.#refuse(mayCartMerchant(intent, choice.merchantId));
       // показ — из своей выдачи: продавец, sku, цена и коды A5, к которым привязано решение человека (Р39 п. 5), и
       // покупка — корневой INTENT (Р40 п. 1)
       const verdicts = offers.map((o): Extract<OfferVerdict, { kind: "AVAILABLE" }> => ({ kind: "AVAILABLE", merchantId: o.merchantId, sku: o.sku, price: { ...o.product.price }, a5: [...o.a5] }));

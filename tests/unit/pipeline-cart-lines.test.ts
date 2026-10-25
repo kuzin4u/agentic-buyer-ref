@@ -140,6 +140,24 @@ describe("Р44 п. 1–3 — корзина из нескольких позиц
     expect(opsFrom(r, from)).toEqual([]);
   });
 
+  it("П17 (б), Р56 п. 2: продавец выбора вне merchantScope INTENT (позиция в контуре выдачи) — STOPPED MANDATE_OUT_OF_SCOPE по INTENT, до обращений к витрине и ПАО", async () => {
+    const r = await setup({ shops: [SHOP, { ...SHOP, merchantId: "shop_2" }] });
+    await signedIntent(r);
+    const intent = r.purchase.intentMandate!;
+    expect(intent.merchantScope).toEqual(["shop_1"]);
+    const zones = await r.purchase.search();
+    // поиск не меняется (Р56 п. 2, STATUS «Открыто» — к AG-16): товар продавца вне области INTENT в выдаче
+    expect(zones.contour.some((o) => o.merchantId === "shop_2" && o.sku === "tartine")).toBe(true);
+    const from = r.stand.stub.calls.length;
+    const choice: CartChoice = { merchantId: "shop_2", lines: [{ sku: "tartine", qty: 1 }], keyTermsShown: true };
+    await expect(r.purchase.cart(choice, { idempotencyKey: "idem-cart-1" })).rejects.toBeInstanceOf(PurchaseStopped);
+    expect(r.purchase.reason).toBe("MANDATE_OUT_OF_SCOPE");
+    expect(r.tail().filter((e) => e.kind === "agent.refused").map((e) => [e.reason, e.mandate])).toEqual([["MANDATE_OUT_OF_SCOPE", intent.id]]);
+    expect(r.live.calls).toEqual([]);
+    expect(r.shop.calls).toEqual([]);
+    expect(opsFrom(r, from)).toEqual([]);
+  });
+
   it("позиции одного продавца у двух витрин — STOPPED OFFER_NOT_IN_CONTOUR по позиции чужой витрины, до обращений (Р44 п. 1)", async () => {
     const other = { ...SHOP, feed: SHOP.feed.replace('<offer id="borodinsky"', '<offer id="rye"'), profile: bakery({ id: "massa-madre-2" }) };
     const r = await setup({ shops: [SHOP, other] });

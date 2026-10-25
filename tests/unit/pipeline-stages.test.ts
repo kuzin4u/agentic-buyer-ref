@@ -1572,19 +1572,20 @@ describe("политика до стадий 4–5 (Р39): отказ — agent.
     });
   }
 
-  it("продавец CART вне merchantScope INTENT — STOPPED MANDATE_OUT_OF_SCOPE после verify обоих уже перед заказом: заказа и реквизита нет (Р39 п. 1.3, Р44 п. 5)", async () => {
+  // Р56 п. 2: прежде (Р39 п. 1.3, Р44 п. 5) такой CART останавливали ворота перед заказом после verify обоих; теперь — cart()
+  // до проекта CART. Второй рубеж ворот (mayAuthorize) остаётся и проверяется модульно — payment-policy.test.ts.
+  it("продавец CART вне merchantScope INTENT — STOPPED MANDATE_OUT_OF_SCOPE в cart() до проекта CART: ни verify, ни CART, ни заказа (Р56 п. 2)", async () => {
     const r = await setup();
     await signedIntent(r, { ...INTENT, merchantScope: ["shop_2"] });
     const zones = await r.purchase.search();
-    await signedCart(r, zones.contour.find((o) => o.sku === "tartine")!);
     const intentId = r.purchase.intentMandate!.id;
-    const cartId = r.purchase.cartMandate!.id;
     const before = verified(r).length;
     const from = r.stand.stub.calls.length;
-    await expect(r.purchase.placeOrder({ idempotencyKey: "idem-order-1" })).rejects.toMatchObject({ code: "MANDATE_OUT_OF_SCOPE" });
+    await expect(r.purchase.cart(one(zones.contour.find((o) => o.sku === "tartine")!, 1), { idempotencyKey: "idem-cart-1" })).rejects.toMatchObject({ code: "MANDATE_OUT_OF_SCOPE" });
+    expect(r.purchase.cartMandate).toBeNull();
     expect(r.shop.calls).toEqual([]);
-    expect(verified(r).slice(before)).toEqual([intentId, cartId]);
-    expect(opsFrom(r, from)).toEqual([VERIFY, VERIFY]);
+    expect(verified(r).slice(before)).toEqual([]);
+    expect(opsFrom(r, from)).toEqual([]);
     expect(r.tail().slice(-2).map((e) => [e.kind, e.reason, e.mandate])).toEqual([
       ["agent.refused", "MANDATE_OUT_OF_SCOPE", intentId],
       ["purchase.stage", "MANDATE_OUT_OF_SCOPE", intentId],

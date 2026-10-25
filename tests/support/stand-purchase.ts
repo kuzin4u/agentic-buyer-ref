@@ -117,13 +117,15 @@ export interface StandPurchaseOptions {
   confirmationTimer?: (fn: () => void, ms: number) => () => void;
   /** ПОДМЕНА ДО PS-11: авторизация продавца доходит до ADP стенда копией сообщения (createContour, `adpUntilPs11`) */
   adpUntilPs11?: boolean;
+  /** эквайрер эмулятора без поддержки aoi (П14, Р56 п. 1) */
+  aoiSupport?: false;
   /** код остановки сделки по исключению шага — как у места сборки (`startFailureCode`, compose.ts); без него — UNKNOWN */
   failureCode?: (e: unknown) => DiagCode | null;
 }
 
 /** Контур со стендом и витринами после start(), покупка на адаптере витрин. Закрыть — `c.close()` у вызывающего. */
 export async function standPurchase(o: StandPurchaseOptions = {}) {
-  const c: Contour = await createContour({ pao: "stand", ...(o.now && { now: o.now }), ...(o.adpUntilPs11 && { adpUntilPs11: true }) });
+  const c: Contour = await createContour({ pao: "stand", ...(o.now && { now: o.now }), ...(o.adpUntilPs11 && { adpUntilPs11: true }), ...(o.aoiSupport === false && { aoiSupport: false as const }) });
   const self = await c.start();
   const { stand } = c;
   if (!stand) throw new Error("контур без стенда");

@@ -8,6 +8,7 @@ import type { FeedItem } from "../../src/agent/ports/events.js";
 import { DIAG } from "../../src/agent/compose.js";
 import { loadParams } from "../../src/shared/config.js";
 import { PlatformFailure, type Mandate, type Operation, type OperationRecord, type PlatformEventType } from "../../src/shared/domain.js";
+import { trackedSignal } from "../support/signal.js";
 
 const T0 = Date.parse("2026-10-23T12:00:00.000Z");
 const PARAMS = loadParams();
@@ -33,6 +34,8 @@ function clock() {
       timers.push(t);
       return () => void (t.live = false);
     },
+    /** таймеров, которые ещё сработают (не сняты и не сработали) */
+    live: () => timers.filter((t) => t.live).length,
     async advance(ms: number) {
       const until = now + ms;
       for (;;) {
@@ -154,6 +157,30 @@ describe("стадия 5: итог операции по событию и GET (
     v.ac.abort(new Error("стоп"));
     await tick();
     expect(v.outcome()).toBeInstanceOf(Error);
+  });
+
+  it("AG-12 ч. 3б (ревью КТ1 Р49 № 14 (в)): исход ожидания — событие, срок или прерывание — ни таймера срока, ни слушателя abort не остаётся", async () => {
+    const cases: [string, (s: ReturnType<typeof setup>, t: ReturnType<typeof trackedSignal>) => Promise<void>][] = [
+      ["событие", async (s) => (s.answers.set("op_1", record("AUTHORIZED")), await s.event("operation.authorized", "op_1"))],
+      ["срок", async (s) => await s.c.advance(DELAY_SEC * 1000)],
+      ["прерывание", async (_s, t) => (t.ac.abort(new Error("стоп")), await tick())],
+    ];
+    for (const [name, decide] of cases) {
+      const s = setup();
+      const t = trackedSignal();
+      const w = s.ops.expect(ORDER, CART);
+      const done = w.outcome(DELAY_SEC * 1000, t.signal).then(
+        (o) => o.kind,
+        () => "ERROR",
+      );
+      await tick();
+      // пока ждёт — один таймер срока и один слушатель abort
+      expect([s.c.live(), t.live()], name).toEqual([1, 1]);
+      await decide(s, t);
+      expect(await done, name).toBe(name === "событие" ? "OPERATION" : name === "срок" ? "NONE" : "ERROR");
+      expect([s.c.live(), t.live()], name).toEqual([0, 0]);
+      w.close();
+    }
   });
 
   it("операция другого заказа — operation.unclaimed; не этого агента (400) — operation.foreign; ожидающая не задета", async () => {

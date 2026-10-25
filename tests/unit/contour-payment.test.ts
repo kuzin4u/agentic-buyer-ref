@@ -7,6 +7,7 @@ import type { PaymentContext, ShopPaymentReply } from "../../src/agent/ports/ind
 import { MemoryJournal } from "../../src/agent/journal/index.js";
 import { loadParams } from "../../src/shared/config.js";
 import type { Mandate, Operation } from "../../src/shared/domain.js";
+import { trackedSignal } from "../support/signal.js";
 
 const PARAMS = loadParams();
 const TOTAL = { amount: 250000, currency: "RUB" };
@@ -14,7 +15,12 @@ const CART = { id: "m_cart", cart: { merchantId: "shop_1", lines: [], total: TOT
 const DECLINED: Operation = { opRef: "op_1", orderRef: "ORD-1", channel: "CARD", amount: TOTAL, merchantId: "shop_1", indicator: null, status: "DECLINED", declineReason: "LIMIT_EXCEEDED", fulfilment: null };
 
 /** Шаги с заглушками модулей: `outcome` — итог операции; `arrival` — появление запроса подтверждения (никогда — не задан). */
-function steps(o: { reply: ShopPaymentReply["status"]; outcome: (ms: number, signal: AbortSignal) => Promise<OperationOutcome>; arrival?: Promise<void>; lookup?: OperationOutcome }) {
+function steps(o: {
+  reply: ShopPaymentReply["status"];
+  outcome: (ms: number, signal: AbortSignal) => Promise<OperationOutcome>;
+  arrival?: Promise<void> | ((signal: AbortSignal) => Promise<void>);
+  lookup?: OperationOutcome;
+}) {
   const log: string[] = [];
   const wait: OperationWait = {
     outcome: (ms, signal) => (log.push(`outcome ${ms}`), o.outcome(ms, signal)),
@@ -29,6 +35,7 @@ function steps(o: { reply: ShopPaymentReply["status"]; outcome: (ms: number, sig
       mark: () => (log.push("mark"), 7),
       arrival: (signal, after) => {
         log.push(`arrival ${after}`);
+        if (typeof o.arrival === "function") return o.arrival(signal);
         return o.arrival ?? new Promise<void>((_, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true }));
       },
     },
@@ -96,6 +103,32 @@ describe("ContourPayment: итог стадии 5 (Р49 п. 5)", () => {
     await expect(a.p.authorize(ctx(), { idempotencyKey: "k" })).rejects.toMatchObject({ code: "CONFIRMATION_REQUIRED" });
     const b = steps({ reply: "PAID", outcome: async () => ({ kind: "MISMATCH" }) });
     await expect(b.p.authorize(ctx(), { idempotencyKey: "k" })).rejects.toMatchObject({ code: "OPERATION_REPLY_MISMATCH" });
+  });
+
+  it("AG-12 ч. 3б (ревью КТ1 Р49 № 14 (в)): гонка решена операцией или запросом подтверждения — проигравшая сторона снята прерыванием, на сигнале покупки слушателя не остаётся", async () => {
+    // ожидание операции и появление запроса честно слушают сигнал гонки — его прерывание и есть снятие проигравшей стороны
+    const honest = <T>(signal: AbortSignal, seen: string[], name: string) =>
+      new Promise<T>((_, reject) => signal.addEventListener("abort", () => (seen.push(name), reject(signal.reason)), { once: true }));
+    for (const winner of ["OPERATION", "CONFIRMATION"] as const) {
+      const seen: string[] = [];
+      let arrivalSignal: AbortSignal | undefined;
+      const { p } = steps({
+        reply: "DECLINED",
+        outcome: (_ms, signal) => (winner === "OPERATION" ? Promise.resolve({ kind: "OPERATION", operation: DECLINED }) : honest(signal, seen, "outcome")),
+        // при победе операции появление запроса должно быть снято
+        arrival: (signal) => ((arrivalSignal = signal), winner === "CONFIRMATION" ? Promise.resolve() : honest(signal, seen, "arrival")),
+      });
+      const t = trackedSignal();
+      const paying = p.authorize(ctx(t.signal), { idempotencyKey: "k" }).then(
+        () => "OPERATION",
+        (e: { code?: string }) => e.code,
+      );
+      expect(await paying, winner).toBe(winner === "OPERATION" ? "OPERATION" : "CONFIRMATION_REQUIRED");
+      await new Promise<void>((r) => setImmediate(r));
+      expect(seen, winner).toEqual([winner === "OPERATION" ? "arrival" : "outcome"]);
+      expect(arrivalSignal?.aborted, winner).toBe(true);
+      expect(t.live(), winner).toBe(0);
+    }
   });
 
   it("ревью КТ1 № 4: покупку остановили, пока продавец отвечал DECLINED, — гонка не ждёт срока, отказ с причиной остановки", async () => {

@@ -6,6 +6,7 @@ import { Confirmations, type ConfirmationOutcome } from "../../src/agent/confirm
 import type { FeedItem } from "../../src/agent/ports/events.js";
 import { loadParams } from "../../src/shared/config.js";
 import { PlatformFailure, type Confirmation, type PlatformEventType } from "../../src/shared/domain.js";
+import { trackedSignal } from "../support/signal.js";
 
 const ID1 = "cnf_11111111-1111-4111-8111-111111111111";
 const ID2 = "cnf_22222222-2222-4222-8222-222222222222";
@@ -599,5 +600,23 @@ describe("появление запроса для гонки стадии 5 (Р
     const later = s.conf.arrival(stop.signal, s.conf.mark());
     stop.abort(new Error("стоп"));
     await expect(later).rejects.toThrow("стоп");
+  });
+
+  it("AG-12 ч. 3б (ревью КТ1 Р49 № 14 (в)): появление решено — запросом или прерыванием — слушателя abort на сигнале не остаётся", async () => {
+    const s = setup();
+    const t = trackedSignal();
+    const waiting = s.conf.arrival(t.signal, s.conf.mark());
+    expect(t.live()).toBe(1);
+    s.answers.set(ID1, confirmation("PENDING"));
+    await s.event("confirmation.required", ID1);
+    await waiting;
+    expect(t.live()).toBe(0);
+    // проигравшая сторона гонки: снята прерыванием сигнала гонки
+    const u = trackedSignal();
+    const lost = s.conf.arrival(u.signal, s.conf.mark()).catch(() => "ABORTED");
+    expect(u.live()).toBe(1);
+    u.ac.abort(new Error("гонка стадии 5 решена"));
+    expect(await lost).toBe("ABORTED");
+    expect(u.live()).toBe(0);
   });
 });

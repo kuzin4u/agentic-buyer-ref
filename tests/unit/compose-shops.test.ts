@@ -11,11 +11,15 @@ import { AGENT, PaoStand } from "../support/pao-stand.js";
 
 let stand: PaoStand | undefined;
 afterEach(async () => {
+  // нарушений схемы ПАО нет (Р45 ревью К3 № 7; AG-12 ч. 3б)
+  expect(stand?.stub.violations ?? []).toEqual([]);
   await stand?.close();
   stand = undefined;
 });
 
 const KEYID = /;keyid="([^"]+)"/;
+/** Полный журнал обращений к PaoStub с номера `from`, без чтения ленты (Р45 ревью К3 № 7, Р49 ревью КТ1 № 14 (в)). */
+const opsFrom = (s: PaoStand, from: number) => s.stub.calls.slice(from).map((c) => c.op).filter((op) => op !== "GET /pao/v1/events");
 
 /** Витрина-заглушка: пустой список; `seen` — заголовки ушедших обращений. */
 function vitrine() {
@@ -76,6 +80,7 @@ describe("AgentCore.payment (Р45 п. 6)", () => {
     stand = s;
     const { core, journal } = await coreOn(s);
     await core.start();
+    const from = s.stub.calls.length;
     const sent: { shopId: string; orderId: string; cartMandateId: string; body: unknown }[] = [];
     const steps = core.payment({
       pay: async (req) => {
@@ -99,6 +104,8 @@ describe("AgentCore.payment (Р45 п. 6)", () => {
     ]);
     expect(journal.entries.filter((e) => e.kind === "pao.call" && e.method === "POST /pao/v1/credentials").map((e) => [e.agent, e.result, e.mandate])).toEqual([[AGENT, "ok", "m_cart"]]);
     expect(JSON.stringify(journal.entries)).not.toMatch(/tok_ref_1|cg_1/);
+    // полный журнал: выдача и один GET операции по событию — без лишних GET /pao/v1/operations
+    expect(opsFrom(s, from)).toEqual(["POST /pao/v1/credentials", "GET /pao/v1/operations/{op_ref}"]);
   });
 
   it("связка ядра (Р49 п. 4, 6): операция по заказу с чужим продавцом — OPERATION_REPLY_MISMATCH; расчёт — GET по op_ref, SETTLED с записью об исполнении", async () => {
@@ -126,6 +133,7 @@ describe("AgentCore.payment (Р45 п. 6)", () => {
     stand = s;
     const { core, journal } = await coreOn(s);
     await core.start();
+    const from = s.stub.calls.length;
     const steps = core.payment({ pay: async () => ({ status: "PAID" }) });
     const total = { amount: 250000, currency: "RUB" };
     const cart = { id: "m_cart", cart: { merchantId: "shop_1", lines: [], total } } as unknown as Mandate;
@@ -138,6 +146,8 @@ describe("AgentCore.payment (Р45 п. 6)", () => {
     const authorized = { opRef: "op_2", orderRef: "ORD-2", channel: "CARD" as const, amount: total, merchantId: "shop_1", indicator: { agentCode: AGENT, mandateId: "m_cart" }, status: "AUTHORIZED" as const, declineReason: null, fulfilment: null };
     await expect(steps.settle(authorized)).resolves.toMatchObject({ status: "SETTLED", fulfilment: { finalAmount: total, spentPosition: total, scopeCheck: "WITHIN_LIMITS" } });
     expect(journal.entries.filter((e) => e.kind === "operation.settled").map((e) => [e.ref, e.detail])).toEqual([["op_2", "WITHIN_LIMITS"]]);
+    // полный журнал: расхождение — без поиска по CART и без второй выдачи; расчёт — один GET (сразу SETTLED)
+    expect(opsFrom(s, from)).toEqual(["POST /pao/v1/credentials", "GET /pao/v1/operations/{op_ref}", "GET /pao/v1/operations/{op_ref}"]);
   });
 
   it("ответ продавца DECLINED и запрос подтверждения раньше операции — CONFIRMATION_REQUIRED, стадия 4 (Р47 п. 4, Р49 п. 5); confirm ждёт модуль подтверждений ядра и прерывается остановкой", async () => {
@@ -163,6 +173,7 @@ describe("AgentCore.payment (Р45 п. 6)", () => {
     stand = s;
     const { core } = await coreOn(s);
     await core.start();
+    const from = s.stub.calls.length;
     const steps = core.payment({ pay: async () => ({ status: "DECLINED" }) });
     const total = { amount: 250000, currency: "RUB" };
     const cart = { id: "m_cart", cart: { merchantId: "shop_1", lines: [], total } } as unknown as Mandate;
@@ -172,6 +183,8 @@ describe("AgentCore.payment (Р45 п. 6)", () => {
     const waiting = steps.confirm(ctx, () => {}, ac.signal);
     ac.abort(new Error("покупка остановлена"));
     await expect(waiting).rejects.toThrow("покупка остановлена");
+    // полный журнал: гонка решена запросом подтверждения — GET операций нет, поиска по CART нет
+    expect(opsFrom(s, from)).toEqual(["POST /pao/v1/credentials", "GET /pao/v1/confirmations/{id}"]);
   });
 
   it("связка ядра (Р47 п. 3): confirmation.required по ленте ядра → GET → REJECTED — исход confirm; уведомления на REJECTED нет", async () => {

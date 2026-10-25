@@ -428,13 +428,36 @@ describe("знак готовности продавца по ПАО (Р53)", ()
   it("merchant_id не по маске — без обращения к Платформе, знак не проверен (Р53 п. 2)", async () => {
     const { a, journal, pao } = adapter({});
     expect(await a.readiness("MER/../x")).toEqual({ unverified: "PATTERN" });
-    // маска SHOP_ID — до 64 знаков (строже 128 у Платформы, нюанс К2.1): 65 — уже без обращения
-    expect(await a.readiness("M".repeat(65))).toEqual({ unverified: "PATTERN" });
+    // маска MERCHANT_ID — до 128 знаков, как у ПАО (Р54 п. 1): 129 — уже без обращения
+    expect(await a.readiness("M".repeat(129))).toEqual({ unverified: "PATTERN" });
     expect(pao.seen).toEqual([]);
     expect(readiness(journal)).toEqual([
       ["GET /pao/v1/merchants/{merchant_id}/readiness", undefined, "refused", "PATTERN"],
       ["GET /pao/v1/merchants/{merchant_id}/readiness", undefined, "refused", "PATTERN"],
     ]);
+  });
+
+  it("merchant_id из 128 знаков — знак запрашивается, в журнале — код продавца (Р54 п. 1, № 46)", async () => {
+    const id = "M".repeat(128);
+    const { a, journal, pao } = adapter({}, {}, { [id]: [READY(id)] });
+    expect(await a.readiness(id)).toEqual({ status: "ACTIVE" });
+    expect(pao.seen.map((s) => s.path)).toEqual([`/pao/v1/merchants/${id}/readiness`]);
+    expect(readiness(journal)).toEqual([["GET /pao/v1/merchants/{merchant_id}/readiness", id, "ok", "ACTIVE"]]);
+  });
+
+  it("через поиск: merchant_id 128 знаков — зона контура по знаку; 129 — запись списка не по маске, витрина недоступна без знака и каталога (Р54 п. 1)", async () => {
+    const long = "M".repeat(128);
+    const { a, seen, pao } = adapter(
+      { ...LIST(shop("S1", { merchant_id: long }), shop("S2", { merchant_id: "M".repeat(129) })), ...catalog("S1", ok(ITEM)), ...catalog("S2", ok(ITEM)) },
+      {},
+      { [long]: [READY(long)] },
+    );
+    const out = await a.search();
+    expect(out).toHaveLength(2);
+    expect(out[0]).toMatchObject({ merchantId: long, inContour: true });
+    expect(out[1]).toEqual({ unavailable: { detail: "BAD_RESPONSE" } });
+    expect(pao.seen.map((s) => s.path)).toEqual([`/pao/v1/merchants/${long}/readiness`]);
+    expect(seen.map((s) => s.path)).toEqual(["/v1/shops", "/v1/shops/S1/catalog"]);
   });
 
   it("403 AGENT_SUSPENDED — остановка подписи и PlatformFailure тем же кодом; к следующим витринам не обращаются (Р53 п. 5)", async () => {

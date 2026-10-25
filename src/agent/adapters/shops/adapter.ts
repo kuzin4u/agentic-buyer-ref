@@ -34,7 +34,7 @@ import {
 import { openPackage } from "../../payment-package/package.js";
 import type { StandParams } from "../../../shared/config.js";
 import { PlatformFailure, type FailureCode } from "../../../shared/domain.js";
-import { SAFE_ID, SHOP_ID } from "../../../shared/ids.js";
+import { MERCHANT_ID, SAFE_ID, SHOP_ID } from "../../../shared/ids.js";
 import { ORDER_REF } from "../../payment-package/order-ref.js";
 import { MERCHANT_RETRYABLE, isMerchantCode } from "./codes.js";
 
@@ -70,6 +70,8 @@ export interface ShopsAdapterOptions {
 
 /** Идентификатор от витрины — в путь и в журнал только по маске (как sku у конвейера, Р38 п. 5). */
 const Id = z.string().regex(SHOP_ID);
+/** Код продавца — до 128 знаков, как у ПАО (Р54 п. 1). */
+const MerchantId = z.string().regex(MERCHANT_ID);
 /** Номер заказа продавца — по маске ссылки агента, одно правило с Платформой (128; Р46 п. 1, выбор 1а). */
 const OrderId = z.string().regex(ORDER_REF);
 /** Знаков после запятой у валюты цены: таблицы в ядре нет (К9); витрина эмулятора — только RUB (ISO 4217). */
@@ -78,7 +80,7 @@ const EXPONENT = { RUB: 2 } as const;
 /** Список витрин — массив; каждая запись разбирается отдельно (ревью КТ1 п. 1): зона и знак не по схеме — зона рынка,
  *  id или код продавца не по маске — витрина недоступна; отказ стадии — только если списка нет целиком. */
 const Shops = z.object({ shops: z.array(z.unknown()) });
-const ShopEntry = z.object({ id: Id, merchant_id: Id });
+const ShopEntry = z.object({ id: Id, merchant_id: MerchantId });
 const Zone = z.object({ zone: z.literal("CONTOUR"), readiness_mark: z.literal(true) });
 const Catalog = z.object({ items: z.array(z.unknown()) });
 const Item = z.object({
@@ -246,7 +248,7 @@ export class ShopsAdapter implements OfferSource, LiveOfferSource, ShopPort, Sho
    *  отказ (400, 414, 503 …), ответ не по схеме, чужой merchant_id, merchant_id не по маске (без обращения) — «знак не
    *  проверен» (Р53 п. 4). */
   async readiness(merchantId: string, signal?: AbortSignal): Promise<Readiness> {
-    if (!SHOP_ID.test(merchantId)) {
+    if (!MERCHANT_ID.test(merchantId)) {
       this.#record("shop.readiness", undefined, "PATTERN", "refused");
       return { unverified: "PATTERN" };
     }
@@ -471,7 +473,7 @@ export class ShopsAdapter implements OfferSource, LiveOfferSource, ShopPort, Sho
     }
   }
 
-  /** shop.readiness и shop.readiness_mismatch (Р53): merchant — код продавца по маске, detail — значение перечня; тела
+  /** shop.readiness и shop.readiness_mismatch (Р53): merchant — код продавца по маске `MERCHANT_ID` (Р54 п. 1), detail — значение перечня; тела
    *  ответа нет. */
   #record(kind: "shop.readiness" | "shop.readiness_mismatch", merchant: string | undefined, detail: string | undefined, result?: JournalResult, reason?: "SHOP_SEARCH_DEADLINE"): void {
     this.o.journal.record({
@@ -479,7 +481,7 @@ export class ShopsAdapter implements OfferSource, LiveOfferSource, ShopPort, Sho
       kind,
       ...(kind === "shop.readiness" && { method: READINESS, attempt: 1 }),
       ...(result !== undefined && { result }),
-      ...(merchant !== undefined && SHOP_ID.test(merchant) && { merchant }),
+      ...(merchant !== undefined && MERCHANT_ID.test(merchant) && { merchant }),
       ...(detail !== undefined && { detail }),
       ...(reason !== undefined && { reason }),
     });

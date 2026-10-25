@@ -85,8 +85,9 @@ const ShopFacts = z.object({
   returns: z.object({ days: z.number().int().nonnegative(), text: z.string() }),
 });
 const Catalog = z.object({ items: z.array(z.unknown()) });
+/** Вариант доставки: `method` — строкой, перечень проверяет ядро (`BAD_METHOD`, как у фида; ревью КТ1 № 1). */
 const Delivery = z.object({
-  method: z.enum(["DELIVERY", "PICKUP"]),
+  method: z.string(),
   region: z.string().optional(),
   min_days: z.number().int().nonnegative(),
   max_days: z.number().int().nonnegative(),
@@ -160,12 +161,14 @@ const pause = (ms: number, signal?: AbortSignal): Promise<void> =>
     signal?.addEventListener("abort", stop, { once: true });
   });
 
-/** Карточка не по схеме (Р42 п. 6): поля нет — REQUIRED, валюта не из таблицы — BAD_CURRENCY, иначе BAD_TYPE. */
+/** Карточка или факты магазина не по схеме (Р42 п. 6, Р54 п. 4) — по полному пути каждой ошибки, на любой глубине
+ *  (ревью КТ1 reviewer № 1): поля нет (или `null`) — REQUIRED, иначе последний сегмент `currency` — BAD_CURRENCY, иначе
+ *  BAD_TYPE. */
 function dropCode(raw: unknown, issues: z.core.$ZodIssue[]): CatalogIssueCode {
-  const rec = typeof raw === "object" && raw !== null ? (raw as Record<string, unknown>) : {};
-  const fields = issues.map((i) => i.path[0]);
-  if (fields.some((f) => typeof f !== "string" || rec[f] === undefined)) return "REQUIRED";
-  return fields.includes("currency") ? "BAD_CURRENCY" : "BAD_TYPE";
+  const at = (path: PropertyKey[]): unknown =>
+    path.reduce<unknown>((v, k) => (typeof v === "object" && v !== null ? (v as Record<PropertyKey, unknown>)[k] : undefined), raw);
+  if (issues.some((i) => at(i.path) == null)) return "REQUIRED";
+  return issues.some((i) => i.path.at(-1) === "currency") ? "BAD_CURRENCY" : "BAD_TYPE";
 }
 
 /** Общий срок стадии поиска (Р44 п. 6). */
@@ -243,12 +246,14 @@ export class ShopsAdapter implements OfferSource, LiveOfferSource, ShopPort, Sho
         if (i.success) items.push(i.data);
         else dropped.push(dropCode(raw, i.error.issues));
       }
-      // запись не стирается: sku, найденный у другой витрины в любой выдаче, становится неоднозначным навсегда
-      for (const i of items) this.#shopOf.set(i.sku, this.#shopOf.has(i.sku) && this.#shopOf.get(i.sku) !== s.id ? null : s.id);
+      const facts = this.#facts(s.id, entry, items, dropped);
+      // запись не стирается: sku, найденный у другой витрины в любой выдаче, становится неоднозначным навсегда; магазин,
+      // исключённый по фактам, sku не регистрирует — иначе он делал бы неоднозначным sku исправной витрины (ревью КТ1 № 3)
+      if (facts.shop !== null) for (const i of items) this.#shopOf.set(i.sku, this.#shopOf.has(i.sku) && this.#shopOf.get(i.sku) !== s.id ? null : s.id);
       out.push({
         merchantId: s.merchant_id,
         inContour,
-        facts: this.#facts(s.id, entry, items, dropped),
+        facts,
         ...(!inContour && { link: `${this.o.baseUrl}/v1/shops/${s.id}/catalog` }),
       });
     }
@@ -388,7 +393,8 @@ export class ShopsAdapter implements OfferSource, LiveOfferSource, ShopPort, Sho
         price: { amount: i.price, currency: i.currency },
         availability: { inStock: i.in_stock },
         delivery: i.delivery_options.map((d) => ({
-          method: d.method,
+          // перечень способов — у ядра: значение вне перечня даёт BAD_METHOD в validateProduct (как у фида)
+          method: d.method as CatalogProduct["delivery"][number]["method"],
           ...(d.region !== undefined && { region: d.region }),
           minDays: d.min_days,
           maxDays: d.max_days,

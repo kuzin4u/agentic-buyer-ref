@@ -21,6 +21,12 @@ import { createContour, type Contour } from "./contour.js";
 import { payments } from "./shop.js";
 import { standShops } from "./stand-shop.js";
 
+/** Регион человека — общий регион доставки всех полных витрин эмулятора (с фактами магазина; у неполной `returns` нет), в
+ *  их системе кодов — ISO 3166-2 (Р54 нюанс К3.1; ревью КТ1 reviewer № 5): из фикстур, не литералом. */
+const FULL_SHOPS = MERCHANT_FIXTURES.filter((f) => f.returns !== undefined);
+export const STAND_REGION = FULL_SHOPS[0]?.delivery_regions.find((r) => FULL_SHOPS.every((f) => f.delivery_regions.includes(r)));
+if (STAND_REGION === undefined) throw new Error("у полных витрин эмулятора нет общего региона доставки");
+
 /** Стенд в процессе теста под параллельной нагрузкой прогона бывает медленнее 5 с (нюанс К2.3 Р38). */
 export const STAND_TIMEOUT_MS = 30_000;
 
@@ -121,7 +127,7 @@ export async function standPurchase(o: StandPurchaseOptions = {}) {
       journal: c.journal,
       admission: () => c.admission(),
       // регион человека — в кодах регионов доставки витрин: у эмулятора ISO 3166-2 (#45, Р54 нюанс К3.1)
-      region: "RU-MOW",
+      region: STAND_REGION,
       ...(o.notify !== undefined && { notify: o.notify }),
       ...(o.failureCode !== undefined && { failureCode: o.failureCode }),
     });

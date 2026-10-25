@@ -195,8 +195,13 @@ describe("адаптер витрин (Р42)", () => {
           { ...ITEM, sku: "B4", price: "390" },
           { ...noDelivery, sku: "B5" },
           { ...noUpdated, sku: "B6" },
-          { ...ITEM, sku: "B7", delivery_options: [{ method: "COURIER", min_days: 1, max_days: 2, cost: 0, currency: "RUB" }] },
           { ...ITEM, sku: "B8", attributes: { вес: 500 } },
+          // вложенные поля — код по полному пути (ревью КТ1 reviewer № 1)
+          { ...ITEM, sku: "B9", delivery_options: [without(ITEM.delivery_options[0]!, "min_days")] },
+          { ...ITEM, sku: "B10", delivery_options: [{ ...ITEM.delivery_options[0]!, currency: "USD" }] },
+          { ...ITEM, sku: "B11", delivery_options: [without(ITEM.delivery_options[0]!, "currency")] },
+          { ...ITEM, sku: "B12", delivery_options: [{ ...ITEM.delivery_options[0]!, max_days: "2" }] },
+          { ...ITEM, sku: "B13", price: null },
         ),
       ),
       ...catalog("S2", ok(ITEM)),
@@ -204,8 +209,16 @@ describe("адаптер витрин (Р42)", () => {
     const [s1] = await a.search();
     expect("unavailable" in s1! ? null : [s1!.facts.products.map((p) => p.product.sku), s1!.facts.dropped]).toEqual([
       ["BRD-1"],
-      ["REQUIRED", "BAD_CURRENCY", "BAD_TYPE", "REQUIRED", "REQUIRED", "BAD_TYPE", "BAD_TYPE"],
+      ["REQUIRED", "BAD_CURRENCY", "BAD_TYPE", "REQUIRED", "REQUIRED", "BAD_TYPE", "REQUIRED", "BAD_CURRENCY", "REQUIRED", "BAD_TYPE", "REQUIRED"],
     ]);
+  });
+
+  it("способ доставки вне перечня — перечень у ядра: карточка переведена, ядро даёт BAD_METHOD, как у фида (ревью КТ1 reviewer № 1)", async () => {
+    const { a } = adapter({ ...LIST(shop("S1")), ...catalog("S1", ok({ ...ITEM, delivery_options: [{ ...ITEM.delivery_options[0]!, method: "COURIER" }] })) });
+    const [s] = await a.search();
+    if (s === undefined || "unavailable" in s) throw new Error("витрина недоступна");
+    expect(s.facts.dropped).toEqual([]);
+    expect(s.facts.products.map((p) => [p.product.sku, p.issues])).toEqual([["BRD-1", ["BAD_METHOD"]]]);
   });
 
   it("факты витрины → модель К8 (Р54 п. 4): магазин — из записи списка, товар — доставка, время обновления, GTIN, бренд, модель, атрибуты; модель ядра без замечаний", async () => {
@@ -240,17 +253,49 @@ describe("адаптер витрин (Р42)", () => {
   it("факты магазина не по схеме — магазин исключён целиком одним кодом, по карточкам записей нет (витрина INCOMPLETE, Р54 п. 5): нет returns — REQUIRED, не тот тип — BAD_TYPE", async () => {
     const noReturns = without(FACTS, "returns");
     const { a, seen } = adapter({
-      ...LIST({ id: "S1", merchant_id: "MER-S1", zone: "CONTOUR", readiness_mark: true, ...noReturns }, shop("S2", { payment_methods: "card" })),
+      ...LIST(
+        { id: "S1", merchant_id: "MER-S1", zone: "CONTOUR", readiness_mark: true, ...noReturns },
+        shop("S2", { payment_methods: "card" }),
+        // вложенные поля и null — код по полному пути (ревью КТ1 reviewer № 1)
+        shop("S3", { returns: { text: FACTS.returns.text } }),
+        shop("S4", { returns: null }),
+        shop("S5", { returns: { ...FACTS.returns, days: "0" } }),
+      ),
       ...catalog("S1", ok(ITEM, { sku: "B2", title: "Хлеб дня" })),
       ...catalog("S2", ok(ITEM)),
+      ...catalog("S3", ok(ITEM)),
+      ...catalog("S4", ok(ITEM)),
+      ...catalog("S5", ok(ITEM)),
     });
     const out = await a.search();
-    expect(out.map((s) => ("unavailable" in s ? null : s.facts))).toEqual([
-      { shop: null, shopIssues: ["REQUIRED"], products: [], dropped: [] },
-      { shop: null, shopIssues: ["BAD_TYPE"], products: [], dropped: [] },
-    ]);
+    expect(out.map((s) => ("unavailable" in s ? null : s.facts))).toEqual(
+      ["REQUIRED", "BAD_TYPE", "REQUIRED", "REQUIRED", "BAD_TYPE"].map((code) => ({ shop: null, shopIssues: [code], products: [], dropped: [] })),
+    );
     // каталог по-прежнему запрашивается
-    expect(seen.map((s) => s.path)).toEqual(["/v1/shops", "/v1/shops/S1/catalog", "/v1/shops/S2/catalog"]);
+    expect(seen.map((s) => s.path)).toEqual(["/v1/shops", ...["S1", "S2", "S3", "S4", "S5"].map((id) => `/v1/shops/${id}/catalog`)]);
+  });
+
+  it("магазин, исключённый по фактам, sku не регистрирует: тот же sku у исправной витрины проходит живую проверку (ревью КТ1 reviewer № 3)", async () => {
+    const { a, seen } = adapter({
+      ...LIST(shop("S1", { returns: null }), shop("S2")),
+      ...catalog("S1", ok(ITEM)),
+      ...catalog("S2", ok(ITEM)),
+    });
+    await a.search();
+    const before = seen.length;
+    const offer = await a.fetch({ sku: ITEM.sku, quantity: 1 }, new AbortController().signal);
+    expect(offer).toMatchObject({ sku: ITEM.sku, price: { amount: ITEM.price, currency: "RUB" } });
+    expect(seen.slice(before).map((s) => s.path)).toEqual(["/v1/shops/S2/catalog"]);
+  });
+
+  it("живая проверка разбирает только цену и наличие: карточка без delivery_options и updated_at — цена и наличие, не отказ (Р32 п. 3, нюанс К3.1 Р54; ревью КТ1 reviewer № 2)", async () => {
+    const bare = without(ITEM, "delivery_options", "updated_at");
+    const { a } = adapter({ ...LIST(shop("S1")), ...catalog("S1", ok(ITEM), ok(bare)) });
+    const [s] = await a.search();
+    if (s === undefined || "unavailable" in s) throw new Error("витрина недоступна");
+    expect(s.facts.products.map((p) => p.product.sku)).toEqual([ITEM.sku]);
+    const offer = await a.fetch({ sku: ITEM.sku, quantity: 1 }, new AbortController().signal);
+    expect(offer).toMatchObject({ sku: ITEM.sku, price: { amount: ITEM.price, currency: "RUB" }, availability: { inStock: true } });
   });
 
   it("GTIN-13 с верной суммой Луна — данные модели, не номер карты: карточка проходит модель, GTIN в журнал не пишется (Р54 п. 4, нюанс #70)", async () => {

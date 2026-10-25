@@ -118,6 +118,35 @@ describe("конвейер на стенде Платформы (Р38 п. 8, К6
     expect(calls.filter((x) => x.target === "merchants" && x.route.endsWith("/orders")).map((x) => x.kid)).toEqual([kid]);
   });
 
+  it.each(["RESET", "GARBLED"] as const)(
+    "обрыв ответа на заказ (%s) — сверка чтением: заказ стенда, ORDERED, сумма = CART, второго POST нет (Р55; ревью КТ1 № 8)",
+    async (failure) => {
+      const r = await run();
+      const start = r.c.calls().length;
+      // заказ витрина записывает до обрыва (передача #70 / #62): сверка находит его, нового заказа нет
+      r.c.merchants!.emulator.failOrderReply(failure);
+      const { cart, order } = await ordered(r);
+      r.c.merchants!.emulator.failOrderReply(null);
+      expect(r.purchase.state).toBe("ORDERED");
+      // найденный заказ прошёл сверку конвейера с CART (Т6) — как ответ POST
+      expect(order.total).toEqual(cart.cart!.total);
+      expect(order.orderId).toMatch(/^ORD-/);
+      const orders = r.c
+        .calls()
+        .slice(start)
+        .filter((x) => x.target === "merchants" && x.route.includes("/orders"))
+        .map((x) => `${x.route.replace(NORMAL.id, "{shop}")} ${x.status}`);
+      // RESET — соединение закрыто без ответа: в журнале стенда записи POST нет; GARBLED — 201 с обрезанным телом
+      expect(orders).toEqual([...(failure === "GARBLED" ? ["POST /v1/shops/{shop}/orders 201"] : []), "GET /v1/shops/{shop}/orders 200"]);
+      expect(
+        r.c.journal.entries.filter((e) => e.kind === "shop.call" && e.method?.endsWith("/orders")).map((e) => [e.method, e.attempt, e.result, e.detail, e.mandate]),
+      ).toEqual([
+        ["POST /v1/shops/{id}/orders", 1, "unknown", failure === "RESET" ? "NO_RESPONSE" : "BAD_RESPONSE", cart.id],
+        ["GET /v1/shops/{id}/orders", 1, "ok", undefined, cart.id],
+      ]);
+    },
+  );
+
   it("INTENT отказан (relinquish) на стенде после поиска, события ещё нет — verify OUT_OF_SCOPE, к витринам ни одного обращения (П05, Р43 п. 1)", async () => {
     const r = await run();
     const intent = await r.purchase.intent({ ...INTENT, merchantScope: [NORMAL.merchant_id] }, { idempotencyKey: "idem-intent-stand" });

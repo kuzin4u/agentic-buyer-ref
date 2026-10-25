@@ -1,10 +1,12 @@
 // Адаптер витрин продавцов (Р42): порты стадий 2–3 `OfferSource`, `LiveOfferSource`, `ShopPort` по API витрин эмулятора
-// (К6, Р26): `GET /v1/shops`, `GET /v1/shops/{id}/catalog`, `POST /v1/shops/{id}/orders`; пакет агентской оплаты —
-// `POST /v1/shops/{id}/orders/{order_id}/payment` (Р45 п. 4).
-// Каждое обращение подписано портом подписи места сборки (A2 п. 5.1, Т4); подпись остановлена — исключение порта, обращения
-// нет (инвариант 4). Ответ витрины — данные: берутся только поля схемы, текст описания — только в `description` для
-// сверки с ценой (инвариант 5, Т5а). Отказ витрины — без обходов: ни без подписи, ни другим ключом; повтор — только
-// `GET` с повторяемым кодом, один раз, тот же запрос с новой подписью (витрина отклоняет повторный x-nonce).
+// (К6, Р26): `GET /v1/shops`, `GET /v1/shops/{id}/catalog`, `POST /v1/shops/{id}/orders`, чтение заказов для сверки —
+// `GET /v1/shops/{id}/orders?cart_mandate_id` (Р55); пакет агентской оплаты — `POST /v1/shops/{id}/orders/{order_id}/payment`
+// (Р45 п. 4).
+// Каждое обращение подписано портом подписи места сборки (A2 п. 5.1, Т4), строка запроса — тоже; подпись остановлена —
+// исключение порта, обращения нет (инвариант 4). Ответ витрины — данные: берутся только поля схемы, текст описания —
+// только в `description` для сверки с ценой (инвариант 5, Т5а). Отказ витрины — без обходов: ни без подписи, ни другим
+// ключом; повтор — только `GET` с повторяемым кодом, один раз, тот же запрос с новой подписью (витрина отклоняет повторный
+// x-nonce). Исключение — заказ: после неизвестного исхода и чтения «заказа нет» — один новый POST (Р55 п. 4).
 // Факты модели каталога (К8) — из витрины (Р54 п. 4, kuzin4u/agentic-ps-platform#45): магазин — из записи списка (ИНН,
 // MCC, оплата, регионы, возврат), товар — доставка, время обновления, GTIN, бренд, модель, атрибуты; перевод snake_case в
 // модель — здесь, проверки значений — ядро (`validateShop` / `validateProduct`). Факты магазина не по схеме — магазин
@@ -125,8 +127,22 @@ type ShopItem = z.infer<typeof Item>;
 const Order = z.object({ id: OrderId, total: z.number().int().nonnegative(), currency: z.enum(Object.keys(EXPONENT) as [keyof typeof EXPONENT]) });
 /** Ответ на оплату — заказ продавца: статус после авторизации у эквайрера (слова продавца, не итог — инвариант 8). */
 const Paid = z.object({ id: OrderId, status: z.enum(["PAID", "DECLINED", "REJECTED"]) });
+/** Чтение заказов по мандату корзины (Р55 п. 3): заказ — со статусом и мандатом корзины; хоть одна запись не по схеме —
+ *  ответ не по схеме целиком. */
+const Orders = z.object({
+  orders: z.array(Order.extend({ cart_mandate_id: z.string(), status: z.enum(["CREATED", "PAYING", "PAID", "DECLINED", "REJECTED"]) })),
+});
+/** POST заказа — не больше двух: второй только после чтения «заказа нет» (Р55 п. 4, инвариант 9). */
+const ORDER_POSTS = 2;
+/** Чтение по схеме, но заказа для продолжения нет (Р55, ревью КТ1 № 7): заказов больше одного, мандат не тот, не CREATED. */
+type OrderMiss = "MULTIPLE" | "FOREIGN_MANDATE" | "NOT_CREATED";
 
-type Method = "GET /v1/shops" | "GET /v1/shops/{id}/catalog" | "POST /v1/shops/{id}/orders" | "POST /v1/shops/{id}/orders/{order_id}/payment";
+type Method =
+  | "GET /v1/shops"
+  | "GET /v1/shops/{id}/catalog"
+  | "POST /v1/shops/{id}/orders"
+  | "GET /v1/shops/{id}/orders"
+  | "POST /v1/shops/{id}/orders/{order_id}/payment";
 
 /** Путь знака готовности (Р53 п. 1): в YAML ПАО 1.4.0 его нет — описан вручную, с ПАО 1.5.0 — из YAML (#37 платформы). */
 const READINESS = "GET /pao/v1/merchants/{merchant_id}/readiness";
@@ -333,27 +349,61 @@ export class ShopsAdapter implements OfferSource, LiveOfferSource, ShopPort, Sho
     return { sku: i.sku, price: { amount: i.price, currency: i.currency }, availability: { inStock: i.in_stock }, checkedAt: catalog.body.responded_at };
   }
 
-  /** Стадия 3: заказ по мандату корзины; не повторяется никогда (у витрины нет ключа идемпотентности заказа, инвариант 9).
-   *  Отказ витрины — SHOP_ORDER_REFUSED; нет ответа в срок или ответ не по схеме — SHOP_ORDER_STATE_UNKNOWN. */
+  /** Стадия 3: заказ по мандату корзины. У витрины нет ключа идемпотентности заказа: исход POST неизвестен (нет ответа в
+   *  срок, ответ не по схеме) — сначала чтение заказов по мандату корзины (Р55): один заказ CREATED — он; пусто — один
+   *  новый POST новой подписью и nonce (инвариант 9), третьего нет; иначе — SHOP_ORDER_STATE_UNKNOWN. Отказ витрины —
+   *  SHOP_ORDER_REFUSED без чтения. */
   async order(req: ShopOrderRequest): Promise<ShopOrder> {
-    const method: Method = "POST /v1/shops/{id}/orders";
     if (!SHOP_ID.test(req.shopId)) throw new Error("id витрины не по маске");
+    for (let attempt = 1; ; attempt++) {
+      const placed = await this.#place(req, attempt);
+      if (placed !== null) return placed;
+      const found = await this.#reconcile(req);
+      if (found !== null) return found;
+      if (attempt >= ORDER_POSTS) throw new ShopFailure("SHOP_ORDER_STATE_UNKNOWN");
+    }
+  }
+
+  /** POST заказа: ответ по схеме — заказ; отказ витрины — SHOP_ORDER_REFUSED; исход неизвестен — null. */
+  async #place(req: ShopOrderRequest, attempt: number): Promise<ShopOrder | null> {
+    const method: Method = "POST /v1/shops/{id}/orders";
     const reply = await this.#send("POST", `/v1/shops/${req.shopId}/orders`, JSON.stringify({ items: req.items, cart_mandate_id: req.cartMandateId }));
     if (reply === null) {
-      this.#log(method, 1, "unknown", req.shopId, { detail: "NO_RESPONSE" }, req.cartMandateId);
-      throw new ShopFailure("SHOP_ORDER_STATE_UNKNOWN");
+      this.#log(method, attempt, "unknown", req.shopId, { detail: "NO_RESPONSE" }, req.cartMandateId);
+      return null;
     }
     if (reply.status >= 400) {
-      this.#log(method, 1, "refused", req.shopId, this.#cause(reply.body), req.cartMandateId);
+      const cause = this.#cause(reply.body);
+      // 5xx без кода из перечня витрин (502 / 504 прокси, пустое тело) — заказ мог быть записан: исход неизвестен, сверка
+      // чтением; 4xx и 5xx с кодом витрины — отказ (Р55 п. 2, ревью КТ1 № 1)
+      if (reply.status >= 500 && cause.reason === "MERCHANT_CODE_UNKNOWN") {
+        this.#log(method, attempt, "unknown", req.shopId, cause, req.cartMandateId);
+        return null;
+      }
+      this.#log(method, attempt, "refused", req.shopId, cause, req.cartMandateId);
       throw new ShopFailure("SHOP_ORDER_REFUSED");
     }
     const b = reply.status === 201 ? Order.safeParse(reply.body) : null;
     if (!b?.success) {
-      this.#log(method, 1, "unknown", req.shopId, { detail: "BAD_RESPONSE" }, req.cartMandateId);
-      throw new ShopFailure("SHOP_ORDER_STATE_UNKNOWN");
+      this.#log(method, attempt, "unknown", req.shopId, { detail: "BAD_RESPONSE" }, req.cartMandateId);
+      return null;
     }
-    this.#log(method, 1, "ok", req.shopId, undefined, req.cartMandateId);
+    this.#log(method, attempt, "ok", req.shopId, undefined, req.cartMandateId);
     return { orderId: b.data.id, total: { amount: b.data.total, currency: b.data.currency } };
+  }
+
+  /** Сверка после неизвестного исхода POST (Р55 п. 3–4): свои заказы витрины по мандату корзины. Один заказ CREATED по
+   *  этому мандату — он; пусто — null; не прочитано, не по схеме, не один, не CREATED или чужой мандат —
+   *  SHOP_ORDER_STATE_UNKNOWN (инвариант 4); причина — detail записи чтения (ревью КТ1 № 7). Пакет на стадии 3 ещё не
+   *  отправлялся: PAYING и далее законно не бывает (Р55 п. 5). */
+  async #reconcile(req: ShopOrderRequest): Promise<ShopOrder | null> {
+    const path = `/v1/shops/${req.shopId}/orders?cart_mandate_id=${encodeURIComponent(req.cartMandateId)}`;
+    const verdict = ({ orders: [o, ...rest] }: z.infer<typeof Orders>): OrderMiss | null =>
+      o === undefined ? null : rest.length > 0 ? "MULTIPLE" : o.cart_mandate_id !== req.cartMandateId ? "FOREIGN_MANDATE" : o.status !== "CREATED" ? "NOT_CREATED" : null;
+    const read = await this.#get("GET /v1/shops/{id}/orders", path, Orders, req.shopId, undefined, undefined, { mandate: req.cartMandateId, verdict });
+    if (!read.ok) throw new ShopFailure("SHOP_ORDER_STATE_UNKNOWN");
+    const o = read.body.orders[0];
+    return o === undefined ? null : { orderId: o.id, total: { amount: o.total, currency: o.currency } };
   }
 
   /** Стадия 5: пакет агентской оплаты продавцу (Р45 п. 4) — подписанным обращением, `content-digest` покрывает тело
@@ -423,8 +473,17 @@ export class ShopsAdapter implements OfferSource, LiveOfferSource, ShopPort, Sho
 
   /** GET с одним повтором по повторяемому коду (Р42 п. 4); 200 не по схеме — BAD_RESPONSE без повтора; `shopId` — для
    *  журнала. `deadline` — общий срок поиска (Р44 п. 6): обращение прервано им или ожидание повтора не меньше остатка —
-   *  SHOP_SEARCH_DEADLINE без повтора. */
-  async #get<T>(method: Method, path: string, schema: z.ZodType<T>, shopId?: string, signal?: AbortSignal, deadline?: Deadline): Promise<Outcome<T>> {
+   *  SHOP_SEARCH_DEADLINE без повтора. `read` — чтение заказов (Р55): `mandate` — мандат корзины для журнала; `verdict` —
+   *  ответ по схеме, но не годится (причина закрытым перечнем): исход unknown с причиной в detail, без повтора. */
+  async #get<T>(
+    method: Method,
+    path: string,
+    schema: z.ZodType<T>,
+    shopId?: string,
+    signal?: AbortSignal,
+    deadline?: Deadline,
+    read: { mandate?: string; verdict?: (body: T) => OrderMiss | null } = {},
+  ): Promise<Outcome<T>> {
     let attempt = 1;
     for (;;) {
       let reply: Reply;
@@ -436,8 +495,10 @@ export class ShopsAdapter implements OfferSource, LiveOfferSource, ShopPort, Sho
         this.#log(method, attempt, "unknown", shopId, DEADLINE);
         return { ok: false, cause: DEADLINE, retry: null };
       }
-      const r = this.#outcome(reply, schema);
-      this.#log(method, attempt, r.ok ? "ok" : r.cause.detail === "NO_RESPONSE" ? "unknown" : "refused", shopId, r.ok ? undefined : r.cause);
+      let r = this.#outcome(reply, schema);
+      const miss = r.ok ? (read.verdict?.(r.body) ?? null) : null;
+      if (miss !== null) r = { ok: false, cause: { detail: miss }, retry: null };
+      this.#log(method, attempt, r.ok ? "ok" : miss !== null || r.cause.detail === "NO_RESPONSE" ? "unknown" : "refused", shopId, r.ok ? undefined : r.cause, read.mandate);
       if (r.ok || r.retry === null || attempt > 1) return r;
       if (deadline !== undefined && r.retry >= deadline.left()) return { ok: false, cause: DEADLINE, retry: null };
       await this.sleep(r.retry, signal);
@@ -482,12 +543,16 @@ export class ShopsAdapter implements OfferSource, LiveOfferSource, ShopPort, Sho
     return isMerchantCode(code) ? { detail: code } : { reason: "MERCHANT_CODE_UNKNOWN" };
   }
 
-  /** Подписанное обращение; нет ответа в shop_request_timeout_ms или сбой сети — null. Перенаправлению не следует. */
-  async #send(method: "GET" | "POST", path: string, body?: string, signal?: AbortSignal): Promise<Reply> {
+  /** Подписанное обращение; нет ответа в shop_request_timeout_ms или сбой сети — null. Перенаправлению не следует.
+   *  Строка запроса (после `?` в `target`) — под подписью (чтение заказов, Р55 п. 3). */
+  async #send(method: "GET" | "POST", target: string, body?: string, signal?: AbortSignal): Promise<Reply> {
+    const q = target.indexOf("?");
+    const path = q < 0 ? target : target.slice(0, q);
+    const query = q < 0 ? "" : target.slice(q + 1);
     const headers = { ...(body !== undefined && { "content-type": "application/json" }), ...this.#headers() };
     // подпись — до сети: остановленная подпись — исключение наружу, обращения нет; пустое тело подписывается как ""
-    const signed = this.o.signing.sign({ method, path, query: "", headers, body: body ?? "" });
-    return this.#request(this.fetchImpl, `${this.o.baseUrl}${path}`, method, signed.headers, body, this.o.params.shop_request_timeout_ms, signal);
+    const signed = this.o.signing.sign({ method, path, query, headers, body: body ?? "" });
+    return this.#request(this.fetchImpl, `${this.o.baseUrl}${target}`, method, signed.headers, body, this.o.params.shop_request_timeout_ms, signal);
   }
 
   /** Заголовки подписи агента (ПАО §2): код агента, время, одноразовый x-nonce. */

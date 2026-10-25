@@ -4,7 +4,7 @@ import { join, resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 import { ORDER_REF } from "../../src/agent/payment-package/index.js";
 import { EVENT_ID } from "../../src/agent/events/cursor.js";
-import { SAFE_ID, SHOP_ID } from "../../src/shared/ids.js";
+import { MERCHANT_ID, SAFE_ID, SHOP_ID } from "../../src/shared/ids.js";
 
 const SRC = resolve(process.cwd(), "src");
 const OWNER = join(SRC, "shared", "ids.ts");
@@ -22,9 +22,12 @@ describe("маски идентификаторов (Р46 п. 1)", () => {
     expect(LITERAL.test(readFileSync(OWNER, "utf8"))).toBe(true);
   });
 
-  it("ORDER_REF и EVENT_ID — та же маска SAFE_ID (128); SHOP_ID — 64", () => {
+  it("ORDER_REF, EVENT_ID и MERCHANT_ID — та же маска SAFE_ID (128, как у ПАО; Р54 п. 1); SHOP_ID — 64", () => {
     expect(ORDER_REF).toBe(SAFE_ID);
     expect(EVENT_ID).toBe(SAFE_ID);
+    expect(MERCHANT_ID).toBe(SAFE_ID);
+    expect(MERCHANT_ID.test("M".repeat(128))).toBe(true);
+    expect(MERCHANT_ID.test("M".repeat(129))).toBe(false);
     expect(SAFE_ID.test("a".repeat(128))).toBe(true);
     expect(SAFE_ID.test("a".repeat(129))).toBe(false);
     expect(SHOP_ID.test("a".repeat(64))).toBe(true);

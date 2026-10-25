@@ -1,7 +1,6 @@
 // Сборка адаптера витрин в месте сборки (Р42 п. 1; ревью К1 № 3): AgentCore.shops — подпись действующим ключом агента
 // (kid из реестра), код агента, журнал ядра; до допуска и после закрытия подписи — исключение, обращений нет.
 import { afterEach, describe, expect, it } from "vitest";
-import type { ShopProfile } from "../../src/agent/adapters/shops/index.js";
 import { SignerStopped } from "../../src/agent/signer/index.js";
 import { openPackage } from "../../src/agent/payment-package/index.js";
 import type { PaymentContext } from "../../src/agent/ports/index.js";
@@ -16,10 +15,6 @@ afterEach(async () => {
   stand = undefined;
 });
 
-const profile: ShopProfile = {
-  shop: { inn: "7705123452", mcc: "5462", paymentMethods: ["card"], deliveryRegions: ["77"], returns: { days: 0, text: "Продовольственные товары надлежащего качества возврату не подлежат" } },
-  item: () => null,
-};
 const KEYID = /;keyid="([^"]+)"/;
 
 /** Витрина-заглушка: пустой список; `seen` — заголовки ушедших обращений. */
@@ -38,7 +33,7 @@ describe("AgentCore.shops (Р42 п. 1)", () => {
     stand = s;
     const { core, journal } = await coreOn(s);
     const v = vitrine();
-    const shops = core.shops({ baseUrl: "http://shops.test", profile: () => profile, fetch: v.f });
+    const shops = core.shops({ baseUrl: "http://shops.test", fetch: v.f });
     await expect(shops.search()).rejects.toBeInstanceOf(SignerStopped);
     expect(v.seen).toEqual([]);
 

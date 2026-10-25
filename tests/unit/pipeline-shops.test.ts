@@ -3,7 +3,7 @@
 // общий срок поиска при допустимой конфигурации — SHOP_SEARCH_DEADLINE в выдаче конвейера и журнале (Р44 К2 № 8).
 import { newEd25519Signer } from "@kuzin4u/agentic-core";
 import { afterEach, describe, expect, it } from "vitest";
-import { ShopsAdapter, type ShopProfile } from "../../src/agent/adapters/shops/index.js";
+import { ShopsAdapter } from "../../src/agent/adapters/shops/index.js";
 import { MemoryJournal } from "../../src/agent/journal/index.js";
 import { ShopFailure } from "../../src/agent/ports/index.js";
 import { SignerStopped } from "../../src/agent/signer/index.js";
@@ -19,11 +19,15 @@ afterEach(async () => {
   stand = undefined;
 });
 
-const profile: ShopProfile = {
-  shop: { inn: "7705123452", mcc: "5462", paymentMethods: ["card"], deliveryRegions: ["77"], returns: { days: 0, text: "Продовольственные товары надлежащего качества возврату не подлежат" } },
-  item: () => null,
+/** Факты магазина в записи списка (Р54 п. 4). */
+const FACTS = {
+  inn: "7705123452",
+  mcc: "5462",
+  payment_methods: ["card"],
+  delivery_regions: ["RU-MOW"],
+  returns: { days: 0, text: "Продовольственные товары надлежащего качества возврату не подлежат" },
 };
-const shop = (id: string) => ({ id, merchant_id: `MER-${id}`, zone: "CONTOUR", readiness_mark: true });
+const shop = (id: string) => ({ id, merchant_id: `MER-${id}`, zone: "CONTOUR", readiness_mark: true, ...FACTS });
 const EMPTY = { status: 200, body: { shop: {}, items: [] } };
 
 type Answer = { status: number; body?: unknown } | "hang" | { delayMs: number; status: number; body?: unknown };
@@ -62,7 +66,6 @@ async function setup(routes: Record<string, Answer>, over: Partial<ReturnType<ty
       },
     },
     params,
-    profile: () => profile,
     journal: shopLog,
     fetch: v.f,
   });

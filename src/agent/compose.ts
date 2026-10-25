@@ -89,8 +89,9 @@ export interface AgentCore {
   close(): void;
 }
 
-/** Витрины для адаптера (Р42): адрес и профиль магазина; подпись, параметры, журнал и часы — от места сборки. */
-export type ShopsOptions = Pick<ShopsAdapterOptions, "baseUrl" | "profile" | "fetch">;
+/** Витрины для адаптера (Р42): адрес; факты магазина — из витрины (Р54 п. 4); подпись, параметры, журнал и часы — от
+ *  места сборки. */
+export type ShopsOptions = Pick<ShopsAdapterOptions, "baseUrl" | "fetch">;
 
 /** Порты стадий покупки от вызывающего (Р38 п. 2) и регион человека из профиля (Р32 п. 5). */
 export interface PurchasePorts {
@@ -281,7 +282,6 @@ export function createAgentCore(o: AgentCoreOptions): AgentCore {
     shops: (s) =>
       new ShopsAdapter({
         baseUrl: s.baseUrl,
-        profile: s.profile,
         ...(s.fetch !== undefined && { fetch: s.fetch }),
         agentCode: o.pao.agentCode,
         signing: { sign: (req) => signRequest(req, signing.current()) },

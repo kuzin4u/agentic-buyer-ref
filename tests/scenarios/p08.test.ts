@@ -7,9 +7,9 @@
 // ключа после знака первой витрины и сдвиг часов стенда за срок кэша каталога ключей у витрин (`merchant_jwks_max_age_sec`,
 // #64 п. 1). С Р53 перед каталогом — знак готовности по ПАО: отзыв ПАО видит сразу (401 AGENT_KEY_REVOKED на знаке
 // следующей витрины) — общее правило обращений к ПАО (Р53 п. 5).
+// Отказ списка витрин (503 / 429) — настоящий ответ эмулятора `failShopList` (#64 п. 3, Р54 п. 3).
 // ЭМУЛЯЦИЯ СВЕРХ ЭМУЛЯТОРА (ответ подменён в fetch адаптера, остальные обращения — настоящие) — только то, чего эмулятор не
-// выдаёт: код вне перечня (MERCHANT_CODE_UNKNOWN) у одной витрины и 503 на список витрин (переход на `failShopList` —
-// STATUS «Открыто», к AG-09 ч. 2 / AG-10).
+// выдаёт: код вне перечня (MERCHANT_CODE_UNKNOWN) у одной витрины.
 import { afterEach, describe, expect, it } from "vitest";
 import { newEd25519Signer, signRequest } from "@kuzin4u/agentic-core";
 import { MERCHANT_ERROR_CODES, MERCHANT_FIXTURES } from "agentic-ps-platform/fixtures";
@@ -138,16 +138,29 @@ describe("П08 — витрина отказывает неопознанным"
     expect(JSON.stringify(r.c.journal.entries)).not.toContain(unknown);
   });
 
-  it("списка витрин нет целиком (эмуляция сверх эмулятора: 503 на список) — отказ стадии 2, STOPPED сделки с SHOP_LIST_UNAVAILABLE (Р46 п. 2); к каталогам ни одного обращения (ревью К1 № 11)", async () => {
-    const { f, seen } = recording({ path: "/v1/shops", status: 503, body: { code: "UPSTREAM_UNAVAILABLE" } });
-    const r = await standPurchase({ fetch: f });
+  // отказ списка — настоящий ответ эмулятора `failShopList` (#64 п. 3, Р54 п. 3): держится до снятия, повтор видит его же
+  it.each([
+    ["503 UPSTREAM_UNAVAILABLE, Retry-After 1 с — один повтор", "UPSTREAM_UNAVAILABLE", 503, 1, 2],
+    ["429 RATE_LIMITED, Retry-After 1 с — один повтор", "RATE_LIMITED", 429, 1, 2],
+    ["429 RATE_LIMITED, Retry-After больше shop_retry_after_max_sec — без повтора", "RATE_LIMITED", 429, null, 1],
+  ] as const)("списка витрин нет целиком (%s): отказ стадии 2, STOPPED сделки с SHOP_LIST_UNAVAILABLE (Р46 п. 2); ни знака, ни каталогов (ревью К1 № 11); агент работает", async (_, code, http, after, attempts) => {
+    const r = await standPurchase();
     c = r.c;
+    const retryAfterSec = after ?? r.c.params.shop_retry_after_max_sec + 1;
+    r.c.merchants!.emulator.failShopList({ code, retryAfterSec });
     await r.signedIntent();
     await expect(r.purchase.search()).rejects.toMatchObject({ name: "ShopFailure", code: "SHOP_LIST_UNAVAILABLE" });
     expect(r.purchase.state).toBe("STOPPED");
     expect(r.purchase.reason).toBe("SHOP_LIST_UNAVAILABLE");
     expect(r.c.admission()).toBeNull();
-    // один повтор списка по повторяемому коду (Р42 п. 4), каталогов нет
-    expect(seen.map((s) => new URL(s.url).pathname)).toEqual(["/v1/shops", "/v1/shops"]);
+    // повтор списка — только по повторяемому коду и Retry-After не больше предела, один раз (Р42 п. 4)
+    const agent = r.c.agentCalls().slice(r.c.agentCalls().findIndex((x) => x.route === "GET /v1/shops"));
+    expect(agent.map((x) => [x.route, x.status, x.code])).toEqual(Array.from({ length: attempts }, () => ["GET /v1/shops", http, code]));
+    expect(r.c.journal.entries.filter((e) => e.kind === "shop.call").map((e) => [e.method, e.attempt, e.result, e.detail])).toEqual(
+      Array.from({ length: attempts }, (_, i) => ["GET /v1/shops", i + 1, "refused", code]),
+    );
+    // снятие отказа — список снова отдаётся тому же агенту
+    r.c.merchants!.emulator.failShopList(null);
+    expect((await r.c.merchants!.request("GET", "/v1/shops")).status).toBe(200);
   });
 });

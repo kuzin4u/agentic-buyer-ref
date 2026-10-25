@@ -4,10 +4,11 @@
 // отказы — по перечню пути в адаптере. Против стенда: ACTIVE и NONE — П07, purchase-stand; 401 AGENT_KEY_REVOKED — П08;
 // SUSPENDED, 403, 400, 503 стенда — К2.3.
 import { describe, expect, it, vi } from "vitest";
-import { ShopsAdapter, type ShopProfile, type ShopsAdapterOptions } from "../../src/agent/adapters/shops/index.js";
+import { ShopsAdapter, type ShopsAdapterOptions } from "../../src/agent/adapters/shops/index.js";
 import { MemoryJournal } from "../../src/agent/journal/index.js";
 import { ShopFailure } from "../../src/agent/ports/index.js";
-import { sealPackage } from "../../src/agent/payment-package/index.js";
+import { orderRefIssue, sealPackage } from "../../src/agent/payment-package/index.js";
+import { luhnTail } from "../support/luhn.js";
 import type { RequestSigning } from "../../src/agent/ports/request-signing.js";
 import { SignerStopped } from "../../src/agent/signer/index.js";
 import { newEd25519Signer } from "@kuzin4u/agentic-core";
@@ -16,12 +17,46 @@ import { PlatformFailure } from "../../src/shared/domain.js";
 
 const params = loadParams();
 const BASE = "http://shops.test";
-const profile: ShopProfile = {
-  shop: { inn: "7705123452", mcc: "5462", paymentMethods: ["card"], deliveryRegions: ["77"], returns: { days: 0, text: "Продовольственные товары надлежащего качества возврату не подлежат" } },
-  item: () => ({ delivery: [{ method: "PICKUP", minDays: 0, maxDays: 0, cost: { amount: 0, currency: "RUB" } }], updatedAt: "2026-10-21T09:00:00+03:00" }),
+/** Факты магазина в записи списка — как у витрин эмулятора (#45, Р54 п. 4): ИНН вымышленный, с верной контрольной цифрой. */
+const FACTS = {
+  inn: "7705123452",
+  mcc: "5462",
+  payment_methods: ["card", "sbp"],
+  delivery_regions: ["RU-MOW", "RU-MOS"],
+  returns: { days: 0, text: "Продовольственные товары надлежащего качества возврату не подлежат" },
 };
-const ITEM = { sku: "BRD-1", title: "Хлеб", description: "Хлеб на закваске.", price: 39000, currency: "RUB", in_stock: true, category: "хлеб" };
-const shop = (id: string, over: Record<string, unknown> = {}) => ({ id, merchant_id: `MER-${id}`, zone: "CONTOUR", readiness_mark: true, ...over });
+/** Время обновления карточки — от часов теста (не литерал: ядро сравнивает его с часами). */
+const UPDATED = new Date(Date.now() - 2 * 3600_000).toISOString();
+const ITEM = {
+  sku: "BRD-1",
+  title: "Хлеб",
+  description: "Хлеб на закваске.",
+  price: 39000,
+  currency: "RUB",
+  in_stock: true,
+  category: "хлеб",
+  delivery_options: [{ method: "PICKUP", min_days: 0, max_days: 0, cost: 0, currency: "RUB" }],
+  updated_at: UPDATED,
+  gtin: null,
+  brand: null,
+  model: null,
+  attributes: { вес: "500 г" },
+};
+const shop = (id: string, over: Record<string, unknown> = {}) => ({ id, merchant_id: `MER-${id}`, zone: "CONTOUR", readiness_mark: true, ...FACTS, ...over });
+
+/** Запись без полей `keys` — витрина их не отдала. */
+const without = (o: object, ...keys: string[]): Record<string, unknown> => Object.fromEntries(Object.entries(o).filter(([k]) => !keys.includes(k)));
+
+/** GTIN-13 с верной контрольной цифрой GTIN и верной суммой Луна — собирается во время прогона (литералов, похожих на
+ *  номер карты, в репозитории нет; префикс 9…, такие номера карт не выпускаются). */
+function gtinLuhn13(): string {
+  for (let n = 0; ; n++) {
+    const base = `9${String(n).padStart(11, "0")}`;
+    const sum = [...base].reduce((s, d, i) => s + Number(d) * (i % 2 === 0 ? 1 : 3), 0);
+    const code = base + String((10 - (sum % 10)) % 10);
+    if (luhnTail(base) === code) return code;
+  }
+}
 
 type Answer = { status: number; body?: unknown; headers?: Record<string, string> } | "hang" | "fail";
 interface Seen {
@@ -89,7 +124,6 @@ function adapter(routes: Record<string, Answer[]>, over: Partial<ShopsAdapterOpt
     signing: { sign: (req) => ({ ...req, headers: { ...req.headers, signature: `sig-${req.headers["x-nonce"]}`, "signature-input": "sig=()" } }) },
     platform: p.platform,
     params,
-    profile: () => profile,
     journal,
     fetch: v.f,
     sleep: async (ms) => void sleeps.push(ms),
@@ -100,7 +134,8 @@ function adapter(routes: Record<string, Answer[]>, over: Partial<ShopsAdapterOpt
 
 const LIST = (...shops: unknown[]): Record<string, Answer[]> => ({ "GET /v1/shops": [{ status: 200, body: { shops } }] });
 const catalog = (id: string, ...a: Answer[]) => ({ [`GET /v1/shops/${id}/catalog`]: a });
-const ok = (...items: unknown[]): Answer => ({ status: 200, body: { shop: {}, items } });
+/** Ответ каталога; `responded_at` — от часов теста в момент сборки ответа (Р54 п. 6). */
+const ok = (...items: unknown[]): Answer => ({ status: 200, body: { shop: {}, items, responded_at: new Date().toISOString() } });
 const calls = (j: MemoryJournal) => j.entries.filter((e) => e.kind === "shop.call").map((e) => [e.method, e.attempt, e.result, e.detail ?? e.reason]);
 
 describe("адаптер витрин (Р42)", () => {
@@ -147,17 +182,163 @@ describe("адаптер витрин (Р42)", () => {
     ]);
   });
 
-  it("карточка не по схеме не переведена: нет поля — REQUIRED, чужая валюта — BAD_CURRENCY, иначе BAD_TYPE; профиля нет — магазин исключён", async () => {
+  it("карточка не по схеме не переведена: нет поля — REQUIRED, чужая валюта — BAD_CURRENCY, иначе BAD_TYPE (Р42 п. 6; доставка и время обновления — Р54 п. 4)", async () => {
+    const noDelivery = without(ITEM, "delivery_options");
+    const noUpdated = without(ITEM, "updated_at");
     const { a } = adapter({
       ...LIST(shop("S1"), shop("S2")),
-      ...catalog("S1", ok(ITEM, { sku: "B2", title: "Хлеб дня" }, { ...ITEM, sku: "B3", currency: "USD" }, { ...ITEM, sku: "B4", price: "390" })),
+      ...catalog(
+        "S1",
+        ok(
+          ITEM,
+          { sku: "B2", title: "Хлеб дня" },
+          { ...ITEM, sku: "B3", currency: "USD" },
+          { ...ITEM, sku: "B4", price: "390" },
+          { ...noDelivery, sku: "B5" },
+          { ...noUpdated, sku: "B6" },
+          { ...ITEM, sku: "B8", attributes: { вес: 500 } },
+          // вложенные поля — код по полному пути (ревью КТ1 reviewer № 1)
+          { ...ITEM, sku: "B9", delivery_options: [without(ITEM.delivery_options[0]!, "min_days")] },
+          { ...ITEM, sku: "B10", delivery_options: [{ ...ITEM.delivery_options[0]!, currency: "USD" }] },
+          { ...ITEM, sku: "B11", delivery_options: [without(ITEM.delivery_options[0]!, "currency")] },
+          { ...ITEM, sku: "B12", delivery_options: [{ ...ITEM.delivery_options[0]!, max_days: "2" }] },
+          { ...ITEM, sku: "B13", price: null },
+        ),
+      ),
       ...catalog("S2", ok(ITEM)),
     });
     const [s1] = await a.search();
-    expect("unavailable" in s1! ? null : [s1!.facts.products.map((p) => p.product.sku), s1!.facts.dropped]).toEqual([["BRD-1"], ["REQUIRED", "BAD_CURRENCY", "BAD_TYPE"]]);
-    const none = adapter({ ...LIST(shop("S1")), ...catalog("S1", ok(ITEM)) }, { profile: () => null });
-    const [n] = await none.a.search();
-    expect("unavailable" in n! ? null : n!.facts).toEqual({ shop: null, shopIssues: ["REQUIRED"], products: [], dropped: [] });
+    expect("unavailable" in s1! ? null : [s1!.facts.products.map((p) => p.product.sku), s1!.facts.dropped]).toEqual([
+      ["BRD-1"],
+      ["REQUIRED", "BAD_CURRENCY", "BAD_TYPE", "REQUIRED", "REQUIRED", "BAD_TYPE", "REQUIRED", "BAD_CURRENCY", "REQUIRED", "BAD_TYPE", "REQUIRED"],
+    ]);
+  });
+
+  it("способ доставки вне перечня — перечень у ядра: карточка переведена, ядро даёт BAD_METHOD, как у фида (ревью КТ1 reviewer № 1)", async () => {
+    const { a } = adapter({ ...LIST(shop("S1")), ...catalog("S1", ok({ ...ITEM, delivery_options: [{ ...ITEM.delivery_options[0]!, method: "COURIER" }] })) });
+    const [s] = await a.search();
+    if (s === undefined || "unavailable" in s) throw new Error("витрина недоступна");
+    expect(s.facts.dropped).toEqual([]);
+    expect(s.facts.products.map((p) => [p.product.sku, p.issues])).toEqual([["BRD-1", ["BAD_METHOD"]]]);
+  });
+
+  it("факты витрины → модель К8 (Р54 п. 4): магазин — из записи списка, товар — доставка, время обновления, GTIN, бренд, модель, атрибуты; модель ядра без замечаний", async () => {
+    const full = { ...ITEM, sku: "BRD-2", delivery_options: [...ITEM.delivery_options, { method: "DELIVERY", region: "RU-MOW", min_days: 1, max_days: 2, cost: 25000, currency: "RUB" }], brand: "Пекарня", model: "Бородинский" };
+    const bare = without(ITEM, "gtin", "brand", "model", "attributes");
+    const { a } = adapter({ ...LIST(shop("S1")), ...catalog("S1", ok(full, { ...bare, sku: "BRD-3" })) });
+    const [s] = await a.search();
+    if (s === undefined || "unavailable" in s) throw new Error("витрина недоступна");
+    expect(s.facts.shop).toEqual({ id: "S1", inn: FACTS.inn, mcc: FACTS.mcc, paymentMethods: ["card", "sbp"], deliveryRegions: ["RU-MOW", "RU-MOS"], returns: FACTS.returns });
+    expect(s.facts.shopIssues).toEqual([]);
+    expect(s.facts.products.map((p) => [p.product.sku, p.issues])).toEqual([
+      ["BRD-2", []],
+      ["BRD-3", []],
+    ]);
+    expect(s.facts.products[0]!.product).toMatchObject({
+      gtin: null,
+      brand: "Пекарня",
+      model: "Бородинский",
+      attributes: { вес: "500 г" },
+      updatedAt: UPDATED,
+      delivery: [
+        { method: "PICKUP", minDays: 0, maxDays: 0, cost: { amount: 0, currency: "RUB" } },
+        { method: "DELIVERY", region: "RU-MOW", minDays: 1, maxDays: 2, cost: { amount: 25000, currency: "RUB" } },
+      ],
+    });
+    // нет полей сопоставления — null и {}
+    expect(s.facts.products[1]!.product).toMatchObject({ gtin: null, brand: null, model: null, attributes: {} });
+    // зона и знак витрины в модель не идут (Р53 п. 3)
+    expect(s.facts.shop).not.toHaveProperty("readiness");
+  });
+
+  it("факты магазина не по схеме — магазин исключён целиком одним кодом, по карточкам записей нет (витрина INCOMPLETE, Р54 п. 5): нет returns — REQUIRED, не тот тип — BAD_TYPE", async () => {
+    const noReturns = without(FACTS, "returns");
+    const { a, seen } = adapter({
+      ...LIST(
+        { id: "S1", merchant_id: "MER-S1", zone: "CONTOUR", readiness_mark: true, ...noReturns },
+        shop("S2", { payment_methods: "card" }),
+        // вложенные поля и null — код по полному пути (ревью КТ1 reviewer № 1)
+        shop("S3", { returns: { text: FACTS.returns.text } }),
+        shop("S4", { returns: null }),
+        shop("S5", { returns: { ...FACTS.returns, days: "0" } }),
+      ),
+      ...catalog("S1", ok(ITEM, { sku: "B2", title: "Хлеб дня" })),
+      ...catalog("S2", ok(ITEM)),
+      ...catalog("S3", ok(ITEM)),
+      ...catalog("S4", ok(ITEM)),
+      ...catalog("S5", ok(ITEM)),
+    });
+    const out = await a.search();
+    expect(out.map((s) => ("unavailable" in s ? null : s.facts))).toEqual(
+      ["REQUIRED", "BAD_TYPE", "REQUIRED", "REQUIRED", "BAD_TYPE"].map((code) => ({ shop: null, shopIssues: [code], products: [], dropped: [] })),
+    );
+    // каталог по-прежнему запрашивается
+    expect(seen.map((s) => s.path)).toEqual(["/v1/shops", ...["S1", "S2", "S3", "S4", "S5"].map((id) => `/v1/shops/${id}/catalog`)]);
+  });
+
+  it("магазин, исключённый по фактам, sku не регистрирует: тот же sku у исправной витрины проходит живую проверку (ревью КТ1 reviewer № 3)", async () => {
+    const { a, seen } = adapter({
+      ...LIST(shop("S1", { returns: null }), shop("S2")),
+      ...catalog("S1", ok(ITEM)),
+      ...catalog("S2", ok(ITEM)),
+    });
+    await a.search();
+    const before = seen.length;
+    const offer = await a.fetch({ sku: ITEM.sku, quantity: 1 }, new AbortController().signal);
+    expect(offer).toMatchObject({ sku: ITEM.sku, price: { amount: ITEM.price, currency: "RUB" } });
+    expect(seen.slice(before).map((s) => s.path)).toEqual(["/v1/shops/S2/catalog"]);
+  });
+
+  it("живая проверка: checkedAt — responded_at ответа витрины, не часы агента (Р54 п. 6)", async () => {
+    // часы агента отстают на сутки — checkedAt от них не зависит
+    const respondedAt = new Date(Date.now() - 10_000).toISOString();
+    const { a } = adapter({ ...LIST(shop("S1")), ...catalog("S1", ok(ITEM), { status: 200, body: { items: [ITEM], responded_at: respondedAt } }) }, { now: () => new Date(Date.now() - 86_400_000) });
+    await a.search();
+    const offer = await a.fetch({ sku: ITEM.sku, quantity: 1 }, new AbortController().signal);
+    expect(offer.checkedAt).toBe(respondedAt);
+  });
+
+  it("живая проверка: responded_at нет, не дата-время или без пояса — отказ источника, не «свежо» (Р54 п. 6; Date.parse = NaN ядро пропустило бы)", async () => {
+    const at = new Date().toISOString();
+    // пояс больше ±14:00 — не по схеме, как у ядра (ревью КТ1б № 3)
+    for (const responded of [undefined, "вчера", at.slice(0, 19), at.slice(0, 10), 1761400000000, `${at.slice(0, 19)}+14:01`, `${at.slice(0, 19)}-14:01`]) {
+      const { a, journal } = adapter({ ...LIST(shop("S1")), ...catalog("S1", ok(ITEM), { status: 200, body: { items: [ITEM], ...(responded !== undefined && { responded_at: responded }) } }) });
+      await a.search();
+      await expect(a.fetch({ sku: ITEM.sku, quantity: 1 }, new AbortController().signal)).rejects.toThrow();
+      expect(calls(journal).at(-1)).toEqual(["GET /v1/shops/{id}/catalog", 1, "refused", "BAD_RESPONSE"]);
+    }
+    // пояс ±14:00 — ещё по схеме: checkedAt — как прислала витрина
+    for (const zone of ["+14:00", "-14:00", "+03:00"]) {
+      const responded = `${at.slice(0, 19)}${zone}`;
+      const { a } = adapter({ ...LIST(shop("S1")), ...catalog("S1", ok(ITEM), { status: 200, body: { items: [ITEM], responded_at: responded } }) });
+      await a.search();
+      expect((await a.fetch({ sku: ITEM.sku, quantity: 1 }, new AbortController().signal)).checkedAt).toBe(responded);
+    }
+    // в поиске responded_at не проверяется — снимок (Р54 п. 6)
+    const { a } = adapter({ ...LIST(shop("S1")), ...catalog("S1", { status: 200, body: { items: [ITEM] } }) });
+    const [s] = await a.search();
+    expect(s !== undefined && !("unavailable" in s)).toBe(true);
+  });
+
+  it("живая проверка разбирает только цену и наличие: карточка без delivery_options и updated_at — цена и наличие, не отказ (Р32 п. 3, нюанс К3.1 Р54; ревью КТ1 reviewer № 2)", async () => {
+    const bare = without(ITEM, "delivery_options", "updated_at");
+    const { a } = adapter({ ...LIST(shop("S1")), ...catalog("S1", ok(ITEM), ok(bare)) });
+    const [s] = await a.search();
+    if (s === undefined || "unavailable" in s) throw new Error("витрина недоступна");
+    expect(s.facts.products.map((p) => p.product.sku)).toEqual([ITEM.sku]);
+    const offer = await a.fetch({ sku: ITEM.sku, quantity: 1 }, new AbortController().signal);
+    expect(offer).toMatchObject({ sku: ITEM.sku, price: { amount: ITEM.price, currency: "RUB" }, availability: { inStock: true } });
+  });
+
+  it("GTIN-13 с верной суммой Луна — данные модели, не номер карты: карточка проходит модель, GTIN в журнал не пишется (Р54 п. 4, нюанс #70)", async () => {
+    const gtin = gtinLuhn13();
+    // сканер номеров карт ссылки заказа (ПАО §4) счёл бы его номером карты — поэтому каталоги через него не идут
+    expect(orderRefIssue(gtin)).toBe("PAN_LIKE");
+    const { a, journal } = adapter({ ...LIST(shop("S1")), ...catalog("S1", ok({ ...ITEM, gtin })) });
+    const [s] = await a.search();
+    if (s === undefined || "unavailable" in s) throw new Error("витрина недоступна");
+    expect(s.facts.products.map((p) => [p.product.gtin, p.issues])).toEqual([[gtin, []]]);
+    expect(JSON.stringify(journal.entries)).not.toContain(gtin);
   });
 
   it("503 без Retry-After — один повтор через shop_retry_default_ms, новой подписью; второй отказ — магазин недоступен", async () => {
@@ -428,13 +609,36 @@ describe("знак готовности продавца по ПАО (Р53)", ()
   it("merchant_id не по маске — без обращения к Платформе, знак не проверен (Р53 п. 2)", async () => {
     const { a, journal, pao } = adapter({});
     expect(await a.readiness("MER/../x")).toEqual({ unverified: "PATTERN" });
-    // маска SHOP_ID — до 64 знаков (строже 128 у Платформы, нюанс К2.1): 65 — уже без обращения
-    expect(await a.readiness("M".repeat(65))).toEqual({ unverified: "PATTERN" });
+    // маска MERCHANT_ID — до 128 знаков, как у ПАО (Р54 п. 1): 129 — уже без обращения
+    expect(await a.readiness("M".repeat(129))).toEqual({ unverified: "PATTERN" });
     expect(pao.seen).toEqual([]);
     expect(readiness(journal)).toEqual([
       ["GET /pao/v1/merchants/{merchant_id}/readiness", undefined, "refused", "PATTERN"],
       ["GET /pao/v1/merchants/{merchant_id}/readiness", undefined, "refused", "PATTERN"],
     ]);
+  });
+
+  it("merchant_id из 128 знаков — знак запрашивается, в журнале — код продавца (Р54 п. 1, № 46)", async () => {
+    const id = "M".repeat(128);
+    const { a, journal, pao } = adapter({}, {}, { [id]: [READY(id)] });
+    expect(await a.readiness(id)).toEqual({ status: "ACTIVE" });
+    expect(pao.seen.map((s) => s.path)).toEqual([`/pao/v1/merchants/${id}/readiness`]);
+    expect(readiness(journal)).toEqual([["GET /pao/v1/merchants/{merchant_id}/readiness", id, "ok", "ACTIVE"]]);
+  });
+
+  it("через поиск: merchant_id 128 знаков — зона контура по знаку; 129 — запись списка не по маске, витрина недоступна без знака и каталога (Р54 п. 1)", async () => {
+    const long = "M".repeat(128);
+    const { a, seen, pao } = adapter(
+      { ...LIST(shop("S1", { merchant_id: long }), shop("S2", { merchant_id: "M".repeat(129) })), ...catalog("S1", ok(ITEM)), ...catalog("S2", ok(ITEM)) },
+      {},
+      { [long]: [READY(long)] },
+    );
+    const out = await a.search();
+    expect(out).toHaveLength(2);
+    expect(out[0]).toMatchObject({ merchantId: long, inContour: true });
+    expect(out[1]).toEqual({ unavailable: { detail: "BAD_RESPONSE" } });
+    expect(pao.seen.map((s) => s.path)).toEqual([`/pao/v1/merchants/${long}/readiness`]);
+    expect(seen.map((s) => s.path)).toEqual(["/v1/shops", "/v1/shops/S1/catalog"]);
   });
 
   it("403 AGENT_SUSPENDED — остановка подписи и PlatformFailure тем же кодом; к следующим витринам не обращаются (Р53 п. 5)", async () => {

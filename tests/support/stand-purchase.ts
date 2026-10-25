@@ -67,6 +67,8 @@ export interface StandPurchaseOptions {
   notify?: (code: PurchaseNotice, amount?: NoticeAmount) => void | Promise<void>;
   /** часы клиента ПАО и модуля подтверждений — тест двигает их вместе с часами стенда (истечение, РП51 п. 6) */
   now?: () => Date;
+  /** часы конвейера (свежесть живой проверки сравнивается с ними, Р54 п. 6): подпись обращений и ПАО — на своих часах */
+  purchaseNow?: () => Date;
   /** таймер модуля подтверждений — тест срабатывает его сам (срок решения — минуты по order_hold_sec Платформы) */
   confirmationTimer?: (fn: () => void, ms: number) => () => void;
   /** ПОДМЕНА ДО PS-11: авторизация продавца доходит до ADP стенда копией сообщения (createContour, `adpUntilPs11`) */
@@ -128,6 +130,7 @@ export async function standPurchase(o: StandPurchaseOptions = {}) {
       admission: () => c.admission(),
       // регион человека — в кодах регионов доставки витрин: у эмулятора ISO 3166-2 (#45, Р54 нюанс К3.1)
       region: STAND_REGION,
+      ...(o.purchaseNow && { now: o.purchaseNow }),
       ...(o.notify !== undefined && { notify: o.notify }),
       ...(o.failureCode !== undefined && { failureCode: o.failureCode }),
     });

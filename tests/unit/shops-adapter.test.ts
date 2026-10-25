@@ -134,7 +134,8 @@ function adapter(routes: Record<string, Answer[]>, over: Partial<ShopsAdapterOpt
 
 const LIST = (...shops: unknown[]): Record<string, Answer[]> => ({ "GET /v1/shops": [{ status: 200, body: { shops } }] });
 const catalog = (id: string, ...a: Answer[]) => ({ [`GET /v1/shops/${id}/catalog`]: a });
-const ok = (...items: unknown[]): Answer => ({ status: 200, body: { shop: {}, items } });
+/** Ответ каталога; `responded_at` — от часов теста в момент сборки ответа (Р54 п. 6). */
+const ok = (...items: unknown[]): Answer => ({ status: 200, body: { shop: {}, items, responded_at: new Date().toISOString() } });
 const calls = (j: MemoryJournal) => j.entries.filter((e) => e.kind === "shop.call").map((e) => [e.method, e.attempt, e.result, e.detail ?? e.reason]);
 
 describe("адаптер витрин (Р42)", () => {
@@ -286,6 +287,29 @@ describe("адаптер витрин (Р42)", () => {
     const offer = await a.fetch({ sku: ITEM.sku, quantity: 1 }, new AbortController().signal);
     expect(offer).toMatchObject({ sku: ITEM.sku, price: { amount: ITEM.price, currency: "RUB" } });
     expect(seen.slice(before).map((s) => s.path)).toEqual(["/v1/shops/S2/catalog"]);
+  });
+
+  it("живая проверка: checkedAt — responded_at ответа витрины, не часы агента (Р54 п. 6)", async () => {
+    // часы агента отстают на сутки — checkedAt от них не зависит
+    const respondedAt = new Date(Date.now() - 10_000).toISOString();
+    const { a } = adapter({ ...LIST(shop("S1")), ...catalog("S1", ok(ITEM), { status: 200, body: { items: [ITEM], responded_at: respondedAt } }) }, { now: () => new Date(Date.now() - 86_400_000) });
+    await a.search();
+    const offer = await a.fetch({ sku: ITEM.sku, quantity: 1 }, new AbortController().signal);
+    expect(offer.checkedAt).toBe(respondedAt);
+  });
+
+  it("живая проверка: responded_at нет, не дата-время или без пояса — отказ источника, не «свежо» (Р54 п. 6; Date.parse = NaN ядро пропустило бы)", async () => {
+    const at = new Date().toISOString();
+    for (const responded of [undefined, "вчера", at.slice(0, 19), at.slice(0, 10), 1761400000000]) {
+      const { a, journal } = adapter({ ...LIST(shop("S1")), ...catalog("S1", ok(ITEM), { status: 200, body: { items: [ITEM], ...(responded !== undefined && { responded_at: responded }) } }) });
+      await a.search();
+      await expect(a.fetch({ sku: ITEM.sku, quantity: 1 }, new AbortController().signal)).rejects.toThrow();
+      expect(calls(journal).at(-1)).toEqual(["GET /v1/shops/{id}/catalog", 1, "refused", "BAD_RESPONSE"]);
+    }
+    // в поиске responded_at не проверяется — снимок (Р54 п. 6)
+    const { a } = adapter({ ...LIST(shop("S1")), ...catalog("S1", { status: 200, body: { items: [ITEM] } }) });
+    const [s] = await a.search();
+    expect(s !== undefined && !("unavailable" in s)).toBe(true);
   });
 
   it("живая проверка разбирает только цену и наличие: карточка без delivery_options и updated_at — цена и наличие, не отказ (Р32 п. 3, нюанс К3.1 Р54; ревью КТ1 reviewer № 2)", async () => {

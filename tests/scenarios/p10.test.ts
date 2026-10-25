@@ -2,9 +2,11 @@
 // адаптер витрин: человек выбирает 2 шт. хлеба из зоны контура → живая проверка у витрины непосредственно перед CART →
 // мандат CART с родителем INTENT, позиция и итог — по живой цене продавца → подпись эмулятором банка → живая проверка
 // перед заказом → заказ по cart_mandate_id; `Order.total` продавца совпадает с итогом CART — тем, что показан человеку.
-// Цена и sku — из витрины по-настоящему (фикстуры Платформы, не литералы); факты ТЕСТОВОГО ПРОФИЛЯ (stand-shop.ts) здесь не
-// проверяются.
+// Цена, sku и факты модели — из витрины по-настоящему (фикстуры Платформы, не литералы; Р54 п. 4). Свежесть живой
+// проверки — по `responded_at` витрины (часы стенда), сдвиг часов стенда за `live_check_max_age_sec` или
+// `live_check_clock_skew_sec` — LIVE_STALE (Р54 п. 6).
 import { afterEach, describe, expect, it } from "vitest";
+import { CartLiveRefused } from "../../src/agent/pipeline/index.js";
 import { shopBy, type Contour } from "../support/contour.js";
 import { expectJournalClean } from "../support/journal.js";
 import { STAND_TIMEOUT_MS, standPurchase } from "../support/stand-purchase.js";
@@ -25,6 +27,49 @@ const QTY = 2;
 const PRICE = { amount: BREAD.price!, currency: BREAD.currency! };
 
 describe("П10 — корзина и мандат корзины", { timeout: STAND_TIMEOUT_MS }, () => {
+  // свежесть — по responded_at витрины (часы стенда), сравнивает ядро с часами конвейера (Р54 п. 6); даты — от часов теста
+  // и стенда (setClock), не литералы. Ответ из будущего — часы стенда спешат только на время ответа витрины на живую
+  // проверку (стенд общий с ПАО: verify INTENT перед ней сверяет срок мандата с его часами). Старый ответ — часы конвейера
+  // спешат: витрина с отставшими на live_check_max_age_sec часами отвергла бы уже подпись агента (окно x-timestamp) —
+  // LIVE_UNAVAILABLE, а не LIVE_STALE
+  it.each([
+    ["ответ витрины старше live_check_max_age_sec (часы конвейера спешат)", "purchase", (p: { live_check_max_age_sec: number }) => (p.live_check_max_age_sec + 5) * 1000],
+    ["responded_at в будущем дальше live_check_clock_skew_sec (часы стенда спешат)", "stand", (p: { live_check_clock_skew_sec: number }) => (p.live_check_clock_skew_sec + 5) * 1000],
+  ] as const)("%s — LIVE_STALE перед CART: мандата корзины нет, покупка в OFFERS; часы верны — CART запрошен", async (_, whose, shift) => {
+    const skew: { ms: number | null } = { ms: null };
+    const f: typeof fetch = async (input, init) => {
+      if (whose !== "stand" || skew.ms === null || !String(input).endsWith(`/v1/shops/${NORMAL.id}/catalog`)) return fetch(input, init);
+      c!.stand!.setClock(new Date(Date.now() + skew.ms));
+      try {
+        return await fetch(input, init);
+      } finally {
+        c!.stand!.setClock(undefined);
+      }
+    };
+    const purchaseNow = () => new Date(Date.now() + (whose === "purchase" && skew.ms !== null ? skew.ms : 0));
+    const r = await standPurchase({ fetch: f, purchaseNow });
+    c = r.c;
+    await r.signedIntent();
+    const zones = await r.purchase.search();
+    const offer = zones.contour.find((o) => o.shopId === NORMAL.id && o.sku === BREAD.sku)!;
+
+    const before = r.c.calls().length;
+    skew.ms = shift(r.c.params);
+    const err = await r.purchase.cart(one(offer, QTY), { idempotencyKey: "idem-cart-p10-stale" }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(CartLiveRefused);
+    expect((err as CartLiveRefused).codes).toEqual(["LIVE_STALE"]);
+    expect(r.purchase.state).toBe("OFFERS");
+    // живая проверка ушла к витрине, запроса CART нет
+    const calls = r.c.calls().slice(before).map((x) => `${x.target} ${x.route} ${x.status}`);
+    expect(calls).toContain(`merchants GET /v1/shops/${NORMAL.id}/catalog 200`);
+    expect(calls.filter((x) => x.startsWith("pao POST /pao/v1/mandates"))).toEqual([]);
+    expect(r.c.journal.entries.filter((e) => e.kind === "cart.live_refused").map((e) => [e.reason, e.ref])).toEqual([["LIVE_STALE", BREAD.sku]]);
+
+    skew.ms = null;
+    const cart = await r.purchase.cart(one(offer, QTY), { idempotencyKey: "idem-cart-p10-fresh" });
+    expect(cart).toMatchObject({ kind: "CART", status: "PENDING_SIGNATURE" });
+  });
+
   it("2 шт. хлеба: CART с parent_id INTENT, итог — по живой цене продавца; заказ создан, Order.total = итогу CART", async () => {
     const r = await standPurchase();
     c = r.c;

@@ -9,7 +9,8 @@
 // MCC, оплата, регионы, возврат), товар — доставка, время обновления, GTIN, бренд, модель, атрибуты; перевод snake_case в
 // модель — здесь, проверки значений — ядро (`validateShop` / `validateProduct`). Факты магазина не по схеме — магазин
 // исключён целиком. GTIN — данные модели: в журнал не пишется и через сканер номеров карт (`order_ref`) не проходит.
-// `checkedAt` живого предложения — по часам агента (Р38 нюанс К6; свежесть по `responded_at` — Р54 п. 6).
+// `checkedAt` живого предложения — `responded_at` ответа каталога (часы витрины, Р54 п. 6): свежесть сравнивает ядро
+// (`checkLiveOffer`); `responded_at` нет или не дата-время с поясом — отказ источника (LIVE_CALL_ERROR), не «свежо».
 // Знак готовности продавца — по ПАО, одной функцией `readiness` (Р53): зона контура — только при ACTIVE; поля витрины
 // `zone` и `readiness_mark` — сведения; знак не проверен — витрина недоступна (READINESS_UNAVAILABLE).
 import { randomUUID } from "node:crypto";
@@ -85,6 +86,9 @@ const ShopFacts = z.object({
   returns: z.object({ days: z.number().int().nonnegative(), text: z.string() }),
 });
 const Catalog = z.object({ items: z.array(z.unknown()) });
+/** Каталог живой проверки: `responded_at` — время ответа по часам витрины, дата-время с поясом (Р54 п. 6). В поиске не
+ *  проверяется: поиск — снимок, свежесть — у живой проверки перед заказом. */
+const LiveCatalog = Catalog.extend({ responded_at: z.iso.datetime({ offset: true }) });
 /** Вариант доставки: `method` — строкой, перечень проверяет ядро (`BAD_METHOD`, как у фида; ревью КТ1 № 1). */
 const Delivery = z.object({
   method: z.string(),
@@ -305,19 +309,20 @@ export class ShopsAdapter implements OfferSource, LiveOfferSource, ShopPort, Sho
     return { unverified: detail };
   }
 
-  /** Живое предложение перед заказом: цена и наличие — из каталога витрины, `checkedAt` — часы агента (#45). Отказ —
-   *  исключение: у конвейера это LIVE_CALL_ERROR или LIVE_UNAVAILABLE, заказа нет. */
+  /** Живое предложение перед заказом: цена и наличие — из каталога витрины, `checkedAt` — `responded_at` ответа (часы
+   *  витрины, Р54 п. 6; свежесть сравнивает ядро). Отказ — исключение: у конвейера это LIVE_CALL_ERROR или
+   *  LIVE_UNAVAILABLE, заказа нет; `responded_at` нет или не по форме — ответ не по схеме, тоже отказ. */
   async fetch(req: LiveOfferRequest, signal: AbortSignal): Promise<LiveOffer> {
     const shop = this.#shopOf.get(req.sku);
     if (shop === undefined || shop === null) throw new Error("sku нет в выдаче или он у двух витрин");
-    const catalog = await this.#get("GET /v1/shops/{id}/catalog", `/v1/shops/${shop}/catalog`, Catalog, shop, signal);
+    const catalog = await this.#get("GET /v1/shops/{id}/catalog", `/v1/shops/${shop}/catalog`, LiveCatalog, shop, signal);
     if (!catalog.ok) throw new Error("витрина не ответила на живую проверку или ответ не по схеме");
     const i = catalog.body.items.flatMap((x) => {
       const p = LiveItem.safeParse(x);
       return p.success && p.data.sku === req.sku ? [p.data] : [];
     })[0];
     if (i === undefined) throw new Error("sku нет у витрины");
-    return { sku: i.sku, price: { amount: i.price, currency: i.currency }, availability: { inStock: i.in_stock }, checkedAt: this.now().toISOString() };
+    return { sku: i.sku, price: { amount: i.price, currency: i.currency }, availability: { inStock: i.in_stock }, checkedAt: catalog.body.responded_at };
   }
 
   /** Стадия 3: заказ по мандату корзины; не повторяется никогда (у витрины нет ключа идемпотентности заказа, инвариант 9).

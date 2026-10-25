@@ -5,9 +5,11 @@
 // нет (инвариант 4). Ответ витрины — данные: берутся только поля схемы, текст описания — только в `description` для
 // сверки с ценой (инвариант 5, Т5а). Отказ витрины — без обходов: ни без подписи, ни другим ключом; повтор — только
 // `GET` с повторяемым кодом, один раз, тот же запрос с новой подписью (витрина отклоняет повторный x-nonce).
-// Факты, которых витрина не отдаёт (ИНН, MCC, оплата, регионы, возврат, доставка, время обновления), — профиль магазина
-// от места сборки (Р42 п. 2; до kuzin4u/agentic-ps-platform#45). Время ответа продавца у витрины нет — `checkedAt`
-// живого предложения по часам агента (Р38 нюанс К6).
+// Факты модели каталога (К8) — из витрины (Р54 п. 4, kuzin4u/agentic-ps-platform#45): магазин — из записи списка (ИНН,
+// MCC, оплата, регионы, возврат), товар — доставка, время обновления, GTIN, бренд, модель, атрибуты; перевод snake_case в
+// модель — здесь, проверки значений — ядро (`validateShop` / `validateProduct`). Факты магазина не по схеме — магазин
+// исключён целиком. GTIN — данные модели: в журнал не пишется и через сканер номеров карт (`order_ref`) не проходит.
+// `checkedAt` живого предложения — по часам агента (Р38 нюанс К6; свежесть по `responded_at` — Р54 п. 6).
 // Знак готовности продавца — по ПАО, одной функцией `readiness` (Р53): зона контура — только при ACTIVE; поля витрины
 // `zone` и `readiness_mark` — сведения; знак не проверен — витрина недоступна (READINESS_UNAVAILABLE).
 import { randomUUID } from "node:crypto";
@@ -38,13 +40,6 @@ import { MERCHANT_ID, SAFE_ID, SHOP_ID } from "../../../shared/ids.js";
 import { ORDER_REF } from "../../payment-package/order-ref.js";
 import { MERCHANT_RETRYABLE, isMerchantCode } from "./codes.js";
 
-/** Профиль магазина (Р42 п. 2): сведения, которых витрина не отдаёт. `item` — доставка и время обновления карточки;
- *  null — сведений нет (карточка не пройдёт модель). */
-export interface ShopProfile {
-  shop: Omit<CatalogShop, "id">;
-  item(sku: string): Pick<CatalogProduct, "delivery" | "updatedAt"> | null;
-}
-
 export type ShopsParams = Pick<
   StandParams,
   "shop_request_timeout_ms" | "shop_retry_after_max_sec" | "shop_retry_default_ms" | "shop_search_deadline_ms" | "pao_request_timeout_ms"
@@ -59,8 +54,6 @@ export interface ShopsAdapterOptions {
    *  `fetch` — по умолчанию `fetch` адаптера (тот же, что у витрин) */
   platform: { baseUrl: string; signing: RequestSigning; fetch?: typeof fetch };
   params: ShopsParams;
-  /** профиль магазина по id витрины; null — профиля нет, магазин исключён целиком (REQUIRED) */
-  profile: (shopId: string) => ShopProfile | null;
   /** попытки обращений (shop.call, Т15) */
   journal: Journal;
   now?: () => Date;
@@ -82,15 +75,38 @@ const EXPONENT = { RUB: 2 } as const;
 const Shops = z.object({ shops: z.array(z.unknown()) });
 const ShopEntry = z.object({ id: Id, merchant_id: MerchantId });
 const Zone = z.object({ zone: z.literal("CONTOUR"), readiness_mark: z.literal(true) });
+const Currency = z.enum(Object.keys(EXPONENT) as [keyof typeof EXPONENT]);
+/** Факты магазина из записи списка (Р54 п. 4): все пять обязательны; значения проверяет ядро (`validateShop`). */
+const ShopFacts = z.object({
+  inn: z.string(),
+  mcc: z.string(),
+  payment_methods: z.array(z.string()),
+  delivery_regions: z.array(z.string()),
+  returns: z.object({ days: z.number().int().nonnegative(), text: z.string() }),
+});
 const Catalog = z.object({ items: z.array(z.unknown()) });
-const Item = z.object({
-  sku: Id,
+const Delivery = z.object({
+  method: z.enum(["DELIVERY", "PICKUP"]),
+  region: z.string().optional(),
+  min_days: z.number().int().nonnegative(),
+  max_days: z.number().int().nonnegative(),
+  cost: z.number().int().nonnegative(),
+  currency: Currency,
+});
+/** Поля живой проверки: цена и наличие (Р32 п. 3). */
+const LiveItem = z.object({ sku: Id, price: z.number().int().nonnegative(), currency: Currency, in_stock: z.boolean() });
+/** Карточка выдачи (Р54 п. 4): доставка и время обновления обязательны; GTIN, бренд, модель — нет поля — `null`, атрибутов
+ *  нет — `{}`. */
+const Item = LiveItem.extend({
   title: z.string(),
   description: z.string().optional(),
-  price: z.number().int().nonnegative(),
-  currency: z.enum(Object.keys(EXPONENT) as [keyof typeof EXPONENT]),
-  in_stock: z.boolean(),
   category: z.string(),
+  delivery_options: z.array(Delivery),
+  updated_at: z.string(),
+  gtin: z.string().nullable().optional(),
+  brand: z.string().nullable().optional(),
+  model: z.string().nullable().optional(),
+  attributes: z.record(z.string(), z.string()).optional(),
 });
 type ShopItem = z.infer<typeof Item>;
 const Order = z.object({ id: OrderId, total: z.number().int().nonnegative(), currency: z.enum(Object.keys(EXPONENT) as [keyof typeof EXPONENT]) });
@@ -232,7 +248,7 @@ export class ShopsAdapter implements OfferSource, LiveOfferSource, ShopPort, Sho
       out.push({
         merchantId: s.merchant_id,
         inContour,
-        facts: this.#facts(s.id, items, dropped),
+        facts: this.#facts(s.id, entry, items, dropped),
         ...(!inContour && { link: `${this.o.baseUrl}/v1/shops/${s.id}/catalog` }),
       });
     }
@@ -292,7 +308,7 @@ export class ShopsAdapter implements OfferSource, LiveOfferSource, ShopPort, Sho
     const catalog = await this.#get("GET /v1/shops/{id}/catalog", `/v1/shops/${shop}/catalog`, Catalog, shop, signal);
     if (!catalog.ok) throw new Error("витрина не ответила на живую проверку или ответ не по схеме");
     const i = catalog.body.items.flatMap((x) => {
-      const p = Item.safeParse(x);
+      const p = LiveItem.safeParse(x);
       return p.success && p.data.sku === req.sku ? [p.data] : [];
     })[0];
     if (i === undefined) throw new Error("sku нет у витрины");
@@ -347,29 +363,42 @@ export class ShopsAdapter implements OfferSource, LiveOfferSource, ShopPort, Sho
     return { status: b.data.status };
   }
 
-  /** Факты витрины: магазин и товары — из витрины и профиля; профиля нет — магазин исключён (REQUIRED). */
-  #facts(shopId: string, items: ShopItem[], dropped: CatalogIssueCode[]): CatalogFacts {
-    const profile = this.o.profile(shopId);
-    if (profile === null) return { shop: null, shopIssues: ["REQUIRED"], products: [], dropped: [] };
-    const shop: CatalogShop = { ...structuredClone(profile.shop), id: shopId };
-    const products = items.map((i): CatalogProduct => {
-      const extra = profile.item(i.sku);
-      return {
+  /** Факты витрины → модель К8 (Р54 п. 4): магазин — из записи списка `entry`, товары — из карточек каталога. Факты
+   *  магазина не по схеме — магазин исключён целиком: один код на магазин, по карточкам записей нет (витрина INCOMPLETE эмулятора, Р54 п. 5). */
+  #facts(shopId: string, entry: unknown, items: ShopItem[], dropped: CatalogIssueCode[]): CatalogFacts {
+    const f = ShopFacts.safeParse(entry);
+    if (!f.success) return { shop: null, shopIssues: [dropCode(entry, f.error.issues)], products: [], dropped: [] };
+    const shop: CatalogShop = {
+      id: shopId,
+      inn: f.data.inn,
+      mcc: f.data.mcc,
+      paymentMethods: f.data.payment_methods,
+      deliveryRegions: f.data.delivery_regions,
+      returns: f.data.returns,
+    };
+    const products = items.map(
+      (i): CatalogProduct => ({
         sku: i.sku,
-        gtin: null,
-        brand: null,
-        model: null,
-        attributes: {},
+        gtin: i.gtin ?? null,
+        brand: i.brand ?? null,
+        model: i.model ?? null,
+        attributes: i.attributes ?? {},
         title: i.title,
         category: i.category,
         price: { amount: i.price, currency: i.currency },
         availability: { inStock: i.in_stock },
-        delivery: extra === null ? [] : structuredClone(extra.delivery),
-        updatedAt: extra?.updatedAt ?? "",
+        delivery: i.delivery_options.map((d) => ({
+          method: d.method,
+          ...(d.region !== undefined && { region: d.region }),
+          minDays: d.min_days,
+          maxDays: d.max_days,
+          cost: { amount: d.cost, currency: d.currency },
+        })),
+        updatedAt: i.updated_at,
         // текст витрины — только для сверки с ценой (A5), решений по нему нет (инвариант 5)
         ...(i.description !== undefined && { description: i.description }),
-      };
-    });
+      }),
+    );
     return readShop(shop, products, dropped, EXPONENT.RUB);
   }
 

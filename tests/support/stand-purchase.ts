@@ -1,11 +1,11 @@
 // Покупка конвейера на стенде Платформы и эмуляторе продавцов (Р38 п. 8, Р42): клиент мандатов на стенде, лента стенда с
-// курсором, адаптер витрин (stand-shop.ts, ТЕСТОВЫЙ ПРОФИЛЬ магазина), стадии 4–6 — тестовый порт PaymentSteps или шаги
+// курсором, адаптер витрин (stand-shop.ts; факты магазина и товара — из витрин эмулятора, Р54 п. 4), стадии 4–6 — тестовый порт PaymentSteps или шаги
 // профиля contour (`contourPayment`, Р45): реквизит по ПАО стенда и пакет агентской оплаты витрине эмулятора; ожидание
 // подтверждения — модуль подтверждений ядра на ленте стенда (Р47).
 // Подпись INTENT и CART — эмулятором банка во время ожидания, решение — по событию mandate.signed (Р29 п. 5, Р34 п. 5).
 import { expect } from "vitest";
 import { MERCHANT_FIXTURES } from "agentic-ps-platform/fixtures";
-import type { ShopsAdapter, ShopProfile } from "../../src/agent/adapters/shops/index.js";
+import type { ShopsAdapter } from "../../src/agent/adapters/shops/index.js";
 import { Confirmations } from "../../src/agent/confirmations/index.js";
 import { MandateClient } from "../../src/agent/mandates/index.js";
 import { Operations } from "../../src/agent/operations/index.js";
@@ -46,7 +46,6 @@ export function feedOf(platform: PaymentPlatform, polls = 100) {
 }
 
 export interface StandPurchaseOptions {
-  profile?: (shopId: string) => ShopProfile | null;
   /** подмена ответа витрины поверх настоящего обращения к эмулятору — только то, чего эмулятор выдать не может */
   fetch?: typeof fetch;
   /** подпись обращений к витринам не ключом агента контура */
@@ -121,7 +120,8 @@ export async function standPurchase(o: StandPurchaseOptions = {}) {
       orderMismatches,
       journal: c.journal,
       admission: () => c.admission(),
-      region: "77",
+      // регион человека — в кодах регионов доставки витрин: у эмулятора ISO 3166-2 (#45, Р54 нюанс К3.1)
+      region: "RU-MOW",
       ...(o.notify !== undefined && { notify: o.notify }),
       ...(o.failureCode !== undefined && { failureCode: o.failureCode }),
     });

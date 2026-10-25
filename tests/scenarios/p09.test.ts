@@ -2,7 +2,8 @@
 // эмулятора: цена и описание — данные витрины (по-настоящему), сверка — `checkProductA5` ядра: CONTRADICTORY (цена в тексте ≠
 // поле price) — пометка A5_PRICE_MISMATCH, покупка только по явному решению человека. Текст витрины — недоверенные данные:
 // INJECTION (инструкция в описании) ведёт себя как витрина без инструкции (инвариант 5; распознавание инструкций, Д01, —
-// у buyer_agent). INCOMPLETE (A5 п. 1.1, Р42 п. 6): карточка без обязательных сведений не переводится — REQUIRED.
+// у buyer_agent). INCOMPLETE (A5 п. 1.1, Р42 п. 6): без условий возврата магазин не переводится — исключён целиком одной
+// записью REQUIRED (Р54 п. 5); карточки без обязательных сведений тоже неполны.
 import { afterEach, describe, expect, it } from "vitest";
 import { CartRefused } from "../../src/agent/pipeline/index.js";
 import { PaymentFailure } from "../../src/agent/ports/index.js";
@@ -123,16 +124,18 @@ describe("П09 — противоречивое описание товара", 
     expect(calls).toEqual(["authorize", "confirm"]);
   });
 
-  it("INCOMPLETE: карточки без цены или наличия — REQUIRED, ни в одной зоне, заказа нет (Р42 п. 6)", async () => {
+  it("INCOMPLETE: неполна и по фактам магазина (нет returns) — магазин исключён одной записью REQUIRED, ни в одной зоне, заказа нет (Р42 п. 6, Р54 п. 5)", async () => {
     const r = await standPurchase();
     c = r.c;
     await r.signedIntent();
     const zones = await r.purchase.search();
-    // цепочка кодов: витрина отдаёт карточки без обязательных сведений (A5 п. 1.1) → схема адаптера → REQUIRED
+    // цепочка кодов: витрина отдаёт магазин без условий возврата и карточки без обязательных сведений (A5 п. 1.1) →
+    // факты магазина не по схеме адаптера → магазин исключён целиком: одна запись REQUIRED, по карточкам записей нет
+    expect(INCOMPLETE.returns).toBeUndefined();
     expect(INCOMPLETE.agent_items.every((i) => i.price === undefined || i.in_stock === undefined)).toBe(true);
     expect([...zones.contour, ...zones.market].some((o) => o.shopId === INCOMPLETE.id)).toBe(false);
     const excluded = r.c.journal.entries.filter((e) => e.kind === "offer.excluded" && e.merchant === INCOMPLETE.merchant_id);
-    expect(excluded.map((e) => [e.reason, e.ref])).toEqual(INCOMPLETE.agent_items.map(() => ["REQUIRED", undefined]));
+    expect(excluded.map((e) => [e.reason, e.ref])).toEqual([["REQUIRED", undefined]]);
     // полный журнал обращений к витринам: список и по одному каталогу на витрину — ни повтора, ни живой проверки, ни заказа
     expect(r.c.calls().filter((x) => x.target === "merchants").map((x) => `${x.route} ${x.status}`)).toEqual([
       "GET /v1/shops 200",

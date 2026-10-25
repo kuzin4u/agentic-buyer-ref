@@ -27,14 +27,16 @@ describe("граф импортов src (Р24)", { timeout: 60_000 }, () => {
     expect(allFiles(join(ROOT, "src")).filter((f) => !SOURCE_FILE.test(f))).toEqual([]);
   });
 
-  it("тестовый профиль магазина (tests/support/stand-shop.ts) — только в тестах: src не импортирует tests/, профиль подключают только прогоны на стенде — тест покупки и общая сборка покупки на стенде для сценариев (Р38 п. 8, К6; Р42 п. 2)", () => {
+  it("src не импортирует tests/; тестового профиля магазина нет ни в src, ни в tests — факты из витрин (Р54 п. 4); адаптер витрин стенда (tests/support/stand-shop.ts) подключают только тест покупки и общая сборка покупки на стенде (Р38 п. 8, К6)", () => {
     const rel = (f: string) => f.slice(ROOT.length + 1);
     const SPEC = /(?:from\s+|import\s*\(\s*|import\s+|require\s*\(\s*|export\s+\*\s+from\s+)["']([^"']+)["']/g;
     const intoTests = allFiles(join(ROOT, "src")).filter((f) =>
       [...readFileSync(f, "utf8").matchAll(SPEC)].some(([, spec]) => spec!.startsWith(".") && rel(resolve(join(f, ".."), spec!)).startsWith("tests/")),
     );
     expect(intoTests.map(rel)).toEqual([]);
-    expect(allFiles(join(ROOT, "src")).filter((f) => readFileSync(f, "utf8").includes("TEST_PROFILE")).map(rel)).toEqual([]);
+    const self = resolve(import.meta.dirname, "import-graph.test.ts");
+    const profiled = [...allFiles(join(ROOT, "src")), ...allFiles(join(ROOT, "tests"))].filter((f) => f !== self && /TEST_PROFILE|testProfile/.test(readFileSync(f, "utf8")));
+    expect(profiled.map(rel)).toEqual([]);
     const users = allFiles(join(ROOT, "tests")).filter(
       (f) => f.endsWith(".ts") && [...readFileSync(f, "utf8").matchAll(SPEC)].some(([, spec]) => spec!.endsWith("/stand-shop.js")),
     );

@@ -112,7 +112,7 @@ describe("ядро и события на стенде v0.11.0 (Р34)", { timeou
     expect(b.journal.entries.filter((e) => e.kind.startsWith("event"))).toEqual([]);
 
     // полный журнал обращений: лишнего PUT или чтения ленты нет; ключ подписки у каждого запуска свой (дополнение Р34 п. 2)
-    const CONF = { route: "GET /.well-known/pao-configuration", status: 404, key: null };
+    const CONF = { route: "GET /.well-known/pao-configuration", status: 200, key: null };
     const SELF = { route: "GET /pao/v1/agent", status: 200, key: null };
     const [k1, k2] = calls.filter((c) => c.route === "PUT /pao/v1/subscription").map((c) => c.key);
     expect(k1).toMatch(/^sub-[0-9a-f]{32}$/);
@@ -177,8 +177,8 @@ describe("ядро и события на стенде v0.11.0 (Р34)", { timeou
       `GET /pao/v1/mandates/${m.id}`,
       `GET /pao/v1/mandates/${m.id}`,
     ]);
-    // ошибок нет, кроме 404 конфигурации (стенд её не отдаёт до PS-05, Р33 п. 10)
-    expect(calls.filter((c) => c.status >= 400).map((c) => c.route)).toEqual(["GET /.well-known/pao-configuration"]);
+    // ошибок нет: конфигурацию стенд отдаёт с v0.26.0 (РП60, передача #74; до неё — 404, Р33 п. 10; Р57 п. 1)
+    expect(calls.filter((c) => c.status >= 400).map((c) => c.route)).toEqual([]);
   });
 
   it("agent.* в ленте — сверка GET /pao/v1/agent, курсор двигается (Р34 п. 5)", async () => {

@@ -66,8 +66,9 @@ async function platform() {
 }
 
 const SELF = "GET /pao/v1/agent";
-/** Р33 п. 10: конфигурация читается на стадии 0; стенд её не отдаёт до PS-05 — 404, версия не определена. */
-const CONF = { route: "GET /.well-known/pao-configuration", status: 404 };
+/** Р33 п. 10: конфигурация читается на стадии 0; с v0.26.0 стенд её отдаёт (РП60, передача #74) — 200, `versions`
+ *  ["1.4.0"], версия известна с шага 1 (до v0.26.0 — 404; Р57 п. 1). */
+const CONF = { route: "GET /.well-known/pao-configuration", status: 200 };
 
 /** Отказ подписи на допуске (SPEC §7а): один повтор с новой подписью (новый x-nonce, Р21), затем остановка. */
 async function expectSignatureStop(core: Awaited<ReturnType<typeof coreAt>>["core"], journal: MemoryJournal, log: Call[]) {

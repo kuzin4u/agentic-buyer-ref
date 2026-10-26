@@ -825,6 +825,37 @@ describe("Р58 п. 3: SIGNATURE_INVALID — сверка времени по Dat
     }
   });
 
+  it("ревью КТ1 № 3: выдача реквизита — повтор не помещается в её срок: отказ операции без остановки агента; CLOCK_SKEW и тут — остановка", async () => {
+    for (const [date, stops] of [
+      [behind(0), []],
+      [behind(params.signature_skew_sec + 60), [["SIGNATURE_INVALID", "CLOCK_SKEW"]]],
+    ] as [string, [string, string | undefined][]][]) {
+      const stopped: [string, string | undefined][] = [];
+      const calls: unknown[] = [];
+      const journal = new MemoryJournal();
+      let t = 0;
+      const platform = new PaoPlatform({
+        journal,
+        baseUrl: "http://pao.test",
+        agentCode: AGENT,
+        signing: { ...signing, stop: (r: string, d?: string) => void stopped.push([r, d]) },
+        params,
+        sleep: async () => {},
+        now: () => NOW,
+        // первая попытка «заняла» весь срок выдачи (registry_cache_ttl_sec): ещё одна не помещается (Р45 п. 2.4)
+        monotonic: () => (t += params.registry_cache_ttl_sec * 1000),
+        fetch: async (_url, init) => {
+          calls.push(init);
+          return new Response(JSON.stringify(rejected), { status: 401, headers: { "content-type": "application/json", date } });
+        },
+      });
+      await expect(platform.issueCredential(draft, { idempotencyKey: "idem-cr" })).rejects.toMatchObject({ code: "SIGNATURE_INVALID" });
+      expect(calls).toHaveLength(1);
+      expect(stopped).toEqual(stops);
+      expect(journal.entries.filter((e) => e.kind === "signature.rejected")).toHaveLength(1);
+    }
+  });
+
   it("сбой журнала на signature.rejected не отменяет остановку (Р53 ревью К2.1 № 8)", async () => {
     const stopped: string[] = [];
     const platform = new PaoPlatform({

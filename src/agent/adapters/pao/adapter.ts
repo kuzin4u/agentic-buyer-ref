@@ -399,7 +399,7 @@ export class PaoPlatform implements PaymentPlatform {
       const skew = signature ? skewSec(last) : undefined;
       const clockSkew = skew !== undefined && Math.abs(skew) > this.o.params.signature_skew_sec;
       // Отказ в допуске — остановка агента целиком (SPEC §7а, П03); SIGNATURE_INVALID — по правилу выше.
-      const halt = AGENT_STOP_CODES.has(failure.code) || (signature && (clockSkew || signatureRetries >= (rule.maxRetries ?? 0) || !fits(0)));
+      const halt = AGENT_STOP_CODES.has(failure.code) || (signature && (clockSkew || signatureRetries >= (rule.maxRetries ?? 0)));
       // Отозванный ключ: другой действующий (нет — SignerStopped).
       const rotate = !halt && rule.action === "ROTATE_KEY";
       try {
@@ -419,6 +419,9 @@ export class PaoPlatform implements PaymentPlatform {
       }
       if (halt) throw failure;
       if (signature) {
+        // Повтор выдачи реквизита не помещается в её срок — агент сам видит истёкший срок: отказ операции без остановки
+        // агента (ревью КТ1 № 3, решение владельца 26.10; как у AGENT_KEY_REVOKED). CLOCK_SKEW и второй отказ — остановка.
+        if (!fits(0)) throw failure;
         signatureRetries++;
         continue;
       }

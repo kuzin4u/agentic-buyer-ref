@@ -60,7 +60,11 @@ describe("плановая ротация против стенда ПАО", () 
     const limit = (ruleForFailure("KEY_INVALID").maxRetries ?? 0) + 1;
     stand.stub.fail("POST /pao/v1/agent/keys", { code: "KEY_INVALID" }, limit + 1); // fail заглушки — раньше обработчика обёртки
     stand.clock = new Date(Date.parse(stand.validTo(old)) - OVERLAP);
-    for (let i = 0; i < limit; i++) await expect(core.maintainKeys()).rejects.toMatchObject({ code: "KEY_INVALID", httpStatus: 422 });
+    for (let i = 0; i < limit - 1; i++) await expect(core.maintainKeys()).rejects.toMatchObject({ code: "KEY_INVALID", httpStatus: 422 });
+    // вызов, набравший предел, — сразу SignerRotationStopped с исходным отказом (ревью КТ1 № 5)
+    const last = (await core.maintainKeys().catch((e: unknown) => e)) as SignerRotationStopped;
+    expect(last).toBeInstanceOf(SignerRotationStopped);
+    expect(last.cause).toMatchObject({ code: "KEY_INVALID", httpStatus: 422 });
     const posts = stand.calls("POST /pao/v1/agent/keys");
     expect(posts.map((c) => c.status)).toEqual(Array(limit).fill(422));
     expect(new Set(posts.map((c) => c.idempotencyKey)).size).toBe(limit); // каждый раз новый ключ
@@ -401,7 +405,9 @@ describe("сверка с реестром (fail-closed)", () => {
       await k.r.start(k.self([k.key()]));
       const p = scripted(k, []);
       const limit = (ruleForFailure("KEY_INVALID").maxRetries ?? 0) + 1; // 3 по SPEC §7а — сверяет declines.test
-      for (let i = 0; i < limit; i++) await expect(k.r.rotate(p)).rejects.toMatchObject({ code: "KEY_INVALID" });
+      for (let i = 0; i < limit - 1; i++) await expect(k.r.rotate(p)).rejects.toMatchObject({ code: "KEY_INVALID" });
+      // вызов, набравший предел, — сразу SignerRotationStopped, исходный отказ — в cause (ревью КТ1 № 5)
+      await expect(k.r.rotate(p)).rejects.toMatchObject({ name: "SignerRotationStopped", cause: { code: "KEY_INVALID" } });
       expect(stopped(k.j)).toMatchObject([{ reason: "KEY_INVALID" }]);
       const files = listKeys(dir!).length;
       await expect(k.r.rotate(p)).rejects.toThrow(SignerRotationStopped); // не SignerKeyRejected: нужен человек (Р58 п. 4 (г))
@@ -428,7 +434,7 @@ describe("сверка с реестром (fail-closed)", () => {
       await expect(k.r.rotate(p)).rejects.toMatchObject({ code: "KEY_INVALID" });
       await expect(k.r.rotate(p)).rejects.toThrow(SignerKeyRejected);
       expect(stopped(k.j)).toEqual([]);
-      await expect(k.r.rotate(p)).rejects.toMatchObject({ code: "KEY_INVALID" });
+      await expect(k.r.rotate(p)).rejects.toMatchObject({ name: "SignerRotationStopped", cause: { code: "KEY_INVALID" } });
       expect(stopped(k.j)).toMatchObject([{ reason: "KEY_INVALID" }]);
       expect(k.j.entries.filter((e) => e.kind === "key.revoked").map((e) => e.reason)).toEqual(["KEY_INVALID", "KEY_NOT_ACTIVE", "KEY_INVALID"]);
       await expect(k.r.rotate(p)).rejects.toThrow(SignerRotationStopped);
@@ -444,11 +450,15 @@ describe("сверка с реестром (fail-closed)", () => {
       await k.r.rotate(p); // сброс
       for (let i = 0; i < 2; i++) await expect(k.r.rotate(p)).rejects.toMatchObject({ code: "KEY_INVALID" });
       expect(stopped(k.j)).toEqual([]);
-      await expect(k.r.rotate(p)).rejects.toThrow(SignerKeyRejected);
+      const err = (await k.r.rotate(p).catch((e: unknown) => e)) as Error;
+      expect(err).toBeInstanceOf(SignerRotationStopped); // предел набран не-ACTIVE ключом — тоже сразу
+      expect(err).not.toBeInstanceOf(SignerKeyRejected);
+      expect(err.cause).toBeUndefined(); // исключения-отказа у KEY_NOT_ACTIVE нет
       expect(stopped(k.j)).toMatchObject([{ reason: "KEY_NOT_ACTIVE" }]);
     });
 
-    it("Р58 п. 4 (б): сбой хранилища при KEY_INVALID — остановка KEYSTORE_WRITE_FAILED, detail KEY_INVALID, исходный отказ в cause", async () => {
+    // chmod 0500 не мешает записи от root — тест зависит от среды (ревью КТ1 № 9)
+    it.skipIf(process.getuid?.() === 0)("Р58 п. 4 (б): сбой хранилища при KEY_INVALID — остановка KEYSTORE_WRITE_FAILED, detail KEY_INVALID, исходный отказ в cause", async () => {
       const k = ring();
       await k.r.start(k.self([k.key()]));
       const failure = keyInvalid();
@@ -477,7 +487,8 @@ describe("сверка с реестром (fail-closed)", () => {
       await k.r.start(k.self([k.key()]));
       const p = scripted(k, []);
       const limit = (ruleForFailure("KEY_INVALID").maxRetries ?? 0) + 1;
-      for (let i = 0; i < limit; i++) await expect(k.r.rotate(p)).rejects.toMatchObject({ code: "KEY_INVALID" });
+      for (let i = 0; i < limit - 1; i++) await expect(k.r.rotate(p)).rejects.toMatchObject({ code: "KEY_INVALID" });
+      await expect(k.r.rotate(p)).rejects.toThrow(SignerRotationStopped);
       expect(k.r.port().current().kid).toBe(k.d.kid);
       clock.now = new Date("2026-12-30T00:00:00Z"); // valid_to прежнего ключа
       expect(() => k.r.port().current()).toThrow(expect.objectContaining({ name: "SignerStopped", reason: "NO_ACTIVE_KEY" }));

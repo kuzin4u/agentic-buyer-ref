@@ -19,6 +19,7 @@ import { KeystoreLocked, generateKey, listKeys, loadKey, lockDir, markKey, prune
 import { kidOf } from "./kid.js";
 
 const DAY_MS = 86_400_000;
+const ROTATION_STOPPED = "ротация остановлена: новый ключ не принят подряд сверх предела, нужен человек (Р31, Р58 п. 4)";
 
 export interface KeyRingOptions {
   /** каталог ключей (keystore) */
@@ -218,7 +219,7 @@ export class KeyRing {
 
   async #doRotate(platform: Registrar): Promise<void> {
     this.#current(false); // остановленный или не допущенный агент не ротирует
-    if (this.#rotationStopped) throw new SignerRotationStopped("ротация остановлена: новый ключ не принят подряд сверх предела, нужен человек (Р31, Р58 п. 4)");
+    if (this.#rotationStopped) throw new SignerRotationStopped(ROTATION_STOPPED);
     // В этом процессе: ожидающий регистрации или зарегистрированный без подтверждённого перехода — тот же ключ
     // и тот же Idempotency-Key (инвариант 9). Временные файлы прошлых запусков не используются (#loadAll).
     const pendingKid = [...this.#held.entries()].find(([, h]) => h.state !== "revoked" && (h.state === "pending" || h.awaiting))?.[0];
@@ -258,13 +259,15 @@ export class KeyRing {
 
   /** Новый ключ не принят (KEY_INVALID или не ACTIVE) — отклонён (повторно не регистрируется, инвариант 9); один счёт
    *  подряд, предел — KEY_INVALID таблицы отказов (Р58 п. 4 (а)). Сбой записи в хранилище — остановка KEYSTORE_WRITE_FAILED
-   *  с причиной отказа в detail и исходным отказом в cause (Р58 п. 4 (б)). */
+   *  с причиной отказа в detail и исходным отказом в cause (Р58 п. 4 (б)). Предел набран — SignerRotationStopped сразу, на
+   *  этом же вызове (исходный отказ — в cause; ревью КТ1 № 5): вызывающий не примет его за «попробовать снова». */
   #keyRejected(kid: string, reason: "KEY_INVALID" | "KEY_NOT_ACTIVE", failure?: unknown): void {
     this.#mark(kid, "revoked", reason, { detail: reason, cause: failure });
     this.#keyInvalidStreak++;
     if (this.#keyInvalidStreak > (ruleForFailure("KEY_INVALID").maxRetries ?? 0)) {
       this.#rotationStopped = true;
       this.#record("key.rotation_stopped", undefined, reason);
+      throw new SignerRotationStopped(ROTATION_STOPPED, failure === undefined ? undefined : { cause: failure });
     }
   }
 

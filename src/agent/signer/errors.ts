@@ -9,6 +9,13 @@ export class SignerKeyRejected extends Error {
   override readonly name: string = "SignerKeyRejected";
 }
 
+/** Ротация остановлена: новый ключ не принят подряд сверх предела таблицы отказов (KEY_INVALID, KEY_NOT_ACTIVE; Р31,
+ *  Р58 п. 4). Не временный отказ: нужен человек (снятие — перезапуск, команда оператора — AG-14); подпись прежним
+ *  подтверждённым ключом продолжается, пока он действителен. */
+export class SignerRotationStopped extends Error {
+  override readonly name = "SignerRotationStopped";
+}
+
 /** Подпись приостановлена до успешной повторной сверки с реестром (Р27: ответ реестра не по схеме после допуска). */
 export class SignerSuspended extends Error {
   override readonly name = "SignerSuspended";

@@ -37,6 +37,9 @@ export const StandParamsSchema = z
   revocation_propagation_max_ms: count,
   pao_max_attempts: positive,
   pao_request_timeout_ms: positive,
+  // Частота обращений к ПАО, пока предел второго слоя неизвестен (Р59 п. 3, fail-closed): до первого GET /pao/v1/agent,
+  // нет rate_limit_per_min или значение не целое ≥ 1.
+  pao_rate_limit_fallback_per_min: positive,
   // Тайм-аут выдачи реквизита POST /pao/v1/credentials (Р45 п. 2.5): выше предела обработчика Платформы.
   pao_credentials_timeout_ms: positive.max(TIMER_MAX_MS),
   // Живая проверка перед заказом (Р32 п. 7): в checkLiveOffer ядра передаются в мс.
@@ -91,6 +94,10 @@ export const StandParamsSchema = z
   .refine((p) => p.operation_outcome_max_delay_sec <= p.registry_cache_ttl_sec, { message: "operation_outcome_max_delay_sec больше registry_cache_ttl_sec" })
   // Перечитывание укладывается в границу ожидания клиринга: хотя бы одно плановое чтение до границы (Р51 п. 2).
   .refine((p) => p.operation_reread_interval_sec <= p.reservation_ttl_sec, { message: "operation_reread_interval_sec больше reservation_ttl_sec" })
+  // Опрос ленты — не больше половины запасной частоты обращений к ПАО (Р59 п. 3).
+  .refine((p) => 60_000 / p.event_poll_interval_ms <= p.pao_rate_limit_fallback_per_min / 2, {
+    message: "60 000 / event_poll_interval_ms больше pao_rate_limit_fallback_per_min / 2",
+  })
   // Срок поиска вмещает хотя бы одно обращение к витрине (Р44 п. 6).
   .refine((p) => p.shop_search_deadline_ms >= p.shop_request_timeout_ms, { message: "shop_search_deadline_ms меньше shop_request_timeout_ms" });
 

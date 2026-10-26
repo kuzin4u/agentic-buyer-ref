@@ -364,6 +364,8 @@ export function agentSelfFromPao(a: Pao.AgentSelf): AgentSelf {
     // Р27: класс обязателен для ядра (в ПАО 1.4.0 — нет); нет поля — тоже «вне перечня», UNKNOWN.
     agentClass: oneOf(a.class, AGENT_CLASSES, "agent.class"),
     keys: (a.keys ?? []).map(keyFromPao),
+    // тип (integer) проверила схема ответа; границы (целое ≥ 1) — у ограничителя частоты (Р59 п. 3)
+    ...(a.rate_limit_per_min !== undefined && { rateLimitPerMin: a.rate_limit_per_min }),
   };
 }
 

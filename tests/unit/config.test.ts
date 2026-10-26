@@ -122,6 +122,18 @@ describe("стендовые параметры", () => {
     expect(() => parseParams({ ...stand, confirmation_wait_ms: stand.registry_cache_ttl_sec * 1000 + 1 })).toThrow(ConfigError);
   });
 
+  it("запасная частота ПАО (Р59 п. 3): обязательна, целое > 0; опрос ленты — не больше её половины", () => {
+    const rest = { ...stand };
+    delete rest.pao_rate_limit_fallback_per_min;
+    expect(() => parseParams(rest)).toThrow(ConfigError);
+    expect(() => parseParams({ ...stand, pao_rate_limit_fallback_per_min: 0 })).toThrow(ConfigError);
+    expect(() => parseParams({ ...stand, pao_rate_limit_fallback_per_min: 1.5 })).toThrow(ConfigError);
+    // граница: 60 000 / event_poll_interval_ms == половина запасной частоты — допустимо, на единицу меньше — отказ
+    const atEdge = (2 * 60_000) / stand.event_poll_interval_ms;
+    expect(() => parseParams({ ...stand, pao_rate_limit_fallback_per_min: atEdge })).not.toThrow();
+    expect(() => parseParams({ ...stand, pao_rate_limit_fallback_per_min: atEdge - 1 })).toThrow(/pao_rate_limit_fallback_per_min/);
+  });
+
   it("отказ при отсутствии файла", () => {
     expect(() => loadParams("config/missing.json")).toThrow(ConfigError);
   });

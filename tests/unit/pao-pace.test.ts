@@ -7,7 +7,7 @@ import { Pace, PaoPlatform } from "../../src/agent/adapters/pao/index.js";
 import { createAgentCore } from "../../src/agent/compose.js";
 import { MemoryJournal } from "../../src/agent/journal/index.js";
 import type { RequestSigning } from "../../src/agent/ports/index.js";
-import { loadParams } from "../../src/shared/config.js";
+import { PAO_RATE_WINDOW_MS, PAO_RETRY_AFTER_MAX_SEC, loadParams } from "../../src/shared/config.js";
 import { INTENT, Consents } from "../support/consents.js";
 import { AGENT, PaoStand } from "../support/pao-stand.js";
 
@@ -41,25 +41,50 @@ describe("ограничитель частоты (Р59 п. 2–3)", () => {
     expect(sleeps).toEqual([20]);
   });
 
-  it("предел неизвестен — запасная частота (fail-closed): нет поля, 0, дробное, отрицательное", () => {
+  it("предел неизвестен — запасная частота (fail-closed): нет поля, дробное, отрицательное", () => {
     const { pace, journal } = paced();
     pace.learn({});
     expect(pace.perMin).toBe(params.pao_rate_limit_fallback_per_min);
-    pace.learn({ rateLimitPerMin: 600 });
-    for (const bad of [0, 1.5, -5]) {
+    for (const bad of [1.5, -5]) {
       pace.learn({ rateLimitPerMin: 600 });
       pace.learn({ rateLimitPerMin: bad });
       expect(pace.perMin).toBe(params.pao_rate_limit_fallback_per_min);
     }
-    expect(journal.entries.map((e) => e.detail)).toEqual([
-      "FALLBACK:NO_FIELD",
-      "AGENT:600",
-      "FALLBACK:OUT_OF_RANGE",
-      "AGENT:600",
-      "FALLBACK:OUT_OF_RANGE",
-      "AGENT:600",
-      "FALLBACK:OUT_OF_RANGE",
-    ]);
+    expect(journal.entries.map((e) => e.detail)).toEqual(["FALLBACK:NO_FIELD", "AGENT:600", "FALLBACK:OUT_OF_RANGE", "AGENT:600", "FALLBACK:OUT_OF_RANGE"]);
+  });
+
+  it.each([
+    [3, PAO_RATE_WINDOW_MS],
+    [5, 15_000],
+    [4, 15_000],
+  ])("нечётный предел (Р59 дополнение 1 п. 1): L = %i — интервал 30 000 / floor(L/2) = %i мс", async (L, ms) => {
+    const { pace, sleeps } = paced();
+    pace.learn({ rateLimitPerMin: L });
+    await pace.wait();
+    await pace.wait();
+    expect(sleeps).toEqual([ms]);
+  });
+
+  it.each([1, 0])(
+    "предел %i — Платформа не пропускает ни одного обращения за окно (дополнение 1 п. 2): pao.contract_violation до pao.rate_limit, одно обращение за окно",
+    async (L) => {
+      const { pace, sleeps, journal } = paced();
+      pace.learn({ rateLimitPerMin: L });
+      expect(journal.entries.map((e) => [e.kind, e.reason, e.detail])).toEqual([
+        ["pao.contract_violation", "RATE_LIMITED", `RATE_LIMIT_UNUSABLE:${L}`],
+        ["pao.rate_limit", undefined, `AGENT:${L}`],
+      ]);
+      await pace.wait();
+      await pace.wait();
+      expect(sleeps).toEqual([PAO_RATE_WINDOW_MS]);
+    },
+  );
+
+  it("часы не дают числа — отказ до сети, без зависания (ревью КТ1 № 1)", async () => {
+    const pace = new Pace({ fallbackPerMin: params.pao_rate_limit_fallback_per_min, journal: new MemoryJournal(), monotonic: () => NaN, sleep: async () => {} });
+    expect(pace.delay()).toBe(Infinity);
+    pace.hold(5);
+    await expect(pace.wait()).rejects.toMatchObject({ code: "RATE_LIMITED", retry: "never", httpStatus: 0 });
   });
 
   it("пауза после 429 (Р59 п. 4): новое обращение — не раньше её конца; ожидающее — новое место после неё", async () => {
@@ -101,6 +126,7 @@ describe("ограничитель в адаптере ПАО (Р59 п. 1–2)",
     suspend: () => {},
   };
   const json = (status: number, body: unknown) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+  const draft = { mandate: { id: "m_cart", currency: "RUB" }, orderRef: "ORD-1", merchantId: "shop_1", amountMax: { amount: 250000, currency: "RUB" }, channel: "CARD" as const };
   const self = (rate?: number) =>
     json(200, { agent_code: AGENT, status: "ACTIVE", class: "BUYER", keys: [], ...(rate !== undefined && { rate_limit_per_min: rate }) });
 
@@ -141,7 +167,7 @@ describe("ограничитель в адаптере ПАО (Р59 п. 1–2)",
 
   it.each([
     ["5", 5000],
-    ["999", 30_000],
+    ["999", PAO_RETRY_AFTER_MAX_SEC * 1000],
   ])("429 с Retry-After %s: запись pao.call, затем пауза всех обращений (не дольше потолка 30 с); сбой журнала её не отменяет", async (after, holdMs) => {
     const { pace } = paced();
     const journal = {
@@ -183,7 +209,7 @@ describe("ограничитель в адаптере ПАО (Р59 п. 1–2)",
     const marks = journal.entries.filter((e) => e.kind === "pao.contract_violation" || (expected.length > 0 && e.kind === "pao.call")).map((e) => [e.kind, e.reason, e.detail]);
     expect(marks).toEqual(expected);
     // пауза — не меньше 30 с (при 30 повтор занимает ещё место в очереди); точное значение — тест выше
-    expect(pace.delay()).toBeGreaterThanOrEqual(30_000);
+    expect(pace.delay()).toBeGreaterThanOrEqual(PAO_RETRY_AFTER_MAX_SEC * 1000);
   });
 
   it("429 без Retry-After — без повтора и без паузы (Р59 п. 4)", async () => {
@@ -227,11 +253,60 @@ describe("ограничитель в адаптере ПАО (Р59 п. 1–2)",
       },
       pace,
     });
-    expect(30_000 + params.pao_credentials_timeout_ms).toBeGreaterThan(params.registry_cache_ttl_sec * 1000);
-    const draft = { mandate: { id: "m_cart", currency: "RUB" }, orderRef: "ORD-1", merchantId: "shop_1", amountMax: { amount: 250000, currency: "RUB" }, channel: "CARD" as const };
+    expect(PAO_RATE_WINDOW_MS + params.pao_credentials_timeout_ms).toBeGreaterThan(params.registry_cache_ttl_sec * 1000);
     await expect(platform.issueCredential(draft, { idempotencyKey: "idem-c" })).rejects.toMatchObject({ code: "RATE_LIMITED", retry: "same_key", httpStatus: 0 });
     expect(calls).toEqual([]);
-    expect(pace.delay()).toBe(30_000);
+    expect(pace.delay()).toBe(PAO_RATE_WINDOW_MS);
+  });
+
+  it("выдача реквизита: пауза после 429, объявленная во время ожидания, — срок перепроверяется, RATE_LIMITED до сети (ревью КТ1 № 3)", async () => {
+    // часы идут вместе со сном; первая пауза сна — объявление паузы 30 с другим обращением агента
+    let t = 0;
+    let n = 0;
+    const sleep = async (ms: number) => {
+      t += ms;
+      if (n++ === 0) pace.hold(PAO_RETRY_AFTER_MAX_SEC);
+    };
+    const pace: Pace = new Pace({ fallbackPerMin: params.pao_rate_limit_fallback_per_min, journal: new MemoryJournal(), monotonic: () => t, sleep });
+    pace.learn({ rateLimitPerMin: 4 }); // интервал 15 с: 15 + 35 ≤ 60 — до ожидания помещается
+    await pace.wait();
+    expect(pace.delay() + params.pao_credentials_timeout_ms).toBeLessThanOrEqual(params.registry_cache_ttl_sec * 1000);
+    const calls: string[] = [];
+    const platform = new PaoPlatform({
+      journal: new MemoryJournal(),
+      baseUrl: "http://pao.test",
+      agentCode: AGENT,
+      signing,
+      params,
+      sleep,
+      monotonic: () => t,
+      fetch: async (url) => {
+        calls.push(String(url));
+        return json(500, {});
+      },
+      pace,
+    });
+    await expect(platform.issueCredential(draft, { idempotencyKey: "idem-c2" })).rejects.toMatchObject({ code: "RATE_LIMITED", retry: "same_key", httpStatus: 0 });
+    expect(calls).toEqual([]);
+    // ожидание 15 с, пауза до 45 с — попытка с тайм-аутом 35 с в срок 60 с уже не помещается
+    expect(t).toBe(15_000 + PAO_RETRY_AFTER_MAX_SEC * 1000);
+  });
+
+  it("429 первого слоя на конфигурации — та же пауза всех обращений (ревью КТ1 № 5)", async () => {
+    const { pace } = paced();
+    const platform = new PaoPlatform({
+      journal: new MemoryJournal(),
+      baseUrl: "http://pao.test",
+      agentCode: AGENT,
+      signing,
+      params,
+      sleep: async () => {},
+      fetch: async () =>
+        new Response(JSON.stringify({ code: "RATE_LIMITED", message: "m", retry: "same_key" }), { status: 429, headers: { "content-type": "application/json", "retry-after": "7" } }),
+      pace,
+    });
+    await expect(platform.checkProtocol()).resolves.toMatchObject({ status: "unknown" });
+    expect(pace.delay()).toBe(7000);
   });
 });
 

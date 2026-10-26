@@ -79,7 +79,9 @@ export type JournalKind =
    *  FALLBACK:NO_FIELD / FALLBACK:OUT_OF_RANGE (запасная частота pao_rate_limit_fallback_per_min) */
   | "pao.rate_limit"
   /** ответ Платформы нарушает контракт ПАО, обращение обработано по правилу агента (Р59 п. 4): reason — код ответа,
-   *  detail — RETRY_AFTER_OVER_MAX:<сек> (Retry-After у 429 больше 30 с, ПАО §2; пауза и ожидание — не дольше 30 с) */
+   *  detail — RETRY_AFTER_OVER_MAX:<сек> (Retry-After у 429 больше 30 с, ПАО §2; пауза и ожидание — не дольше 30 с) или
+   *  RATE_LIMIT_UNUSABLE:<L> (rate_limit_per_min с floor(L/2) = 0 — Платформа не пропускает ни одного обращения за окно;
+   *  агент — одно обращение за окно и Retry-After, Р59 дополнение 1 п. 2) */
   | "pao.contract_violation"
   /** держимый мандат отозван — особое событие Т15 (Р37 п. 4); мандат больше не держится */
   | "mandate.revoked"

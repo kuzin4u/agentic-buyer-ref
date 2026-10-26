@@ -78,7 +78,7 @@ export interface ProtocolJournal {
       | { at: string; kind: "platform.protocol_unsupported"; reason: "PLATFORM_PROTOCOL_UNSUPPORTED"; detail: "CONFIGURATION" | "MANDATE" }
       | { at: string; kind: "signature.rejected"; kid: string; reason: "SIGNATURE_INVALID"; detail: string }
       | { at: string; kind: "pao.rate_limit"; detail: string }
-      | { at: string; kind: "pao.contract_violation"; reason: "RATE_LIMITED"; detail: `RETRY_AFTER_OVER_MAX:${number}` }
+      | { at: string; kind: "pao.contract_violation"; reason: "RATE_LIMITED"; detail: `RETRY_AFTER_OVER_MAX:${number}` | `RATE_LIMIT_UNUSABLE:${number}` }
       | PaoCallEntry,
   ): void;
 }
@@ -271,7 +271,13 @@ export class PaoPlatform implements PaymentPlatform {
       if (e instanceof SyntaxError || (e instanceof PaoCallError && e.clientCode !== "PAO_CLIENT_SIGNER_MISSING")) {
         // битый JSON 2xx — тот же BAD_RESPONSE, что в platform.version_unknown (ревью reviewer К2 № 2)
         const f = e instanceof SyntaxError ? new PlatformFailure("BAD_RESPONSE", "never", null, last.status ?? 200, null) : toFailure(e);
-        this.logCall(CONFIG, 1, UNCONFIRMED.has(f.code) ? "unknown" : "refused", f.httpStatus || (last.status ?? 0), f.code);
+        try {
+          this.logCall(CONFIG, 1, UNCONFIRMED.has(f.code) ? "unknown" : "refused", f.httpStatus || (last.status ?? 0), f.code);
+          this.retryAfterViolation(f.code, last.retryAfter);
+        } finally {
+          // 429 первого слоя на конфигурации — та же пауза всех обращений (ревью КТ1 № 5)
+          this.holdAfter(f.code, last.retryAfter);
+        }
       }
       if (e instanceof SyntaxError) return this.unknownVersion("BAD_RESPONSE");
       // Отказ самого клиента — не «адрес не отвечает»: 3xx — ответ указывает на другой адрес, агент не стартует (Р37 п. 2);
@@ -313,6 +319,20 @@ export class PaoPlatform implements PaymentPlatform {
 
   private logUnsupported(step: "CONFIGURATION" | "MANDATE"): void {
     this.o.journal.record({ at: this.at(), kind: "platform.protocol_unsupported", reason: "PLATFORM_PROTOCOL_UNSUPPORTED", detail: step });
+  }
+
+  /** Retry-After у 429 больше 30 с — нарушение ПАО §2, не молча (Р59 п. 4, К2а): запись после pao.call, до паузы. */
+  private retryAfterViolation(code: FailureCode, retryAfter: number | undefined): void {
+    if (code === "RATE_LIMITED" && retryAfter !== undefined && retryAfter > PAO_RETRY_AFTER_MAX_SEC) {
+      this.o.journal.record({ at: this.at(), kind: "pao.contract_violation", reason: "RATE_LIMITED", detail: `RETRY_AFTER_OVER_MAX:${retryAfter}` });
+    }
+  }
+
+  /** 429: пауза всех обращений агента до истечения Retry-After (Р59 п. 4) — не дольше потолка ожидания: по ПАО §2
+   *  Retry-After у 429 — до 30 с, больше — ответ не по контракту, а пауза без предела остановила бы и ленту. Вызывается в
+   *  finally после записей (Р-645). */
+  private holdAfter(code: FailureCode, retryAfter: number | undefined): void {
+    if (code === "RATE_LIMITED" && retryAfter !== undefined) this.pace.hold(Math.min(retryAfter, PAO_RETRY_AFTER_MAX_SEC));
   }
 
   /** Запись pao.call (Р37 п. 3): на каждую попытку, attempt > 1 — попытка повтора (Т15). */
@@ -394,6 +414,10 @@ export class PaoPlatform implements PaymentPlatform {
       let ok: { out: R; mandate: string | undefined } | undefined;
       const began = clock();
       await this.pace.wait();
+      // пауза после 429, объявленная во время ожидания, могла сдвинуть место — срок перепроверяется (ревью КТ1 № 3)
+      if (!fits(clock() - began)) {
+        throw new PlatformFailure("RATE_LIMITED", "same_key", null, 0, key, "ожидание ограничителя частоты не помещается в срок выдачи");
+      }
       try {
         const r = await this.client(last, signer, timeoutMs).call(op, args);
         // «Открыто» № 4 (ревью AG-02): ответ 2xx — по схеме ПАО до перевода; значение вне перечня (`status`, `outcome`,
@@ -453,10 +477,7 @@ export class PaoPlatform implements PaymentPlatform {
         if (failure.code !== "PAO_CLIENT_SIGNER_MISSING") {
           this.logCall(op, tries, UNCONFIRMED.has(failure.code) ? "unknown" : "refused", failure.httpStatus, failure.code, mandateOf(op, args));
         }
-        // Retry-After у 429 больше 30 с — нарушение ПАО §2: не молча (решение владельца 26.10, Р59 п. 4)
-        if (failure.code === "RATE_LIMITED" && last.retryAfter !== undefined && last.retryAfter > PAO_RETRY_AFTER_MAX_SEC) {
-          this.o.journal.record({ at: this.at(), kind: "pao.contract_violation", reason: "RATE_LIMITED", detail: `RETRY_AFTER_OVER_MAX:${last.retryAfter}` });
-        }
+        this.retryAfterViolation(failure.code, last.retryAfter);
         if (signature) {
           const detail = skew === undefined ? "NO_DATE" : `DATE:${skew >= 0 ? "+" : ""}${skew}`;
           this.o.journal.record({ at: this.at(), kind: "signature.rejected", kid: signer.kid, reason: "SIGNATURE_INVALID", detail });
@@ -465,9 +486,7 @@ export class PaoPlatform implements PaymentPlatform {
         // Остановка и смена ключа — и при сбое журнала (Р53 ревью К2.1 № 8): запись не отменяет действие.
         if (halt) this.o.signing.stop(failure.code, clockSkew ? "CLOCK_SKEW" : undefined);
         else if (rotate) this.o.signing.keyRevoked(signer.kid, failure);
-        // 429: пауза всех обращений агента до истечения Retry-After (Р59 п. 4) — не дольше потолка ожидания: по ПАО §2
-        // Retry-After у 429 — до 30 с, больше — ответ не по контракту, а пауза без предела остановила бы и ленту
-        if (failure.code === "RATE_LIMITED" && last.retryAfter !== undefined) this.pace.hold(Math.min(last.retryAfter, PAO_RETRY_AFTER_MAX_SEC));
+        this.holdAfter(failure.code, last.retryAfter);
       }
       if (halt) throw failure;
       if (signature) {

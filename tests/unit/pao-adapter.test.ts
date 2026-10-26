@@ -875,9 +875,11 @@ describe("Р58 п. 3: SIGNATURE_INVALID — сверка времени по Dat
         params,
         sleep: async () => {},
         now: () => NOW,
-        // первая попытка «заняла» весь срок выдачи (registry_cache_ttl_sec): ещё одна не помещается (Р45 п. 2.4)
-        monotonic: () => (t += params.registry_cache_ttl_sec * 1000),
+        // первая попытка «заняла» весь срок выдачи (registry_cache_ttl_sec): ещё одна не помещается (Р45 п. 2.4). Часы идут
+        // во время обращения, а не на каждом чтении: срок перепроверяется и после ожидания ограничителя (Р59, ревью КТ1 № 3)
+        monotonic: () => t,
         fetch: async (_url, init) => {
+          t += params.registry_cache_ttl_sec * 1000;
           calls.push(init);
           return new Response(JSON.stringify(rejected), { status: 401, headers: { "content-type": "application/json", date } });
         },

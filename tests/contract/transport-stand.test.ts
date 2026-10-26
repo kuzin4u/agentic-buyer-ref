@@ -12,7 +12,7 @@ import { join } from "node:path";
 import { signRequest } from "@kuzin4u/agentic-core";
 import { createStand, type Stand } from "agentic-ps-platform/stand";
 import { afterEach, describe, expect, it } from "vitest";
-import { PaoPlatform } from "../../src/agent/adapters/pao/index.js";
+import { Pace, PaoPlatform } from "../../src/agent/adapters/pao/index.js";
 import { MemoryJournal } from "../../src/agent/journal/index.js";
 import { KeyRing, generateKey } from "../../src/agent/signer/index.js";
 import { loadParams } from "../../src/shared/config.js";
@@ -68,7 +68,10 @@ async function setup() {
   };
   const r = new KeyRing({ dir, params, journal });
   ring = r;
-  const pao = { baseUrl, agentCode: AGENT, params, sleep: async () => {}, journal, fetch: fetchLog };
+  const sleep = async () => {};
+  // один ограничитель частоты на агента — у допуска и рабочего адаптера (Р59 п. 1; ревью КТ1 № 13)
+  const pace = new Pace({ fallbackPerMin: params.pao_rate_limit_fallback_per_min, journal, sleep });
+  const pao = { baseUrl, agentCode: AGENT, params, sleep, journal, fetch: fetchLog, pace };
   await r.start((signing) => new PaoPlatform({ ...pao, signing }).agentSelf());
   const platform = new PaoPlatform({ ...pao, signing: r.port() });
   calls.length = 0;

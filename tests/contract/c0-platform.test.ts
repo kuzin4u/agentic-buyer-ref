@@ -114,6 +114,24 @@ describe("С0 — подпись агента принимается Платф�
     expect(JSON.stringify(journal.entries)).not.toContain(descriptor.public_key);
   });
 
+  it("Р33 п. 10, Р59 п. 6: версия ПАО подтверждена шагом 1 по конфигурации стенда — запасной шаг 2 не нужен; предел частоты — из GET /pao/v1/agent", async () => {
+    const { s, calls } = await platform();
+    const dir = keysDir();
+    const { descriptor } = generateKey(dir);
+    expect(s.admit(application(descriptor.public_key), OPERATOR)).toMatchObject({ admitted: true });
+    const { core, journal } = await coreAt(s, dir);
+
+    await core.start();
+
+    expect(calls()).toEqual([CONF, { route: SELF, status: 200 }]);
+    // шаг 1 подтвердил версию: самопроверка platform.protocol — ok, предупреждения «версия не определена» нет — шаг 2 (по
+    // первому мандату) на этой Платформе не срабатывает; он остаётся запасным для сбоя или конфигурации без версии (Р59 п. 6)
+    expect(journal.entries).toContainEqual(expect.objectContaining({ kind: "agent.selfcheck", check: "platform.protocol", status: "ok" }));
+    expect(journal.entries.filter((e) => e.kind === "platform.version_unknown" || e.kind === "platform.protocol_unsupported")).toEqual([]);
+    // предел второго слоя уровня 1 стенда — запись до смены (Р59 п. 3)
+    expect(journal.entries.filter((e) => e.kind === "pao.rate_limit").map((e) => e.detail)).toEqual([`AGENT:${s.params.pao_agent_rate_limit_per_min_l1}`]);
+  });
+
   it("расхождение № 10: у ACTIVE-ключа Платформа отдаёт valid_to; сроки — в метаданных хранилища (Р25 п. 3)", async () => {
     const { s, calls } = await platform();
     const dir = keysDir();

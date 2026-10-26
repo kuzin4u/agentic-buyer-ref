@@ -141,8 +141,8 @@ export class KeyRing {
    * (ACTIVE, valid_to в будущем) — один на попытку допуска; нет такого — остановка (SPEC §7а: «подписать действующим
    * новым ключом; нет — остановка»).
    * Неподтверждённые ключи не пробуются.
-   * SIGNATURE_INVALID — повтор тем же ключом с новой подписью не больше maxRetries таблицы отказов (SPEC §7а: один), затем
-   * остановка.
+   * SIGNATURE_INVALID — повтор и остановку делает адаптер ПАО (Р58 п. 3: одно место для допуска и работы); дошедший сюда
+   * без остановки — остановка без повтора (fail-closed).
    * Прочие сбои (503, тайм-аут) — допуск не состоялся; можно ли повторить, решает место сборки по действию кода в реестре
    * (ответ не по схеме — BAD_RESPONSE, остановка по дополнению 2 к Р36; нет ответа — NO_RESPONSE, допуск можно повторить,
    * Р48 п. 3); AGENT_UNKNOWN / AGENT_SUSPENDED — остановка (адаптер);
@@ -162,27 +162,24 @@ export class KeyRing {
       if (this.#unlock === null) this.#lock();
       if (this.#held.size === 0) this.#loadAll();
       this.#currentKid = this.#admissionKey();
-      const signatureRetries = ruleForFailure("SIGNATURE_INVALID").maxRetries ?? 0; // null — без повтора (fail-closed)
-      for (let attempt = 1; ; attempt++) {
-        let self: AgentSelf;
-        try {
-          self = await admit(signing);
-        } catch (e) {
-          if (!(e instanceof PlatformFailure) || this.#stopped !== null) throw e;
-          this.#record("admission.failed", this.#currentKid, e.code);
-          // Недостижимо при maxRetries ≥ 1 (дополнение 2 к Р36 п. 4 (в), тест): адаптер на каждом AGENT_KEY_REVOKED вызывает
-          // keyRevoked, второй отказ — NO_ACTIVE_KEY. Станет достижимо (смена ключей) — по действию реестра (new_key).
-          if (e.code === "AGENT_KEY_REVOKED") this.#halt("AGENT_KEY_REVOKED", e);
-          if (e.code === "SIGNATURE_INVALID") {
-            if (attempt > signatureRetries) this.#halt("SIGNATURE_INVALID", e);
-            continue;
-          }
-          throw e;
-        }
-        this.#reconcile(self);
-        this.#admission = "admitted";
-        return self;
+      let self: AgentSelf;
+      try {
+        self = await admit(signing);
+      } catch (e) {
+        if (!(e instanceof PlatformFailure)) throw e;
+        // Адаптер уже остановил подпись (Р58 п. 3; без остановки — здесь, fail-closed): наружу, как прежде, SignerStopped
+        // с исходным отказом в cause.
+        if (e.code === "SIGNATURE_INVALID") this.#halt("SIGNATURE_INVALID", e);
+        if (this.#stopped !== null) throw e;
+        this.#record("admission.failed", this.#currentKid, e.code);
+        // Недостижимо при maxRetries ≥ 1 (дополнение 2 к Р36 п. 4 (в), тест): адаптер на каждом AGENT_KEY_REVOKED вызывает
+        // keyRevoked, второй отказ — NO_ACTIVE_KEY. Станет достижимо (смена ключей) — по действию реестра (new_key).
+        if (e.code === "AGENT_KEY_REVOKED") this.#halt("AGENT_KEY_REVOKED", e);
+        throw e;
       }
+      this.#reconcile(self);
+      this.#admission = "admitted";
+      return self;
     } catch (e) {
       if (this.#admission === "admitting") {
         this.#admission = "none";

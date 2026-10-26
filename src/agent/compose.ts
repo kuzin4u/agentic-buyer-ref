@@ -293,7 +293,7 @@ export function createAgentCore(o: AgentCoreOptions): AgentCore {
       }),
     payment: (shop) => new ContourPayment({ platform, shop, journal, confirmations, operations, params, now }),
     // Ключи загружаются до обращений к Платформе (сбой хранилища — без сети), затем курсор ленты и конфигурация, затем
-    // GET /pao/v1/agent; курсор и конфигурация — один раз за start, повтор допуска (SIGNATURE_INVALID) их не повторяет.
+    // GET /pao/v1/agent; курсор и конфигурация — один раз за start (повтор при SIGNATURE_INVALID — внутри адаптера, Р58 п. 3).
     start: async () => {
       lastReport = null;
       const results: Partial<Record<SelfCheckName, CheckResult>> = { "config.params": OK, "core.pao": OK };

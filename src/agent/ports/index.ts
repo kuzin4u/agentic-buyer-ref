@@ -3,6 +3,7 @@ export type { IssuedPackage, PaymentPlatform, PlatformCapabilities, Mutation } f
 export type { MandatePort } from "./mandates.js";
 export type { EventsPort, FeedItem } from "./events.js";
 export type { HttpRequestSigning, RequestSigning } from "./request-signing.js";
+export { SIGNER_STOP_DETAILS } from "./request-signing.js";
 export type { LiveAvailability, LiveOffer, LiveOfferRequest, LiveOfferSource } from "./catalog.js";
 export type { ConfirmationOutcome, LateNotice, NoticeAmount, OfferSource, PaymentContext, PaymentSteps, PurchaseNotice, Readiness, ShopOffers, ShopOrder, ShopOrderRequest, ShopPaymentPort, ShopPaymentReply, ShopPaymentRequest, ShopPort, ShopUnavailable, ShopUnavailableCause } from "./shop.js";
 export { PaymentFailure, ShopFailure } from "./shop.js";

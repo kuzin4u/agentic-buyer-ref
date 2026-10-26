@@ -3,6 +3,10 @@
 import type { HttpLike, Signer } from "@kuzin4u/agentic-core";
 import type { DiagCode } from "../../shared/diag-codes.js";
 
+/** Уточнения остановки агента — значения detail, а не коды причины (Р58 п. 3): CLOCK_SKEW — часы агента и Платформы
+ *  расходятся больше signature_skew_sec по Date ответа, повтор подписи не поможет. С кодами реестра не пересекаются. */
+export const SIGNER_STOP_DETAILS = ["CLOCK_SKEW"] as const;
+
 export interface RequestSigning {
   /** Подписант действующего ключа; агент остановлен или не допущен — SignerStopped; подпись приостановлена (Р27) —
    *  SignerSuspended. */
@@ -12,7 +16,7 @@ export interface RequestSigning {
   keyRevoked(kid: string, failure?: unknown): Signer;
   /** Отказ в допуске или нет действующего ключа: остановка агента; дальнейшая подпись — SignerStopped.
    *  detail — уточнение для журнала: только значение перечня ПАО (класс при AGENT_CLASS_MISMATCH, Р27) или версия вида
-   *  1.x.y, собранная из чисел (PLATFORM_PROTOCOL_UNSUPPORTED, Р33 п. 10). */
+   *  1.x.y, собранная из чисел (PLATFORM_PROTOCOL_UNSUPPORTED, Р33 п. 10), или значение SIGNER_STOP_DETAILS. */
   stop(reason: DiagCode, detail?: string): void;
   /** Ответ реестра не по схеме после допуска (Р27): подпись приостановлена до успешной повторной сверки; до допуска —
    *  без действия (допуск и так не состоялся). */

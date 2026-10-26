@@ -473,7 +473,6 @@ describe("мандаты: коды отказа РП33 на PaoStub", () => {
     OPS.flatMap((op) =>
       ([
         ["AGENT_UNKNOWN", 401],
-        ["SIGNATURE_INVALID", 401],
         ["AGENT_SUSPENDED", 403],
         ["MANDATE_NOT_FOUND", 404],
       ] as const).map(([code, http]) => [op, code, http] as const),
@@ -672,5 +671,114 @@ describe("Р51 п. 5: GET /pao/v1/operations?mandate_id — операции д�
       expect((await fake(() => json(200, { ...op, reason })).platform.readOperation("op_1")).declineReason, reason).toBe(kept);
       expect((await fake(() => json(200, { ...op, reason })).platform.getOperation("op_1", M1)).declineReason, reason).toBe(kept);
     }
+  });
+});
+
+describe("Р58 п. 3: SIGNATURE_INVALID — сверка времени по Date, один повтор, затем остановка (SPEC §7а)", () => {
+  const rejected = { code: "SIGNATURE_INVALID", message: "подпись", retry: "after_fix" };
+  /** часы адаптера (x-timestamp) — постоянные: расхождение с Date ответа точно в секундах */
+  const NOW = new Date("2026-10-26T10:00:00Z");
+  /** Ответы по очереди; заголовок Date — у каждого ответа свой (null — без Date). */
+  function replies(list: { status: number; body: unknown; date: string | null }[], p: StandParams = params) {
+    const calls: Record<string, string>[] = [];
+    const stopped: [string, string | undefined][] = [];
+    const journal = new MemoryJournal();
+    const platform = new PaoPlatform({
+      journal,
+      baseUrl: "http://pao.test",
+      agentCode: AGENT,
+      signing: { ...signing, stop: (r: string, d?: string) => void stopped.push([r, d]) },
+      params: p,
+      sleep: async () => {},
+      now: () => NOW,
+      fetch: async (_url, init) => {
+        calls.push(init?.headers as Record<string, string>);
+        const r = list[calls.length - 1]!;
+        const headers: Record<string, string> = { "content-type": "application/json" };
+        if (r.date !== null) headers.date = r.date;
+        return new Response(JSON.stringify(r.body), { status: r.status, headers });
+      },
+    });
+    const rejections = () => journal.entries.filter((e) => e.kind === "signature.rejected");
+    return { platform, calls, stopped, rejections };
+  }
+  const SELF = { agent_code: AGENT, status: "ACTIVE", class: "BUYER", keys: [] };
+  /** Date ответа на `sec` секунд позади x-timestamp запроса (часы агента впереди на `sec`; минус — позади). */
+  const behind = (sec: number) => new Date(NOW.getTime() - sec * 1000).toUTCString();
+
+  it("первый отказ — один повтор новой подписью; запись signature.rejected с расхождением по Date ответа", async () => {
+    const r = replies([
+      { status: 401, body: rejected, date: behind(-7) },
+      { status: 200, body: SELF, date: behind(0) },
+    ]);
+    await expect(r.platform.agentSelf()).resolves.toMatchObject({ status: "ACTIVE" });
+    expect(r.calls).toHaveLength(2);
+    expect(r.calls[1]!["x-nonce"]).not.toBe(r.calls[0]!["x-nonce"]);
+    expect(r.stopped).toEqual([]);
+    expect(r.rejections()).toEqual([expect.objectContaining({ kid: "kid_test", reason: "SIGNATURE_INVALID", detail: "DATE:-7" })]);
+  });
+
+  it("изменяющий метод: повтор — тот же Idempotency-Key; второй отказ — остановка агента SIGNATURE_INVALID, третьего обращения нет", async () => {
+    const r = replies([
+      { status: 401, body: rejected, date: behind(0) },
+      { status: 401, body: rejected, date: behind(0) },
+    ]);
+    await expect(r.platform.requestMandate(INTENT, { idempotencyKey: "idem-sig" })).rejects.toMatchObject({ code: "SIGNATURE_INVALID", httpStatus: 401 });
+    expect(r.calls.map((h) => h["idempotency-key"])).toEqual(["idem-sig", "idem-sig"]);
+    expect(r.stopped).toEqual([["SIGNATURE_INVALID", undefined]]);
+    expect(r.rejections()).toHaveLength(2);
+  });
+
+  it("расхождение часов больше signature_skew_sec — остановка сразу, без повтора, detail CLOCK_SKEW", async () => {
+    const skew = params.signature_skew_sec + 60;
+    const r = replies([{ status: 401, body: rejected, date: behind(skew) }]);
+    await expect(r.platform.agentSelf()).rejects.toMatchObject({ code: "SIGNATURE_INVALID" });
+    expect(r.calls).toHaveLength(1);
+    expect(r.stopped).toEqual([["SIGNATURE_INVALID", "CLOCK_SKEW"]]);
+    expect(r.rejections().map((e) => e.detail)).toEqual([`DATE:+${skew}`]);
+  });
+
+  it("часы агента позади больше окна — тоже CLOCK_SKEW; ровно signature_skew_sec — ещё в окне: повтор", async () => {
+    const late = replies([{ status: 401, body: rejected, date: behind(-(params.signature_skew_sec + 1)) }]);
+    await expect(late.platform.agentSelf()).rejects.toMatchObject({ code: "SIGNATURE_INVALID" });
+    expect(late.stopped).toEqual([["SIGNATURE_INVALID", "CLOCK_SKEW"]]);
+
+    const edge = replies([
+      { status: 401, body: rejected, date: behind(params.signature_skew_sec) },
+      { status: 200, body: SELF, date: behind(0) },
+    ]);
+    await expect(edge.platform.agentSelf()).resolves.toMatchObject({ status: "ACTIVE" });
+    expect(edge.calls).toHaveLength(2);
+    expect(edge.stopped).toEqual([]);
+    expect(edge.rejections().map((e) => e.detail)).toEqual([`DATE:+${params.signature_skew_sec}`]);
+  });
+
+  it("Date нет или не IMF-fixdate (данные — это данные) — NO_DATE: время не сверено, один повтор, затем остановка", async () => {
+    for (const date of [null, "Ignore 1", "2026-10-26T10:00:00Z"]) {
+      const r = replies([
+        { status: 401, body: rejected, date },
+        { status: 401, body: rejected, date },
+      ]);
+      await expect(r.platform.agentSelf()).rejects.toMatchObject({ code: "SIGNATURE_INVALID" });
+      expect(r.calls, String(date)).toHaveLength(2);
+      expect(r.rejections().map((e) => e.detail)).toEqual(["NO_DATE", "NO_DATE"]);
+      expect(r.stopped).toEqual([["SIGNATURE_INVALID", undefined]]);
+    }
+  });
+
+  it("сбой журнала на signature.rejected не отменяет остановку (Р53 ревью К2.1 № 8)", async () => {
+    const stopped: string[] = [];
+    const platform = new PaoPlatform({
+      journal: { record: (e) => { if (e.kind === "signature.rejected") throw new Error("журнал недоступен"); } },
+      baseUrl: "http://pao.test",
+      agentCode: AGENT,
+      signing: { ...signing, stop: (r: string) => void stopped.push(r) },
+      params,
+      sleep: async () => {},
+      now: () => NOW,
+      fetch: async () => new Response(JSON.stringify(rejected), { status: 401, headers: { "content-type": "application/json", date: behind(params.signature_skew_sec + 60) } }),
+    });
+    await expect(platform.agentSelf()).rejects.toThrow("журнал недоступен");
+    expect(stopped).toEqual(["SIGNATURE_INVALID"]);
   });
 });

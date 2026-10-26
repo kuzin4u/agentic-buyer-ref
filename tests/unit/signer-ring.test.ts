@@ -163,6 +163,23 @@ describe("сверка с реестром (fail-closed)", () => {
     expect(() => k.r.port().current()).toThrow(SignerStopped);
   });
 
+  it("Р58 п. 3: SIGNATURE_INVALID дошёл до допуска без остановки адаптером — остановка, без повтора (повтор — у адаптера)", async () => {
+    const k = ring();
+    let calls = 0;
+    const failure = new PlatformFailure("SIGNATURE_INVALID", "after_fix", "SIGNATURE_INVALID", 401, null);
+    const err = (await k.r
+      .start(async () => {
+        calls++;
+        throw failure;
+      })
+      .catch((e: unknown) => e)) as SignerStopped;
+    expect(err).toBeInstanceOf(SignerStopped);
+    expect(err.reason).toBe("SIGNATURE_INVALID");
+    expect(err.cause).toBe(failure);
+    expect(calls).toBe(1);
+    expect(k.j.entries.at(-1)).toMatchObject({ kind: "agent.stopped", reason: "SIGNATURE_INVALID" });
+  });
+
   it("SUSPENDED и SELLER — остановка по статусу, класс не проверяется", async () => {
     const k = ring();
     await expect(k.r.start(k.self([k.key()], "SUSPENDED", "SELLER"))).rejects.toMatchObject({ reason: "AGENT_SUSPENDED" });

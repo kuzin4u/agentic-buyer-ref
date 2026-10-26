@@ -83,7 +83,8 @@ export interface AgentCore {
   /** Повторная сверка с реестром (Р27): снимает приостановку подписи при ACTIVE и BUYER; не ACTIVE или не BUYER — остановка;
    *  ответ снова не по схеме или сбой — приостановка остаётся. Расписание сверок — за вызывающим (AG-12). */
   recheck(): Promise<AgentSelf>;
-  /** плановая ротация ключа, если до valid_to (по данным платформы) осталось не больше key_overlap_days */
+  /** плановая ротация ключа, если до valid_to (по данным платформы) осталось не больше key_overlap_days; ротация
+   *  остановлена (новый ключ не принят подряд сверх предела) — SignerRotationStopped: нужен человек, не повторять (Р58 п. 4) */
   maintainKeys(): Promise<void>;
   /** освободить каталог ключей (один процесс на каталог) */
   close(): void;
@@ -293,7 +294,7 @@ export function createAgentCore(o: AgentCoreOptions): AgentCore {
       }),
     payment: (shop) => new ContourPayment({ platform, shop, journal, confirmations, operations, params, now }),
     // Ключи загружаются до обращений к Платформе (сбой хранилища — без сети), затем курсор ленты и конфигурация, затем
-    // GET /pao/v1/agent; курсор и конфигурация — один раз за start, повтор допуска (SIGNATURE_INVALID) их не повторяет.
+    // GET /pao/v1/agent; курсор и конфигурация — один раз за start (повтор при SIGNATURE_INVALID — внутри адаптера, Р58 п. 3).
     start: async () => {
       lastReport = null;
       const results: Partial<Record<SelfCheckName, CheckResult>> = { "config.params": OK, "core.pao": OK };

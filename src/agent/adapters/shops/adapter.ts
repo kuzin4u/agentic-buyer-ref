@@ -323,9 +323,13 @@ export class ShopsAdapter implements OfferSource, LiveOfferSource, ShopPort, Sho
     const code = paoCode(reply.status, reply.body);
     if (reply.status === 401 || (code !== null && AGENT_STOP_CODES.has(code))) {
       const failure = new PlatformFailure(code ?? "BAD_RESPONSE", ruleForFailure(code ?? "BAD_RESPONSE").retry, code, reply.status, null, "знак готовности: отказ по агенту");
-      this.#record("shop.readiness", merchantId, code ?? "BAD_RESPONSE", "refused");
-      if (code !== null && AGENT_STOP_CODES.has(code)) this.o.platform.signing.stop(code);
-      else if (code !== null && ruleForFailure(code).action === "ROTATE_KEY") this.o.platform.signing.keyRevoked(kid, failure);
+      try {
+        this.#record("shop.readiness", merchantId, code ?? "BAD_RESPONSE", "refused");
+      } finally {
+        // остановка и смена ключа — и при сбое журнала (Р53 ревью К2.1 № 8, Р58 п. 0)
+        if (code !== null && AGENT_STOP_CODES.has(code)) this.o.platform.signing.stop(code);
+        else if (code !== null && ruleForFailure(code).action === "ROTATE_KEY") this.o.platform.signing.keyRevoked(kid, failure);
+      }
       throw failure;
     }
     const detail = code ?? `HTTP_${reply.status}`;

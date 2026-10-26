@@ -3,6 +3,8 @@
 // Повторяет адаптер — только по таблице ядра (RETRY_SAME_KEY), с прежним Idempotency-Key и новой подписью (Р21).
 // AGENT_KEY_REVOKED (ROTATE_KEY): другой действующий ключ из порта подписи и один повтор тем же Idempotency-Key.
 // NO_RESPONSE (Р48 п. 4): повтор тем же ключом без ожидания — только у методов с Idempotency-Key, кроме выдачи реквизита.
+// SIGNATURE_INVALID (Р58 п. 3): сверка времени по Date ответа, один повтор новой подписью, затем остановка агента — здесь
+// же для допуска и работы.
 import {
   PAO_OPERATIONS,
   PAO_VERSION,
@@ -73,8 +75,24 @@ export interface ProtocolJournal {
     entry:
       | { at: string; kind: "platform.version_unknown"; reason: "PLATFORM_VERSION_UNKNOWN"; detail: "NO_VERSION" | "BAD_RESPONSE" | "NO_RESPONSE" }
       | { at: string; kind: "platform.protocol_unsupported"; reason: "PLATFORM_PROTOCOL_UNSUPPORTED"; detail: "CONFIGURATION" | "MANDATE" }
+      | { at: string; kind: "signature.rejected"; kid: string; reason: "SIGNATURE_INVALID"; detail: string }
       | PaoCallEntry,
   ): void;
+}
+
+/** Что видно об одной попытке, кроме тела: Retry-After, HTTP-статус, x-timestamp запроса и Date ответа (Р58 п. 3). */
+type Last = { retryAfter?: number; status?: number; timestamp?: string; date?: string | null };
+
+/** HTTP-date только в форме IMF-fixdate (RFC 9110 §5.6.7): Date.parse принимает и мусор (данные — это данные). */
+const IMF_FIXDATE = /^(Mon|Tue|Wed|Thu|Fri|Sat|Sun), \d{2} (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) \d{4} \d{2}:\d{2}:\d{2} GMT$/;
+
+/** Расхождение x-timestamp запроса и Date ответа в секундах (свои часы впереди — плюс); не разобрать — undefined. */
+function skewSec(last: Last): number | undefined {
+  const date = last.date ?? "";
+  if (!IMF_FIXDATE.test(date) || last.timestamp === undefined) return undefined;
+  const d = Date.parse(date);
+  const t = Date.parse(last.timestamp);
+  return Number.isNaN(d) || Number.isNaN(t) ? undefined : Math.round((t - d) / 1000);
 }
 
 /** Попытка обращения к ПАО (Т15, Р37 п. 3): ключ операции — шаблон пути без подстановок; mandate — по маске
@@ -249,9 +267,11 @@ export class PaoPlatform implements PaymentPlatform {
     const version = versions === undefined ? null : highestPaoVersion(versions);
     if (version === null) return this.unknownVersion("NO_VERSION");
     if (belowMin(version)) {
-      const failure = this.unsupported("CONFIGURATION", version, 200, null);
-      this.o.signing.stop("PLATFORM_PROTOCOL_UNSUPPORTED", version);
-      throw failure;
+      try {
+        throw this.unsupported("CONFIGURATION", version, 200, null);
+      } finally {
+        this.o.signing.stop("PLATFORM_PROTOCOL_UNSUPPORTED", version); // и при сбое журнала (Р53 ревью К2.1 № 8)
+      }
     }
     this.protocolConfirmed = true;
     return { status: "confirmed", version };
@@ -291,7 +311,7 @@ export class PaoPlatform implements PaymentPlatform {
   /** Одно обращение без повторов клиента; тайм-аут — pao_request_timeout_ms. Retry-After и HTTP-статус ответа — в last.
    *  Без подписанта — только операции без подписи (конфигурация); подписанная — PAO_CLIENT_SIGNER_MISSING до запроса.
    *  Свой fetch получает init целиком, вместе с redirect: "manual" клиента (передача #34 п. 4). */
-  private client(last: { retryAfter?: number; status?: number }, signer?: ReturnType<RequestSigning["current"]>, timeoutMs = this.o.params.pao_request_timeout_ms): PaoClient {
+  private client(last: Last, signer?: ReturnType<RequestSigning["current"]>, timeoutMs = this.o.params.pao_request_timeout_ms): PaoClient {
     const f = this.fetchImpl;
     return new PaoClient({
       baseUrl: this.o.baseUrl,
@@ -299,9 +319,12 @@ export class PaoPlatform implements PaymentPlatform {
       ...(signer && { signer }),
       maxAttempts: 1,
       fetch: async (url, init) => {
+        const ts = (init?.headers as Record<string, string> | undefined)?.["x-timestamp"];
+        if (ts !== undefined) last.timestamp = ts;
         const res = await f(url, { ...init, signal: AbortSignal.timeout(timeoutMs) });
         last.status = res.status;
         last.retryAfter = retryAfterSec(res.headers.get("retry-after"));
+        last.date = res.headers.get("date");
         return res;
       },
       ...(this.o.now && { now: this.o.now }),
@@ -320,6 +343,7 @@ export class PaoPlatform implements PaymentPlatform {
     const key = args.idempotencyKey ?? null;
     let waitedSec = 0;
     let rotations = 0;
+    let signatureRetries = 0;
     // выдача реквизита — свой тайм-аут (выше предела обработчика Платформы) и общий срок: попытки и ожидание повторов
     // вместе — не больше registry_cache_ttl_sec (Р45 п. 2.4, В2а; инвариант 4)
     const credentials = op === CREDENTIALS;
@@ -331,7 +355,7 @@ export class PaoPlatform implements PaymentPlatform {
     // попытки обращения для журнала: повторы тем же ключом и переход на другой ключ (Т15)
     let tries = 0;
     for (let attempt = 1; ; ) {
-      const last: { retryAfter?: number; status?: number } = {};
+      const last: Last = {};
       const signer = this.o.signing.current(); // остановлен — SignerStopped, обращения нет
       tries++;
       let failure: PlatformFailure;
@@ -368,20 +392,41 @@ export class PaoPlatform implements PaymentPlatform {
         }
       }
       spentMs += clock() - began;
-      // попытка — только запрос, ушедший в сеть (ревью К2.2 № 1): отказ клиента до сети (PAO_CLIENT_SIGNER_MISSING) — не попытка;
-      // SignerStopped и пустой Idempotency-Key — тоже до сети, сюда не доходят
-      if (failure.code !== "PAO_CLIENT_SIGNER_MISSING") {
-        this.logCall(op, tries, UNCONFIRMED.has(failure.code) ? "unknown" : "refused", failure.httpStatus, failure.code, mandateOf(op, args));
-      }
       const rule = ruleForFailure(failure.code);
-      // Отказ в допуске — остановка агента целиком (SPEC §7а, П03).
-      if (AGENT_STOP_CODES.has(failure.code)) {
-        this.o.signing.stop(failure.code);
-        throw failure;
+      // Подпись не принята (SPEC §7а, Р58 п. 3): часы вне signature_skew_sec по Date ответа — повтор не поможет, остановка
+      // сразу; иначе один повтор за обращение новой подписью и тем же Idempotency-Key, затем остановка агента.
+      const signature = failure.code === "SIGNATURE_INVALID";
+      const skew = signature ? skewSec(last) : undefined;
+      const clockSkew = skew !== undefined && Math.abs(skew) > this.o.params.signature_skew_sec;
+      // Отказ в допуске — остановка агента целиком (SPEC §7а, П03); SIGNATURE_INVALID — по правилу выше.
+      const halt = AGENT_STOP_CODES.has(failure.code) || (signature && (clockSkew || signatureRetries >= (rule.maxRetries ?? 0)));
+      // Отозванный ключ: другой действующий (нет — SignerStopped).
+      const rotate = !halt && rule.action === "ROTATE_KEY";
+      try {
+        // попытка — только запрос, ушедший в сеть (ревью К2.2 № 1): отказ клиента до сети (PAO_CLIENT_SIGNER_MISSING) — не
+        // попытка; SignerStopped и пустой Idempotency-Key — тоже до сети, сюда не доходят
+        if (failure.code !== "PAO_CLIENT_SIGNER_MISSING") {
+          this.logCall(op, tries, UNCONFIRMED.has(failure.code) ? "unknown" : "refused", failure.httpStatus, failure.code, mandateOf(op, args));
+        }
+        if (signature) {
+          const detail = skew === undefined ? "NO_DATE" : `DATE:${skew >= 0 ? "+" : ""}${skew}`;
+          this.o.journal.record({ at: this.at(), kind: "signature.rejected", kid: signer.kid, reason: "SIGNATURE_INVALID", detail });
+        }
+      } finally {
+        // Остановка и смена ключа — и при сбое журнала (Р53 ревью К2.1 № 8): запись не отменяет действие.
+        if (halt) this.o.signing.stop(failure.code, clockSkew ? "CLOCK_SKEW" : undefined);
+        else if (rotate) this.o.signing.keyRevoked(signer.kid, failure);
       }
-      // Отозванный ключ: другой действующий (нет — SignerStopped); повтор не больше maxRetries за обращение.
-      if (rule.action === "ROTATE_KEY") {
-        this.o.signing.keyRevoked(signer.kid, failure);
+      if (halt) throw failure;
+      if (signature) {
+        // Повтор выдачи реквизита не помещается в её срок — агент сам видит истёкший срок: отказ операции без остановки
+        // агента (ревью КТ1 № 3, решение владельца 26.10; как у AGENT_KEY_REVOKED). CLOCK_SKEW и второй отказ — остановка.
+        if (!fits(0)) throw failure;
+        signatureRetries++;
+        continue;
+      }
+      // повтор другим ключом — не больше maxRetries за обращение
+      if (rotate) {
         if (rotations >= (rule.maxRetries ?? 0)) throw failure;
         // повтор выдачи другим ключом — тоже в пределах срока (Р45 п. 2.4; ревью reviewer К3 № 1)
         if (!fits(0)) throw failure;

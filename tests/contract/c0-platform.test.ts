@@ -151,8 +151,30 @@ describe("С0 — подпись агента принимается Платф�
     s.setClock(new Date(Date.now() + (s.params.signature_skew_sec + 60) * 1000));
     const { core, journal } = await coreAt(s, dir);
 
+    // Date ответа стенд ставит по настоящим часам, а не по setClock: расхождения по Date нет — не CLOCK_SKEW, повтор (Р58 п. 3)
     await expectSignatureStop(core, journal, log);
     expect(listKeys(dir)).toEqual([{ kid: descriptor.kid, state: "active" }]);
+    expect(journal.entries.filter((e) => e.kind === "signature.rejected")).toHaveLength(2);
+  });
+
+  it("Р58 п. 3: часы агента вне окна signature_skew_sec — по Date ответа CLOCK_SKEW, остановка без повтора", async () => {
+    const { s, log } = await platform();
+    const dir = keysDir();
+    const { descriptor } = generateKey(dir);
+    expect(s.admit(application(descriptor.public_key), OPERATOR)).toMatchObject({ admitted: true });
+    const ahead = (s.params.signature_skew_sec + 60) * 1000;
+    const baseUrl = await s.listen();
+    const journal = new MemoryJournal();
+    const core = createAgentCore({ keysDir: dir, stateDir: `${dir}-state`, journal, pao: { baseUrl, agentCode: AGENT, sleep: async () => {}, now: () => new Date(Date.now() + ahead) } });
+
+    const err = (await startCause(core.start()).catch((e: unknown) => e)) as SignerStopped;
+    expect(err).toBeInstanceOf(SignerStopped);
+    expect(err.reason).toBe("SIGNATURE_INVALID");
+    expect(log.map(({ route, status }) => ({ route, status }))).toEqual([CONF, { route: SELF, status: 401 }]);
+    const [rejected] = journal.entries.filter((e) => e.kind === "signature.rejected");
+    expect(rejected).toMatchObject({ kid: descriptor.kid, reason: "SIGNATURE_INVALID", detail: expect.stringMatching(/^DATE:\+\d+$/) });
+    expect(Number(rejected!.detail!.slice("DATE:+".length))).toBeGreaterThan(s.params.signature_skew_sec);
+    expect(journal.entries).toContainEqual(expect.objectContaining({ kind: "agent.stopped", reason: "SIGNATURE_INVALID", detail: "CLOCK_SKEW" }));
   });
 
   // Р27: стенд допускает заявление любого класса из перечня — агент, допущенный как SELLER, останавливается сам.

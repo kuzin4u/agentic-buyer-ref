@@ -14,11 +14,12 @@ import { ruleForFailure } from "../declines/index.js";
 import type { Journal, JournalKind } from "../journal/index.js";
 import type { PaymentPlatform } from "../ports/payment-platform.js";
 import type { RequestSigning } from "../ports/request-signing.js";
-import { SignerKeyRejected, SignerStopped, SignerSuspended, type SignerStopReason } from "./errors.js";
+import { SignerKeyRejected, SignerRotationStopped, SignerStopped, SignerSuspended, type SignerStopReason } from "./errors.js";
 import { KeystoreLocked, generateKey, listKeys, loadKey, lockDir, markKey, pruneKey, readMeta, writeMeta, type KeyMeta, type KeyState, type LoadedKey } from "./keystore.js";
 import { kidOf } from "./kid.js";
 
 const DAY_MS = 86_400_000;
+const ROTATION_STOPPED = "ротация остановлена: новый ключ не принят подряд сверх предела, нужен человек (Р31, Р58 п. 4)";
 
 export interface KeyRingOptions {
   /** каталог ключей (keystore) */
@@ -42,6 +43,8 @@ interface Held {
 }
 
 type Admission = "none" | "admitting" | "admitted";
+/** Причина записи состояния ключа — для остановки при сбое хранилища (Р58 п. 4 (б)). */
+type WriteContext = { detail: DiagCode; cause?: unknown };
 /** Запрос допуска через данный порт подписи (адаптер платформы, собранный для допуска). */
 export type Admit = (signing: RequestSigning) => Promise<AgentSelf>;
 type Registrar = Pick<PaymentPlatform, "registerKey" | "agentSelf">;
@@ -70,7 +73,8 @@ export class KeyRing {
   #admissionSwitched = false;
   /** брошенные временные ключи прошлых запусков (не загружаются) */
   readonly #abandoned = new Set<string>();
-  /** KEY_INVALID подряд при регистрации (Р31); успешная регистрация сбрасывает. Счёт — в процессе: перезапуск — решение человека */
+  /** Новый ключ не принят подряд при регистрации — KEY_INVALID или зарегистрирован не ACTIVE (Р31, Р58 п. 4); успешная
+   *  регистрация сбрасывает. Счёт — в процессе: перезапуск — решение человека */
   #keyInvalidStreak = 0;
   /** ротация остановлена по пределу KEY_INVALID (Р31); подпись прежним подтверждённым ключом продолжается */
   #rotationStopped = false;
@@ -141,8 +145,8 @@ export class KeyRing {
    * (ACTIVE, valid_to в будущем) — один на попытку допуска; нет такого — остановка (SPEC §7а: «подписать действующим
    * новым ключом; нет — остановка»).
    * Неподтверждённые ключи не пробуются.
-   * SIGNATURE_INVALID — повтор тем же ключом с новой подписью не больше maxRetries таблицы отказов (SPEC §7а: один), затем
-   * остановка.
+   * SIGNATURE_INVALID — повтор и остановку делает адаптер ПАО (Р58 п. 3: одно место для допуска и работы); дошедший сюда
+   * без остановки — остановка без повтора (fail-closed).
    * Прочие сбои (503, тайм-аут) — допуск не состоялся; можно ли повторить, решает место сборки по действию кода в реестре
    * (ответ не по схеме — BAD_RESPONSE, остановка по дополнению 2 к Р36; нет ответа — NO_RESPONSE, допуск можно повторить,
    * Р48 п. 3); AGENT_UNKNOWN / AGENT_SUSPENDED — остановка (адаптер);
@@ -162,27 +166,24 @@ export class KeyRing {
       if (this.#unlock === null) this.#lock();
       if (this.#held.size === 0) this.#loadAll();
       this.#currentKid = this.#admissionKey();
-      const signatureRetries = ruleForFailure("SIGNATURE_INVALID").maxRetries ?? 0; // null — без повтора (fail-closed)
-      for (let attempt = 1; ; attempt++) {
-        let self: AgentSelf;
-        try {
-          self = await admit(signing);
-        } catch (e) {
-          if (!(e instanceof PlatformFailure) || this.#stopped !== null) throw e;
-          this.#record("admission.failed", this.#currentKid, e.code);
-          // Недостижимо при maxRetries ≥ 1 (дополнение 2 к Р36 п. 4 (в), тест): адаптер на каждом AGENT_KEY_REVOKED вызывает
-          // keyRevoked, второй отказ — NO_ACTIVE_KEY. Станет достижимо (смена ключей) — по действию реестра (new_key).
-          if (e.code === "AGENT_KEY_REVOKED") this.#halt("AGENT_KEY_REVOKED", e);
-          if (e.code === "SIGNATURE_INVALID") {
-            if (attempt > signatureRetries) this.#halt("SIGNATURE_INVALID", e);
-            continue;
-          }
-          throw e;
-        }
-        this.#reconcile(self);
-        this.#admission = "admitted";
-        return self;
+      let self: AgentSelf;
+      try {
+        self = await admit(signing);
+      } catch (e) {
+        if (!(e instanceof PlatformFailure)) throw e;
+        // Адаптер уже остановил подпись (Р58 п. 3; без остановки — здесь, fail-closed): наружу, как прежде, SignerStopped
+        // с исходным отказом в cause.
+        if (e.code === "SIGNATURE_INVALID") this.#halt("SIGNATURE_INVALID", e);
+        if (this.#stopped !== null) throw e;
+        this.#record("admission.failed", this.#currentKid, e.code);
+        // Недостижимо при maxRetries ≥ 1 (дополнение 2 к Р36 п. 4 (в), тест): адаптер на каждом AGENT_KEY_REVOKED вызывает
+        // keyRevoked, второй отказ — NO_ACTIVE_KEY. Станет достижимо (смена ключей) — по действию реестра (new_key).
+        if (e.code === "AGENT_KEY_REVOKED") this.#halt("AGENT_KEY_REVOKED", e);
+        throw e;
       }
+      this.#reconcile(self);
+      this.#admission = "admitted";
+      return self;
     } catch (e) {
       if (this.#admission === "admitting") {
         this.#admission = "none";
@@ -203,8 +204,9 @@ export class KeyRing {
    * Плановая ротация (A2 п. 5.3): новый ключ регистрируется, подписываясь прежним; переход — только после
    * подтверждения платформы и сверки с GET /pao/v1/agent. Повторный вызов во время ротации ждёт ту же ротацию;
    * после сбоя связи регистрируется тот же ожидающий ключ с тем же Idempotency-Key (инвариант 9).
-   * KEY_INVALID (Р31) — ключ отклонён, следующая ротация — новый ключ; подряд сверх maxRetries таблицы отказов — ротация
-   * остановлена (инцидент в журнал, нужен человек), подпись прежним ключом — пока он действителен.
+   * KEY_INVALID (Р31) и новый ключ не ACTIVE (KEY_NOT_ACTIVE, Р58 п. 4) — ключ отклонён, следующая ротация — новый ключ;
+   * подряд сверх maxRetries KEY_INVALID таблицы отказов — ротация остановлена (инцидент в журнал, SignerRotationStopped —
+   * нужен человек), подпись прежним ключом — пока он действителен.
    */
   rotate(platform: Registrar): Promise<void> {
     this.#rotating ??= this.#doRotate(platform).finally(() => (this.#rotating = null));
@@ -217,7 +219,7 @@ export class KeyRing {
 
   async #doRotate(platform: Registrar): Promise<void> {
     this.#current(false); // остановленный или не допущенный агент не ротирует
-    if (this.#rotationStopped) throw new SignerKeyRejected("ротация остановлена после KEY_INVALID подряд: нужен человек (Р31)");
+    if (this.#rotationStopped) throw new SignerRotationStopped(ROTATION_STOPPED);
     // В этом процессе: ожидающий регистрации или зарегистрированный без подтверждённого перехода — тот же ключ
     // и тот же Idempotency-Key (инвариант 9). Временные файлы прошлых запусков не используются (#loadAll).
     const pendingKid = [...this.#held.entries()].find(([, h]) => h.state !== "revoked" && (h.state === "pending" || h.awaiting))?.[0];
@@ -234,12 +236,12 @@ export class KeyRing {
     try {
       reg = await platform.registerKey({ alg, publicKey: public_key }, { idempotencyKey: `agent-key-${kid}` });
     } catch (e) {
-      if (e instanceof PlatformFailure && e.code === "KEY_INVALID") this.#keyInvalid(kid);
+      if (e instanceof PlatformFailure && e.code === "KEY_INVALID") this.#keyRejected(kid, "KEY_INVALID", e);
       throw e; // прочие отказы: итог регистрации неизвестен — тот же ключ с тем же Idempotency-Key (инвариант 9)
     }
     if (reg.kid !== kid || reg.publicKey !== public_key) this.#halt("KEY_MISMATCH");
     if (reg.status !== "ACTIVE") {
-      this.#mark(kid, "revoked", "KEY_NOT_ACTIVE"); // отклонённый ключ не повторяется: следующая ротация — новый ключ
+      this.#keyRejected(kid, "KEY_NOT_ACTIVE"); // отклонённый ключ не повторяется: следующая ротация — новый ключ
       throw new SignerKeyRejected("платформа не подтвердила новый ключ как действующий");
     }
     this.#record("key.registered", kid);
@@ -255,13 +257,17 @@ export class KeyRing {
     if (this.#currentKid !== kid) throw new SignerKeyRejected("после регистрации платформа не показала новый ключ действующим");
   }
 
-  /** KEY_INVALID: ключ не принят — отклонён (повторно не регистрируется, инвариант 9); предел подряд — из таблицы отказов. */
-  #keyInvalid(kid: string): void {
-    this.#mark(kid, "revoked", "KEY_INVALID");
+  /** Новый ключ не принят (KEY_INVALID или не ACTIVE) — отклонён (повторно не регистрируется, инвариант 9); один счёт
+   *  подряд, предел — KEY_INVALID таблицы отказов (Р58 п. 4 (а)). Сбой записи в хранилище — остановка KEYSTORE_WRITE_FAILED
+   *  с причиной отказа в detail и исходным отказом в cause (Р58 п. 4 (б)). Предел набран — SignerRotationStopped сразу, на
+   *  этом же вызове (исходный отказ — в cause; ревью КТ1 № 5): вызывающий не примет его за «попробовать снова». */
+  #keyRejected(kid: string, reason: "KEY_INVALID" | "KEY_NOT_ACTIVE", failure?: unknown): void {
+    this.#mark(kid, "revoked", reason, { detail: reason, cause: failure });
     this.#keyInvalidStreak++;
     if (this.#keyInvalidStreak > (ruleForFailure("KEY_INVALID").maxRetries ?? 0)) {
       this.#rotationStopped = true;
-      this.#record("key.rotation_stopped", undefined, "KEY_INVALID");
+      this.#record("key.rotation_stopped", undefined, reason);
+      throw new SignerRotationStopped(ROTATION_STOPPED, failure === undefined ? undefined : { cause: failure });
     }
   }
 
@@ -473,7 +479,7 @@ export class KeyRing {
   }
 
   /** Состояние ключа: сначала в памяти, затем в хранилище; переход в revoked пишется в журнал с причиной. */
-  #mark(kid: string, to: KeyState, reason?: DiagCode): void {
+  #mark(kid: string, to: KeyState, reason?: DiagCode, why?: WriteContext): void {
     const h = this.#held.get(kid)!;
     if (h.state === to) return;
     h.state = to;
@@ -481,18 +487,19 @@ export class KeyRing {
       h.awaiting = false; // отозванный ключ не регистрируется повторно
       this.#record("key.revoked", kid, reason);
     }
-    this.#write(kid, to);
+    this.#write(kid, to, why);
   }
 
-  /** Запись состояния в хранилище; сбой — расхождение памяти и хранилища: остановка (инвариант 4). */
-  #write(kid: string, to: KeyState): void {
+  /** Запись состояния в хранилище; сбой — расхождение памяти и хранилища: остановка (инвариант 4). `why` — что привело к
+   *  записи: detail и cause остановки (иначе cause — ошибка файловой системы). */
+  #write(kid: string, to: KeyState, why?: WriteContext): void {
     if (this.#closed) throw new SignerStopped("CLOSED"); // каталог мог взять другой процесс
     const h = this.#held.get(kid)!;
     if (h.disk === to) return;
     try {
       markKey(this.#o.dir, kid, h.disk, to);
     } catch (e) {
-      this.#halt("KEYSTORE_WRITE_FAILED", e);
+      this.#halt("KEYSTORE_WRITE_FAILED", why?.cause ?? e, why?.detail);
     }
     h.disk = to;
   }

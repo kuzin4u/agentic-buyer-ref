@@ -78,6 +78,7 @@ export interface ProtocolJournal {
       | { at: string; kind: "platform.protocol_unsupported"; reason: "PLATFORM_PROTOCOL_UNSUPPORTED"; detail: "CONFIGURATION" | "MANDATE" }
       | { at: string; kind: "signature.rejected"; kid: string; reason: "SIGNATURE_INVALID"; detail: string }
       | { at: string; kind: "pao.rate_limit"; detail: string }
+      | { at: string; kind: "pao.contract_violation"; reason: "RATE_LIMITED"; detail: `RETRY_AFTER_OVER_MAX:${number}` }
       | PaoCallEntry,
   ): void;
 }
@@ -451,6 +452,10 @@ export class PaoPlatform implements PaymentPlatform {
         // попытка; SignerStopped и пустой Idempotency-Key — тоже до сети, сюда не доходят
         if (failure.code !== "PAO_CLIENT_SIGNER_MISSING") {
           this.logCall(op, tries, UNCONFIRMED.has(failure.code) ? "unknown" : "refused", failure.httpStatus, failure.code, mandateOf(op, args));
+        }
+        // Retry-After у 429 больше 30 с — нарушение ПАО §2: не молча (решение владельца 26.10, Р59 п. 4)
+        if (failure.code === "RATE_LIMITED" && last.retryAfter !== undefined && last.retryAfter > PAO_RETRY_AFTER_MAX_SEC) {
+          this.o.journal.record({ at: this.at(), kind: "pao.contract_violation", reason: "RATE_LIMITED", detail: `RETRY_AFTER_OVER_MAX:${last.retryAfter}` });
         }
         if (signature) {
           const detail = skew === undefined ? "NO_DATE" : `DATE:${skew >= 0 ? "+" : ""}${skew}`;

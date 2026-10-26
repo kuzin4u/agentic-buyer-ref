@@ -163,6 +163,29 @@ describe("ограничитель в адаптере ПАО (Р59 п. 1–2)",
     expect(pace.delay()).toBe(holdMs);
   });
 
+  it.each([
+    ["30", []],
+    ["31", [["pao.call", "RATE_LIMITED", "429"], ["pao.contract_violation", "RATE_LIMITED", "RETRY_AFTER_OVER_MAX:31"]]],
+  ])("429 с Retry-After %s: больше 30 с — запись pao.contract_violation после pao.call (ПАО §2, решение владельца 26.10)", async (after, expected) => {
+    const { pace } = paced();
+    const journal = new MemoryJournal();
+    const platform = new PaoPlatform({
+      journal,
+      baseUrl: "http://pao.test",
+      agentCode: AGENT,
+      signing,
+      params,
+      sleep: async () => {},
+      fetch: async () => new Response(JSON.stringify({ code: "RATE_LIMITED", message: "m", retry: "same_key" }), { status: 429, headers: { "content-type": "application/json", "retry-after": after } }),
+      pace,
+    });
+    await expect(platform.verifyMandate({ id: "m_1", currency: "RUB" })).rejects.toMatchObject({ code: "RATE_LIMITED" });
+    const marks = journal.entries.filter((e) => e.kind === "pao.contract_violation" || (expected.length > 0 && e.kind === "pao.call")).map((e) => [e.kind, e.reason, e.detail]);
+    expect(marks).toEqual(expected);
+    // пауза — не меньше 30 с (при 30 повтор занимает ещё место в очереди); точное значение — тест выше
+    expect(pace.delay()).toBeGreaterThanOrEqual(30_000);
+  });
+
   it("429 без Retry-After — без повтора и без паузы (Р59 п. 4)", async () => {
     const { pace } = paced();
     pace.learn({ rateLimitPerMin: 60_000 }); // интервал 1 мс

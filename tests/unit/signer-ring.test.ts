@@ -481,6 +481,27 @@ describe("сверка с реестром (fail-closed)", () => {
       }
     });
 
+    it("ревью КТ1 № 2: журнал отказывает на key.revoked — отзыв в хранилище и счёт подряд всё равно; после предела регистраций нет", async () => {
+      // журнал отказывает только на key.revoked: допуск и прочие записи проходят
+      const j = new (class extends MemoryJournal {
+        override record(e: Parameters<MemoryJournal["record"]>[0]): void {
+          if (e.kind === "key.revoked") throw new Error("журнал недоступен");
+          super.record(e);
+        }
+      })();
+      const k = ring(j);
+      await k.r.start(k.self([k.key()]));
+      const p = scripted(k, []);
+      const limit = (ruleForFailure("KEY_INVALID").maxRetries ?? 0) + 1;
+      for (let i = 0; i < limit; i++) await expect(k.r.rotate(p)).rejects.toThrow("журнал недоступен");
+      // отклонённые ключи записаны отозванными до записи журнала: после перезапуска не станут рабочими
+      expect(listKeys(dir!).filter((x) => x.state === "revoked").map((x) => x.kid).sort()).toEqual(p.sent.map((s) => s.kid).sort());
+      // предел набран и при сбое журнала: ротация остановлена, к платформе больше не обращается
+      await expect(k.r.rotate(p)).rejects.toThrow(SignerRotationStopped);
+      expect(p.sent).toHaveLength(limit);
+      expect(k.r.port().current().kid).toBe(k.d.kid);
+    });
+
     it("Р58 п. 4 (в): ротация остановлена, прежний ключ истёк — остановка NO_ACTIVE_KEY (Р31 п. 4)", async () => {
       const clock = { now: new Date("2026-10-12T09:00:00Z") };
       const k = ring(new MemoryJournal(), clock);

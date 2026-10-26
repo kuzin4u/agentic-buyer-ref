@@ -392,7 +392,7 @@ export class PaoPlatform implements PaymentPlatform {
         // Заголовки пришли, но ответ не разобран (не JSON, пустое тело, не по схеме, обрыв или тайм-аут при чтении тела) —
         // BAD_RESPONSE с HTTP-статусом ответа: «ответ не подтверждён» (Р27, fail-closed) отличается от тайм-аута и обрыва до
         // заголовков (NO_RESPONSE, httpStatus 0). При 2xx изменяющего запроса действие, вероятно, выполнено — повтора нет
-        // (Р48 п. 3; сверка по GET — ч. 2).
+        // (Р48 п. 3); сверка одним чтением — у регистрации ключа и отказа от мандата (`reconciled`, Р58 п. 5 и доп. 1).
         if ((failure.code === "UNKNOWN" || failure.code === "BAD_RESPONSE") && failure.httpStatus === 0 && last.status !== undefined) {
           failure = new PlatformFailure("BAD_RESPONSE", "never", null, last.status, key, "ответ ПАО не по схеме");
         }
@@ -496,8 +496,32 @@ export class PaoPlatform implements PaymentPlatform {
     }
   }
 
+  /** Сверка регистрации (Р58 п. 5): наш открытый ключ в реестре ACTIVE — регистрация состоялась. */
   async registerKey(draft: Parameters<PaymentPlatform["registerKey"]>[0], m: Mutation) {
-    return this.call("POST /pao/v1/agent/keys", { body: map.keyDraftToPao(draft), idempotencyKey: keyOf(m) }, map.keyFromPao);
+    try {
+      return await this.call("POST /pao/v1/agent/keys", { body: map.keyDraftToPao(draft), idempotencyKey: keyOf(m) }, map.keyFromPao);
+    } catch (e) {
+      return this.reconciled(e, async () => (await this.agentSelf()).keys.find((k) => k.publicKey === draft.publicKey && k.status === "ACTIVE"));
+    }
+  }
+
+  /**
+   * Р58 п. 5: BAD_RESPONSE на 2xx изменяющего запроса — действие, вероятно, выполнено; одно чтение, без повтора
+   * изменяющего запроса (Р48 п. 3). Чтение подтвердило — его итог; не подтвердило или отказ Платформы — исходный
+   * BAD_RESPONSE (fail-closed). Не отказ Платформы (сбой журнала, остановка подписи) — наружу как есть. Прочие отказы
+   * обращения — как есть, без чтения. След в журнале — две записи pao.call (unknown, затем ok чтения).
+   */
+  private async reconciled<R>(failure: unknown, read: () => Promise<R | undefined>): Promise<R> {
+    if (!(failure instanceof PlatformFailure && failure.code === "BAD_RESPONSE" && failure.httpStatus >= 200 && failure.httpStatus < 300)) throw failure;
+    let got: R | undefined;
+    try {
+      got = await read();
+    } catch (e) {
+      if (e instanceof PlatformFailure) throw failure;
+      throw e;
+    }
+    if (got === undefined) throw failure;
+    return got;
   }
 
   async requestMandate(draft: Parameters<PaymentPlatform["requestMandate"]>[0], m: Mutation) {
@@ -533,8 +557,16 @@ export class PaoPlatform implements PaymentPlatform {
     return this.call("GET /pao/v1/mandates/{id}/verify", { path: { id: ref.id } }, (r) => map.mandateCheckFromPao(r, ref));
   }
 
+  /** Сверка отказа (Р58 п. 5): мандат по GET — REVOKED, отказ состоялся. */
   async relinquishMandate(id: string, m: Mutation) {
-    return this.call("POST /pao/v1/mandates/{id}/relinquish", { path: { id }, idempotencyKey: keyOf(m) }, this.mandate);
+    try {
+      return await this.call("POST /pao/v1/mandates/{id}/relinquish", { path: { id }, idempotencyKey: keyOf(m) }, this.mandate);
+    } catch (e) {
+      return this.reconciled(e, async () => {
+        const got = await this.getMandate(id);
+        return got.id === id && got.status === "REVOKED" ? got : undefined;
+      });
+    }
   }
 
   mandateEvidence(id: string) {

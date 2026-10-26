@@ -191,6 +191,14 @@ describe("перевод ПАО ↔ ядро", () => {
     }
   });
 
+  it("агент: rate_limit_per_min переводится как есть; нет поля — без rateLimitPerMin (Р59 п. 3)", () => {
+    const a = { agent_code: "nspk:agent:x:v1", status: "ACTIVE" as const, class: "BUYER" as const, keys: [] };
+    expect(map.agentSelfFromPao({ ...a, rate_limit_per_min: 3000 })).toMatchObject({ rateLimitPerMin: 3000 });
+    // границы проверяет ограничитель частоты, не перевод
+    expect(map.agentSelfFromPao({ ...a, rate_limit_per_min: 0 })).toMatchObject({ rateLimitPerMin: 0 });
+    expect(map.agentSelfFromPao(a)).not.toHaveProperty("rateLimitPerMin");
+  });
+
   it("лента: известное событие переводится, лишние поля data отбрасываются (Р34 п. 6, ПАО §7)", () => {
     const item = map.feedItemFromPao({
       event_id: "ev_1",

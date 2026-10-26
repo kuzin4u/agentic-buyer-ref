@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { readFileSync } from "node:fs";
-import { ConfigError, loadParams, parseParams } from "../../src/shared/config.js";
+import { ConfigError, PAO_RETRY_AFTER_MAX_SEC, loadParams, paoRateIntervalMs, parseParams } from "../../src/shared/config.js";
 
 const stand = JSON.parse(readFileSync("config/params.stand.json", "utf8"));
 
@@ -28,14 +28,16 @@ describe("стендовые параметры", () => {
 
   it("бюджет: attempts × timeout + 30 с (РП24) не больше registry_cache_ttl_sec", () => {
     expect(() => parseParams({ ...stand, pao_max_attempts: 3, pao_request_timeout_ms: 10001 })).toThrow(/registry_cache_ttl_sec/);
-    expect(() => parseParams({ ...stand, registry_cache_ttl_sec: 44 })).toThrow(ConfigError);
-    expect(() => parseParams({ ...stand, registry_cache_ttl_sec: 45 })).not.toThrow();
+    // с интервалом запасной частоты (Р59 дополнение 1 п. 4): 3 × (5 + 0,5) + 30 = 46,5 с
+    expect(() => parseParams({ ...stand, registry_cache_ttl_sec: 46 })).toThrow(ConfigError);
+    expect(() => parseParams({ ...stand, registry_cache_ttl_sec: 47 })).not.toThrow();
     expect(() => parseParams({ ...stand, pao_max_attempts: 0 })).toThrow(ConfigError);
   });
 
   it("Р48 п. 4б: бюджет повторов тем же ключом не больше idempotency_ttl_sec (срок хранения ключа на Платформе)", () => {
-    // 3 × 5 с + 30 с = 45 с: при registry_cache_ttl_sec 45 срок ключа 44 с — отказ, 45 с — принят
-    const tight = { ...stand, registry_cache_ttl_sec: 45, pao_max_attempts: 3, pao_request_timeout_ms: 5000 };
+    // 3 × 5 с + 30 с = 45 с: при registry_cache_ttl_sec 47 (бюджет с интервалом ограничителя — 46,5 с, Р59 дополнение 1
+    // п. 4) срок ключа 44 с — отказ, 45 с — принят
+    const tight = { ...stand, registry_cache_ttl_sec: 47, pao_max_attempts: 3, pao_request_timeout_ms: 5000 };
     expect(() => parseParams({ ...tight, idempotency_ttl_sec: 44 })).toThrow(/idempotency_ttl_sec/);
     expect(() => parseParams({ ...tight, idempotency_ttl_sec: 45 })).not.toThrow();
   });
@@ -120,6 +122,29 @@ describe("стендовые параметры", () => {
     expect(() => parseParams({ ...stand, confirmation_wait_ms: 1.5 })).toThrow(ConfigError);
     expect(() => parseParams({ ...stand, confirmation_wait_ms: stand.registry_cache_ttl_sec * 1000 })).not.toThrow();
     expect(() => parseParams({ ...stand, confirmation_wait_ms: stand.registry_cache_ttl_sec * 1000 + 1 })).toThrow(ConfigError);
+  });
+
+  it("запасная частота ПАО (Р59 п. 3): обязательна, целое > 0; опрос ленты — не больше её половины", () => {
+    const rest = { ...stand };
+    delete rest.pao_rate_limit_fallback_per_min;
+    expect(() => parseParams(rest)).toThrow(ConfigError);
+    expect(() => parseParams({ ...stand, pao_rate_limit_fallback_per_min: 0 })).toThrow(ConfigError);
+    expect(() => parseParams({ ...stand, pao_rate_limit_fallback_per_min: 1.5 })).toThrow(ConfigError);
+    // граница: 60 000 / event_poll_interval_ms == половина запасной частоты — допустимо, на единицу меньше — отказ
+    const atEdge = (2 * 60_000) / stand.event_poll_interval_ms;
+    expect(() => parseParams({ ...stand, pao_rate_limit_fallback_per_min: atEdge })).not.toThrow();
+    expect(() => parseParams({ ...stand, pao_rate_limit_fallback_per_min: atEdge - 1 })).toThrow(/pao_rate_limit_fallback_per_min/);
+  });
+
+  it("бюджет срока с интервалом ограничителя (Р59 дополнение 1 п. 4, ревью КТ1 № 4): attempts × (timeout + интервал запасной частоты) + 30 с ≤ registry_cache_ttl_sec", () => {
+    const budget = (stand.pao_max_attempts * (stand.pao_request_timeout_ms + paoRateIntervalMs(stand.pao_rate_limit_fallback_per_min))) / 1000 + PAO_RETRY_AFTER_MAX_SEC;
+    expect(budget).toBe(46.5); // 3 × (5 + 0,5) + 30 при стендовых значениях
+    expect(() => parseParams({ ...stand, registry_cache_ttl_sec: Math.ceil(budget) })).not.toThrow();
+    expect(() => parseParams({ ...stand, registry_cache_ttl_sec: Math.floor(budget) })).toThrow(/интервал запасной частоты/);
+  });
+
+  it("интервал ограничителя (Р59 дополнение 1 п. 1–2): 30 000 / floor(L/2); floor(L/2) = 0 — окно целиком", () => {
+    expect([3000, 120, 6, 5, 3, 2, 1, 0].map(paoRateIntervalMs)).toEqual([20, 500, 10_000, 15_000, 30_000, 30_000, 30_000, 30_000]);
   });
 
   it("отказ при отсутствии файла", () => {

@@ -22,6 +22,7 @@ import type { RequestSigning } from "../../ports/request-signing.js";
 import { AGENT_STOP_CODES, ruleForFailure } from "../../declines/index.js";
 import { toFailure } from "./errors.js";
 import * as map from "./map.js";
+import { Pace } from "./pace.js";
 
 const CONFIG = "GET /.well-known/pao-configuration";
 
@@ -76,6 +77,8 @@ export interface ProtocolJournal {
       | { at: string; kind: "platform.version_unknown"; reason: "PLATFORM_VERSION_UNKNOWN"; detail: "NO_VERSION" | "BAD_RESPONSE" | "NO_RESPONSE" }
       | { at: string; kind: "platform.protocol_unsupported"; reason: "PLATFORM_PROTOCOL_UNSUPPORTED"; detail: "CONFIGURATION" | "MANDATE" }
       | { at: string; kind: "signature.rejected"; kid: string; reason: "SIGNATURE_INVALID"; detail: string }
+      | { at: string; kind: "pao.rate_limit"; detail: string }
+      | { at: string; kind: "pao.contract_violation"; reason: "RATE_LIMITED"; detail: `RETRY_AFTER_OVER_MAX:${number}` | `RATE_LIMIT_UNUSABLE:${number}` }
       | PaoCallEntry,
   ): void;
 }
@@ -159,6 +162,8 @@ export interface PaoPlatformOptions {
   /** монотонные часы в мс — длительность попыток выдачи реквизита для её общего срока (Р45 п. 2.4); по умолчанию
    *  performance.now */
   monotonic?: () => number;
+  /** ограничитель частоты, общий для всех адаптеров ПАО агента (Р59 п. 1); не передан — свой у адаптера */
+  pace?: Pace;
 }
 
 /** Выдача реквизита (Р45 п. 2.4–2.5): свой тайм-аут и общий срок попыток вместе с ожиданием повторов. */
@@ -199,6 +204,7 @@ function keyOf(m: Mutation): string {
 export class PaoPlatform implements PaymentPlatform {
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly fetchImpl: typeof fetch;
+  private readonly pace: Pace;
   private readonly cur: map.Currencies = new Set(PAO_CURRENCIES);
   /** версия ПАО Платформы подтверждена — конфигурацией или первым ответом с мандатом; до перезапуска (Р33 п. 10) */
   private protocolConfirmed = false;
@@ -209,6 +215,15 @@ export class PaoPlatform implements PaymentPlatform {
     assertPaoVersion();
     this.fetchImpl = o.fetch ?? globalThis.fetch;
     this.sleep = o.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
+    this.pace =
+      o.pace ??
+      new Pace({
+        fallbackPerMin: o.params.pao_rate_limit_fallback_per_min,
+        journal: o.journal,
+        sleep: this.sleep,
+        ...(o.now && { now: o.now }),
+        ...(o.monotonic && { monotonic: o.monotonic }),
+      });
   }
 
   capabilities(): PlatformCapabilities {
@@ -231,10 +246,15 @@ export class PaoPlatform implements PaymentPlatform {
    * PAO_MIN_PLATFORM_VERSION — остановка агента и отказ PLATFORM_PROTOCOL_UNSUPPORTED; не ниже — версия подтверждена;
    * значений 1.x.y нет, `versions` не массив строк, ответ не объект или отказ — версия не определена, проверка по первому
    * мандату (шаг 2).
+   * Шаг 2 — запасной путь (Р59 п. 6): Платформа с конфигурацией (стенд с v0.26.0) подтверждает версию здесь, и шаг 2 не
+   * срабатывает; он остаётся на сбой сети при этом единственном чтении и на конфигурацию без версии. Снятие — отдельным
+   * решением, когда ПАО сделает конфигурацию обязательной, а её чтение — с повторами.
    */
   async checkProtocol(): Promise<ProtocolCheck> {
     let versions: string[] | undefined;
     const last: { retryAfter?: number; status?: number } = {};
+    // и неподписанное обращение — в общей очереди частоты (Р59 п. 1)
+    await this.pace.wait();
     try {
       // Клиент без подписанта (ядро v0.9.0, Р37 п. 1): по типам он допускает только операции без подписи.
       const r: unknown = await this.client(last).call(CONFIG, {});
@@ -254,7 +274,13 @@ export class PaoPlatform implements PaymentPlatform {
       if (e instanceof SyntaxError || (e instanceof PaoCallError && e.clientCode !== "PAO_CLIENT_SIGNER_MISSING")) {
         // битый JSON 2xx — тот же BAD_RESPONSE, что в platform.version_unknown (ревью reviewer К2 № 2)
         const f = e instanceof SyntaxError ? new PlatformFailure("BAD_RESPONSE", "never", null, last.status ?? 200, null) : toFailure(e);
-        this.logCall(CONFIG, 1, UNCONFIRMED.has(f.code) ? "unknown" : "refused", f.httpStatus || (last.status ?? 0), f.code);
+        try {
+          this.logCall(CONFIG, 1, UNCONFIRMED.has(f.code) ? "unknown" : "refused", f.httpStatus || (last.status ?? 0), f.code);
+          this.retryAfterViolation(f.code, last.retryAfter);
+        } finally {
+          // 429 первого слоя на конфигурации — та же пауза всех обращений (ревью КТ1 № 5)
+          this.holdAfter(f.code, last.retryAfter);
+        }
       }
       if (e instanceof SyntaxError) return this.unknownVersion("BAD_RESPONSE");
       // Отказ самого клиента — не «адрес не отвечает»: 3xx — ответ указывает на другой адрес, агент не стартует (Р37 п. 2);
@@ -296,6 +322,20 @@ export class PaoPlatform implements PaymentPlatform {
 
   private logUnsupported(step: "CONFIGURATION" | "MANDATE"): void {
     this.o.journal.record({ at: this.at(), kind: "platform.protocol_unsupported", reason: "PLATFORM_PROTOCOL_UNSUPPORTED", detail: step });
+  }
+
+  /** Retry-After у 429 больше 30 с — нарушение ПАО §2, не молча (Р59 п. 4, К2а): запись после pao.call, до паузы. */
+  private retryAfterViolation(code: FailureCode, retryAfter: number | undefined): void {
+    if (code === "RATE_LIMITED" && retryAfter !== undefined && retryAfter > PAO_RETRY_AFTER_MAX_SEC) {
+      this.o.journal.record({ at: this.at(), kind: "pao.contract_violation", reason: "RATE_LIMITED", detail: `RETRY_AFTER_OVER_MAX:${retryAfter}` });
+    }
+  }
+
+  /** 429: пауза всех обращений агента до истечения Retry-After (Р59 п. 4) — не дольше потолка ожидания: по ПАО §2
+   *  Retry-After у 429 — до 30 с, больше — ответ не по контракту, а пауза без предела остановила бы и ленту. Вызывается в
+   *  finally после записей (Р-645). */
+  private holdAfter(code: FailureCode, retryAfter: number | undefined): void {
+    if (code === "RATE_LIMITED" && retryAfter !== undefined) this.pace.hold(Math.min(retryAfter, PAO_RETRY_AFTER_MAX_SEC));
   }
 
   /** Запись pao.call (Р37 п. 3): на каждую попытку, attempt > 1 — попытка повтора (Т15). */
@@ -368,10 +408,19 @@ export class PaoPlatform implements PaymentPlatform {
     for (let attempt = 1; ; ) {
       const last: Last = {};
       const signer = this.o.signing.current(); // остановлен — SignerStopped, обращения нет
+      // ожидание ограничителя частоты — в сроке выдачи (Р59 п. 2): не помещается — отказ до сети, место в очереди не занято
+      if (!fits(this.pace.delay())) {
+        throw new PlatformFailure("RATE_LIMITED", "same_key", null, 0, key, "ожидание ограничителя частоты не помещается в срок выдачи");
+      }
       tries++;
       let failure: PlatformFailure | undefined;
       let ok: { out: R; mandate: string | undefined } | undefined;
       const began = clock();
+      await this.pace.wait();
+      // пауза после 429, объявленная во время ожидания, могла сдвинуть место — срок перепроверяется (ревью КТ1 № 3)
+      if (!fits(clock() - began)) {
+        throw new PlatformFailure("RATE_LIMITED", "same_key", null, 0, key, "ожидание ограничителя частоты не помещается в срок выдачи");
+      }
       try {
         const r = await this.client(last, signer, timeoutMs).call(op, args);
         // «Открыто» № 4 (ревью AG-02): ответ 2xx — по схеме ПАО до перевода; значение вне перечня (`status`, `outcome`,
@@ -431,6 +480,7 @@ export class PaoPlatform implements PaymentPlatform {
         if (failure.code !== "PAO_CLIENT_SIGNER_MISSING") {
           this.logCall(op, tries, UNCONFIRMED.has(failure.code) ? "unknown" : "refused", failure.httpStatus, failure.code, mandateOf(op, args));
         }
+        this.retryAfterViolation(failure.code, last.retryAfter);
         if (signature) {
           const detail = skew === undefined ? "NO_DATE" : `DATE:${skew >= 0 ? "+" : ""}${skew}`;
           this.o.journal.record({ at: this.at(), kind: "signature.rejected", kid: signer.kid, reason: "SIGNATURE_INVALID", detail });
@@ -439,6 +489,7 @@ export class PaoPlatform implements PaymentPlatform {
         // Остановка и смена ключа — и при сбое журнала (Р53 ревью К2.1 № 8): запись не отменяет действие.
         if (halt) this.o.signing.stop(failure.code, clockSkew ? "CLOCK_SKEW" : undefined);
         else if (rotate) this.o.signing.keyRevoked(signer.kid, failure);
+        this.holdAfter(failure.code, last.retryAfter);
       }
       if (halt) throw failure;
       if (signature) {
@@ -481,10 +532,14 @@ export class PaoPlatform implements PaymentPlatform {
    *  остановка подписи, кто бы ни спросил. */
   async agentSelf() {
     try {
-      // остановка — в settle: и при сбое записи pao.call «ok» (ревью КТ1 № 1)
+      // остановка — в settle: и при сбое записи pao.call «ok» (ревью КТ1 № 1) и pao.rate_limit (Р59 п. 3)
       return await this.call("GET /pao/v1/agent", {}, map.agentSelfFromPao, (self) => {
-        if (self.status !== "ACTIVE") this.o.signing.stop(`AGENT_${self.status}`);
-        else if (self.agentClass !== "BUYER") this.o.signing.stop("AGENT_CLASS_MISMATCH", self.agentClass);
+        try {
+          this.pace.learn(self);
+        } finally {
+          if (self.status !== "ACTIVE") this.o.signing.stop(`AGENT_${self.status}`);
+          else if (self.agentClass !== "BUYER") this.o.signing.stop("AGENT_CLASS_MISMATCH", self.agentClass);
+        }
       });
     } catch (e) {
       // Р27: ответ 2xx получен, но не по схеме — состояние агента в реестре не подтверждено: приостановка подписи

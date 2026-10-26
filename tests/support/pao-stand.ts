@@ -8,6 +8,9 @@
 //     не по схеме) — обёртка отвечает 201; где нужен отказ, тест ставит stub.fail (он главнее обработчика). STATUS «Открыто», Р31.
 // С v0.5.0 (К13 ядра) заглушка умеет 1–4 сама, но свои обработчики GET /pao/v1/agent и POST /pao/v1/agent/keys по-прежнему
 // имеют приоритет — тесты идут через обёртку. Упрощение обёртки до заглушки ядра — STATUS «Открыто» (Р31).
+//  6) rate_limit_per_min в GET /pao/v1/agent (Р59; поле `rateLimitPerMin`, по умолчанию не отдаётся) — своим обработчиком:
+//     заглушка текущей версии умеет его сама (PaoStubAgent.rateLimitPerMin), но обработчик GET /pao/v1/agent у обёртки свой
+//     (см. выше); упрощение — то же, что для 1–4 (ревью КТ1 № 11). Против стенда Платформы — rate-stand.test.ts.
 // Ключ заглушки: status необязателен с v0.5.0 (PaoStubKey), по умолчанию ACTIVE.
 // Подпись, nonce, окно времени, Idempotency-Key и схемы проверяет сама заглушка.
 import { createHash, createPublicKey } from "node:crypto";
@@ -51,6 +54,8 @@ export class PaoStand {
   status: "ACTIVE" | "SUSPENDED" | "EXCLUDED" = "ACTIVE";
   /** класс в реестре (эмуляция, см. шапку); undefined — поле не отдаётся */
   agentClass: string | undefined = "BUYER";
+  /** предел второго слоя лимита (ПАО §2, Р59); undefined — поле не отдаётся (в ПАО 1.4.0 необязательно) */
+  rateLimitPerMin: number | undefined = undefined;
   clock = new Date("2026-10-12T09:00:00Z");
   readonly stub: PaoStub;
   private readonly agent: PaoStubAgent = { agentCode: AGENT, status: "ACTIVE", keys: [] };
@@ -85,6 +90,7 @@ export class PaoStand {
             // приведение — чтобы тест мог отдать и значение вне перечня ПАО (ожидается UNKNOWN у адаптера)
             ...(this.agentClass !== undefined && { class: this.agentClass as "BUYER" }),
             keys: this.agent.keys.map((k) => ({ kid: k.kid, alg: k.alg, public_key: k.publicKey, status: k.status ?? "ACTIVE", ...this.dates.get(k.kid)! })),
+            ...(this.rateLimitPerMin !== undefined && { rate_limit_per_min: this.rateLimitPerMin }),
           },
         }),
         "POST /pao/v1/agent/keys": ({ body }) => {

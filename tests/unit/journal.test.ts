@@ -63,8 +63,10 @@ describe("записи ядра (Р37 п. 3)", () => {
     await expect(core.mandates.check(active)).resolves.toBeDefined();
     core.close();
     expect(new Set(journal.entries.map((e) => e.kind))).toEqual(
-      new Set(["key.loaded", "events.cursor_initial", "pao.call", "request.signed", "agent.selfcheck", "agent.closed"]),
+      new Set(["key.loaded", "events.cursor_initial", "pao.call", "pao.rate_limit", "request.signed", "agent.selfcheck", "agent.closed"]),
     );
+    // предел частоты (Р59 п. 3): заглушка без rate_limit_per_min — запасная частота, одна запись при первом чтении
+    expect(journal.entries.filter((e) => e.kind === "pao.rate_limit").map((e) => e.detail)).toEqual(["FALLBACK:NO_FIELD"]);
     // журнал обращений (Р37 п. 3): попытка на обращение, ключ операции — шаблон, mandate — из ответа, пути или тела
     expect(journal.entries.filter((e) => e.kind === "pao.call").map((e) => [e.method, e.attempt, e.result, e.mandate, e.detail])).toEqual([
       ["GET /.well-known/pao-configuration", 1, "ok", undefined, "200"],

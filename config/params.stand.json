@@ -15,6 +15,7 @@
   "revocation_propagation_max_ms": 1000,
   "pao_max_attempts": 3,
   "pao_request_timeout_ms": 5000,
+  "pao_rate_limit_fallback_per_min": 120,
   "pao_credentials_timeout_ms": 35000,
   "live_check_timeout_ms": 5000,
   "live_check_max_age_sec": 60,

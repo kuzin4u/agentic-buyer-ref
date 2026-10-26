@@ -23,23 +23,24 @@ describe("зависимость от agentic-core", () => {
     );
   });
 
-  it("стенд Платформы для С0 — dev-зависимость по git+https с тегом v0.25.1 (Р24, PS-12; К2а, Р33 п. 9; К1.2, Р34 п. 10; Р41 п. 2; Р45 п. 1; Р47 п. 1; Р48 п. 1; Р49 п. 1; PR #65; Р52, PR #69; Р53 п. 8, PR #71; корневая запись lock — Р54 п. 2)", () => {
+  it("стенд Платформы для С0 — dev-зависимость по git+https с тегом v0.28.0 (Р24, PS-12; К2а, Р33 п. 9; К1.2, Р34 п. 10; Р41 п. 2; Р45 п. 1; Р47 п. 1; Р48 п. 1; Р49 п. 1; PR #65; Р52, PR #69; Р53 п. 8, PR #71; корневая запись lock — Р54 п. 2; Р57 п. 1, PR #79)", () => {
     const pkg = JSON.parse(readFileSync("package.json", "utf8"));
     expect(pkg.devDependencies["agentic-ps-platform"]).toBe(
-      "git+https://github.com/kuzin4u/agentic-ps-platform.git#v0.25.1",
+      "git+https://github.com/kuzin4u/agentic-ps-platform.git#v0.28.0",
     );
     expect(pkg.dependencies["agentic-ps-platform"]).toBeUndefined();
     const lock = JSON.parse(readFileSync("package-lock.json", "utf8"));
     const entry = lock.packages["node_modules/agentic-ps-platform"];
-    expect(entry).toMatchObject({ version: "0.25.1", dev: true });
+    expect(entry).toMatchObject({ version: "0.28.0", dev: true });
     // корневая запись lock — те же адреса и теги, что package.json (Р54 п. 2, #72): npm ci ставит дерево по записям
     // node_modules/… и отставания корневой записи не замечает (с v0.24.0 до К1.2 ч. 2в там был #v0.23.0)
     expect(lock.packages[""].devDependencies).toEqual(pkg.devDependencies);
     expect(lock.packages[""].dependencies).toEqual(pkg.dependencies);
-    // 5708313… — коммит тега v0.25.1 (MER-62-45, передача #70; fastify закреплён 5.12.6, DEP-1 / РП59; ПАО 1.4.0, YAML прежний;
-    // AG-09 ч. 2б, PR #71, Р53 п. 8; прежде v0.24.0 — 5762349…, PS-30 ч. 2, служебный PR #69, Р52; v0.23.0 — a5d496a…, PS-30 ч. 1, PR #65; v0.20.0 — dfa4328…, Р49 п. 1; v0.19.0 — 9454e9f…, Р48 п. 1; v0.17.0 — 57b357c…, Р47 п. 1; v0.15.0 — 9fda145…, Р45 п. 1; v0.11.0 — 693a388…, Р41 п. 2). npm install переписывает адрес на git+ssh — в lock только git+https.
+    // c86d97d… — коммит тега v0.28.0 (PS-05б ч. 4, передачи #74, #77, #78 — v0.26.0 и v0.27.0 пропущены; зависимости стенда
+    // прежние; ПАО 1.4.0, YAML прежний; служебный PR #79, Р57 п. 1; прежде v0.25.1 — 5708313…, MER-62-45, передача #70,
+    // fastify закреплён 5.12.6, DEP-1 / РП59, AG-09 ч. 2б, PR #71, Р53 п. 8; v0.24.0 — 5762349…, PS-30 ч. 2, служебный PR #69, Р52; v0.23.0 — a5d496a…, PS-30 ч. 1, PR #65; v0.20.0 — dfa4328…, Р49 п. 1; v0.19.0 — 9454e9f…, Р48 п. 1; v0.17.0 — 57b357c…, Р47 п. 1; v0.15.0 — 9fda145…, Р45 п. 1; v0.11.0 — 693a388…, Р41 п. 2). npm install переписывает адрес на git+ssh — в lock только git+https.
     expect(entry.resolved).toBe(
-      "git+https://github.com/kuzin4u/agentic-ps-platform.git#57083138f9176928f5b0eb0695e2bb675fdfd45f",
+      "git+https://github.com/kuzin4u/agentic-ps-platform.git#c86d97d6b4a84181376c0a73d56fb8ff4f87e06e",
     );
     expect(readFileSync("package-lock.json", "utf8")).not.toMatch(/git\+ssh:|"github:/);
     // стенд объявляет тот же тег ядра, что и агент: npm сводит их к одной копии (Р41 п. 2)

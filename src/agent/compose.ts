@@ -7,7 +7,7 @@ import { relative, resolve } from "node:path";
 import { ConfigError, loadParams, type StandParams } from "../shared/config.js";
 import { PLATFORM_EVENT_TYPES, PlatformFailure, type AgentSelf } from "../shared/domain.js";
 import type { PaymentPlatform, PlatformCapabilities } from "./ports/payment-platform.js";
-import { PAO_CLIENT_DIAG, PAO_DIAG, PaoPlatform, assertPaoVersion, type PaoPlatformOptions } from "./adapters/pao/index.js";
+import { PAO_CLIENT_DIAG, PAO_DIAG, Pace, PaoPlatform, assertPaoVersion, type PaoPlatformOptions } from "./adapters/pao/index.js";
 import { ShopsAdapter, type ShopsAdapterOptions } from "./adapters/shops/index.js";
 import { CATALOG_DIAG } from "./catalog/index.js";
 import { MemoryJournal, type Journal } from "./journal/index.js";
@@ -118,7 +118,7 @@ export interface AgentCoreOptions {
   pushUrl?: string;
   journal?: Journal;
   now?: () => Date;
-  pao: Omit<PaoPlatformOptions, "params" | "signing" | "journal">;
+  pao: Omit<PaoPlatformOptions, "params" | "signing" | "journal" | "pace">;
 }
 
 /** Один каталог внутри другого или они совпадают (по пути; символические ссылки — забота оператора, Р34 нюансы К2.3). */
@@ -180,7 +180,16 @@ export function createAgentCore(o: AgentCoreOptions): AgentCore {
   // Рабочий адаптер получает порт, закрытый до допуска; запрос допуска идёт через отдельный адаптер с портом допуска.
   // События версии ПАО (Р33 п. 10) и попытки обращений (pao.call) пишет адаптер — через ту же обёртку; журнал получают и
   // адаптеры допуска и сверки с реестром (ревью К2.1 № 2).
-  const platform = new PaoPlatform({ ...o.pao, params, signing: ring.port(), journal });
+  // Один ограничитель частоты на агента (Р59 п. 1): счётчик Платформы — по коду агента, общий для адаптеров основного,
+  // допуска и сверки; предел из GET /pao/v1/agent любого из них действует для всех.
+  const pace = new Pace({
+    fallbackPerMin: params.pao_rate_limit_fallback_per_min,
+    journal,
+    now,
+    ...(o.pao.sleep && { sleep: o.pao.sleep }),
+    ...(o.pao.monotonic && { monotonic: o.pao.monotonic }),
+  });
+  const platform = new PaoPlatform({ ...o.pao, params, signing: ring.port(), journal, pace });
   const at = (): string => now().toISOString();
   // Остановка по курсору — через порт подписи: агент целиком, запись agent.stopped — у связки ключей (Р34 п. 4).
   const signing = ring.port();
@@ -214,7 +223,7 @@ export function createAgentCore(o: AgentCoreOptions): AgentCore {
   // Сверка с реестром одна на всех (Р27): событие agent.* и вызов recheck() снаружи ждут одну и ту же.
   let rechecking: Promise<AgentSelf> | null = null;
   const recheck = (): Promise<AgentSelf> =>
-    (rechecking ??= ring.recheck((s) => new PaoPlatform({ ...o.pao, params, signing: s, journal }).agentSelf()).finally(() => {
+    (rechecking ??= ring.recheck((s) => new PaoPlatform({ ...o.pao, params, signing: s, journal, pace }).agentSelf()).finally(() => {
       rechecking = null;
     }));
   // agent.key_revoked / agent.suspended / agent.reinstated — сигнал: статус и ключи — по GET /pao/v1/agent (Р34 п. 5).
@@ -327,7 +336,7 @@ export function createAgentCore(o: AgentCoreOptions): AgentCore {
             results["platform.protocol"] = p.status === "confirmed" ? OK : { status: "warn", code: "PLATFORM_VERSION_UNKNOWN" };
             connected = true;
           }
-          return new PaoPlatform({ ...o.pao, params, signing: admission, journal }).agentSelf();
+          return new PaoPlatform({ ...o.pao, params, signing: admission, journal, pace }).agentSelf();
         });
       } catch (e) {
         const code = startFailureCode(e);

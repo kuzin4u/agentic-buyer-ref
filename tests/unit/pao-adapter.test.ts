@@ -3,7 +3,7 @@ import { describe, it, expect, afterEach } from "vitest";
 import { newEd25519Signer } from "@kuzin4u/agentic-core";
 import { PaoStub } from "@kuzin4u/agentic-core/pao";
 import { MemoryJournal } from "../../src/agent/journal/index.js";
-import { PaoPlatform, assertPaoVersion } from "../../src/agent/adapters/pao/index.js";
+import { Pace, PaoPlatform, assertPaoVersion } from "../../src/agent/adapters/pao/index.js";
 import { mandateDraftToPao } from "../../src/agent/adapters/pao/map.js";
 import { loadParams, type StandParams } from "../../src/shared/config.js";
 import { PlatformFailure, type CredentialDraft } from "../../src/shared/domain.js";
@@ -31,6 +31,10 @@ const signing: RequestSigning = {
   suspend: () => {},
 };
 
+/** Ограничитель частоты без интервала (Р59): в `sleeps` — только ожидание повторов по Retry-After; сам ограничитель —
+ *  pao-pace.test.ts. */
+const quietPace = () => new Pace({ fallbackPerMin: Infinity, journal: new MemoryJournal() });
+
 let stub: PaoStub | undefined;
 afterEach(async () => {
   await stub?.close();
@@ -57,7 +61,7 @@ async function setup(sleeps: number[] = []) {
     },
   });
   const baseUrl = await stub.start();
-  const platform = new PaoPlatform({ journal: new MemoryJournal(), baseUrl, agentCode: AGENT, signing, params, sleep: async (ms) => void sleeps.push(ms) });
+  const platform = new PaoPlatform({ journal: new MemoryJournal(), baseUrl, agentCode: AGENT, signing, params, sleep: async (ms) => void sleeps.push(ms), pace: quietPace() });
   return { platform, stub };
 }
 
@@ -458,7 +462,7 @@ describe("мандаты: коды отказа РП33 на PaoStub", () => {
     });
     const baseUrl = await stub.start();
     const sleeps: number[] = [];
-    const platform = new PaoPlatform({ journal: new MemoryJournal(), baseUrl, agentCode: AGENT, signing, params, sleep: async (ms) => void sleeps.push(ms) });
+    const platform = new PaoPlatform({ journal: new MemoryJournal(), baseUrl, agentCode: AGENT, signing, params, sleep: async (ms) => void sleeps.push(ms), pace: quietPace() });
     // мандат m_1 для GET — до отказов
     await platform.requestMandate(INTENT, { idempotencyKey: "idem_m_seed" });
     return { platform, stub, sleeps };
@@ -514,9 +518,9 @@ describe("версия ПАО", () => {
 });
 
 describe("экспорт адаптера ПАО (ревью AG-02 № 19)", () => {
-  it("наружу — только адаптер, версия копии, проверка версии и реестры кодов ПАО и клиента ПАО (Р36, Р37 п. 1); переводчики ПАО (map) не экспортируются", async () => {
+  it("наружу — только адаптер, ограничитель частоты, версия копии, проверка версии и реестры кодов ПАО и клиента ПАО (Р36, Р37 п. 1, Р59 п. 1); переводчики ПАО (map) не экспортируются", async () => {
     const exported = Object.keys(await import("../../src/agent/adapters/pao/index.js")).sort();
-    expect(exported).toEqual(["PAO_CLIENT_CODES", "PAO_CLIENT_DIAG", "PAO_COPY_VERSION", "PAO_DIAG", "PaoPlatform", "assertPaoVersion"]);
+    expect(exported).toEqual(["PAO_CLIENT_CODES", "PAO_CLIENT_DIAG", "PAO_COPY_VERSION", "PAO_DIAG", "Pace", "PaoPlatform", "assertPaoVersion"]);
   });
 });
 

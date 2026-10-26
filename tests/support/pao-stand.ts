@@ -51,6 +51,8 @@ export class PaoStand {
   status: "ACTIVE" | "SUSPENDED" | "EXCLUDED" = "ACTIVE";
   /** класс в реестре (эмуляция, см. шапку); undefined — поле не отдаётся */
   agentClass: string | undefined = "BUYER";
+  /** предел второго слоя лимита (ПАО §2, Р59); undefined — поле не отдаётся (в ПАО 1.4.0 необязательно) */
+  rateLimitPerMin: number | undefined = undefined;
   clock = new Date("2026-10-12T09:00:00Z");
   readonly stub: PaoStub;
   private readonly agent: PaoStubAgent = { agentCode: AGENT, status: "ACTIVE", keys: [] };
@@ -85,6 +87,7 @@ export class PaoStand {
             // приведение — чтобы тест мог отдать и значение вне перечня ПАО (ожидается UNKNOWN у адаптера)
             ...(this.agentClass !== undefined && { class: this.agentClass as "BUYER" }),
             keys: this.agent.keys.map((k) => ({ kid: k.kid, alg: k.alg, public_key: k.publicKey, status: k.status ?? "ACTIVE", ...this.dates.get(k.kid)! })),
+            ...(this.rateLimitPerMin !== undefined && { rate_limit_per_min: this.rateLimitPerMin }),
           },
         }),
         "POST /pao/v1/agent/keys": ({ body }) => {

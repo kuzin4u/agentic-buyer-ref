@@ -33,7 +33,7 @@ import { join } from "node:path";
 import { signRequest } from "@kuzin4u/agentic-core";
 import { AGENT_FIXTURES, MERCHANT_FIXTURES, agentApplication, type MerchantFixture, type ShopBehaviour } from "agentic-ps-platform/fixtures";
 import { createMerchants, createStand, type MerchantsStand, type Stand } from "agentic-ps-platform/stand";
-import { PaoPlatform } from "../../src/agent/adapters/pao/index.js";
+import { Pace, PaoPlatform } from "../../src/agent/adapters/pao/index.js";
 import { MemoryJournal } from "../../src/agent/journal/index.js";
 import type { PaymentPlatform } from "../../src/agent/ports/payment-platform.js";
 import type { HttpRequestSigning, RequestSigning } from "../../src/agent/ports/request-signing.js";
@@ -193,7 +193,10 @@ function agent(o: { dir: string; baseUrl: string; agentCode: string; params: Sta
   const ring = new KeyRing({ dir: o.dir, params: o.params, journal: o.journal, ...(o.now && { now: o.now }) });
   // Часы клиента ПАО — системные, как в tests/support/core.ts: окно времени подписи проверяет сервер по своим часам.
   // `paoNow` — только для стенда, когда тест двигает часы стенда (setClock) и клиента вместе (истечение подтверждения, Р47)
-  const pao = { baseUrl: o.baseUrl, agentCode: o.agentCode, params: o.params, sleep: async () => {}, journal: o.journal, ...(o.paoNow && { now: o.paoNow }) };
+  const sleep = async () => {};
+  // один ограничитель частоты на агента, как в compose (Р59 п. 1)
+  const pace = new Pace({ fallbackPerMin: o.params.pao_rate_limit_fallback_per_min, journal: o.journal, sleep });
+  const pao = { baseUrl: o.baseUrl, agentCode: o.agentCode, params: o.params, sleep, journal: o.journal, pace, ...(o.paoNow && { now: o.paoNow }) };
   const platform = new PaoPlatform({ ...pao, signing: ring.port() });
   let admitted = false;
   return {

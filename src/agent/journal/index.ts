@@ -75,6 +75,9 @@ export type JournalKind =
   /** попытка обращения к ПАО (Т15, Р37 п. 3): method — ключ операции, attempt — номер попытки (> 1 — попытка повтора),
    *  result и reason — итог попытки; detail — HTTP-статус */
   | "pao.call"
+  /** смена предела частоты обращений к ПАО (Р59 п. 3): detail — AGENT:<n> (rate_limit_per_min из GET /pao/v1/agent) или
+   *  FALLBACK:NO_FIELD / FALLBACK:OUT_OF_RANGE (запасная частота pao_rate_limit_fallback_per_min) */
+  | "pao.rate_limit"
   /** держимый мандат отозван — особое событие Т15 (Р37 п. 4); мандат больше не держится */
   | "mandate.revoked"
   /** держимый мандат не ACTIVE (истёк, исчерпан и т. п.) — больше не держится; detail — статус (Р37 п. 4) */

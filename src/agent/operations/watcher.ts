@@ -437,7 +437,8 @@ export class Operations {
     try {
       r = await this.#o.port.readOperation(opRef);
     } catch (e) {
-      if (e instanceof PlatformFailure && e.code === "REQUEST_INVALID") {
+      // чужая операция — только 400 по x-pao-errors; ответ транспорта §6 (404 / 413 / 414, Р58 п. 1) — operation.unread
+      if (e instanceof PlatformFailure && e.code === "REQUEST_INVALID" && e.httpStatus === 400) {
         this.#record({ kind: "operation.foreign", ref: opRef });
         return null;
       }

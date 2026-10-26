@@ -186,7 +186,8 @@ export class EventFeed {
         page = await this.#o.port.listEvents(after);
       } catch (e) {
         // Курсор отвергнут Платформой (чужой, неизвестный, не по форме — РП39 п. 7): молча с начала нельзя (п. 4).
-        if (after !== null && e instanceof PlatformFailure && e.code === "REQUEST_INVALID") throw this.#halt("REJECTED");
+        // Только 400 по x-pao-errors: 404 / 413 / 414 — ответ транспорта §6, о курсоре не говорит (Р58 п. 1).
+        if (after !== null && e instanceof PlatformFailure && e.code === "REQUEST_INVALID" && e.httpStatus === 400) throw this.#halt("REJECTED");
         throw e;
       }
       if (page.length === 0) return;

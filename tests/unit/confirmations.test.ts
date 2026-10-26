@@ -247,6 +247,15 @@ describe("модуль подтверждений: сигнал → GET → ст
     expect(w.outcome()).toBe("UNKNOWN");
   });
 
+  it("Р58 п. 1: REQUEST_INVALID ответа транспорта (404) — не «чужой запрос», а сбой GET: UNKNOWN, без confirmation.foreign", async () => {
+    const s = setup();
+    const w = s.waiter();
+    s.answers.set(ID1, new PlatformFailure("REQUEST_INVALID", "after_fix", "REQUEST_INVALID", 404, null));
+    await s.event("confirmation.required", ID1);
+    expect(w.outcome()).toBe("UNKNOWN");
+    expect(s.journal.filter((e) => e.kind === "confirmation.foreign")).toEqual([]);
+  });
+
   it("ответ не по схеме — UNKNOWN: APPROVED без ссылки, PENDING со ссылкой, чужой id", async () => {
     for (const bad of [
       confirmation("APPROVED", { confirmationRef: null }),

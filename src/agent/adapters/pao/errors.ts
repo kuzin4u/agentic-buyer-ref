@@ -1,6 +1,7 @@
 // Отказ ПАО → отказ ядра (SPEC §7а, Р20). Класс повтора — из таблицы ядра по коду, не из тела ответа.
 // Р48 п. 3: тайм-аут и сбой сети до заголовков — NO_RESPONSE (same_key); отказ без тела ПАО и пара «код, HTTP» не по
-// x-pao-errors — BAD_RESPONSE; код вне ПАО 1.4.0 и неразобранное — UNKNOWN (never, инвариант 4).
+// x-pao-errors — BAD_RESPONSE, кроме ответов транспорта §6 (REQUEST_INVALID при 404 / 413 / 414 — Р58 п. 1); код вне
+// ПАО 1.4.0 и неразобранное — UNKNOWN (never, инвариант 4).
 import { PAO_ERRORS, PaoCallError, type ErrorCode } from "@kuzin4u/agentic-core/pao";
 import { PlatformFailure, type FailureCode } from "../../../shared/domain.js";
 import { FAILURE_RULES } from "../../declines/index.js";
@@ -29,6 +30,10 @@ const CODES: Record<ErrorCode, FailureCode> = {
   KEY_INVALID: "KEY_INVALID",
 };
 
+/** Ответы транспорта §6 копии md ПАО 1.4.0 (Р58 п. 1): REQUEST_INVALID при этих HTTP — отказ до проверки обращения,
+ *  операция не исполнялась. С ПАО 1.5.0 — свои коды (#37 платформы), исключение снимается при переходе на версию. */
+const TRANSPORT_HTTP: ReadonlySet<number> = new Set([404, 413, 414]);
+
 /** Код платформы для журнала — только если похож на код; иначе не переносим ничего из тела. */
 const safeCode = (v: unknown): string | null => (typeof v === "string" && /^[A-Z][A-Z0-9_]{0,63}$/.test(v) ? v : null);
 
@@ -49,6 +54,11 @@ export function toFailure(e: unknown, idempotencyKey: string | null = null): Pla
       if (e.status === 0) return new PlatformFailure("NO_RESPONSE", FAILURE_RULES.NO_RESPONSE.retry, null, 0, key, "нет ответа");
       if (!e.body) return new PlatformFailure("BAD_RESPONSE", "never", null, e.status, key, "ответ без тела ПАО");
       return new PlatformFailure("UNKNOWN", "never", raw, e.status, key, "код не из ПАО 1.4.0");
+    }
+    // Ответ транспорта §6 (Р58 п. 1): отказ REQUEST_INVALID (after_fix), в журнале — refused с HTTP в detail; без сверки
+    // чтением и без повтора (таблица отказов: STOP). Исключение — только этот код и эти три статуса.
+    if (code === "REQUEST_INVALID" && TRANSPORT_HTTP.has(e.status)) {
+      return new PlatformFailure(code, FAILURE_RULES[code].retry, raw, e.status, key, "ответ транспорта ПАО (§6)");
     }
     // Пара «код, HTTP» должна совпасть с x-pao-errors; иначе ответ не подтверждён контрактом (инвариант 4).
     if (PAO_ERRORS[raw as ErrorCode].http !== e.status) {

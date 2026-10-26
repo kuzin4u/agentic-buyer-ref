@@ -681,6 +681,7 @@ describe("Р53 ревью К2.1 № 8 (Р58, К1.3): сбой журнала н�
   function on(reply: () => Response, kind: string) {
     const stopped: [string, string | undefined][] = [];
     const revoked: string[] = [];
+    const suspended: string[] = [];
     const platform = new PaoPlatform({
       journal: broken(kind),
       baseUrl: "http://pao.test",
@@ -689,12 +690,13 @@ describe("Р53 ревью К2.1 № 8 (Р58, К1.3): сбой журнала н�
         ...signing,
         stop: (r: string, d?: string) => void stopped.push([r, d]),
         keyRevoked: (kid: string) => (revoked.push(kid), signer),
+        suspend: (r: string) => void suspended.push(r),
       },
       params,
       sleep: async () => {},
       fetch: async () => reply(),
     });
-    return { platform, stopped, revoked };
+    return { platform, stopped, revoked, suspended };
   }
 
   it("403 AGENT_SUSPENDED — сбой записи pao.call, подпись всё равно остановлена", async () => {
@@ -724,6 +726,26 @@ describe("Р53 ревью К2.1 № 8 (Р58, К1.3): сбой журнала н�
     });
     await expect(platform.agentSelf()).rejects.toThrow("журнал недоступен");
     expect(stopped).toEqual(["SIGNATURE_INVALID"]);
+  });
+
+  it.each([
+    ["EXCLUDED", "BUYER", ["AGENT_EXCLUDED", undefined]],
+    ["ACTIVE", "SELLER", ["AGENT_CLASS_MISMATCH", "SELLER"]],
+  ] as const)("ревью КТ1 № 1: GET /pao/v1/agent — %s / %s, сбой записи pao.call «ok» — остановка всё равно, без приостановки и UNKNOWN", async (status, cls, stop) => {
+    const r = on(() => new Response(JSON.stringify({ agent_code: AGENT, status, class: cls, keys: [] }), { status: 200, headers: { "content-type": "application/json" } }), "pao.call");
+    const err = (await r.platform.agentSelf().catch((e: unknown) => e)) as Error;
+    expect(err.message).toBe("журнал недоступен"); // ошибка журнала как есть, не отказ Платформы
+    expect(err).not.toBeInstanceOf(PlatformFailure);
+    expect(r.stopped).toEqual([stop]);
+    expect(r.suspended).toEqual([]);
+  });
+
+  it("ревью КТ1 № 1: изменяющий запрос состоялся, сбой записи pao.call «ok» — наружу ошибка журнала, не BAD_RESPONSE", async () => {
+    const r = on(() => new Response(JSON.stringify({ url: "https://agent.test/push", events: ["operation.settled"] }), { status: 200, headers: { "content-type": "application/json" } }), "pao.call");
+    const err = (await r.platform.subscribe("https://agent.test/push", ["operation.settled"], { idempotencyKey: "idem_s1" }).catch((e: unknown) => e)) as Error;
+    expect(err.message).toBe("журнал недоступен");
+    expect(err).not.toBeInstanceOf(PlatformFailure);
+    expect(r.stopped).toEqual([]);
   });
 
   it("Р33 п. 10, шаг 1: ПАО Платформы ниже 1.4.0 — сбой записи platform.protocol_unsupported, остановка всё равно", async () => {

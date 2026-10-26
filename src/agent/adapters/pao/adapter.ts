@@ -246,7 +246,6 @@ export class PaoPlatform implements PaymentPlatform {
         this.logCall(CONFIG, 1, "unknown", last.status ?? 200, "BAD_RESPONSE");
         return this.unknownVersion("BAD_RESPONSE");
       }
-      this.logCall(CONFIG, 1, "ok", last.status ?? 200);
       versions = v;
     } catch (e) {
       // Тело и сообщение исключения не переносятся (инвариант 1). Наружу — всё, что не ответ и не разбор: дефект агента
@@ -265,16 +264,18 @@ export class PaoPlatform implements PaymentPlatform {
       throw e;
     }
     const version = versions === undefined ? null : highestPaoVersion(versions);
-    if (version === null) return this.unknownVersion("NO_VERSION");
-    if (belowMin(version)) {
-      const failure = this.unsupported(version, 200, null);
-      try {
-        this.logUnsupported("CONFIGURATION");
-      } finally {
-        this.o.signing.stop("PLATFORM_PROTOCOL_UNSUPPORTED", version); // и при сбое журнала (Р53 ревью К2.1 № 8)
-      }
-      throw failure;
+    const failure = version !== null && belowMin(version) ? this.unsupported(version, 200, null) : undefined;
+    // Записи — вне try обращения, остановка — в finally (КТ1 сессии 39 № 1; Р53 ревью К2.1 № 8): сбой журнала на
+    // pao.call «ok» или platform.protocol_unsupported не отменяет остановку на версии ниже 1.4.0. Сюда доходит только
+    // разобранный ответ: прочие исходы обращения вернулись или брошены выше.
+    try {
+      this.logCall(CONFIG, 1, "ok", last.status ?? 200);
+      if (failure !== undefined) this.logUnsupported("CONFIGURATION");
+    } finally {
+      if (failure !== undefined) this.o.signing.stop("PLATFORM_PROTOCOL_UNSUPPORTED", version!);
     }
+    if (failure !== undefined) throw failure;
+    if (version === null) return this.unknownVersion("NO_VERSION");
     this.protocolConfirmed = true;
     return { status: "confirmed", version };
   }

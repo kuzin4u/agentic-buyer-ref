@@ -296,6 +296,41 @@ describe("модуль подтверждений: сигнал → GET → ст
     expect(gets).toEqual([ID1, ID1]);
   });
 
+  it("КТ1 сессии 39 № 8: сбой журнала в таймере — истечение даёт UNKNOWN без необработанного отказа; discarded не роняет таймер", async () => {
+    const c = clock();
+    let failOn: string | null = null;
+    let answer = confirmation("PENDING");
+    const kinds: string[] = [];
+    const conf = new Confirmations({
+      port: { getConfirmation: async () => structuredClone(answer) },
+      journal: {
+        record: (e) => {
+          kinds.push(e.kind);
+          if (e.kind === failOn) throw new Error("журнал недоступен");
+        },
+      },
+      params: { confirmation_wait_ms: WAIT_MS, signature_skew_sec: SKEW_SEC, event_seen_max: SEEN_MAX },
+      now: c.now,
+      timer: c.timer,
+    });
+    const item = (id: string, eventId: string): FeedItem => ({ kind: "event", event: { eventId, type: "confirmation.required", at: c.now().toISOString(), mandateId: null, opRef: null, confirmationId: id, declineReason: null } });
+    let outcome: ConfirmationOutcome | undefined;
+    void conf.wait({ signal: new AbortController().signal }).then((o) => (outcome = o));
+    await conf.listener(item(ID1, "evt_1"));
+    // срок: GET по таймеру даёт EXPIRED, но журнал не принимает confirmation.status — исход UNKNOWN, а не зависание
+    answer = confirmation("EXPIRED");
+    failOn = "confirmation.status";
+    await c.advance(HOLD_MS + SKEW_SEC * 1000);
+    expect(outcome).toBe("UNKNOWN");
+    // невостребованный запрос: таймер выброса не бросает при сбое записи confirmation.discarded
+    failOn = null;
+    answer = confirmation("PENDING", { id: ID2, expiresAt: new Date(c.now().getTime() + HOLD_MS).toISOString() });
+    await conf.listener(item(ID2, "evt_2"));
+    failOn = "confirmation.discarded";
+    await expect(c.advance(WAIT_MS)).resolves.toBeUndefined();
+    expect(kinds).toContain("confirmation.discarded"); // таймер выброса действительно сработал
+  });
+
   it("запроса нет за confirmation_wait_ms — NONE", async () => {
     const s = setup();
     const w = s.waiter();

@@ -753,6 +753,12 @@ describe("Р53 ревью К2.1 № 8 (Р58, К1.3): сбой журнала н�
     await expect(r.platform.checkProtocol()).rejects.toThrow("журнал недоступен");
     expect(r.stopped).toEqual([["PLATFORM_PROTOCOL_UNSUPPORTED", "1.3.0"]]);
   });
+
+  it("КТ1 сессии 39 № 1: ПАО Платформы ниже 1.4.0 — сбой записи pao.call «ok» конфигурации, остановка всё равно", async () => {
+    const r = on(() => new Response(JSON.stringify({ versions: ["1.3.0"] }), { status: 200, headers: { "content-type": "application/json" } }), "pao.call");
+    await expect(r.platform.checkProtocol()).rejects.toThrow("журнал недоступен");
+    expect(r.stopped).toEqual([["PLATFORM_PROTOCOL_UNSUPPORTED", "1.3.0"]]);
+  });
 });
 
 describe("Р58 п. 3: SIGNATURE_INVALID — сверка времени по Date, один повтор, затем остановка (SPEC §7а)", () => {

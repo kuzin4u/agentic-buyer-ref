@@ -260,12 +260,17 @@ export class KeyRing {
   /** Новый ключ не принят (KEY_INVALID или не ACTIVE) — отклонён (повторно не регистрируется, инвариант 9); один счёт
    *  подряд, предел — KEY_INVALID таблицы отказов (Р58 п. 4 (а)). Сбой записи в хранилище — остановка KEYSTORE_WRITE_FAILED
    *  с причиной отказа в detail и исходным отказом в cause (Р58 п. 4 (б)). Предел набран — SignerRotationStopped сразу, на
-   *  этом же вызове (исходный отказ — в cause; ревью КТ1 № 5): вызывающий не примет его за «попробовать снова». */
+   *  этом же вызове (исходный отказ — в cause; ревью КТ1 № 5): вызывающий не примет его за «попробовать снова».
+   *  Счёт и предел — в finally: сбой журнала на key.revoked их не отменяет (ревью КТ1 № 2), иначе ротация регистрирует
+   *  ключи без предела; наружу тогда — ошибка журнала, SignerRotationStopped — со следующего вызова. */
   #keyRejected(kid: string, reason: "KEY_INVALID" | "KEY_NOT_ACTIVE", failure?: unknown): void {
-    this.#mark(kid, "revoked", reason, { detail: reason, cause: failure });
-    this.#keyInvalidStreak++;
-    if (this.#keyInvalidStreak > (ruleForFailure("KEY_INVALID").maxRetries ?? 0)) {
-      this.#rotationStopped = true;
+    try {
+      this.#mark(kid, "revoked", reason, { detail: reason, cause: failure });
+    } finally {
+      this.#keyInvalidStreak++;
+      if (this.#keyInvalidStreak > (ruleForFailure("KEY_INVALID").maxRetries ?? 0)) this.#rotationStopped = true;
+    }
+    if (this.#rotationStopped) {
       this.#record("key.rotation_stopped", undefined, reason);
       throw new SignerRotationStopped(ROTATION_STOPPED, failure === undefined ? undefined : { cause: failure });
     }
@@ -478,16 +483,15 @@ export class KeyRing {
     }
   }
 
-  /** Состояние ключа: сначала в памяти, затем в хранилище; переход в revoked пишется в журнал с причиной. */
+  /** Состояние ключа: сначала в памяти, затем в хранилище; переход в revoked пишется в журнал с причиной — после
+   *  хранилища: сбой журнала не отменяет запись отзыва на диск (ревью КТ1 № 2). */
   #mark(kid: string, to: KeyState, reason?: DiagCode, why?: WriteContext): void {
     const h = this.#held.get(kid)!;
     if (h.state === to) return;
     h.state = to;
-    if (to === "revoked") {
-      h.awaiting = false; // отозванный ключ не регистрируется повторно
-      this.#record("key.revoked", kid, reason);
-    }
+    if (to === "revoked") h.awaiting = false; // отозванный ключ не регистрируется повторно
     this.#write(kid, to, why);
+    if (to === "revoked") this.#record("key.revoked", kid, reason);
   }
 
   /** Запись состояния в хранилище; сбой — расхождение памяти и хранилища: остановка (инвариант 4). `why` — что привело к

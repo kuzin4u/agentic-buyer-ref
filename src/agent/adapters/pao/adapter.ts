@@ -16,7 +16,7 @@ import {
   type PaoOperations,
 } from "@kuzin4u/agentic-core/pao";
 import { PAO_RETRY_AFTER_MAX_SEC, type StandParams } from "../../../shared/config.js";
-import { PlatformFailure, type AgentSelf, type FailureCode, type MandateRef, type PlatformEventType } from "../../../shared/domain.js";
+import { PlatformFailure, type FailureCode, type MandateRef, type PlatformEventType } from "../../../shared/domain.js";
 import type { PaymentPlatform, PlatformCapabilities, ProtocolCheck, Mutation } from "../../ports/payment-platform.js";
 import type { RequestSigning } from "../../ports/request-signing.js";
 import { AGENT_STOP_CODES, ruleForFailure } from "../../declines/index.js";
@@ -246,7 +246,6 @@ export class PaoPlatform implements PaymentPlatform {
         this.logCall(CONFIG, 1, "unknown", last.status ?? 200, "BAD_RESPONSE");
         return this.unknownVersion("BAD_RESPONSE");
       }
-      this.logCall(CONFIG, 1, "ok", last.status ?? 200);
       versions = v;
     } catch (e) {
       // Тело и сообщение исключения не переносятся (инвариант 1). Наружу — всё, что не ответ и не разбор: дефект агента
@@ -265,14 +264,18 @@ export class PaoPlatform implements PaymentPlatform {
       throw e;
     }
     const version = versions === undefined ? null : highestPaoVersion(versions);
-    if (version === null) return this.unknownVersion("NO_VERSION");
-    if (belowMin(version)) {
-      try {
-        throw this.unsupported("CONFIGURATION", version, 200, null);
-      } finally {
-        this.o.signing.stop("PLATFORM_PROTOCOL_UNSUPPORTED", version); // и при сбое журнала (Р53 ревью К2.1 № 8)
-      }
+    const failure = version !== null && belowMin(version) ? this.unsupported(version, 200, null) : undefined;
+    // Записи — вне try обращения, остановка — в finally (КТ1 сессии 39 № 1; Р53 ревью К2.1 № 8): сбой журнала на
+    // pao.call «ok» или platform.protocol_unsupported не отменяет остановку на версии ниже 1.4.0. Сюда доходит только
+    // разобранный ответ: прочие исходы обращения вернулись или брошены выше.
+    try {
+      this.logCall(CONFIG, 1, "ok", last.status ?? 200);
+      if (failure !== undefined) this.logUnsupported("CONFIGURATION");
+    } finally {
+      if (failure !== undefined) this.o.signing.stop("PLATFORM_PROTOCOL_UNSUPPORTED", version!);
     }
+    if (failure !== undefined) throw failure;
+    if (version === null) return this.unknownVersion("NO_VERSION");
     this.protocolConfirmed = true;
     return { status: "confirmed", version };
   }
@@ -282,12 +285,17 @@ export class PaoPlatform implements PaymentPlatform {
     return { status: "unknown", detail };
   }
 
-  /** Несовместимая Платформа: событие в журнал (одна точка для обоих шагов и всех путей с мандатом — ревью К2.3 № 1).
-   *  Остановку агента делает вызывающий: шаг 1 — checkProtocol, шаг 2 — call по AGENT_STOP_CODES. */
-  private unsupported(step: "CONFIGURATION" | "MANDATE", version: string | null, httpStatus: number, key: string | null): PlatformFailure {
+  /** Несовместимая Платформа: флаг и отказ (одна точка для обоих шагов и всех путей с мандатом — ревью К2.3 № 1).
+   *  Запись `platform.protocol_unsupported` и остановку агента делает вызывающий — запись в `try`, остановка в `finally`
+   *  (Р58 нюанс К1.3, Р-620): шаг 1 — checkProtocol, шаг 2 — call по AGENT_STOP_CODES. Внутри `try` обращения запись
+   *  не делается: её сбой ушёл бы в UNKNOWN, и агент не был бы остановлен. */
+  private unsupported(version: string | null, httpStatus: number, key: string | null): PlatformFailure {
     this.protocolUnsupported = true;
-    this.o.journal.record({ at: this.at(), kind: "platform.protocol_unsupported", reason: "PLATFORM_PROTOCOL_UNSUPPORTED", detail: step });
     return new PlatformFailure("PLATFORM_PROTOCOL_UNSUPPORTED", "never", null, httpStatus, key, protocolUnsupportedText(version));
+  }
+
+  private logUnsupported(step: "CONFIGURATION" | "MANDATE"): void {
+    this.o.journal.record({ at: this.at(), kind: "platform.protocol_unsupported", reason: "PLATFORM_PROTOCOL_UNSUPPORTED", detail: step });
   }
 
   /** Запись pao.call (Р37 п. 3): на каждую попытку, attempt > 1 — попытка повтора (Т15). */
@@ -335,10 +343,13 @@ export class PaoPlatform implements PaymentPlatform {
     });
   }
 
+  /** `settle` — действие вызывающего по успешному ответу (остановка подписи по `GET /pao/v1/agent`): в `finally` после
+   *  записи `pao.call` «ok» — сбой журнала его не отменяет (ревью КТ1 № 1, К1.3). */
   private async call<K extends PaoOperationKey, R>(
     op: K,
     args: PaoCallArgs<K>,
     to: (r: PaoOperations[K]["response"]) => R,
+    settle?: (out: R) => void,
   ): Promise<R> {
     const key = args.idempotencyKey ?? null;
     let waitedSec = 0;
@@ -358,7 +369,8 @@ export class PaoPlatform implements PaymentPlatform {
       const last: Last = {};
       const signer = this.o.signing.current(); // остановлен — SignerStopped, обращения нет
       tries++;
-      let failure: PlatformFailure;
+      let failure: PlatformFailure | undefined;
+      let ok: { out: R; mandate: string | undefined } | undefined;
       const began = clock();
       try {
         const r = await this.client(last, signer, timeoutMs).call(op, args);
@@ -371,18 +383,16 @@ export class PaoPlatform implements PaymentPlatform {
         // отвергать весь ответ — её разбирает map.feedFromPao по элементам (Р34 п. 6).
         const schema = op === "GET /pao/v1/events" ? undefined : PAO_OPERATIONS[op].response;
         if (schema !== undefined && validatePao(schema, r).length > 0) {
-          if (!this.protocolConfirmed && mandateWithoutOrder(op, r)) throw this.unsupported("MANDATE", null, last.status ?? 200, key);
+          if (!this.protocolConfirmed && mandateWithoutOrder(op, r)) throw this.unsupported(null, last.status ?? 200, key);
           throw new PlatformFailure("BAD_RESPONSE", "never", null, last.status ?? 200, key, "ответ ПАО не по схеме");
         }
-        const out = to(r);
-        this.logCall(op, tries, "ok", last.status ?? 200, undefined, mandateOf(op, args, r));
-        return out;
+        ok = { out: to(r), mandate: mandateOf(op, args, r) };
       } catch (e) {
         failure = toFailure(e, key);
         // Заголовки пришли, но ответ не разобран (не JSON, пустое тело, не по схеме, обрыв или тайм-аут при чтении тела) —
         // BAD_RESPONSE с HTTP-статусом ответа: «ответ не подтверждён» (Р27, fail-closed) отличается от тайм-аута и обрыва до
         // заголовков (NO_RESPONSE, httpStatus 0). При 2xx изменяющего запроса действие, вероятно, выполнено — повтора нет
-        // (Р48 п. 3; сверка по GET — ч. 2).
+        // (Р48 п. 3); сверка одним чтением — у регистрации ключа и отказа от мандата (`reconciled`, Р58 п. 5 и доп. 1).
         if ((failure.code === "UNKNOWN" || failure.code === "BAD_RESPONSE") && failure.httpStatus === 0 && last.status !== undefined) {
           failure = new PlatformFailure("BAD_RESPONSE", "never", null, last.status, key, "ответ ПАО не по схеме");
         }
@@ -390,6 +400,17 @@ export class PaoPlatform implements PaymentPlatform {
         if (failure.code === "NO_RESPONSE" && !retriesNoResponse(op)) {
           failure = new PlatformFailure("NO_RESPONSE", "never", null, 0, key, "нет ответа; метод без повтора");
         }
+      }
+      // Запись успешного ответа — вне try обращения (ревью КТ1 № 1): сбой журнала уходит наружу как есть, а не в UNKNOWN
+      // («не подтверждён» у состоявшегося изменяющего запроса, лишняя приостановка AGENT_SELF_UNKNOWN).
+      if (failure === undefined) {
+        const { out, mandate } = ok!;
+        try {
+          this.logCall(op, tries, "ok", last.status ?? 200, undefined, mandate);
+        } finally {
+          settle?.(out);
+        }
+        return out;
       }
       spentMs += clock() - began;
       const rule = ruleForFailure(failure.code);
@@ -403,6 +424,8 @@ export class PaoPlatform implements PaymentPlatform {
       // Отозванный ключ: другой действующий (нет — SignerStopped).
       const rotate = !halt && rule.action === "ROTATE_KEY";
       try {
+        // шаг 2 Р33 п. 10: мандат без порядка отзыва до подтверждения версии — запись здесь, остановка — в finally (Р-620)
+        if (failure.code === "PLATFORM_PROTOCOL_UNSUPPORTED") this.logUnsupported("MANDATE");
         // попытка — только запрос, ушедший в сеть (ревью К2.2 № 1): отказ клиента до сети (PAO_CLIENT_SIGNER_MISSING) — не
         // попытка; SignerStopped и пустой Idempotency-Key — тоже до сети, сюда не доходят
         if (failure.code !== "PAO_CLIENT_SIGNER_MISSING") {
@@ -457,9 +480,12 @@ export class PaoPlatform implements PaymentPlatform {
   /** Агент не ACTIVE по ответу платформы (EXCLUDED — 200 по РП23 п. 6.3) или класс не BUYER (Р27; сначала статус) —
    *  остановка подписи, кто бы ни спросил. */
   async agentSelf() {
-    let self: AgentSelf;
     try {
-      self = await this.call("GET /pao/v1/agent", {}, map.agentSelfFromPao);
+      // остановка — в settle: и при сбое записи pao.call «ok» (ревью КТ1 № 1)
+      return await this.call("GET /pao/v1/agent", {}, map.agentSelfFromPao, (self) => {
+        if (self.status !== "ACTIVE") this.o.signing.stop(`AGENT_${self.status}`);
+        else if (self.agentClass !== "BUYER") this.o.signing.stop("AGENT_CLASS_MISMATCH", self.agentClass);
+      });
     } catch (e) {
       // Р27: ответ 2xx получен, но не по схеме — состояние агента в реестре не подтверждено: приостановка подписи
       // до успешной повторной сверки (не бессрочно: ответы Платформы не подписаны до ПАО 1.5.0, Р34 п. 11).
@@ -468,13 +494,34 @@ export class PaoPlatform implements PaymentPlatform {
       }
       throw e;
     }
-    if (self.status !== "ACTIVE") this.o.signing.stop(`AGENT_${self.status}`);
-    else if (self.agentClass !== "BUYER") this.o.signing.stop("AGENT_CLASS_MISMATCH", self.agentClass);
-    return self;
   }
 
+  /** Сверка регистрации (Р58 п. 5): наш открытый ключ в реестре ACTIVE — регистрация состоялась. */
   async registerKey(draft: Parameters<PaymentPlatform["registerKey"]>[0], m: Mutation) {
-    return this.call("POST /pao/v1/agent/keys", { body: map.keyDraftToPao(draft), idempotencyKey: keyOf(m) }, map.keyFromPao);
+    try {
+      return await this.call("POST /pao/v1/agent/keys", { body: map.keyDraftToPao(draft), idempotencyKey: keyOf(m) }, map.keyFromPao);
+    } catch (e) {
+      return this.reconciled(e, async () => (await this.agentSelf()).keys.find((k) => k.publicKey === draft.publicKey && k.status === "ACTIVE"));
+    }
+  }
+
+  /**
+   * Р58 п. 5: BAD_RESPONSE на 2xx изменяющего запроса — действие, вероятно, выполнено; одно чтение, без повтора
+   * изменяющего запроса (Р48 п. 3). Чтение подтвердило — его итог; не подтвердило или отказ Платформы — исходный
+   * BAD_RESPONSE (fail-closed). Не отказ Платформы (сбой журнала, остановка подписи) — наружу как есть. Прочие отказы
+   * обращения — как есть, без чтения. След в журнале — две записи pao.call (unknown, затем ok чтения).
+   */
+  private async reconciled<R>(failure: unknown, read: () => Promise<R | undefined>): Promise<R> {
+    if (!(failure instanceof PlatformFailure && failure.code === "BAD_RESPONSE" && failure.httpStatus >= 200 && failure.httpStatus < 300)) throw failure;
+    let got: R | undefined;
+    try {
+      got = await read();
+    } catch (e) {
+      if (e instanceof PlatformFailure) throw failure;
+      throw e;
+    }
+    if (got === undefined) throw failure;
+    return got;
   }
 
   async requestMandate(draft: Parameters<PaymentPlatform["requestMandate"]>[0], m: Mutation) {
@@ -493,7 +540,7 @@ export class PaoPlatform implements PaymentPlatform {
       r = parse();
     } catch (e) {
       if (!this.protocolConfirmed && e instanceof PlatformFailure && e.code === "MANDATE_REVOCATION_ORDER_MISSING") {
-        throw this.unsupported("MANDATE", null, e.httpStatus, e.idempotencyKey);
+        throw this.unsupported(null, e.httpStatus, e.idempotencyKey);
       }
       throw e;
     }
@@ -510,8 +557,16 @@ export class PaoPlatform implements PaymentPlatform {
     return this.call("GET /pao/v1/mandates/{id}/verify", { path: { id: ref.id } }, (r) => map.mandateCheckFromPao(r, ref));
   }
 
+  /** Сверка отказа (Р58 п. 5): мандат по GET — REVOKED, отказ состоялся. */
   async relinquishMandate(id: string, m: Mutation) {
-    return this.call("POST /pao/v1/mandates/{id}/relinquish", { path: { id }, idempotencyKey: keyOf(m) }, this.mandate);
+    try {
+      return await this.call("POST /pao/v1/mandates/{id}/relinquish", { path: { id }, idempotencyKey: keyOf(m) }, this.mandate);
+    } catch (e) {
+      return this.reconciled(e, async () => {
+        const got = await this.getMandate(id);
+        return got.id === id && got.status === "REVOKED" ? got : undefined;
+      });
+    }
   }
 
   mandateEvidence(id: string) {

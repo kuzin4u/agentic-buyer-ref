@@ -4,6 +4,7 @@ import { newEd25519Signer } from "@kuzin4u/agentic-core";
 import { PaoStub } from "@kuzin4u/agentic-core/pao";
 import { MemoryJournal } from "../../src/agent/journal/index.js";
 import { PaoPlatform, assertPaoVersion } from "../../src/agent/adapters/pao/index.js";
+import { mandateDraftToPao } from "../../src/agent/adapters/pao/map.js";
 import { loadParams, type StandParams } from "../../src/shared/config.js";
 import { PlatformFailure, type CredentialDraft } from "../../src/shared/domain.js";
 import type { RequestSigning } from "../../src/agent/ports/index.js";
@@ -681,6 +682,7 @@ describe("Р53 ревью К2.1 № 8 (Р58, К1.3): сбой журнала н�
   function on(reply: () => Response, kind: string) {
     const stopped: [string, string | undefined][] = [];
     const revoked: string[] = [];
+    const suspended: string[] = [];
     const platform = new PaoPlatform({
       journal: broken(kind),
       baseUrl: "http://pao.test",
@@ -689,12 +691,13 @@ describe("Р53 ревью К2.1 № 8 (Р58, К1.3): сбой журнала н�
         ...signing,
         stop: (r: string, d?: string) => void stopped.push([r, d]),
         keyRevoked: (kid: string) => (revoked.push(kid), signer),
+        suspend: (r: string) => void suspended.push(r),
       },
       params,
       sleep: async () => {},
       fetch: async () => reply(),
     });
-    return { platform, stopped, revoked };
+    return { platform, stopped, revoked, suspended };
   }
 
   it("403 AGENT_SUSPENDED — сбой записи pao.call, подпись всё равно остановлена", async () => {
@@ -726,8 +729,34 @@ describe("Р53 ревью К2.1 № 8 (Р58, К1.3): сбой журнала н�
     expect(stopped).toEqual(["SIGNATURE_INVALID"]);
   });
 
+  it.each([
+    ["EXCLUDED", "BUYER", ["AGENT_EXCLUDED", undefined]],
+    ["ACTIVE", "SELLER", ["AGENT_CLASS_MISMATCH", "SELLER"]],
+  ] as const)("ревью КТ1 № 1: GET /pao/v1/agent — %s / %s, сбой записи pao.call «ok» — остановка всё равно, без приостановки и UNKNOWN", async (status, cls, stop) => {
+    const r = on(() => new Response(JSON.stringify({ agent_code: AGENT, status, class: cls, keys: [] }), { status: 200, headers: { "content-type": "application/json" } }), "pao.call");
+    const err = (await r.platform.agentSelf().catch((e: unknown) => e)) as Error;
+    expect(err.message).toBe("журнал недоступен"); // ошибка журнала как есть, не отказ Платформы
+    expect(err).not.toBeInstanceOf(PlatformFailure);
+    expect(r.stopped).toEqual([stop]);
+    expect(r.suspended).toEqual([]);
+  });
+
+  it("ревью КТ1 № 1: изменяющий запрос состоялся, сбой записи pao.call «ok» — наружу ошибка журнала, не BAD_RESPONSE", async () => {
+    const r = on(() => new Response(JSON.stringify({ url: "https://agent.test/push", events: ["operation.settled"] }), { status: 200, headers: { "content-type": "application/json" } }), "pao.call");
+    const err = (await r.platform.subscribe("https://agent.test/push", ["operation.settled"], { idempotencyKey: "idem_s1" }).catch((e: unknown) => e)) as Error;
+    expect(err.message).toBe("журнал недоступен");
+    expect(err).not.toBeInstanceOf(PlatformFailure);
+    expect(r.stopped).toEqual([]);
+  });
+
   it("Р33 п. 10, шаг 1: ПАО Платформы ниже 1.4.0 — сбой записи platform.protocol_unsupported, остановка всё равно", async () => {
     const r = on(() => new Response(JSON.stringify({ versions: ["1.3.0"] }), { status: 200, headers: { "content-type": "application/json" } }), "platform.protocol_unsupported");
+    await expect(r.platform.checkProtocol()).rejects.toThrow("журнал недоступен");
+    expect(r.stopped).toEqual([["PLATFORM_PROTOCOL_UNSUPPORTED", "1.3.0"]]);
+  });
+
+  it("КТ1 сессии 39 № 1: ПАО Платформы ниже 1.4.0 — сбой записи pao.call «ok» конфигурации, остановка всё равно", async () => {
+    const r = on(() => new Response(JSON.stringify({ versions: ["1.3.0"] }), { status: 200, headers: { "content-type": "application/json" } }), "pao.call");
     await expect(r.platform.checkProtocol()).rejects.toThrow("журнал недоступен");
     expect(r.stopped).toEqual([["PLATFORM_PROTOCOL_UNSUPPORTED", "1.3.0"]]);
   });
@@ -870,5 +899,71 @@ describe("Р58 п. 3: SIGNATURE_INVALID — сверка времени по Dat
     });
     await expect(platform.agentSelf()).rejects.toThrow("журнал недоступен");
     expect(stopped).toEqual(["SIGNATURE_INVALID"]);
+  });
+});
+
+describe("Р58 п. 5 и доп. 1: сверка одним чтением после BAD_RESPONSE на 2xx изменяющего запроса", () => {
+  const json = (status: number, body: unknown) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+  const KEY = { kid: "kid_new", alg: "ed25519", public_key: "pk_new", status: "ACTIVE", valid_from: "2026-10-01T00:00:00Z", valid_to: "2026-12-30T00:00:00Z" };
+  const self = (keys: unknown[]) => ({ agent_code: AGENT, status: "ACTIVE", class: "BUYER", keys });
+  const mandate = (status: string) => ({ ...mandateDraftToPao(INTENT, new Set(["RUB"])), id: "m_1", agent_code: AGENT, status, created_at: "2026-10-01T00:00:00Z", revocation_order: "https://bank.test/revoke" });
+  /** ответы по маршруту «метод путь»; обращения — по порядку */
+  function on(routes: Record<string, () => Response>) {
+    const calls: string[] = [];
+    const journal = new MemoryJournal();
+    const platform = new PaoPlatform({
+      journal,
+      baseUrl: "http://pao.test",
+      agentCode: AGENT,
+      signing,
+      params,
+      sleep: async () => {},
+      fetch: async (url, init) => {
+        const route = `${init?.method ?? "GET"} ${new URL(String(url)).pathname}`;
+        calls.push(route);
+        return routes[route]!();
+      },
+    });
+    return { platform, calls, journal };
+  }
+  const broken = () => new Response("{", { status: 201, headers: { "content-type": "application/json" } });
+
+  it("регистрация ключа: битый 201, в реестре наш ключ ACTIVE — успех, ключ из реестра; одно чтение, без повтора POST", async () => {
+    const r = on({ "POST /pao/v1/agent/keys": broken, "GET /pao/v1/agent": () => json(200, self([KEY])) });
+    await expect(r.platform.registerKey({ alg: "ed25519", publicKey: "pk_new" }, { idempotencyKey: "agent-key-kid_new" })).resolves.toMatchObject({ kid: "kid_new", publicKey: "pk_new", status: "ACTIVE" });
+    expect(r.calls).toEqual(["POST /pao/v1/agent/keys", "GET /pao/v1/agent"]);
+    expect(r.journal.entries.filter((e) => e.kind === "pao.call").map((e) => [e.method, e.result])).toEqual([
+      ["POST /pao/v1/agent/keys", "unknown"],
+      ["GET /pao/v1/agent", "ok"],
+    ]);
+  });
+
+  it.each([
+    ["ключа нет в реестре", () => json(200, self([]))],
+    ["ключ не ACTIVE", () => json(200, self([{ ...KEY, status: "REVOKED" }]))],
+    ["чтение отказало", () => json(503, { code: "STATE_UNAVAILABLE", message: "x", retry: "same_key" })],
+  ])("регистрация ключа: %s — прежний BAD_RESPONSE, без повтора POST", async (_, read) => {
+    const r = on({ "POST /pao/v1/agent/keys": broken, "GET /pao/v1/agent": read });
+    await expect(r.platform.registerKey({ alg: "ed25519", publicKey: "pk_new" }, { idempotencyKey: "agent-key-kid_new" })).rejects.toMatchObject({ code: "BAD_RESPONSE", httpStatus: 201 });
+    expect(r.calls.filter((c) => c.startsWith("POST"))).toEqual(["POST /pao/v1/agent/keys"]);
+    expect(r.calls.filter((c) => c.startsWith("GET")).length).toBeGreaterThanOrEqual(1);
+  });
+
+  it("отказ от мандата: битый 200, по GET — REVOKED — успех; ACTIVE — прежний BAD_RESPONSE", async () => {
+    const ok = on({ "POST /pao/v1/mandates/m_1/relinquish": broken, "GET /pao/v1/mandates/m_1": () => json(200, mandate("REVOKED")) });
+    await expect(ok.platform.relinquishMandate("m_1", { idempotencyKey: "idem_r" })).resolves.toMatchObject({ id: "m_1", status: "REVOKED" });
+    expect(ok.calls).toEqual(["POST /pao/v1/mandates/m_1/relinquish", "GET /pao/v1/mandates/m_1"]);
+    const no = on({ "POST /pao/v1/mandates/m_1/relinquish": broken, "GET /pao/v1/mandates/m_1": () => json(200, mandate("ACTIVE")) });
+    await expect(no.platform.relinquishMandate("m_1", { idempotencyKey: "idem_r" })).rejects.toMatchObject({ code: "BAD_RESPONSE" });
+    expect(no.calls).toEqual(["POST /pao/v1/mandates/m_1/relinquish", "GET /pao/v1/mandates/m_1"]);
+  });
+
+  it("отказ Платформы (не BAD_RESPONSE на 2xx) — как есть, без чтения; подписка — без сверки (доп. 1)", async () => {
+    const refused = on({ "POST /pao/v1/mandates/m_1/relinquish": () => json(404, { code: "MANDATE_NOT_FOUND", message: "x", retry: "never" }) });
+    await expect(refused.platform.relinquishMandate("m_1", { idempotencyKey: "idem_r" })).rejects.toMatchObject({ code: "MANDATE_NOT_FOUND" });
+    expect(refused.calls).toEqual(["POST /pao/v1/mandates/m_1/relinquish"]);
+    const sub = on({ "PUT /pao/v1/subscription": () => new Response("{", { status: 200, headers: { "content-type": "application/json" } }) });
+    await expect(sub.platform.subscribe("https://agent.test/push", ["operation.settled"], { idempotencyKey: "idem_s" })).rejects.toMatchObject({ code: "BAD_RESPONSE" });
+    expect(sub.calls).toEqual(["PUT /pao/v1/subscription"]);
   });
 });

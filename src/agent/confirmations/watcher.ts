@@ -223,7 +223,12 @@ export class Confirmations {
     const drop = this.#timer(() => {
       if (!this.#unclaimed.delete(id)) return;
       this.#done.add(id);
-      this.#record({ kind: "confirmation.discarded", ref: id });
+      // запрос уже выброшен; исключение в таймере ловить некому — оно уронило бы процесс (КТ1 сессии 39 № 8)
+      try {
+        this.#record({ kind: "confirmation.discarded", ref: id });
+      } catch {
+        // журнал недоступен: записи нет, действие состоялось
+      }
     }, this.#o.params.confirmation_wait_ms);
     const seq = ++this.#held;
     this.#unclaimed.set(id, { read, drop, seq });
@@ -303,7 +308,11 @@ export class Confirmations {
     w.cancel?.();
     w.cancel = this.#timer(() => {
       w.cancel = null;
-      void this.#expire(id, w, deadline);
+      // отказ из таймера ловить некому: сбой журнала (запись confirmation.status в #read) — исход UNKNOWN (fail-closed),
+      // иначе необработанный отказ обещания уронил бы процесс, а стадия 4 ждала бы до внешнего signal (КТ1 сессии 39 № 8)
+      this.#expire(id, w, deadline).catch(() => {
+        if (!w.settled) w.finish("UNKNOWN");
+      });
     }, ms);
   }
 
@@ -334,7 +343,8 @@ export class Confirmations {
     try {
       c = await this.#o.port.getConfirmation(id);
     } catch (e) {
-      if (e instanceof PlatformFailure && e.code === "REQUEST_INVALID") return "FOREIGN";
+      // чужой запрос — только 400 по x-pao-errors; ответ транспорта §6 (404 / 413 / 414, Р58 п. 1) — FAILED
+      if (e instanceof PlatformFailure && e.code === "REQUEST_INVALID" && e.httpStatus === 400) return "FOREIGN";
       return "FAILED";
     }
     const withRef = typeof c.confirmationRef === "string" && c.confirmationRef !== "";

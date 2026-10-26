@@ -1,8 +1,8 @@
 // Ответы транспорта ПАО на стенде v0.28.0 (Р57 п. 3; передачи #77 — PS-05б ч. 3, РП62, и #78 — PS-05б ч. 4, РП63;
 // копия ПАО 1.4.0, §6 «Ответы транспорта»). Отказ до проверки обращения — тело §6 `{code, message, retry}`; до ПАО 1.5.0
 // у 404 / 413 / 414 код — REQUEST_INVALID (`after_fix`) при своём HTTP, не 400 из таблицы `x-pao-errors`.
-// Адаптер ПАО агента такой ответ не повторяет: пара «код, HTTP» не из `x-pao-errors` — BAD_RESPONSE `never`, одна
-// попытка, отказ вызывающему (инвариант 4, инвариант 9; свои коды 404 / 413 / 414 — с ПАО 1.5.0, #37 платформы).
+// Адаптер ПАО агента такой ответ считает отклонённым (Р58 п. 1): отказ REQUEST_INVALID `after_fix`, в журнале — `refused`
+// с HTTP в detail, одна попытка, без повтора и без сверки чтением (свои коды 404 / 413 / 414 — с ПАО 1.5.0, #37 платформы).
 // Обращения тестовой поддержки подписаны действующим ключом агента (как tests/support/pao-unkeyed.ts); ответы адаптеру —
 // настоящие ответы стенда: подменён только адрес или тело уже подписанного запроса, проверки подписи транспорт не ждёт.
 import { randomUUID } from "node:crypto";
@@ -116,14 +116,14 @@ describe("ответы транспорта ПАО на стенде v0.28.0 (§
     expect(await raw("POST", "/pao/v1/mandates", { body: big, agentCode: "", signed: false })).toEqual(unknown);
   });
 
-  it("адаптер ПАО: REQUEST_INVALID при HTTP 404 / 413 / 414 — BAD_RESPONSE never, одна попытка, без повтора (инвариант 4)", async () => {
+  it("адаптер ПАО: REQUEST_INVALID при HTTP 404 / 413 / 414 — отказ REQUEST_INVALID, refused, одна попытка, без повтора и сверки (Р58 п. 1)", async () => {
     const { platform, calls, rewrite, journal } = await setup();
     const from = journal.entries.length; // после допуска
 
-    // Пара «код, HTTP» не совпадает с x-pao-errors (REQUEST_INVALID — 400): ответ не подтверждён контрактом — BAD_RESPONSE
-    // `never`, код Платформы сохранён (adapters/pao/errors.ts, инвариант 4); поведение ядра прежнее (Р57, нюанс К2.1).
+    // Ответ транспорта §6 — отказ до проверки обращения: REQUEST_INVALID `after_fix` с HTTP ответа (adapters/pao/errors.ts),
+    // а не BAD_RESPONSE «не подтверждён» (Р58 п. 1 отменяет Р57, нюанс К2.1).
     const refused = (httpStatus: number, idempotencyKey: string | null) =>
-      expect.objectContaining({ code: "BAD_RESPONSE", retry: "never", platformCode: "REQUEST_INVALID", httpStatus, idempotencyKey });
+      expect.objectContaining({ code: "REQUEST_INVALID", retry: "after_fix", platformCode: "REQUEST_INVALID", httpStatus, idempotencyKey });
     rewrite.set("GET /pao/v1/mandates/*", { path: (p) => p.replace("/mandates/", "/mandatez/") });
     await expect(platform.getMandate("m_404")).rejects.toEqual(refused(404, null));
     rewrite.set("GET /pao/v1/mandates/*", { path: () => `/pao/v1/mandates/${OVER_PARAM_LIMIT}` });
@@ -131,17 +131,19 @@ describe("ответы транспорта ПАО на стенде v0.28.0 (§
     rewrite.set("POST /pao/v1/mandates", { body: (b) => b + " ".repeat(OVER_BODY_LIMIT) });
     await expect(platform.requestMandate(INTENT, { idempotencyKey: "idem-413" })).rejects.toEqual(refused(413, "idem-413"));
 
-    // одна попытка на каждое обращение, повтора нет — ни нового x-nonce, ни того же ключа идемпотентности
+    // одна попытка на каждое обращение, повтора и сверки чтением нет — ни нового x-nonce, ни GET после отказа
     expect(calls).toEqual([
       { route: "GET /pao/v1/mandates/m_404", status: 404 },
       { route: "GET /pao/v1/mandates/m_414", status: 414 },
       { route: "POST /pao/v1/mandates", status: 413 },
     ]);
-    // в журнале — попытка с исходом «не подтверждён» (unknown), как у любого BAD_RESPONSE
+    // в журнале — отклонённая попытка (refused) с HTTP в detail
     expect(journal.entries.slice(from).filter((e) => e.kind === "pao.call")).toEqual([
-      expect.objectContaining({ method: "GET /pao/v1/mandates/{id}", attempt: 1, result: "unknown", reason: "BAD_RESPONSE", detail: "404" }),
-      expect.objectContaining({ method: "GET /pao/v1/mandates/{id}", attempt: 1, result: "unknown", reason: "BAD_RESPONSE", detail: "414" }),
-      expect.objectContaining({ method: "POST /pao/v1/mandates", attempt: 1, result: "unknown", reason: "BAD_RESPONSE", detail: "413" }),
+      expect.objectContaining({ method: "GET /pao/v1/mandates/{id}", attempt: 1, result: "refused", reason: "REQUEST_INVALID", detail: "404" }),
+      expect.objectContaining({ method: "GET /pao/v1/mandates/{id}", attempt: 1, result: "refused", reason: "REQUEST_INVALID", detail: "414" }),
+      expect.objectContaining({ method: "POST /pao/v1/mandates", attempt: 1, result: "refused", reason: "REQUEST_INVALID", detail: "413" }),
     ]);
+    // агент не остановлен: дефект запроса — отказ операции (таблица отказов: STOP операции)
+    expect(journal.entries.slice(from).filter((e) => e.kind === "agent.stopped")).toEqual([]);
   });
 });

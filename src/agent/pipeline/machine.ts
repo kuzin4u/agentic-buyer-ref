@@ -192,10 +192,14 @@ export class PurchaseMachine {
    *  без надобности, авторизация без подтверждения, повторный вход в идущую стадию) — тот же отказ, что у таблицы. */
   forbid(next: PurchaseState): never {
     const from = this.#state;
-    this.o.journal.record({ at: this.#at(), kind: "agent.refused", reason: "PIPELINE_TRANSITION_FORBIDDEN", detail: `${from}->${next}`, ...this.mandate });
-    // исключение из Р38 (Р45, Б2в (б)): пакет уже уходит продавцу — отменять нечего, деньги, возможно, в пути; покупка
-    // завершится исходом стадии 5, а не кодом параллельного вызова
-    if (!isTerminal(from) && !(this.#sending && from === "AUTHORIZING")) this.stop("PIPELINE_TRANSITION_FORBIDDEN");
+    try {
+      this.o.journal.record({ at: this.#at(), kind: "agent.refused", reason: "PIPELINE_TRANSITION_FORBIDDEN", detail: `${from}->${next}`, ...this.mandate });
+    } finally {
+      // остановка — и при сбое журнала (КТ1 сессии 39 № 6, Р58 нюанс К1.3): иначе идущая стадия продолжала бы работу;
+      // наружу тогда — ошибка журнала. Исключение из Р38 (Р45, Б2в (б)): пакет уже уходит продавцу — отменять нечего,
+      // деньги, возможно, в пути; покупка завершится исходом стадии 5, а не кодом параллельного вызова
+      if (!isTerminal(from) && !(this.#sending && from === "AUTHORIZING")) this.stop("PIPELINE_TRANSITION_FORBIDDEN");
+    }
     throw new PurchaseTransitionForbidden(from, next);
   }
 

@@ -193,6 +193,13 @@ describe("стадия 5: итог операции по событию и GET (
     expect(w.outcome()).toBeUndefined();
   });
 
+  it("Р58 п. 1: REQUEST_INVALID ответа транспорта (404) — не «чужая», а operation.unread с кодом", async () => {
+    const s = setup();
+    s.answers.set("op_9", new PlatformFailure("REQUEST_INVALID", "after_fix", "REQUEST_INVALID", 404, null));
+    await s.event("operation.authorized", "op_9");
+    expect(kinds(s.journal)).toEqual(["operation.unread:REQUEST_INVALID"]); // detail — код отказа
+  });
+
   it("order_ref не по маске (адаптер отдал null) — не привязывается", async () => {
     const s = setup();
     const w = s.waiting();

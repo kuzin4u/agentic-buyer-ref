@@ -191,6 +191,19 @@ describe("запрещённый переход — STOPPED и agent.refused (Р
     expect(journal.entries.map((e) => [e.kind, e.detail, e.reason])).toEqual([["purchase.stage", "STOPPED", "MANDATE_NOT_ACTIVE"]]);
   });
 
+  it("КТ1 сессии 39 № 6: журнал отказывает на agent.refused — покупка всё равно остановлена, сигнал взведён, наружу ошибка журнала", () => {
+    const { m, journal } = at("OFFERS");
+    const record = journal.record.bind(journal);
+    journal.record = (e) => {
+      if (e.kind === "agent.refused") throw new Error("журнал недоступен");
+      record(e);
+    };
+    expect(() => m.to("AUTHORIZING")).toThrow("журнал недоступен");
+    expect(m.state).toBe("STOPPED");
+    expect(m.reason).toBe("PIPELINE_TRANSITION_FORBIDDEN");
+    expect(m.stopped.aborted).toBe(true);
+  });
+
   it("код — в реестре: ошибся агент, без повтора", () => {
     expect(DIAG.PIPELINE_TRANSITION_FORBIDDEN).toMatchObject({ source: ["agent"], action: "after_fix" });
   });

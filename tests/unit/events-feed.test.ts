@@ -218,6 +218,19 @@ describe("курсор не читается или отвергнут — ос�
     expect(s.port.calls).toEqual(["evt_foreign"]);
   });
 
+  it("Р58 п. 1: REQUEST_INVALID ответа транспорта (404, 414) с курсором — не «курсор отвергнут»: отказ как есть, лента не остановлена", async () => {
+    for (const status of [404, 414]) {
+      const store = new MemoryCursorStore();
+      store.after = "e1";
+      const s = setup([], { store });
+      s.port.listEvents = async () => {
+        throw new PlatformFailure("REQUEST_INVALID", "after_fix", "REQUEST_INVALID", status, null);
+      };
+      await expect(s.feed.signal(), String(status)).rejects.toMatchObject({ code: "REQUEST_INVALID", httpStatus: status });
+      expect(s.stops, String(status)).toEqual([]);
+    }
+  });
+
   it("400 без курсора — не курсор: отказ как есть, ленту не останавливает", async () => {
     const s = setup([]);
     s.port.listEvents = async () => {

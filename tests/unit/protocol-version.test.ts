@@ -251,6 +251,21 @@ describe("шаг 2 — версия не определена: по первом
     expect(s.stub.violations).toEqual([]);
   });
 
+  it("Р-620 (Р58 нюанс К1.3): сбой записи platform.protocol_unsupported — агент всё равно остановлен, наружу ошибка журнала", async () => {
+    const { core, journal, consents, kinds } = await setup();
+    await core.start();
+    withoutOrder(consents);
+    const record = journal.record.bind(journal);
+    journal.record = (e) => {
+      if (e.kind === "platform.protocol_unsupported") throw new Error("журнал недоступен");
+      record(e);
+    };
+    const err = (await core.mandates.request(INTENT, { idempotencyKey: "idem_u1" }).catch((e: unknown) => e)) as Error;
+    expect(err.message).toBe("журнал недоступен"); // не UNKNOWN операции
+    expect(kinds("agent.stopped")).toEqual([expect.objectContaining({ reason: "PLATFORM_PROTOCOL_UNSUPPORTED" })]);
+    await expect(core.platform.agentSelf()).rejects.toThrow(SignerStopped);
+  });
+
   it.each([
     ["GET мандата", "GET /pao/v1/mandates/{id}"],
     ["отказ от мандата", "POST /pao/v1/mandates/{id}/relinquish"],

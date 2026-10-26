@@ -842,6 +842,18 @@ describe("знак готовности продавца по ПАО (Р53)", ()
     expect(s.seen.map((x) => x.path)).toEqual(["/v1/shops"]);
   });
 
+  it("Р53 ревью К2.1 № 8 (Р58): сбой журнала на shop.readiness не отменяет остановку подписи и смену ключа", async () => {
+    const broken = { record: (e: { kind: string }) => { if (e.kind === "shop.readiness") throw new Error("журнал недоступен"); } };
+    for (const [answer, stops, rotations] of [
+      [{ status: 403, body: { code: "AGENT_SUSPENDED", retry: "never" } }, ["AGENT_SUSPENDED"], []],
+      [{ status: 401, body: { code: "AGENT_KEY_REVOKED", retry: "new_key" } }, [], ["kid_test"]],
+    ] as [Answer, string[], string[]][]) {
+      const { a, pao } = adapter({}, { journal: broken }, { "MER-S1": [answer] });
+      await expect(a.readiness("MER-S1")).rejects.toThrow("журнал недоступен");
+      expect([pao.stops, pao.rotations]).toEqual([stops, rotations]);
+    }
+  });
+
   it("нет ответа в pao_request_timeout_ms (не shop_request_timeout_ms) — знак не проверен NO_RESPONSE", async () => {
     const quick = { ...params, pao_request_timeout_ms: 30, shop_request_timeout_ms: 60_000 };
     const { a, journal } = adapter({}, { params: quick }, { "MER-S1": ["hang"] });

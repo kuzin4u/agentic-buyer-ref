@@ -674,6 +674,65 @@ describe("Р51 п. 5: GET /pao/v1/operations?mandate_id — операции д�
   });
 });
 
+describe("Р53 ревью К2.1 № 8 (Р58, К1.3): сбой журнала не отменяет остановку и смену ключа", () => {
+  /** журнал, отказывающий на записи вида `kind` */
+  const broken = (kind: string) => ({ record: (e: { kind: string }) => { if (e.kind === kind) throw new Error("журнал недоступен"); } });
+  const body = (code: string, retry: string) => JSON.stringify({ code, message: "отказ", retry });
+  function on(reply: () => Response, kind: string) {
+    const stopped: [string, string | undefined][] = [];
+    const revoked: string[] = [];
+    const platform = new PaoPlatform({
+      journal: broken(kind),
+      baseUrl: "http://pao.test",
+      agentCode: AGENT,
+      signing: {
+        ...signing,
+        stop: (r: string, d?: string) => void stopped.push([r, d]),
+        keyRevoked: (kid: string) => (revoked.push(kid), signer),
+      },
+      params,
+      sleep: async () => {},
+      fetch: async () => reply(),
+    });
+    return { platform, stopped, revoked };
+  }
+
+  it("403 AGENT_SUSPENDED — сбой записи pao.call, подпись всё равно остановлена", async () => {
+    const r = on(() => new Response(body("AGENT_SUSPENDED", "never"), { status: 403, headers: { "content-type": "application/json" } }), "pao.call");
+    await expect(r.platform.getMandate("m_1")).rejects.toThrow("журнал недоступен");
+    expect(r.stopped).toEqual([["AGENT_SUSPENDED", undefined]]);
+  });
+
+  it("401 AGENT_KEY_REVOKED — сбой записи pao.call, ключ всё равно отмечен отозванным (смена ключа)", async () => {
+    const r = on(() => new Response(body("AGENT_KEY_REVOKED", "new_key"), { status: 401, headers: { "content-type": "application/json" } }), "pao.call");
+    await expect(r.platform.getMandate("m_1")).rejects.toThrow("журнал недоступен");
+    expect(r.revoked).toEqual(["kid_test"]);
+    expect(r.stopped).toEqual([]);
+  });
+
+  it("SIGNATURE_INVALID второй раз — сбой записи pao.call, остановка всё равно", async () => {
+    const stopped: string[] = [];
+    let n = 0;
+    const platform = new PaoPlatform({
+      journal: { record: (e) => { if (e.kind === "pao.call" && ++n === 2) throw new Error("журнал недоступен"); } },
+      baseUrl: "http://pao.test",
+      agentCode: AGENT,
+      signing: { ...signing, stop: (s: string) => void stopped.push(s) },
+      params,
+      sleep: async () => {},
+      fetch: async () => new Response(body("SIGNATURE_INVALID", "after_fix"), { status: 401, headers: { "content-type": "application/json" } }),
+    });
+    await expect(platform.agentSelf()).rejects.toThrow("журнал недоступен");
+    expect(stopped).toEqual(["SIGNATURE_INVALID"]);
+  });
+
+  it("Р33 п. 10, шаг 1: ПАО Платформы ниже 1.4.0 — сбой записи platform.protocol_unsupported, остановка всё равно", async () => {
+    const r = on(() => new Response(JSON.stringify({ versions: ["1.3.0"] }), { status: 200, headers: { "content-type": "application/json" } }), "platform.protocol_unsupported");
+    await expect(r.platform.checkProtocol()).rejects.toThrow("журнал недоступен");
+    expect(r.stopped).toEqual([["PLATFORM_PROTOCOL_UNSUPPORTED", "1.3.0"]]);
+  });
+});
+
 describe("Р58 п. 3: SIGNATURE_INVALID — сверка времени по Date, один повтор, затем остановка (SPEC §7а)", () => {
   const rejected = { code: "SIGNATURE_INVALID", message: "подпись", retry: "after_fix" };
   /** часы адаптера (x-timestamp) — постоянные: расхождение с Date ответа точно в секундах */

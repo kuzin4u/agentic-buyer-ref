@@ -267,9 +267,11 @@ export class PaoPlatform implements PaymentPlatform {
     const version = versions === undefined ? null : highestPaoVersion(versions);
     if (version === null) return this.unknownVersion("NO_VERSION");
     if (belowMin(version)) {
-      const failure = this.unsupported("CONFIGURATION", version, 200, null);
-      this.o.signing.stop("PLATFORM_PROTOCOL_UNSUPPORTED", version);
-      throw failure;
+      try {
+        throw this.unsupported("CONFIGURATION", version, 200, null);
+      } finally {
+        this.o.signing.stop("PLATFORM_PROTOCOL_UNSUPPORTED", version); // и при сбое журнала (Р53 ревью К2.1 № 8)
+      }
     }
     this.protocolConfirmed = true;
     return { status: "confirmed", version };
@@ -390,41 +392,42 @@ export class PaoPlatform implements PaymentPlatform {
         }
       }
       spentMs += clock() - began;
-      // попытка — только запрос, ушедший в сеть (ревью К2.2 № 1): отказ клиента до сети (PAO_CLIENT_SIGNER_MISSING) — не попытка;
-      // SignerStopped и пустой Idempotency-Key — тоже до сети, сюда не доходят
-      if (failure.code !== "PAO_CLIENT_SIGNER_MISSING") {
-        this.logCall(op, tries, UNCONFIRMED.has(failure.code) ? "unknown" : "refused", failure.httpStatus, failure.code, mandateOf(op, args));
-      }
       const rule = ruleForFailure(failure.code);
-      // Отказ в допуске — остановка агента целиком (SPEC §7а, П03).
-      if (AGENT_STOP_CODES.has(failure.code)) {
-        this.o.signing.stop(failure.code);
-        throw failure;
+      // Подпись не принята (SPEC §7а, Р58 п. 3): часы вне signature_skew_sec по Date ответа — повтор не поможет, остановка
+      // сразу; иначе один повтор за обращение новой подписью и тем же Idempotency-Key, затем остановка агента.
+      const signature = failure.code === "SIGNATURE_INVALID";
+      const skew = signature ? skewSec(last) : undefined;
+      const clockSkew = skew !== undefined && Math.abs(skew) > this.o.params.signature_skew_sec;
+      // Отказ в допуске — остановка агента целиком (SPEC §7а, П03); SIGNATURE_INVALID — по правилу выше.
+      const halt = AGENT_STOP_CODES.has(failure.code) || (signature && (clockSkew || signatureRetries >= (rule.maxRetries ?? 0) || !fits(0)));
+      // Отозванный ключ: другой действующий (нет — SignerStopped).
+      const rotate = !halt && rule.action === "ROTATE_KEY";
+      try {
+        // попытка — только запрос, ушедший в сеть (ревью К2.2 № 1): отказ клиента до сети (PAO_CLIENT_SIGNER_MISSING) — не
+        // попытка; SignerStopped и пустой Idempotency-Key — тоже до сети, сюда не доходят
+        if (failure.code !== "PAO_CLIENT_SIGNER_MISSING") {
+          this.logCall(op, tries, UNCONFIRMED.has(failure.code) ? "unknown" : "refused", failure.httpStatus, failure.code, mandateOf(op, args));
+        }
+        if (signature) {
+          const detail = skew === undefined ? "NO_DATE" : `DATE:${skew >= 0 ? "+" : ""}${skew}`;
+          this.o.journal.record({ at: this.at(), kind: "signature.rejected", kid: signer.kid, reason: "SIGNATURE_INVALID", detail });
+        }
+      } finally {
+        // Остановка и смена ключа — и при сбое журнала (Р53 ревью К2.1 № 8): запись не отменяет действие.
+        if (halt) this.o.signing.stop(failure.code, clockSkew ? "CLOCK_SKEW" : undefined);
+        else if (rotate) this.o.signing.keyRevoked(signer.kid, failure);
       }
-      // Отозванный ключ: другой действующий (нет — SignerStopped); повтор не больше maxRetries за обращение.
-      if (rule.action === "ROTATE_KEY") {
-        this.o.signing.keyRevoked(signer.kid, failure);
+      if (halt) throw failure;
+      if (signature) {
+        signatureRetries++;
+        continue;
+      }
+      // повтор другим ключом — не больше maxRetries за обращение
+      if (rotate) {
         if (rotations >= (rule.maxRetries ?? 0)) throw failure;
         // повтор выдачи другим ключом — тоже в пределах срока (Р45 п. 2.4; ревью reviewer К3 № 1)
         if (!fits(0)) throw failure;
         rotations++;
-        continue;
-      }
-      // Подпись не принята (SPEC §7а, Р58 п. 3): часы вне signature_skew_sec по Date ответа — повтор не поможет, остановка
-      // сразу; иначе один повтор за обращение новой подписью и тем же Idempotency-Key, затем остановка агента. Остановка — в
-      // finally: сбой журнала её не отменяет (Р53 ревью К2.1 № 8).
-      if (failure.code === "SIGNATURE_INVALID") {
-        const skew = skewSec(last);
-        const clock = skew !== undefined && Math.abs(skew) > this.o.params.signature_skew_sec;
-        const halt = clock || signatureRetries >= (rule.maxRetries ?? 0) || !fits(0);
-        try {
-          const detail = skew === undefined ? "NO_DATE" : `DATE:${skew >= 0 ? "+" : ""}${skew}`;
-          this.o.journal.record({ at: this.at(), kind: "signature.rejected", kid: signer.kid, reason: "SIGNATURE_INVALID", detail });
-        } finally {
-          if (halt) this.o.signing.stop("SIGNATURE_INVALID", clock ? "CLOCK_SKEW" : undefined);
-        }
-        if (halt) throw failure;
-        signatureRetries++;
         continue;
       }
       // Повтор — только по таблице ядра, в пределах попыток и потолка ожидания (инвариант 4, Р20).

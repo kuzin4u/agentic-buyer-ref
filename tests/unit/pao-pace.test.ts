@@ -62,6 +62,26 @@ describe("ограничитель частоты (Р59 п. 2–3)", () => {
     ]);
   });
 
+  it("пауза после 429 (Р59 п. 4): новое обращение — не раньше её конца; ожидающее — новое место после неё", async () => {
+    const sleeps: number[] = [];
+    // пауза объявляется, пока второе обращение ждёт своего места (время стоит)
+    const pace: Pace = new Pace({
+      fallbackPerMin: 60,
+      journal: new MemoryJournal(),
+      monotonic: () => 0,
+      sleep: async (ms) => {
+        sleeps.push(ms);
+        if (sleeps.length === 1) pace.hold(5);
+      },
+    });
+    await pace.wait(); // место 0
+    await pace.wait(); // место 1 000; во время ожидания — пауза до 5 000: новое место 5 000
+    expect(sleeps).toEqual([1000, 4000]);
+    expect(pace.delay()).toBe(6000);
+    pace.hold(1); // более короткая пауза прежнюю не сокращает
+    expect(pace.delay()).toBe(6000);
+  });
+
   it("сбой журнала не отменяет смену предела (Р-645): наружу — ошибка журнала, предел сменён", () => {
     const failing = { record: () => { throw new Error("журнал недоступен"); } };
     const pace = new Pace({ fallbackPerMin: params.pao_rate_limit_fallback_per_min, journal: failing, monotonic: () => 0, sleep: async () => {} });
@@ -117,6 +137,52 @@ describe("ограничитель в адаптере ПАО (Р59 п. 1–2)",
     });
     await expect(platform.agentSelf()).rejects.toThrow("журнал недоступен");
     expect(stops).toEqual(["AGENT_SUSPENDED"]);
+  });
+
+  it.each([
+    ["5", 5000],
+    ["999", 30_000],
+  ])("429 с Retry-After %s: запись pao.call, затем пауза всех обращений (не дольше потолка 30 с); сбой журнала её не отменяет", async (after, holdMs) => {
+    const { pace } = paced();
+    const journal = {
+      record: (e: { kind: string }) => {
+        if (e.kind === "pao.call") throw new Error("журнал недоступен");
+      },
+    };
+    const platform = new PaoPlatform({
+      journal,
+      baseUrl: "http://pao.test",
+      agentCode: AGENT,
+      signing,
+      params,
+      sleep: async () => {},
+      fetch: async () => new Response(JSON.stringify({ code: "RATE_LIMITED", message: "m", retry: "same_key" }), { status: 429, headers: { "content-type": "application/json", "retry-after": after } }),
+      pace,
+    });
+    await expect(platform.verifyMandate({ id: "m_1", currency: "RUB" })).rejects.toThrow("журнал недоступен");
+    expect(pace.delay()).toBe(holdMs);
+  });
+
+  it("429 без Retry-After — без повтора и без паузы (Р59 п. 4)", async () => {
+    const { pace } = paced();
+    pace.learn({ rateLimitPerMin: 60_000 }); // интервал 1 мс
+    let calls = 0;
+    const platform = new PaoPlatform({
+      journal: new MemoryJournal(),
+      baseUrl: "http://pao.test",
+      agentCode: AGENT,
+      signing,
+      params,
+      sleep: async () => {},
+      fetch: async () => {
+        calls++;
+        return json(429, { code: "RATE_LIMITED", message: "m", retry: "same_key" });
+      },
+      pace,
+    });
+    await expect(platform.verifyMandate({ id: "m_1", currency: "RUB" })).rejects.toMatchObject({ code: "RATE_LIMITED" });
+    expect(calls).toBe(1);
+    expect(pace.delay()).toBe(1);
   });
 
   it("выдача реквизита: ожидание ограничителя не помещается в срок — RATE_LIMITED до сети, место в очереди не занято", async () => {

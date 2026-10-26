@@ -42,9 +42,9 @@ function fake(replies: (() => Response | Promise<Response>)[], o: { p?: StandPar
     params: o.p ?? params,
     sleep: async (ms) => void sleeps.push(ms),
     monotonic: () => t,
-    // ограничитель частоты без интервала (Р59): в `sleeps` и сроке выдачи — только ожидание по Retry-After; сам
-    // ограничитель и его ожидание в сроке выдачи — pao-pace.test.ts
-    pace: new Pace({ fallbackPerMin: Infinity, journal }),
+    // ограничитель частоты без интервала и без настоящего ожидания (Р59): в `sleeps` и сроке выдачи — только ожидание по
+    // Retry-After; сам ограничитель и его ожидание в сроке выдачи — pao-pace.test.ts
+    pace: new Pace({ fallbackPerMin: Infinity, journal, sleep: async () => {}, monotonic: () => t }),
     fetch: async (_url, init) => {
       calls.push({ key: new Headers(init?.headers).get("idempotency-key"), signal: init?.signal });
       t += o.step ?? 0;

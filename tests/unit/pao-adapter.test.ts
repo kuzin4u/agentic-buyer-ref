@@ -31,9 +31,9 @@ const signing: RequestSigning = {
   suspend: () => {},
 };
 
-/** Ограничитель частоты без интервала (Р59): в `sleeps` — только ожидание повторов по Retry-After; сам ограничитель —
- *  pao-pace.test.ts. */
-const quietPace = () => new Pace({ fallbackPerMin: Infinity, journal: new MemoryJournal() });
+/** Ограничитель частоты без интервала и без настоящего ожидания (Р59; пауза после 429 — тоже): в `sleeps` — только
+ *  ожидание повторов по Retry-After; сам ограничитель — pao-pace.test.ts. */
+const quietPace = () => new Pace({ fallbackPerMin: Infinity, journal: new MemoryJournal(), sleep: async () => {} });
 
 let stub: PaoStub | undefined;
 afterEach(async () => {

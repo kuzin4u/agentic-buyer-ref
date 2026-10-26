@@ -460,6 +460,9 @@ export class PaoPlatform implements PaymentPlatform {
         // Остановка и смена ключа — и при сбое журнала (Р53 ревью К2.1 № 8): запись не отменяет действие.
         if (halt) this.o.signing.stop(failure.code, clockSkew ? "CLOCK_SKEW" : undefined);
         else if (rotate) this.o.signing.keyRevoked(signer.kid, failure);
+        // 429: пауза всех обращений агента до истечения Retry-After (Р59 п. 4) — не дольше потолка ожидания: по ПАО §2
+        // Retry-After у 429 — до 30 с, больше — ответ не по контракту, а пауза без предела остановила бы и ленту
+        if (failure.code === "RATE_LIMITED" && last.retryAfter !== undefined) this.pace.hold(Math.min(last.retryAfter, PAO_RETRY_AFTER_MAX_SEC));
       }
       if (halt) throw failure;
       if (signature) {

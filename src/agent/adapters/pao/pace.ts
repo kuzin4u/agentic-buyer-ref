@@ -27,6 +27,8 @@ export class Pace {
   #detail = INITIAL;
   /** время отправки последнего обращения, которому выдано место в очереди (мс монотонных часов) */
   #last = -Infinity;
+  /** до этого времени не уходит ни одно обращение агента — пауза после 429 (Р59 п. 4) */
+  #holdUntil = -Infinity;
   private readonly clock: () => number;
   private readonly sleep: (ms: number) => Promise<void>;
 
@@ -47,16 +49,26 @@ export class Pace {
     return Math.max(0, this.#slot(t) - t);
   }
 
-  /** Место в очереди и ожидание до него: между отправками — не меньше 60 000 / предел мс; порядок — порядок вызова. */
+  /** Место в очереди и ожидание до него: между отправками — не меньше 60 000 / предел мс; порядок — порядок вызова. Пауза,
+   *  объявленная во время ожидания, — новое место после неё (без опроса часов: время отсчитывается от места). */
   async wait(): Promise<void> {
-    const t = this.clock();
-    const at = this.#slot(t);
-    this.#last = at;
-    if (at > t) await this.sleep(at - t);
+    let t = this.clock();
+    for (;;) {
+      const at = this.#slot(t);
+      this.#last = at;
+      if (at > t) await this.sleep(at - t);
+      if (this.#holdUntil <= at) return;
+      t = at;
+    }
+  }
+
+  /** 429 (Р59 п. 4): окно Платформы общее для всех обращений агента — ни одно не уходит раньше, чем через `sec` секунд. */
+  hold(sec: number): void {
+    this.#holdUntil = Math.max(this.#holdUntil, this.clock() + sec * 1000);
   }
 
   #slot(t: number): number {
-    return Math.max(t, this.#last + 60_000 / this.#perMin);
+    return Math.max(t, this.#last + 60_000 / this.#perMin, this.#holdUntil);
   }
 
   /**

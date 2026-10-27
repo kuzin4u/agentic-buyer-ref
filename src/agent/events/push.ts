@@ -1,5 +1,5 @@
 // Приём push-событий Платформы (Р34 п. 2): до ПАО 1.5.0 тело не подписано (РП39 п. 6) и в обработку не идёт — push только
-// будит чтение ленты. Проверяется форма: JSON-объект Event (тип — любая строка), x-event-id равен event_id. Ответ — сразу,
+// будит чтение ленты (при приостановке подписи — сверку с реестром, Р60 п. 5). Проверяется форма: JSON-объект Event (тип — любая строка), x-event-id равен event_id. Ответ — сразу,
 // до чтения ленты (в пределах event_delivery_timeout_ms Платформы). HTTP-сервера здесь нет: он у оболочки или buyer_agent.
 import { SAFE_ID } from "../../shared/ids.js";
 
@@ -11,8 +11,9 @@ export interface PushJournal {
 }
 
 export interface PushOptions {
-  /** сигнал «прочитай ленту» — EventFeed.signal: слияние сигналов и предел частоты — там */
-  wake: () => Promise<void>;
+  /** сигнал «прочитай ленту» — EventFeed.signal: слияние сигналов и предел частоты — там; при приостановке подписи —
+   *  сверка с реестром (место сборки, Р60 п. 5). type — из непроверенного тела: только ожидание для сравнения (п. 5а) */
+  wake: (type: string) => Promise<void>;
   journal: PushJournal;
   now?: () => Date;
 }
@@ -44,6 +45,6 @@ export function acceptPush(o: PushOptions, body: string, headers: Readonly<Recor
     return reject("NOT_EVENT");
   }
   if (headers["x-event-id"] !== e.event_id) return reject("EVENT_ID_MISMATCH");
-  void o.wake().catch(() => undefined);
+  void o.wake(e.type).catch(() => undefined);
   return { status: 200 };
 }

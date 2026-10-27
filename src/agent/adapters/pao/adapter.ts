@@ -164,7 +164,19 @@ export interface PaoPlatformOptions {
   monotonic?: () => number;
   /** ограничитель частоты, общий для всех адаптеров ПАО агента (Р59 п. 1); не передан — свой у адаптера */
   pace?: Pace;
+  /** перед обращением из OBLIGATION_OPERATIONS: бросает, если брать обязательство сейчас нельзя (лента недоступна,
+   *  Р60 п. 4, нюанс К1.2) — обращения нет */
+  hold?: () => void;
 }
+
+/** Обращения, которые берут обязательство (Р60 п. 4, нюанс К1.2): при недоступной ленте не идут. Защитные — отказ от
+ *  мандата, отзыв ключа, спор — и чтение, подписка не входят: человек останавливает агента и при сбое ленты. Регистрация
+ *  ключа (ротация) не входит: без неё при долгом сбое ленты и истёкшем ключе агент не подпишет и сверку. */
+export const OBLIGATION_OPERATIONS: ReadonlySet<PaoOperationKey> = new Set<PaoOperationKey>([
+  "POST /pao/v1/mandates",
+  "POST /pao/v1/credentials",
+  "POST /pao/v1/confirmations",
+]);
 
 /** Выдача реквизита (Р45 п. 2.4–2.5): свой тайм-аут и общий срок попыток вместе с ожиданием повторов. */
 const CREDENTIALS: PaoOperationKey = "POST /pao/v1/credentials";
@@ -407,6 +419,7 @@ export class PaoPlatform implements PaymentPlatform {
     let tries = 0;
     for (let attempt = 1; ; ) {
       const last: Last = {};
+      if (OBLIGATION_OPERATIONS.has(op)) this.o.hold?.();
       const signer = this.o.signing.current(); // остановлен — SignerStopped, обращения нет
       // ожидание ограничителя частоты — в сроке выдачи (Р59 п. 2): не помещается — отказ до сети, место в очереди не занято
       if (!fits(this.pace.delay())) {

@@ -28,6 +28,9 @@ export interface KeyRingOptions {
   params: Pick<StandParams, "key_overlap_days">;
   journal: Journal;
   now?: () => Date;
+  /** смена состояния подписи — приостановка, снятие, остановка (расписание повторной сверки — место сборки, Р60 п. 4);
+   *  вызывается и при сбое журнала: запись не отменяет действие */
+  onState?: () => void;
 }
 
 interface Held {
@@ -131,7 +134,11 @@ export class KeyRing {
       this.#reconcile(self);
       if (this.#suspended !== null && this.#suspensions === before) {
         this.#suspended = null;
-        this.#record("signing.resumed");
+        try {
+          this.#record("signing.resumed");
+        } finally {
+          this.#o.onState?.();
+        }
       }
       return self;
     } finally {
@@ -329,15 +336,23 @@ export class KeyRing {
     this.#suspensions++;
     if (this.#suspended === reason) return;
     this.#suspended = reason;
-    this.#record("signing.suspended", undefined, reason);
+    try {
+      this.#record("signing.suspended", undefined, reason);
+    } finally {
+      this.#o.onState?.();
+    }
   }
 
   #stop(reason: SignerStopReason, detail?: string): void {
     if (this.#stopped !== null) return;
     this.#stopped = reason;
-    // штатное закрытие — не код реестра (Р36 (в)): своя запись без причины (Р37 п. 3)
-    if (reason === "CLOSED") this.#record("agent.closed");
-    else this.#record("agent.stopped", undefined, reason, detail);
+    try {
+      // штатное закрытие — не код реестра (Р36 (в)): своя запись без причины (Р37 п. 3)
+      if (reason === "CLOSED") this.#record("agent.closed");
+      else this.#record("agent.stopped", undefined, reason, detail);
+    } finally {
+      this.#o.onState?.();
+    }
   }
 
   /** Завершение: подпись и запись в хранилище останавливаются (CLOSED), затем каталог освобождается. */

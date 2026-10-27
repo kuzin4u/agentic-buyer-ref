@@ -607,39 +607,43 @@ describe("NO_RESPONSE: повтор тем же ключом (Р48 п. 4)", () =
   });
 });
 
-describe("Р50 п. 6 (а): 403 AGENT_SUSPENDED на GET операции — подпись агента остановлена (оговорка ревью КТ1 Р49 снята)", () => {
-  it("readOperation (стадия 5, событие operation.*) — остановка подписи AGENT_SUSPENDED, без повтора", async () => {
+describe("Р50 п. 6 (а), Р60 п. 1: 403 AGENT_SUSPENDED на GET операции — подпись агента приостановлена, не остановлена", () => {
+  it("readOperation (стадия 5, событие operation.*) — приостановка подписи AGENT_SUSPENDED, без повтора и без остановки", async () => {
     const stopped: string[] = [];
+    const suspended: string[] = [];
     stub = new PaoStub({ agents: [{ agentCode: AGENT, keys: [{ kid: "kid_test", alg: "ed25519", publicKey, status: "ACTIVE" }] }] });
     stub.fail("GET /pao/v1/operations/{op_ref}", { code: "AGENT_SUSPENDED" });
     const platform = new PaoPlatform({
       journal: new MemoryJournal(),
       baseUrl: await stub.start(),
       agentCode: AGENT,
-      signing: { ...signing, stop: (r: string) => void stopped.push(r) },
+      signing: { ...signing, stop: (r: string) => void stopped.push(r), suspend: (r: string) => void suspended.push(r) },
       params,
       sleep: async () => {},
     });
     await expect(platform.readOperation("op_1")).rejects.toMatchObject({ code: "AGENT_SUSPENDED", httpStatus: 403 });
-    expect(stopped).toEqual(["AGENT_SUSPENDED"]);
+    expect(suspended).toEqual(["AGENT_SUSPENDED"]);
+    expect(stopped).toEqual([]);
     expect(stub.calls.filter((c) => c.op === "GET /pao/v1/operations/{op_ref}")).toHaveLength(1);
   });
 
-  it("Р51 п. 5: readOperations (поиск по CART) — 403 AGENT_SUSPENDED останавливает подпись, без повтора; 404 MANDATE_NOT_FOUND — отказ без остановки", async () => {
-    for (const [code, status, stops] of [["AGENT_SUSPENDED", 403, true], ["MANDATE_NOT_FOUND", 404, false]] as const) {
+  it("Р51 п. 5: readOperations (поиск по CART) — 403 AGENT_SUSPENDED приостанавливает подпись, без повтора; 404 MANDATE_NOT_FOUND — отказ без приостановки", async () => {
+    for (const [code, status, halts] of [["AGENT_SUSPENDED", 403, true], ["MANDATE_NOT_FOUND", 404, false]] as const) {
       const stopped: string[] = [];
+      const suspended: string[] = [];
       stub = new PaoStub({ agents: [{ agentCode: AGENT, keys: [{ kid: "kid_test", alg: "ed25519", publicKey, status: "ACTIVE" }] }] });
       stub.fail("GET /pao/v1/operations", { code });
       const platform = new PaoPlatform({
         journal: new MemoryJournal(),
         baseUrl: await stub.start(),
         agentCode: AGENT,
-        signing: { ...signing, stop: (r: string) => void stopped.push(r) },
+        signing: { ...signing, stop: (r: string) => void stopped.push(r), suspend: (r: string) => void suspended.push(r) },
         params,
         sleep: async () => {},
       });
       await expect(platform.readOperations("m_cart_1")).rejects.toMatchObject({ code, httpStatus: status });
-      expect(stopped, code).toEqual(stops ? [code] : []);
+      expect(suspended, code).toEqual(halts ? [code] : []);
+      expect(stopped, code).toEqual([]);
       expect(stub.calls.filter((c) => c.op === "GET /pao/v1/operations")).toHaveLength(1);
       await stub.close();
       stub = undefined;
@@ -704,10 +708,18 @@ describe("Р53 ревью К2.1 № 8 (Р58, К1.3): сбой журнала н�
     return { platform, stopped, revoked, suspended };
   }
 
-  it("403 AGENT_SUSPENDED — сбой записи pao.call, подпись всё равно остановлена", async () => {
+  it("403 AGENT_SUSPENDED — сбой записи pao.call, подпись всё равно приостановлена (Р60 п. 1)", async () => {
     const r = on(() => new Response(body("AGENT_SUSPENDED", "never"), { status: 403, headers: { "content-type": "application/json" } }), "pao.call");
     await expect(r.platform.getMandate("m_1")).rejects.toThrow("журнал недоступен");
-    expect(r.stopped).toEqual([["AGENT_SUSPENDED", undefined]]);
+    expect(r.suspended).toEqual(["AGENT_SUSPENDED"]);
+    expect(r.stopped).toEqual([]);
+  });
+
+  it("403 AGENT_UNKNOWN — сбой записи pao.call, подпись всё равно остановлена", async () => {
+    const r = on(() => new Response(body("AGENT_UNKNOWN", "never"), { status: 401, headers: { "content-type": "application/json" } }), "pao.call");
+    await expect(r.platform.getMandate("m_1")).rejects.toThrow("журнал недоступен");
+    expect(r.stopped).toEqual([["AGENT_UNKNOWN", undefined]]);
+    expect(r.suspended).toEqual([]);
   });
 
   it("401 AGENT_KEY_REVOKED — сбой записи pao.call, ключ всё равно отмечен отозванным (смена ключа)", async () => {

@@ -80,8 +80,9 @@ export interface AgentCore {
    *  (дополнение Р34 п. 1) — events.subscription: warn. Коды остановки агента и остановленная подпись на подписке —
    *  events.subscription: fail, AgentNotReady (ревью К2.2 № 4, дополнение 2 п. 5). */
   start(): Promise<AgentSelf>;
-  /** Повторная сверка с реестром (Р27): снимает приостановку подписи при ACTIVE и BUYER; не ACTIVE или не BUYER — остановка;
-   *  ответ снова не по схеме или сбой — приостановка остаётся. Расписание сверок — за вызывающим (AG-12). */
+  /** Повторная сверка с реестром (Р27): снимает приостановку подписи при ACTIVE и BUYER; SUSPENDED — приостановка
+   *  остаётся (SignerSuspended, Р60 п. 2); иной статус или не BUYER — остановка; ответ снова не по схеме или сбой —
+   *  приостановка остаётся. Расписание сверок — за вызывающим (до К1.2 AG-14, Р60 п. 4). */
   recheck(): Promise<AgentSelf>;
   /** плановая ротация ключа, если до valid_to (по данным платформы) осталось не больше key_overlap_days; ротация
    *  остановлена (новый ключ не принят подряд сверх предела) — SignerRotationStopped: нужен человек, не повторять (Р58 п. 4) */
@@ -213,7 +214,8 @@ export function createAgentCore(o: AgentCoreOptions): AgentCore {
       await platform.subscribe(url, types, { idempotencyKey });
       return OK;
     } catch (e) {
-      // остановка агента (AGENT_SUSPENDED и др.) и дефекты — наружу; адрес и тело в журнал не идут
+      // остановка или приостановка агента (AGENT_SUSPENDED — приостановка, Р60 п. 1) и дефекты — наружу; адрес и тело
+      // в журнал не идут
       if (!(e instanceof PlatformFailure) || AGENT_STOP_CODES.has(e.code)) throw e;
       const kind = e.code === "REQUEST_INVALID" ? "events.subscription_rejected" : "events.subscription_failed";
       journal.record({ at: at(), kind, reason: e.code });

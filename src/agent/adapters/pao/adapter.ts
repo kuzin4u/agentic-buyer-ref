@@ -18,7 +18,7 @@ import {
 import { PAO_RETRY_AFTER_MAX_SEC, type StandParams } from "../../../shared/config.js";
 import { PlatformFailure, type FailureCode, type MandateRef, type PlatformEventType } from "../../../shared/domain.js";
 import type { PaymentPlatform, PlatformCapabilities, ProtocolCheck, Mutation } from "../../ports/payment-platform.js";
-import type { RequestSigning } from "../../ports/request-signing.js";
+import { haltAgent, type RequestSigning } from "../../ports/request-signing.js";
 import { AGENT_STOP_CODES, ruleForFailure } from "../../declines/index.js";
 import { toFailure } from "./errors.js";
 import * as map from "./map.js";
@@ -487,7 +487,8 @@ export class PaoPlatform implements PaymentPlatform {
         }
       } finally {
         // Остановка и смена ключа — и при сбое журнала (Р53 ревью К2.1 № 8): запись не отменяет действие.
-        if (halt) this.o.signing.stop(failure.code, clockSkew ? "CLOCK_SKEW" : undefined);
+        // AGENT_SUSPENDED — приостановка до сверки с реестром, а не остановка (Р60 п. 1).
+        if (halt) haltAgent(this.o.signing, failure.code, clockSkew ? "CLOCK_SKEW" : undefined);
         else if (rotate) this.o.signing.keyRevoked(signer.kid, failure);
         this.holdAfter(failure.code, last.retryAfter);
       }
@@ -529,7 +530,7 @@ export class PaoPlatform implements PaymentPlatform {
   }
 
   /** Агент не ACTIVE по ответу платформы (EXCLUDED — 200 по РП23 п. 6.3) или класс не BUYER (Р27; сначала статус) —
-   *  остановка подписи, кто бы ни спросил. */
+   *  остановка подписи, кто бы ни спросил; SUSPENDED после допуска — приостановка до сверки (Р60 п. 1). */
   async agentSelf() {
     try {
       // остановка — в settle: и при сбое записи pao.call «ok» (ревью КТ1 № 1) и pao.rate_limit (Р59 п. 3)
@@ -537,7 +538,7 @@ export class PaoPlatform implements PaymentPlatform {
         try {
           this.pace.learn(self);
         } finally {
-          if (self.status !== "ACTIVE") this.o.signing.stop(`AGENT_${self.status}`);
+          if (self.status !== "ACTIVE") haltAgent(this.o.signing, `AGENT_${self.status}`);
           else if (self.agentClass !== "BUYER") this.o.signing.stop("AGENT_CLASS_MISMATCH", self.agentClass);
         }
       });

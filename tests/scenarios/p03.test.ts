@@ -2,7 +2,7 @@
 // EXCLUDED эмулирует обёртка стенда (шапка pao-stand.ts): в PaoStub ядра статус есть с v0.5.0, но обработчик обёртки главнее;
 // упрощение обёртки — STATUS «Открыто», Р31.
 import { afterEach, describe, expect, it } from "vitest";
-import { SignerStopped } from "../../src/agent/signer/index.js";
+import { SignerStopped, SignerSuspended } from "../../src/agent/signer/index.js";
 import { PlatformFailure } from "../../src/shared/domain.js";
 import { CREDENTIALS, DRAFT, coreOn, startCause, lastEntry } from "../support/core.js";
 import { PaoStand, CONFIGURATION } from "../support/pao-stand.js";
@@ -26,7 +26,9 @@ describe("П03 — исключённый или отсутствующий в �
     expect(stand.stub.violations).toEqual([]);
   });
 
-  it("исключён после допуска: прочий метод — 403 AGENT_SUSPENDED, retry never; без повтора, остановка", async () => {
+  // Р60 п. 1: 403 AGENT_SUSPENDED не отличает приостановленного от исключённого (оба получают его на прочих методах) —
+  // сначала приостановка подписи (агент не действует, не повторяет), остановка — по сверке: GET /pao/v1/agent — EXCLUDED.
+  it("исключён после допуска: прочий метод — 403 AGENT_SUSPENDED, retry never; без повтора; приостановка, по сверке EXCLUDED — остановка", async () => {
     stand = new PaoStand({ handlers: CREDENTIALS });
     const { core, journal } = await coreOn(stand);
     await core.start();
@@ -38,10 +40,19 @@ describe("П03 — исключённый или отсутствующий в �
       httpStatus: 403,
     });
     expect(stand.calls(OP)).toHaveLength(1);
-    expect(lastEntry(journal)).toMatchObject({ kind: "agent.stopped", reason: "AGENT_SUSPENDED" });
+    expect(lastEntry(journal)).toMatchObject({ kind: "signing.suspended", reason: "AGENT_SUSPENDED" });
+    // не повторяет: рабочая подпись приостановлена, обращения нет
+    await expect(core.platform.issueCredential(DRAFT, { idempotencyKey: "idem-p03" })).rejects.toThrow(SignerSuspended);
+    await expect(core.recheck()).rejects.toThrow(SignerStopped);
+    expect(lastEntry(journal)).toMatchObject({ kind: "agent.stopped", reason: "AGENT_EXCLUDED" });
     await expect(core.platform.issueCredential(DRAFT, { idempotencyKey: "idem-p03" })).rejects.toThrow(SignerStopped);
     await expect(core.platform.agentSelf()).rejects.toThrow(SignerStopped);
-    expect(stand.log()).toEqual([CONFIGURATION, { op: "GET /pao/v1/agent", status: 200 }, { op: OP, status: 403 }]);
+    expect(stand.log()).toEqual([
+      CONFIGURATION,
+      { op: "GET /pao/v1/agent", status: 200 },
+      { op: OP, status: 403 },
+      { op: "GET /pao/v1/agent", status: 200 },
+    ]);
     expect(stand.stub.violations).toEqual([]);
   });
 

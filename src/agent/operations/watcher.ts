@@ -217,7 +217,8 @@ export class Operations {
    * Восстановление op_ref (Р51 п. 5; РП55 п. 6): итога по событию нет за срок стадии 5 — один раз операции по CART покупки
    * (только с итогом). Кандидаты — операции с её order_ref; ровно одна — сверка с CART той же привязкой, что у события
    * (bind.ts): итог или MISMATCH (запись operation.mismatch). Ни одной или больше одной — NONE. Отказ Платформы — NONE,
-   * код — в записи operation.lookup (403 AGENT_SUSPENDED подпись уже остановил адаптер); сбой журнала — наружу. Повтора нет.
+   * код — в записи operation.lookup (403 AGENT_SUSPENDED подпись уже приостановил адаптер, Р60 п. 1); сбой журнала —
+   * наружу. Повтора нет.
    */
   async lookup(orderRef: string, cart: Mandate, notice?: LateNotice): Promise<OperationOutcome> {
     const ref = mandateRef(cart.id).mandate;

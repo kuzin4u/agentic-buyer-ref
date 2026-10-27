@@ -16,7 +16,8 @@ export class SignerRotationStopped extends Error {
   override readonly name = "SignerRotationStopped";
 }
 
-/** Подпись приостановлена до успешной повторной сверки с реестром (Р27: ответ реестра не по схеме после допуска). */
+/** Подпись приостановлена до успешной повторной сверки с реестром: ответ реестра не по схеме после допуска (Р27), лента
+ *  недоступна (Р50 дополнение 1), агент приостановлен оператором (AGENT_SUSPENDED, Р60 п. 1). */
 export class SignerSuspended extends Error {
   override readonly name = "SignerSuspended";
   constructor(readonly reason: DiagCode) {

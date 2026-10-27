@@ -211,6 +211,8 @@ function agent(o: { dir: string; baseUrl: string; agentCode: string; params: Sta
     admission: (): DiagCode | null => {
       const stopped = ring.stopReason;
       if (stopped !== null) return stopped === "CLOSED" ? "UNKNOWN" : stopped;
+      // приостановка (AGENT_SUSPENDED, AGENT_SELF_UNKNOWN, EVENTS_UNAVAILABLE) — как у места сборки (Р60 п. 1)
+      if (ring.suspendReason !== null) return ring.suspendReason;
       return admitted ? null : "NOT_ADMITTED";
     },
   };

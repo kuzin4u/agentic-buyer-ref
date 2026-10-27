@@ -95,6 +95,7 @@ function platform(marks: Record<string, Answer[]>) {
   const seen: Seen[] = [];
   const stops: string[] = [];
   const rotations: string[] = [];
+  const suspends: string[] = [];
   const f: typeof fetch = async (input, init) => {
     const url = new URL(String(input));
     seen.push({ method: init?.method ?? "GET", path: url.pathname, headers: { ...(init?.headers as Record<string, string>) }, redirect: init?.redirect, body: typeof init?.body === "string" ? init.body : undefined });
@@ -110,9 +111,9 @@ function platform(marks: Record<string, Answer[]>) {
     current: () => signer,
     keyRevoked: (kid) => (rotations.push(kid), signer),
     stop: (r) => void stops.push(r),
-    suspend: () => {},
+    suspend: (r) => void suspends.push(r),
   };
-  return { platform: { baseUrl: PAO, signing, fetch: f }, seen, stops, rotations };
+  return { platform: { baseUrl: PAO, signing, fetch: f }, seen, stops, rotations, suspends };
 }
 
 function adapter(routes: Record<string, Answer[]>, over: Partial<ShopsAdapterOptions> = {}, marks: Record<string, Answer[]> = {}) {
@@ -810,7 +811,7 @@ describe("знак готовности продавца по ПАО (Р53)", ()
     expect(seen.map((s) => s.path)).toEqual(["/v1/shops", "/v1/shops/S1/catalog"]);
   });
 
-  it("403 AGENT_SUSPENDED — остановка подписи и PlatformFailure тем же кодом; к следующим витринам не обращаются (Р53 п. 5)", async () => {
+  it("403 AGENT_SUSPENDED — приостановка подписи (Р60 п. 1) и PlatformFailure тем же кодом; к следующим витринам не обращаются (Р53 п. 5)", async () => {
     const { a, seen, pao, journal } = adapter(
       { ...LIST(shop("S1"), shop("S2")), ...catalog("S1", ok(ITEM)), ...catalog("S2", ok(ITEM)) },
       {},
@@ -819,7 +820,8 @@ describe("знак готовности продавца по ПАО (Р53)", ()
     const err = await a.search().catch((e: unknown) => e);
     expect(err).toBeInstanceOf(PlatformFailure);
     expect((err as PlatformFailure).code).toBe("AGENT_SUSPENDED");
-    expect(pao.stops).toEqual(["AGENT_SUSPENDED"]);
+    expect(pao.suspends).toEqual(["AGENT_SUSPENDED"]);
+    expect(pao.stops).toEqual([]);
     expect(readiness(journal)).toEqual([["GET /pao/v1/merchants/{merchant_id}/readiness", "MER-S1", "refused", "AGENT_SUSPENDED"]]);
     expect(pao.seen.map((s) => s.path)).toEqual(["/pao/v1/merchants/MER-S1/readiness"]);
     expect(seen.map((s) => s.path)).toEqual(["/v1/shops"]);
@@ -842,15 +844,16 @@ describe("знак готовности продавца по ПАО (Р53)", ()
     expect(s.seen.map((x) => x.path)).toEqual(["/v1/shops"]);
   });
 
-  it("Р53 ревью К2.1 № 8 (Р58): сбой журнала на shop.readiness не отменяет остановку подписи и смену ключа", async () => {
+  it("Р53 ревью К2.1 № 8 (Р58): сбой журнала на shop.readiness не отменяет остановку и приостановку подписи и смену ключа", async () => {
     const broken = { record: (e: { kind: string }) => { if (e.kind === "shop.readiness") throw new Error("журнал недоступен"); } };
-    for (const [answer, stops, rotations] of [
-      [{ status: 403, body: { code: "AGENT_SUSPENDED", retry: "never" } }, ["AGENT_SUSPENDED"], []],
-      [{ status: 401, body: { code: "AGENT_KEY_REVOKED", retry: "new_key" } }, [], ["kid_test"]],
-    ] as [Answer, string[], string[]][]) {
+    for (const [answer, stops, suspends, rotations] of [
+      [{ status: 403, body: { code: "AGENT_SUSPENDED", retry: "never" } }, [], ["AGENT_SUSPENDED"], []],
+      [{ status: 401, body: { code: "AGENT_UNKNOWN", retry: "never" } }, ["AGENT_UNKNOWN"], [], []],
+      [{ status: 401, body: { code: "AGENT_KEY_REVOKED", retry: "new_key" } }, [], [], ["kid_test"]],
+    ] as [Answer, string[], string[], string[]][]) {
       const { a, pao } = adapter({}, { journal: broken }, { "MER-S1": [answer] });
       await expect(a.readiness("MER-S1")).rejects.toThrow("журнал недоступен");
-      expect([pao.stops, pao.rotations]).toEqual([stops, rotations]);
+      expect([pao.stops, pao.suspends, pao.rotations]).toEqual([stops, suspends, rotations]);
     }
   });
 

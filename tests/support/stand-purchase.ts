@@ -223,5 +223,5 @@ export async function standPurchase(o: StandPurchaseOptions = {}) {
   }
   // readFeed — одно чтение ленты тем же курсором, что у ожиданий: после итога покупки ленту читает оболочка (events.items)
   // или push, а не конвейер — тест делает это сам (наблюдение после итога, Р51 п. 4)
-  return { c, self, stand, purchase, next, orderMismatches, payment, split, params, confirmations, signWhileWaiting, signedIntent, readFeed: wake };
+  return { c, self, stand, purchase, next, orderMismatches, payment, split, params, confirmations, mandates, signWhileWaiting, signedIntent, readFeed: wake };
 }

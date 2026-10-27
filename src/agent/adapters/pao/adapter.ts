@@ -596,9 +596,10 @@ export class PaoPlatform implements PaymentPlatform {
    * При приостановке — SignerSuspended до обращения (call); лента недоступна — разрешён (не обязательство, К1.2).
    */
   async revokeKey(kid: string, m: Mutation): Promise<AgentKey> {
+    const idempotencyKey = keyOf(m); // один раз: отправленный и записанный в отказ — одно значение (инвариант 9; КТ1 № 7)
     let key: AgentKey;
     try {
-      key = await this.call("POST /pao/v1/agent/keys/{kid}/revoke", { path: { kid }, idempotencyKey: keyOf(m) }, map.keyFromPao, undefined, kid);
+      key = await this.call("POST /pao/v1/agent/keys/{kid}/revoke", { path: { kid }, idempotencyKey }, map.keyFromPao, undefined, kid);
     } catch (e) {
       if (e instanceof SelfKeyRevoked) return this.revokedByRead(kid, e.failure);
       if (e instanceof PlatformFailure && e.code === "KEY_INVALID") {
@@ -607,7 +608,7 @@ export class PaoPlatform implements PaymentPlatform {
       throw e;
     }
     if (key.kid !== kid || key.status !== "REVOKED") {
-      throw new PlatformFailure("BAD_RESPONSE", "never", null, 200, keyOf(m), "ответ отзыва не подтверждает отзыв ключа");
+      throw new PlatformFailure("BAD_RESPONSE", "never", null, 200, idempotencyKey, "ответ отзыва не подтверждает отзыв ключа");
     }
     this.o.signing.keyRevoked(kid);
     return key;

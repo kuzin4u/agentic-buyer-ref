@@ -51,6 +51,9 @@ export const StandParamsSchema = z
   // Частота обращений к ПАО, пока предел второго слоя неизвестен (Р59 п. 3, fail-closed): до первого GET /pao/v1/agent,
   // нет rate_limit_per_min или значение не целое ≥ 1.
   pao_rate_limit_fallback_per_min: positive,
+  // Повторная сверка с реестром при приостановке подписи (Р60 п. 4, 6): раз в столько секунд, обращение — через общий
+  // ограничитель частоты. × 1000 — срок таймера: не больше его предела.
+  agent_recheck_interval_sec: positive.max(Math.floor(TIMER_MAX_MS / 1000)),
   // Тайм-аут выдачи реквизита POST /pao/v1/credentials (Р45 п. 2.5): выше предела обработчика Платформы.
   pao_credentials_timeout_ms: positive.max(TIMER_MAX_MS),
   // Живая проверка перед заказом (Р32 п. 7): в checkLiveOffer ядра передаются в мс.
@@ -106,6 +109,8 @@ export const StandParamsSchema = z
   .refine((p) => p.confirmation_wait_ms <= p.registry_cache_ttl_sec * 1000, { message: "confirmation_wait_ms больше registry_cache_ttl_sec" })
   // Ожидание итога операции — в пределах registry_cache_ttl_sec (Р49 п. 1, инвариант 4).
   .refine((p) => p.operation_outcome_max_delay_sec <= p.registry_cache_ttl_sec, { message: "operation_outcome_max_delay_sec больше registry_cache_ttl_sec" })
+  // Сверка при приостановке — хотя бы раз за registry_cache_ttl_sec (Р60 п. 6, инвариант 4).
+  .refine((p) => p.agent_recheck_interval_sec <= p.registry_cache_ttl_sec, { message: "agent_recheck_interval_sec больше registry_cache_ttl_sec" })
   // Перечитывание укладывается в границу ожидания клиринга: хотя бы одно плановое чтение до границы (Р51 п. 2).
   .refine((p) => p.operation_reread_interval_sec <= p.reservation_ttl_sec, { message: "operation_reread_interval_sec больше reservation_ttl_sec" })
   // Опрос ленты — не больше половины запасной частоты обращений к ПАО (Р59 п. 3).

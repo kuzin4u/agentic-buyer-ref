@@ -25,13 +25,17 @@ export class SignerSuspended extends Error {
   }
 }
 
-/** Подпись остановлена: нет действующего ключа или агенту отказано в допуске (Т1, SPEC §7а). */
+/** Подпись остановлена: нет действующего ключа или агенту отказано в допуске (Т1, SPEC §7а). `revokedKid` — ключ,
+ *  отмеченный отозванным перед остановкой NO_ACTIVE_KEY (Р60 п. 7): совпал с ключом, который агент отзывал сам, — отзыв
+ *  состоялся и агент остановлен; иной ключ или null — отзыв не состоялся. */
 export class SignerStopped extends Error {
   override readonly name = "SignerStopped";
+  readonly revokedKid: string | null;
   constructor(
     readonly reason: SignerStopReason,
-    options?: ErrorOptions,
+    options?: ErrorOptions & { revokedKid?: string },
   ) {
     super(`подпись остановлена: ${reason}`, options);
+    this.revokedKid = options?.revokedKid ?? null;
   }
 }

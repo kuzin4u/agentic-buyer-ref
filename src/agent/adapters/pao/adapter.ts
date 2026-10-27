@@ -16,7 +16,7 @@ import {
   type PaoOperations,
 } from "@kuzin4u/agentic-core/pao";
 import { PAO_RETRY_AFTER_MAX_SEC, type StandParams } from "../../../shared/config.js";
-import { PlatformFailure, type FailureCode, type MandateRef, type PlatformEventType } from "../../../shared/domain.js";
+import { PlatformFailure, type AgentKey, type AgentSelf, type FailureCode, type MandateRef, type PlatformEventType } from "../../../shared/domain.js";
 import type { PaymentPlatform, PlatformCapabilities, ProtocolCheck, Mutation } from "../../ports/payment-platform.js";
 import { haltAgent, type RequestSigning } from "../../ports/request-signing.js";
 import { AGENT_STOP_CODES, ruleForFailure } from "../../declines/index.js";
@@ -202,6 +202,14 @@ const UNCONFIRMED: ReadonlySet<FailureCode> = new Set<FailureCode>(["UNKNOWN", "
 /** Retry-After в секундах; по копии ПАО — integer ≥ 0. Дату и мусор не принимаем: повтора не будет. */
 function retryAfterSec(v: string | null): number | undefined {
   return v !== null && /^\d{1,6}$/.test(v.trim()) ? Number(v.trim()) : undefined;
+}
+
+/** Р60 п. 7 (а): отзываемый ключ подписал сам запрос и получил 401 AGENT_KEY_REVOKED — отзыв состоялся, ключ отмечен в
+ *  связке. Внутренний сигнал call → revokeKey, наружу не выходит. */
+class SelfKeyRevoked extends Error {
+  constructor(readonly failure: PlatformFailure) {
+    super("отозван ключ, которым подписан запрос отзыва");
+  }
 }
 
 /** Ключ читается у вызывающего один раз: проверенный и отправленный — одно значение (инвариант 9; ревью К1а). */
@@ -396,12 +404,14 @@ export class PaoPlatform implements PaymentPlatform {
   }
 
   /** `settle` — действие вызывающего по успешному ответу (остановка подписи по `GET /pao/v1/agent`): в `finally` после
-   *  записи `pao.call` «ok» — сбой журнала его не отменяет (ревью КТ1 № 1, К1.3). */
+   *  записи `pao.call` «ok» — сбой журнала его не отменяет (ревью КТ1 № 1, К1.3). `revoking` — kid, который отзывается
+   *  этим обращением (Р60 п. 7 (а)): 401 AGENT_KEY_REVOKED на запрос, подписанный им же, — SelfKeyRevoked без повтора. */
   private async call<K extends PaoOperationKey, R>(
     op: K,
     args: PaoCallArgs<K>,
     to: (r: PaoOperations[K]["response"]) => R,
     settle?: (out: R) => void,
+    revoking?: string,
   ): Promise<R> {
     const key = args.idempotencyKey ?? null;
     let waitedSec = 0;
@@ -485,6 +495,8 @@ export class PaoPlatform implements PaymentPlatform {
       const halt = AGENT_STOP_CODES.has(failure.code) || (signature && (clockSkew || signatureRetries >= (rule.maxRetries ?? 0)));
       // Отозванный ключ: другой действующий (нет — SignerStopped).
       const rotate = !halt && rule.action === "ROTATE_KEY";
+      // Отзывается ключ, которым подписан сам запрос (Р60 п. 7 (а)): отзыв состоялся — пометка и переход, повтора нет.
+      const selfRevoked = rotate && revoking !== undefined && signer.kid === revoking;
       try {
         // шаг 2 Р33 п. 10: мандат без порядка отзыва до подтверждения версии — запись здесь, остановка — в finally (Р-620)
         if (failure.code === "PLATFORM_PROTOCOL_UNSUPPORTED") this.logUnsupported("MANDATE");
@@ -513,6 +525,7 @@ export class PaoPlatform implements PaymentPlatform {
         signatureRetries++;
         continue;
       }
+      if (selfRevoked) throw new SelfKeyRevoked(failure);
       // повтор другим ключом — не больше maxRetries за обращение
       if (rotate) {
         if (rotations >= (rule.maxRetries ?? 0)) throw failure;
@@ -572,6 +585,48 @@ export class PaoPlatform implements PaymentPlatform {
     } catch (e) {
       return this.reconciled(e, async () => (await this.agentSelf()).keys.find((k) => k.publicKey === draft.publicKey && k.status === "ACTIVE"));
     }
+  }
+
+  /**
+   * Отзыв своего ключа (Р60 п. 7; ПАО, РП60): пустое тело, подпись и Idempotency-Key вызывающего. 200 — Key REVOKED с тем
+   * же kid (иначе BAD_RESPONSE, `never`), ключ отмечается в связке (`keyRevoked`: действующий — переход, нет другого —
+   * SignerStopped NO_ACTIVE_KEY с `revokedKid`). (а) 401 AGENT_KEY_REVOKED на запрос, подписанный отзываемым ключом, —
+   * отзыв состоялся: ключ отмечен в call, одно GET /pao/v1/agent другим ключом через общий Pace подтверждает REVOKED
+   * (не подтвердило — BAD_RESPONSE). (б) 422 KEY_INVALID — такого своего ключа нет: `never`, вне счёта ротации (Р58 п. 2, 4).
+   * При приостановке — SignerSuspended до обращения (call); лента недоступна — разрешён (не обязательство, К1.2).
+   */
+  async revokeKey(kid: string, m: Mutation): Promise<AgentKey> {
+    let key: AgentKey;
+    try {
+      key = await this.call("POST /pao/v1/agent/keys/{kid}/revoke", { path: { kid }, idempotencyKey: keyOf(m) }, map.keyFromPao, undefined, kid);
+    } catch (e) {
+      if (e instanceof SelfKeyRevoked) return this.revokedByRead(kid, e.failure);
+      if (e instanceof PlatformFailure && e.code === "KEY_INVALID") {
+        throw new PlatformFailure("KEY_INVALID", "never", e.platformCode, e.httpStatus, e.idempotencyKey, "у агента нет такого ключа");
+      }
+      throw e;
+    }
+    if (key.kid !== kid || key.status !== "REVOKED") {
+      throw new PlatformFailure("BAD_RESPONSE", "never", null, 200, keyOf(m), "ответ отзыва не подтверждает отзыв ключа");
+    }
+    this.o.signing.keyRevoked(kid);
+    return key;
+  }
+
+  /** Р60 п. 7 (а): подтверждение отзыва одним чтением, подписанным другим ключом; отказ чтения или ключ не REVOKED —
+   *  BAD_RESPONSE (отзыв не подтверждён, fail-closed); не отказ Платформы (остановка подписи, сбой журнала) — как есть. */
+  private async revokedByRead(kid: string, failure: PlatformFailure): Promise<AgentKey> {
+    const unconfirmed = () => new PlatformFailure("BAD_RESPONSE", "never", null, failure.httpStatus, failure.idempotencyKey, "отзыв ключа не подтверждён сверкой");
+    let self: AgentSelf;
+    try {
+      self = await this.agentSelf();
+    } catch (e) {
+      if (e instanceof PlatformFailure) throw unconfirmed();
+      throw e;
+    }
+    const key = self.keys.find((k) => k.kid === kid);
+    if (key?.status !== "REVOKED") throw unconfirmed();
+    return key;
   }
 
   /**

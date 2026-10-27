@@ -315,7 +315,8 @@ export class KeyRing {
     try {
       if (kid === this.#currentKid) this.#switchTo(this.#pick());
     } catch (e) {
-      if (e instanceof SignerStopped) throw new SignerStopped(e.reason, { cause: failure });
+      // ключ уже отмечен отозванным (key.revoked — до остановки, Р-645): его kid — в признаке остановки (Р60 п. 7)
+      if (e instanceof SignerStopped) throw new SignerStopped(e.reason, { cause: failure, revokedKid: kid });
       throw e;
     }
     return this.#current(admitting, rechecking);

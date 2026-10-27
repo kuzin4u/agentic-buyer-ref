@@ -98,7 +98,7 @@ describe("С0 — подпись агента принимается Платф�
     const { s, calls } = await platform();
     const dir = keysDir();
     const { descriptor } = generateKey(dir);
-    const decision = s.admit(application(descriptor.public_key), OPERATOR);
+    const decision = await s.admit(application(descriptor.public_key), OPERATOR);
     expect(decision).toMatchObject({ admitted: true });
     const { core, journal } = await coreAt(s, dir);
 
@@ -118,7 +118,7 @@ describe("С0 — подпись агента принимается Платф�
     const { s, calls } = await platform();
     const dir = keysDir();
     const { descriptor } = generateKey(dir);
-    expect(s.admit(application(descriptor.public_key), OPERATOR)).toMatchObject({ admitted: true });
+    expect(await s.admit(application(descriptor.public_key), OPERATOR)).toMatchObject({ admitted: true });
     const { core, journal } = await coreAt(s, dir);
 
     await core.start();
@@ -136,7 +136,7 @@ describe("С0 — подпись агента принимается Платф�
     const { s, calls } = await platform();
     const dir = keysDir();
     const { descriptor } = generateKey(dir);
-    s.admit(application(descriptor.public_key), OPERATOR);
+    await s.admit(application(descriptor.public_key), OPERATOR);
     const { core } = await coreAt(s, dir);
 
     const [key] = (await core.start()).keys;
@@ -153,7 +153,7 @@ describe("С0 — подпись агента принимается Платф�
     const dir = keysDir();
     const own = generateKey(dir).descriptor;
     const foreign = generateKey(keysDir()).descriptor;
-    expect(s.admit(application(foreign.public_key), OPERATOR)).toMatchObject({ admitted: true });
+    expect(await s.admit(application(foreign.public_key), OPERATOR)).toMatchObject({ admitted: true });
     const { core, journal } = await coreAt(s, dir);
 
     await expectSignatureStop(core, journal, log);
@@ -165,7 +165,7 @@ describe("С0 — подпись агента принимается Платф�
     const { s, log } = await platform();
     const dir = keysDir();
     const { descriptor } = generateKey(dir);
-    expect(s.admit(application(descriptor.public_key), OPERATOR)).toMatchObject({ admitted: true });
+    expect(await s.admit(application(descriptor.public_key), OPERATOR)).toMatchObject({ admitted: true });
     s.setClock(new Date(Date.now() + (s.params.signature_skew_sec + 60) * 1000));
     const { core, journal } = await coreAt(s, dir);
 
@@ -179,7 +179,7 @@ describe("С0 — подпись агента принимается Платф�
     const { s, log } = await platform();
     const dir = keysDir();
     const { descriptor } = generateKey(dir);
-    expect(s.admit(application(descriptor.public_key), OPERATOR)).toMatchObject({ admitted: true });
+    expect(await s.admit(application(descriptor.public_key), OPERATOR)).toMatchObject({ admitted: true });
     const ahead = (s.params.signature_skew_sec + 60) * 1000;
     const baseUrl = await s.listen();
     const journal = new MemoryJournal();
@@ -200,7 +200,7 @@ describe("С0 — подпись агента принимается Платф�
     const { s, calls } = await platform();
     const dir = keysDir();
     const { descriptor } = generateKey(dir);
-    expect(s.admit(application(descriptor.public_key, "SELLER"), OPERATOR)).toMatchObject({ admitted: true });
+    expect(await s.admit(application(descriptor.public_key, "SELLER"), OPERATOR)).toMatchObject({ admitted: true });
     const { core, journal } = await coreAt(s, dir);
 
     await expect(startCause(core.start())).rejects.toMatchObject({ reason: "AGENT_CLASS_MISMATCH" });

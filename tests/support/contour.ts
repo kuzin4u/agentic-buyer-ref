@@ -315,7 +315,7 @@ async function standContour(paoNow?: () => Date, adpUntilPs11 = false, aoiSuppor
     captureCredentials(stand.app, secrets);
     // Допуск — заявлением оператора по фикстуре: только открытый ключ (инвариант 2).
     const { descriptor } = generateKey(dir);
-    const decision = stand.admit(agentApplication(fixture, { alg: descriptor.alg, public_key: descriptor.public_key }), fixture.operator);
+    const decision = await stand.admit(agentApplication(fixture, { alg: descriptor.alg, public_key: descriptor.public_key }), fixture.operator);
     if (!decision.admitted) throw new Error(`стенд не допустил агента фикстуры: ${JSON.stringify(decision)}`);
     const [baseUrl, merchantsUrl] = await Promise.all([stand.listen(), emulator.listen()]);
     const a = agent({ dir, baseUrl, agentCode: fixture.agent_code, params, journal, ...(paoNow && { paoNow }) });

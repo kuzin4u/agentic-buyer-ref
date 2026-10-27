@@ -53,7 +53,7 @@ async function setup() {
   const keysDir = tmp("ev-keys-");
   const stateDir = join(tmp("ev-state-"), "state");
   const { descriptor } = generateKey(keysDir);
-  const decision = s.admit(
+  const decision = await s.admit(
     { agent_code: AGENT, class: "BUYER", model: "buyer-agent-ref", runtime: "node-20", alg: "ed25519", public_key: descriptor.public_key },
     "buyref-operator",
   );
@@ -86,7 +86,7 @@ describe("ядро и события на стенде v0.11.0 (Р34)", { timeou
     const { s, core, stateDir, pushUrl, calls } = await setup();
     const a = core(pushUrl);
     await a.c.start();
-    expect(s.registry.subscription(AGENT)).toMatchObject({ url: pushUrl });
+    expect(await s.registry.subscription(AGENT)).toMatchObject({ url: pushUrl });
 
     const m = await a.c.platform.requestMandate(INTENT, { idempotencyKey: "idem-m1" });
     await s.issuer.sign(m.id);
@@ -232,7 +232,7 @@ describe("ядро и события на стенде v0.11.0 (Р34)", { timeou
     for (const url of urls) {
       const r = core(url);
       await r.c.start();
-      expect(s.registry.subscription(AGENT)?.url).toBe(url);
+      expect((await s.registry.subscription(AGENT))?.url).toBe(url);
       r.c.close();
     }
     const keys = calls.filter((c) => c.route === "PUT /pao/v1/subscription").map((c) => c.key);

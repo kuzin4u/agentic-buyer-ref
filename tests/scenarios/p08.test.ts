@@ -81,19 +81,19 @@ describe("П08 — витрина отказывает неопознанным"
     // часы стенда сдвигаются на merchant_jwks_max_age_sec — витрина перечитывает каталог ключей и не находит ключ (кэш 1 с
     // остаётся настоящим, #64 п. 1); ПАО отзыв видит сразу — знак следующей витрины не проверяется
     const [first, second] = MERCHANT_FIXTURES;
-    const hook: { afterMark?: () => void } = {};
+    const hook: { afterMark?: () => Promise<void> } = {};
     const seen: { url: string; headers: Record<string, string> }[] = [];
     const f: typeof fetch = async (input, init) => {
       seen.push({ url: String(input), headers: { ...(init?.headers as Record<string, string>) } });
       const res = await fetch(input, init);
-      if (new URL(String(input)).pathname === readinessOf(first!.merchant_id)) hook.afterMark?.();
+      if (new URL(String(input)).pathname === readinessOf(first!.merchant_id)) await hook.afterMark?.();
       return res;
     };
     const r = await standPurchase({ fetch: f, failureCode: startFailureCode });
     c = r.c;
-    hook.afterMark = () => {
+    hook.afterMark = async () => {
       hook.afterMark = undefined;
-      for (const k of r.self.keys) r.stand.keys.revoke(r.c.agentCode, k.kid);
+      for (const k of r.self.keys) await r.stand.keys.revoke(r.c.agentCode, k.kid);
       r.stand.setClock(new Date(r.stand.now().getTime() + r.stand.params.merchant_jwks_max_age_sec * 1000));
     };
     await r.signedIntent();

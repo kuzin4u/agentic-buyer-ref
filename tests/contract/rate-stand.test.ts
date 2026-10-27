@@ -55,7 +55,7 @@ describe("429 второго слоя на стенде v0.28.0 (Р59 п. 4–5)
     stand = s;
     expect(s.params.pao_agent_rate_limit_per_min_l1).toBe(2);
     const a = generateKey(tmp("rate-keys-a-"));
-    const decision = s.admit(
+    const decision = await s.admit(
       { agent_code: AGENT, class: "BUYER", model: "buyer-agent-ref", runtime: "node-20", alg: "ed25519", public_key: a.descriptor.public_key },
       "buyref-operator",
     );
@@ -122,8 +122,8 @@ describe("429 второго слоя на стенде v0.28.0 (Р59 п. 4–5)
     expect(new Set(posts.map((x) => x.nonce)).size).toBe(posts.length);
     expect(new Set(posts.map((x) => x.key))).toEqual(new Set(["idem-rate-key-b"]));
     // второй слой отвечает до обработчика: ключ B не зарегистрирован — двойного (и вообще) исполнения нет
-    expect(s.keys.list(AGENT).map((k) => k.kid)).not.toContain(b.descriptor.kid);
-    expect(s.keys.list(AGENT).map((k) => k.kid)).toContain(a.descriptor.kid);
+    expect((await s.keys.list(AGENT)).map((k) => k.kid)).not.toContain(b.descriptor.kid);
+    expect((await s.keys.list(AGENT)).map((k) => k.kid)).toContain(a.descriptor.kid);
 
     // журнал: каждая попытка — refused RATE_LIMITED 429, номер попытки растёт
     expect(

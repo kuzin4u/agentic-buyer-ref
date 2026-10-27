@@ -16,6 +16,7 @@ import { INTENT } from "../support/consents.js";
 import { AGENT } from "../support/pao-stand.js";
 import { feedOffers, liveOffers, payments, shopOrders } from "../support/shop.js";
 import { SHOP } from "../support/purchase.js";
+import { reinstated } from "../support/stand-purchase.js";
 
 /** Стенд в процессе теста под параллельной нагрузкой прогона бывает медленнее 5 с по умолчанию (нюанс К2.3 Р38). */
 const STAND_TIMEOUT_MS = 20_000;
@@ -104,7 +105,7 @@ describe("приостановление и снятие агента на ст�
     expect(r.kinds("agent.recheck_failed")).toEqual([]);
 
     // оператор снял приостановление — снимает следующий тик, push не нужен
-    await r.s.reinstateAgent(AGENT);
+    await reinstated(r.s, AGENT);
     await vi.advanceTimersByTimeAsync(TICK);
     await vi.waitFor(() => expect(r.kinds("signing.resumed")).toHaveLength(1));
     // два тика и по сверке на каждое agent.* из ленты, прочитанной после снятия
@@ -117,7 +118,7 @@ describe("приостановление и снятие агента на ст�
   it("второй прогон: настоящий push agent.reinstated со стенда → acceptPush → сверка сразу, снятие без тика", async () => {
     const r = await admitted();
     await r.suspended();
-    await r.s.reinstateAgent(AGENT);
+    await reinstated(r.s, AGENT);
     await r.s.deliverEvents();
     const got = r.s.agentReceiver.received.find((x) => (x.event as { type?: string }).type === "agent.reinstated");
     if (!got) throw new Error("push agent.reinstated не доставлен");

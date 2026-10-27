@@ -8,7 +8,7 @@ import { PurchaseTransitionForbidden, type Purchase } from "../../src/agent/pipe
 import { INTENT } from "../support/consents.js";
 import { shopBy, type Contour } from "../support/contour.js";
 import { one } from "../support/purchase.js";
-import { SHORT_DELAY_SEC, STAND_TIMEOUT_MS, standPurchase } from "../support/stand-purchase.js";
+import { STAND_TIMEOUT_MS, adpDecision, processing, reinstated, standPurchase } from "../support/stand-purchase.js";
 
 let c: Contour | undefined;
 afterEach(async () => {
@@ -34,8 +34,9 @@ async function ordered(r: Run, p: Purchase, tag: string) {
 
 describe("покупка при приостановлении агента на стенде (Р60 п. 3, К1.3б)", { timeout: STAND_TIMEOUT_MS }, () => {
   it("suspendAgent перед оплатой — STOPPED AGENT_SUSPENDED без реквизита; reinstateAgent и сверка — новая покупка: новый заказ и новый реквизит, прежний не используется", async () => {
-    // итога операции на стенде без подмены до PS-11 нет — стадия 5 кончается по сроку SHORT_DELAY_SEC (Р49 п. 5)
-    const r = await standPurchase({ contourPayment: true, failureCode: startFailureCode, params: { operation_outcome_max_delay_sec: SHORT_DELAY_SEC } });
+    // авторизация продавца доходит до ADP стенда копией сообщения (подмена до PS-11, `adpUntilPs11`): решение ADP по новому
+    // реквизиту видно тесту, итог стадии 5 — из события Платформы после ответа эмитента (как П15)
+    const r = await standPurchase({ contourPayment: true, adpUntilPs11: true, failureCode: startFailureCode });
     c = r.c;
     const first = await ordered(r, r.purchase, "s1");
 
@@ -55,7 +56,7 @@ describe("покупка при приостановлении агента на
     expect(r.c.issuedSecrets()).toEqual([]);
 
     // снял оператор; сверка с реестром прочитала ACTIVE — подпись возобновлена (Р60 п. 2)
-    await r.stand.reinstateAgent(r.c.agentCode);
+    await reinstated(r.stand, r.c.agentCode);
     await expect(r.c.recheck()).resolves.toMatchObject({ status: "ACTIVE" });
     expect(r.c.admission()).toBeNull();
     expect(r.c.journal.entries.filter((e) => e.kind === "signing.resumed")).toHaveLength(1);
@@ -71,7 +72,12 @@ describe("покупка при приостановлении агента на
     expect(second.order.orderId).not.toBe(first.order.orderId);
     expect(second.cart.id).not.toBe(first.cart.id);
     const from = r.c.agentCalls().length;
-    await expect(p2.authorize({ idempotencyKey: "idem-pay-s2" })).rejects.toMatchObject({ code: "OPERATION_RESULT_UNCONFIRMED" });
+    const authorizing = p2.authorize({ idempotencyKey: "idem-pay-s2" });
+    // новый реквизит выдан после приостановления: ADP стенда его принимает (граница до миллисекунды, Р61 п. 3)
+    const d = await adpDecision(r.c);
+    expect(d.decision).toBe("APPROVE");
+    await processing(r.c, { op_ref: d.op_ref, msg_type: "ISSUER_RESPONSE", issuer_approved: true });
+    await expect(authorizing).resolves.toMatchObject({ opRef: d.op_ref, orderRef: second.order.orderId, status: "AUTHORIZED" });
     const paid = r.c.agentCalls().slice(from);
     expect(paid.filter((x) => x.route === CREDENTIALS).map((x) => [x.status, x.idempotencyKey])).toEqual([[201, "idem-pay-s2"]]);
     // пакет — витрине по новому заказу; по прежнему заказу обращений нет

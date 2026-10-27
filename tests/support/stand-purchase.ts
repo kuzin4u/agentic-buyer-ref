@@ -5,6 +5,7 @@
 // Подпись INTENT и CART — эмулятором банка во время ожидания, решение — по событию mandate.signed (Р29 п. 5, Р34 п. 5).
 import { expect } from "vitest";
 import { MERCHANT_FIXTURES } from "agentic-ps-platform/fixtures";
+import type { Stand } from "agentic-ps-platform/stand";
 import type { ShopsAdapter } from "../../src/agent/adapters/shops/index.js";
 import { Confirmations } from "../../src/agent/confirmations/index.js";
 import { MandateClient } from "../../src/agent/mandates/index.js";
@@ -35,6 +36,16 @@ export const STAND_TIMEOUT_MS = 30_000;
 export const SHORT_DELAY_SEC = Math.min(loadParams().operation_outcome_max_delay_sec, 1);
 
 export const pause = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/** Снятие приостановления оператором стенда и ожидание, пока часы стенда пройдут метку приостановления (Р61 п. 3, Р-634):
+ *  реквизит и запрос подтверждения в ту же миллисекунду, что `suspended_at`, Платформа считает выданными до приостановления. */
+export async function reinstated(stand: Pick<Stand, "reinstateAgent" | "now">, agentCode: string) {
+  const rec = await stand.reinstateAgent(agentCode);
+  const mark = Date.parse(rec.suspended_at ?? "");
+  if (Number.isNaN(mark)) throw new Error("у снятого агента нет метки приостановления");
+  while (stand.now().getTime() <= mark) await pause(1);
+  return rec;
+}
 
 /** Решение ADP стенда по n-й копии сообщения эквайрера (`adpUntilPs11`): ждать, пока продавец его запросит. */
 export async function adpDecision(c: Contour, n = 1): Promise<{ op_ref: string; decision: string; reason?: string }> {

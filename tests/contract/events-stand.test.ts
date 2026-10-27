@@ -55,7 +55,7 @@ describe("лента событий на стенде v0.11.0 (Р34 п. 1, РП3
 
   it("приостановленный агент: лента — 403 AGENT_SUSPENDED, подпись приостановлена до сверки (Р34 п. 7, РП40 п. 6, Р60 п. 1)", async () => {
     const { c, stand } = await started();
-    stand.registry.changeStatus(c.agentCode, { to: "SUSPENDED", ground: "INCIDENT_EVASION" });
+    await stand.registry.changeStatus(c.agentCode, { to: "SUSPENDED", ground: "INCIDENT_EVASION" });
     const err = await c.platform.listEvents(null).catch((e: unknown) => e);
     expect(err).toMatchObject({ code: "AGENT_SUSPENDED", httpStatus: 403 });
     await expect(c.platform.listEvents(null)).rejects.toBeInstanceOf(SignerSuspended);

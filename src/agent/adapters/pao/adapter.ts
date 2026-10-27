@@ -16,9 +16,9 @@ import {
   type PaoOperations,
 } from "@kuzin4u/agentic-core/pao";
 import { PAO_RETRY_AFTER_MAX_SEC, type StandParams } from "../../../shared/config.js";
-import { PlatformFailure, type FailureCode, type MandateRef, type PlatformEventType } from "../../../shared/domain.js";
+import { PlatformFailure, type AgentKey, type AgentSelf, type FailureCode, type MandateRef, type PlatformEventType } from "../../../shared/domain.js";
 import type { PaymentPlatform, PlatformCapabilities, ProtocolCheck, Mutation } from "../../ports/payment-platform.js";
-import type { RequestSigning } from "../../ports/request-signing.js";
+import { haltAgent, type RequestSigning } from "../../ports/request-signing.js";
 import { AGENT_STOP_CODES, ruleForFailure } from "../../declines/index.js";
 import { toFailure } from "./errors.js";
 import * as map from "./map.js";
@@ -164,7 +164,19 @@ export interface PaoPlatformOptions {
   monotonic?: () => number;
   /** ограничитель частоты, общий для всех адаптеров ПАО агента (Р59 п. 1); не передан — свой у адаптера */
   pace?: Pace;
+  /** перед обращением из OBLIGATION_OPERATIONS: бросает, если брать обязательство сейчас нельзя (лента недоступна,
+   *  Р60 п. 4, нюанс К1.2) — обращения нет */
+  hold?: () => void;
 }
+
+/** Обращения, которые берут обязательство (Р60 п. 4, нюанс К1.2): при недоступной ленте не идут. Защитные — отказ от
+ *  мандата, отзыв ключа, спор — и чтение, подписка не входят: человек останавливает агента и при сбое ленты. Регистрация
+ *  ключа (ротация) не входит: без неё при долгом сбое ленты и истёкшем ключе агент не подпишет и сверку. */
+export const OBLIGATION_OPERATIONS: ReadonlySet<PaoOperationKey> = new Set<PaoOperationKey>([
+  "POST /pao/v1/mandates",
+  "POST /pao/v1/credentials",
+  "POST /pao/v1/confirmations",
+]);
 
 /** Выдача реквизита (Р45 п. 2.4–2.5): свой тайм-аут и общий срок попыток вместе с ожиданием повторов. */
 const CREDENTIALS: PaoOperationKey = "POST /pao/v1/credentials";
@@ -190,6 +202,14 @@ const UNCONFIRMED: ReadonlySet<FailureCode> = new Set<FailureCode>(["UNKNOWN", "
 /** Retry-After в секундах; по копии ПАО — integer ≥ 0. Дату и мусор не принимаем: повтора не будет. */
 function retryAfterSec(v: string | null): number | undefined {
   return v !== null && /^\d{1,6}$/.test(v.trim()) ? Number(v.trim()) : undefined;
+}
+
+/** Р60 п. 7 (а): отзываемый ключ подписал сам запрос и получил 401 AGENT_KEY_REVOKED — отзыв состоялся, ключ отмечен в
+ *  связке. Внутренний сигнал call → revokeKey, наружу не выходит. */
+class SelfKeyRevoked extends Error {
+  constructor(readonly failure: PlatformFailure) {
+    super("отозван ключ, которым подписан запрос отзыва");
+  }
 }
 
 /** Ключ читается у вызывающего один раз: проверенный и отправленный — одно значение (инвариант 9; ревью К1а). */
@@ -384,12 +404,14 @@ export class PaoPlatform implements PaymentPlatform {
   }
 
   /** `settle` — действие вызывающего по успешному ответу (остановка подписи по `GET /pao/v1/agent`): в `finally` после
-   *  записи `pao.call` «ok» — сбой журнала его не отменяет (ревью КТ1 № 1, К1.3). */
+   *  записи `pao.call` «ok» — сбой журнала его не отменяет (ревью КТ1 № 1, К1.3). `revoking` — kid, который отзывается
+   *  этим обращением (Р60 п. 7 (а)): 401 AGENT_KEY_REVOKED на запрос, подписанный им же, — SelfKeyRevoked без повтора. */
   private async call<K extends PaoOperationKey, R>(
     op: K,
     args: PaoCallArgs<K>,
     to: (r: PaoOperations[K]["response"]) => R,
     settle?: (out: R) => void,
+    revoking?: string,
   ): Promise<R> {
     const key = args.idempotencyKey ?? null;
     let waitedSec = 0;
@@ -407,6 +429,7 @@ export class PaoPlatform implements PaymentPlatform {
     let tries = 0;
     for (let attempt = 1; ; ) {
       const last: Last = {};
+      if (OBLIGATION_OPERATIONS.has(op)) this.o.hold?.();
       const signer = this.o.signing.current(); // остановлен — SignerStopped, обращения нет
       // ожидание ограничителя частоты — в сроке выдачи (Р59 п. 2): не помещается — отказ до сети, место в очереди не занято
       if (!fits(this.pace.delay())) {
@@ -472,6 +495,8 @@ export class PaoPlatform implements PaymentPlatform {
       const halt = AGENT_STOP_CODES.has(failure.code) || (signature && (clockSkew || signatureRetries >= (rule.maxRetries ?? 0)));
       // Отозванный ключ: другой действующий (нет — SignerStopped).
       const rotate = !halt && rule.action === "ROTATE_KEY";
+      // Отзывается ключ, которым подписан сам запрос (Р60 п. 7 (а)): отзыв состоялся — пометка и переход, повтора нет.
+      const selfRevoked = rotate && revoking !== undefined && signer.kid === revoking;
       try {
         // шаг 2 Р33 п. 10: мандат без порядка отзыва до подтверждения версии — запись здесь, остановка — в finally (Р-620)
         if (failure.code === "PLATFORM_PROTOCOL_UNSUPPORTED") this.logUnsupported("MANDATE");
@@ -487,7 +512,8 @@ export class PaoPlatform implements PaymentPlatform {
         }
       } finally {
         // Остановка и смена ключа — и при сбое журнала (Р53 ревью К2.1 № 8): запись не отменяет действие.
-        if (halt) this.o.signing.stop(failure.code, clockSkew ? "CLOCK_SKEW" : undefined);
+        // AGENT_SUSPENDED — приостановка до сверки с реестром, а не остановка (Р60 п. 1).
+        if (halt) haltAgent(this.o.signing, failure.code, clockSkew ? "CLOCK_SKEW" : undefined);
         else if (rotate) this.o.signing.keyRevoked(signer.kid, failure);
         this.holdAfter(failure.code, last.retryAfter);
       }
@@ -499,6 +525,7 @@ export class PaoPlatform implements PaymentPlatform {
         signatureRetries++;
         continue;
       }
+      if (selfRevoked) throw new SelfKeyRevoked(failure);
       // повтор другим ключом — не больше maxRetries за обращение
       if (rotate) {
         if (rotations >= (rule.maxRetries ?? 0)) throw failure;
@@ -529,7 +556,7 @@ export class PaoPlatform implements PaymentPlatform {
   }
 
   /** Агент не ACTIVE по ответу платформы (EXCLUDED — 200 по РП23 п. 6.3) или класс не BUYER (Р27; сначала статус) —
-   *  остановка подписи, кто бы ни спросил. */
+   *  остановка подписи, кто бы ни спросил; SUSPENDED после допуска — приостановка до сверки (Р60 п. 1). */
   async agentSelf() {
     try {
       // остановка — в settle: и при сбое записи pao.call «ok» (ревью КТ1 № 1) и pao.rate_limit (Р59 п. 3)
@@ -537,7 +564,7 @@ export class PaoPlatform implements PaymentPlatform {
         try {
           this.pace.learn(self);
         } finally {
-          if (self.status !== "ACTIVE") this.o.signing.stop(`AGENT_${self.status}`);
+          if (self.status !== "ACTIVE") haltAgent(this.o.signing, `AGENT_${self.status}`);
           else if (self.agentClass !== "BUYER") this.o.signing.stop("AGENT_CLASS_MISMATCH", self.agentClass);
         }
       });
@@ -558,6 +585,49 @@ export class PaoPlatform implements PaymentPlatform {
     } catch (e) {
       return this.reconciled(e, async () => (await this.agentSelf()).keys.find((k) => k.publicKey === draft.publicKey && k.status === "ACTIVE"));
     }
+  }
+
+  /**
+   * Отзыв своего ключа (Р60 п. 7; ПАО, РП60): пустое тело, подпись и Idempotency-Key вызывающего. 200 — Key REVOKED с тем
+   * же kid (иначе BAD_RESPONSE, `never`), ключ отмечается в связке (`keyRevoked`: действующий — переход, нет другого —
+   * SignerStopped NO_ACTIVE_KEY с `revokedKid`). (а) 401 AGENT_KEY_REVOKED на запрос, подписанный отзываемым ключом, —
+   * отзыв состоялся: ключ отмечен в call, одно GET /pao/v1/agent другим ключом через общий Pace подтверждает REVOKED
+   * (не подтвердило — BAD_RESPONSE). (б) 422 KEY_INVALID — такого своего ключа нет: `never`, вне счёта ротации (Р58 п. 2, 4).
+   * При приостановке — SignerSuspended до обращения (call); лента недоступна — разрешён (не обязательство, К1.2).
+   */
+  async revokeKey(kid: string, m: Mutation): Promise<AgentKey> {
+    const idempotencyKey = keyOf(m); // один раз: отправленный и записанный в отказ — одно значение (инвариант 9; КТ1 № 7)
+    let key: AgentKey;
+    try {
+      key = await this.call("POST /pao/v1/agent/keys/{kid}/revoke", { path: { kid }, idempotencyKey }, map.keyFromPao, undefined, kid);
+    } catch (e) {
+      if (e instanceof SelfKeyRevoked) return this.revokedByRead(kid, e.failure);
+      if (e instanceof PlatformFailure && e.code === "KEY_INVALID") {
+        throw new PlatformFailure("KEY_INVALID", "never", e.platformCode, e.httpStatus, e.idempotencyKey, "у агента нет такого ключа");
+      }
+      throw e;
+    }
+    if (key.kid !== kid || key.status !== "REVOKED") {
+      throw new PlatformFailure("BAD_RESPONSE", "never", null, 200, idempotencyKey, "ответ отзыва не подтверждает отзыв ключа");
+    }
+    this.o.signing.keyRevoked(kid);
+    return key;
+  }
+
+  /** Р60 п. 7 (а): подтверждение отзыва одним чтением, подписанным другим ключом; отказ чтения или ключ не REVOKED —
+   *  BAD_RESPONSE (отзыв не подтверждён, fail-closed); не отказ Платформы (остановка подписи, сбой журнала) — как есть. */
+  private async revokedByRead(kid: string, failure: PlatformFailure): Promise<AgentKey> {
+    const unconfirmed = () => new PlatformFailure("BAD_RESPONSE", "never", null, failure.httpStatus, failure.idempotencyKey, "отзыв ключа не подтверждён сверкой");
+    let self: AgentSelf;
+    try {
+      self = await this.agentSelf();
+    } catch (e) {
+      if (e instanceof PlatformFailure) throw unconfirmed();
+      throw e;
+    }
+    const key = self.keys.find((k) => k.kid === kid);
+    if (key?.status !== "REVOKED") throw unconfirmed();
+    return key;
   }
 
   /**

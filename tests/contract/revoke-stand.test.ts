@@ -69,10 +69,10 @@ async function setup() {
     return { status: res.status, body: text === "" ? undefined : (JSON.parse(text) as Record<string, unknown>) };
   }
 
-  /** Ядро агента с хранилищем ключей `dir` — допуск по стадии 0, как у места сборки. */
-  function core(dir: string) {
+  /** Ядро агента с хранилищем ключей `dir` — допуск по стадии 0, как у места сборки; `fetch` — свой (потеря ответа). */
+  function core(dir: string, fetchImpl?: typeof fetch) {
     const journal = new MemoryJournal();
-    const c = createAgentCore({ keysDir: dir, stateDir: `${dir}-state`, journal, now: () => new Date(), pao: { baseUrl, agentCode: AGENT, sleep: async () => {} } });
+    const c = createAgentCore({ keysDir: dir, stateDir: `${dir}-state`, journal, now: () => new Date(), pao: { baseUrl, agentCode: AGENT, sleep: async () => {}, ...(fetchImpl && { fetch: fetchImpl }) } });
     cores.push(c);
     return { c, journal };
   }
@@ -120,6 +120,75 @@ describe("отзыв своего ключа по ПАО и предел час�
     expect(onB.journal.entries).toContainEqual(expect.objectContaining({ kind: "agent.stopped", reason: "NO_ACTIVE_KEY" }));
     // ключ A не задет: допуск ядра с ключом A — ACTIVE
     await expect(core(dirA).c.start()).resolves.toMatchObject({ agentCode: AGENT, status: "ACTIVE" });
+  });
+
+  /** Связка ядра с единственным ключом A: после отзыва — остановка NO_ACTIVE_KEY с признаком отозванного ключа, запись
+   *  key.revoked — раньше agent.stopped (Р-645). */
+  function stoppedAfterRevoke(err: unknown, journal: MemoryJournal, kid: string) {
+    expect(err).toBeInstanceOf(SignerStopped);
+    expect(err).toMatchObject({ reason: "NO_ACTIVE_KEY", revokedKid: kid });
+    const kinds = journal.entries.map((e) => e.kind);
+    expect(kinds.indexOf("key.revoked")).toBeGreaterThanOrEqual(0);
+    expect(kinds.indexOf("key.revoked")).toBeLessThan(kinds.indexOf("agent.stopped"));
+    expect(journal.entries).toContainEqual(expect.objectContaining({ kind: "key.revoked", kid }));
+  }
+
+  it("revokeKey ядра (Р60 п. 7): единственный ключ — 200 REVOKED, связка — NO_ACTIVE_KEY с revokedKid (отзыв состоялся)", async () => {
+    const { s, a, dirA, core } = await setup();
+    const { c, journal } = core(dirA);
+    await c.start();
+    const err = await c.platform.revokeKey(a.descriptor.kid, { idempotencyKey: "idem-revoke-a" }).catch((e: unknown) => e);
+    stoppedAfterRevoke(err, journal, a.descriptor.kid);
+    expect((await s.keys.list(AGENT)).find((k) => k.kid === a.descriptor.kid)).toMatchObject({ status: "REVOKED" });
+  });
+
+  it("(а) ответ на отзыв потерян, повтор тем же ключом — 401 AGENT_KEY_REVOKED: отзыв состоялся, другого ключа нет — NO_ACTIVE_KEY с revokedKid, без чтения", async () => {
+    const { s, a, dirA, core } = await setup();
+    const calls: string[] = [];
+    let lost = false;
+    const lossy: typeof fetch = async (url, init) => {
+      const route = `${init?.method ?? "GET"} ${new URL(String(url)).pathname}`;
+      calls.push(route);
+      const res = await fetch(url, init);
+      if (route.endsWith("/revoke") && !lost) {
+        lost = true;
+        throw new TypeError("fetch failed"); // запрос дошёл и исполнен, ответ потерян
+      }
+      return res;
+    };
+    const { c, journal } = core(dirA, lossy);
+    await c.start();
+    const from = calls.length;
+    const err = await c.platform.revokeKey(a.descriptor.kid, { idempotencyKey: "idem-revoke-a" }).catch((e: unknown) => e);
+    stoppedAfterRevoke(err, journal, a.descriptor.kid);
+    const revoke = `POST /pao/v1/agent/keys/${a.descriptor.kid}/revoke`;
+    expect(calls.slice(from)).toEqual([revoke, revoke]);
+    expect(journal.entries.filter((e) => e.kind === "pao.call" && e.method === "POST /pao/v1/agent/keys/{kid}/revoke").map((e) => [e.result, e.reason])).toEqual([
+      ["unknown", "NO_RESPONSE"],
+      ["refused", "AGENT_KEY_REVOKED"],
+    ]);
+    expect((await s.keys.list(AGENT)).find((k) => k.kid === a.descriptor.kid)).toMatchObject({ status: "REVOKED" });
+  });
+
+  it("(б) неизвестный kid — 422 KEY_INVALID never, ключ не отмечен, ротация не задета, агент работает", async () => {
+    const { dirA, core } = await setup();
+    const { c, journal } = core(dirA);
+    await c.start();
+    const unknown = generateKey(tmp("revoke-keys-x-")).descriptor.kid; // по форме — kid, у агента такого нет
+    await expect(c.platform.revokeKey(unknown, { idempotencyKey: "idem-revoke-x" })).rejects.toMatchObject({ name: "PlatformFailure", code: "KEY_INVALID", retry: "never", httpStatus: 422 });
+    expect(journal.entries.filter((e) => e.kind === "key.revoked" || e.kind === "key.rotation_stopped")).toEqual([]);
+    await expect(c.platform.agentSelf()).resolves.toMatchObject({ status: "ACTIVE" });
+  });
+
+  it("отзыв не состоялся: ключ подписи A отозван оператором — 401, связка NO_ACTIVE_KEY с revokedKid = A, а не запрошенный ключ", async () => {
+    const { s, a, dirA, core } = await setup();
+    const { c, journal } = core(dirA);
+    await c.start();
+    await s.keys.revoke(AGENT, a.descriptor.kid);
+    const other = generateKey(tmp("revoke-keys-y-")).descriptor.kid;
+    const err = await c.platform.revokeKey(other, { idempotencyKey: "idem-revoke-y" }).catch((e: unknown) => e);
+    stoppedAfterRevoke(err, journal, a.descriptor.kid);
+    expect((err as SignerStopped).revokedKid).not.toBe(other);
   });
 
   it("GET /pao/v1/agent отдаёт rate_limit_per_min — предел второго слоя уровня 1 из параметров стенда (РП63 п. 1; AG-08)", async () => {

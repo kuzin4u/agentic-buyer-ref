@@ -21,7 +21,7 @@ import { z } from "zod";
 import { readShop, type CatalogFacts, type CatalogIssueCode, type CatalogProduct, type CatalogShop } from "../../catalog/index.js";
 import type { Journal, JournalResult } from "../../journal/index.js";
 import type { LiveOffer, LiveOfferRequest, LiveOfferSource } from "../../ports/catalog.js";
-import type { HttpRequestSigning, RequestSigning } from "../../ports/request-signing.js";
+import { haltAgent, type HttpRequestSigning, type RequestSigning } from "../../ports/request-signing.js";
 import { AGENT_STOP_CODES, ruleForFailure } from "../../declines/index.js";
 import {
   ShopFailure,
@@ -291,7 +291,8 @@ export class ShopsAdapter implements OfferSource, LiveOfferSource, ShopPort, Sho
   /** Знак готовности продавца по ПАО (Р53) — единственное место, где агент его берёт: подписанный
    *  `GET /pao/v1/merchants/{merchant_id}/readiness` (ПАО §2, пустое тело), без кэша у агента (ответ Платформы — `no-store`)
    *  и без повтора, тайм-аут `pao_request_timeout_ms`. Подпись остановлена — исключение, обращения нет. Отказ по агенту —
-   *  общим правилом обращений к ПАО (Р53 п. 5): код из `AGENT_STOP_CODES` — остановка подписи, `AGENT_KEY_REVOKED` — смена
+   *  общим правилом обращений к ПАО (Р53 п. 5): код из `AGENT_STOP_CODES` — остановка подписи (`AGENT_SUSPENDED` —
+   *  приостановка, Р60 п. 1), `AGENT_KEY_REVOKED` — смена
    *  ключа; затем PlatformFailure наружу (сделка STOPPED тем же кодом); 401 без кода по перечню — BAD_RESPONSE. Другого
    *  действующего ключа нет — `keyRevoked` сам бросает SignerStopped (`NO_ACTIVE_KEY`), он и уходит наружу. Нет ответа, прочий
    *  отказ (400, 414, 503 …), ответ не по схеме, чужой merchant_id, merchant_id не по маске (без обращения) — «знак не
@@ -326,8 +327,8 @@ export class ShopsAdapter implements OfferSource, LiveOfferSource, ShopPort, Sho
       try {
         this.#record("shop.readiness", merchantId, code ?? "BAD_RESPONSE", "refused");
       } finally {
-        // остановка и смена ключа — и при сбое журнала (Р53 ревью К2.1 № 8, Р58 п. 0)
-        if (code !== null && AGENT_STOP_CODES.has(code)) this.o.platform.signing.stop(code);
+        // остановка и смена ключа — и при сбое журнала (Р53 ревью К2.1 № 8, Р58 п. 0); AGENT_SUSPENDED — приостановка (Р60 п. 1)
+        if (code !== null && AGENT_STOP_CODES.has(code)) haltAgent(this.o.platform.signing, code);
         else if (code !== null && ruleForFailure(code).action === "ROTATE_KEY") this.o.platform.signing.keyRevoked(kid, failure);
       }
       throw failure;

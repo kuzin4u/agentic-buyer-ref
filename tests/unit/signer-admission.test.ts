@@ -381,14 +381,42 @@ describe("после допуска", () => {
     expect(journal.entries.filter((e) => e.kind === "agent.stopped")).toEqual([expect.objectContaining({ reason: "AGENT_SUSPENDED" })]);
   });
 
-  it("порядок в адаптере на прямом запросе после допуска: SUSPENDED и SELLER — AGENT_SUSPENDED", async () => {
+  it("порядок в адаптере на прямом запросе после допуска: SUSPENDED и SELLER — приостановка AGENT_SUSPENDED, не остановка (Р60 п. 1)", async () => {
     stand = new PaoStand({ handlers: CREDENTIALS });
     const { core, journal } = await coreOn(stand);
     await core.start();
     stand.status = "SUSPENDED";
     stand.agentClass = "SELLER";
     await core.platform.agentSelf();
-    expect(journal.entries.filter((e) => e.kind === "agent.stopped")).toEqual([expect.objectContaining({ reason: "AGENT_SUSPENDED" })]);
+    expect(journal.entries.filter((e) => e.kind === "signing.suspended")).toEqual([expect.objectContaining({ reason: "AGENT_SUSPENDED" })]);
+    expect(journal.entries.filter((e) => e.kind === "agent.stopped")).toEqual([]);
+    await expect(core.platform.issueCredential(DRAFT, { idempotencyKey: "idem-r60" })).rejects.toMatchObject({ name: "SignerSuspended", reason: "AGENT_SUSPENDED" });
+  });
+
+  it("Р60 п. 1–2: SUSPENDED после допуска — приостановка; сверка с SUSPENDED её держит; ACTIVE — снятие; EXCLUDED — остановка", async () => {
+    stand = new PaoStand({ handlers: CREDENTIALS });
+    const { core, journal } = await coreOn(stand);
+    await core.start();
+    stand.status = "SUSPENDED";
+    await core.platform.agentSelf();
+    // рабочая подпись приостановлена: обращения нет
+    const calls = stand.stub.calls.length;
+    await expect(core.platform.issueCredential(DRAFT, { idempotencyKey: "idem-r60" })).rejects.toThrow(SignerSuspended);
+    expect(stand.stub.calls).toHaveLength(calls);
+    // сверка: всё ещё SUSPENDED — приостановка остаётся
+    await expect(core.recheck()).rejects.toMatchObject({ name: "SignerSuspended", reason: "AGENT_SUSPENDED" });
+    await expect(core.platform.issueCredential(DRAFT, { idempotencyKey: "idem-r60" })).rejects.toThrow(SignerSuspended);
+    expect(journal.entries.filter((e) => e.kind === "signing.resumed")).toEqual([]);
+    // снятие оператором — сверка ACTIVE снимает приостановку, подпись работает
+    stand.status = "ACTIVE";
+    await core.recheck();
+    expect(journal.entries.filter((e) => e.kind === "signing.resumed")).toHaveLength(1);
+    await expect(core.platform.issueCredential(DRAFT, { idempotencyKey: "idem-r60-2" })).resolves.toMatchObject({ status: "ISSUED" });
+    // исключение — остановка: сверка и подпись — SignerStopped
+    stand.status = "EXCLUDED";
+    await expect(core.recheck()).rejects.toThrow(SignerStopped);
+    await expect(core.recheck()).rejects.toMatchObject({ name: "SignerStopped", reason: "AGENT_EXCLUDED" });
+    expect(journal.entries.filter((e) => e.kind === "agent.stopped")).toEqual([expect.objectContaining({ reason: "AGENT_EXCLUDED" })]);
   });
 
   // Дополнение 2 к Р36 (а): ответ не по схеме — действие реестра stop, подписант остановлен (fail-closed); с Р48 п. 3 —

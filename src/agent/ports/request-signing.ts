@@ -18,9 +18,17 @@ export interface RequestSigning {
    *  detail — уточнение для журнала: только значение перечня ПАО (класс при AGENT_CLASS_MISMATCH, Р27) или версия вида
    *  1.x.y, собранная из чисел (PLATFORM_PROTOCOL_UNSUPPORTED, Р33 п. 10), или значение SIGNER_STOP_DETAILS. */
   stop(reason: DiagCode, detail?: string): void;
-  /** Ответ реестра не по схеме после допуска (Р27): подпись приостановлена до успешной повторной сверки; до допуска —
-   *  без действия (допуск и так не состоялся). */
+  /** Ответ реестра не по схеме после допуска (Р27), лента недоступна (Р50 дополнение 1), агент приостановлен оператором
+   *  (AGENT_SUSPENDED, Р60 п. 1): подпись приостановлена до успешной повторной сверки; AGENT_SUSPENDED сильнее прочих
+   *  причин. До допуска — без действия (допуск и так не состоялся), кроме AGENT_SUSPENDED — остановка, как прежде. */
   suspend(reason: DiagCode): void;
+}
+
+/** Агент не может действовать (AGENT_STOP_CODES, SIGNATURE_INVALID, статус реестра не ACTIVE): AGENT_SUSPENDED —
+ *  приостановка подписи до сверки с реестром (Р60 п. 1: приостановление обратимо, снимает его оператор), иное — остановка. */
+export function haltAgent(signing: Pick<RequestSigning, "stop" | "suspend">, reason: DiagCode, detail?: string): void {
+  if (reason === "AGENT_SUSPENDED") signing.suspend(reason);
+  else signing.stop(reason, detail);
 }
 
 /** Подпись обращения не к ПАО (витрины продавцов, Р42 п. 1): действующим ключом порта `RequestSigning`, тот же профиль

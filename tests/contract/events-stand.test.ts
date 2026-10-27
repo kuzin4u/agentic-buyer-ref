@@ -1,8 +1,8 @@
 // Лента и подписка адаптера ПАО против стенда Платформы v0.11.0 (Р34 п. 1, 7, 8, 10; РП39, РП40; Р41 п. 2). Курсор — event_id
-// последнего события; чужой курсор — 400 REQUEST_INVALID; приостановленному — 403 AGENT_SUSPENDED и остановка.
+// последнего события; чужой курсор — 400 REQUEST_INVALID; приостановленному — 403 AGENT_SUSPENDED и приостановка (Р60 п. 1).
 // Адрес подписки — хост из event_subscription_allow_hosts стенда, без литерала.
 import { afterEach, describe, expect, it } from "vitest";
-import { SignerStopped } from "../../src/agent/signer/index.js";
+import { SignerSuspended } from "../../src/agent/signer/index.js";
 import { PLATFORM_EVENT_TYPES, PlatformFailure } from "../../src/shared/domain.js";
 import { INTENT } from "../support/consents.js";
 import { createContour, type Contour } from "../support/contour.js";
@@ -53,12 +53,13 @@ describe("лента событий на стенде v0.11.0 (Р34 п. 1, РП3
     expect(c.calls().filter((x) => x.route.startsWith("GET /pao/v1/events"))).toHaveLength(2);
   });
 
-  it("приостановленный агент: лента — 403 AGENT_SUSPENDED, агент остановлен (Р34 п. 7, РП40 п. 6)", async () => {
+  it("приостановленный агент: лента — 403 AGENT_SUSPENDED, подпись приостановлена до сверки (Р34 п. 7, РП40 п. 6, Р60 п. 1)", async () => {
     const { c, stand } = await started();
     await stand.registry.changeStatus(c.agentCode, { to: "SUSPENDED", ground: "INCIDENT_EVASION" });
     const err = await c.platform.listEvents(null).catch((e: unknown) => e);
     expect(err).toMatchObject({ code: "AGENT_SUSPENDED", httpStatus: 403 });
-    await expect(c.platform.listEvents(null)).rejects.toBeInstanceOf(SignerStopped);
+    await expect(c.platform.listEvents(null)).rejects.toBeInstanceOf(SignerSuspended);
+    expect(c.admission()).toBe("AGENT_SUSPENDED");
   });
 });
 

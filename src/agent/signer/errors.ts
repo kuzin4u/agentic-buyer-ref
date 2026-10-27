@@ -16,7 +16,8 @@ export class SignerRotationStopped extends Error {
   override readonly name = "SignerRotationStopped";
 }
 
-/** Подпись приостановлена до успешной повторной сверки с реестром (Р27: ответ реестра не по схеме после допуска). */
+/** Подпись приостановлена до успешной повторной сверки с реестром: ответ реестра не по схеме после допуска (Р27), лента
+ *  недоступна (Р50 дополнение 1), агент приостановлен оператором (AGENT_SUSPENDED, Р60 п. 1). */
 export class SignerSuspended extends Error {
   override readonly name = "SignerSuspended";
   constructor(readonly reason: DiagCode) {
@@ -24,13 +25,17 @@ export class SignerSuspended extends Error {
   }
 }
 
-/** Подпись остановлена: нет действующего ключа или агенту отказано в допуске (Т1, SPEC §7а). */
+/** Подпись остановлена: нет действующего ключа или агенту отказано в допуске (Т1, SPEC §7а). `revokedKid` — ключ,
+ *  отмеченный отозванным перед остановкой NO_ACTIVE_KEY (Р60 п. 7): совпал с ключом, который агент отзывал сам, — отзыв
+ *  состоялся и агент остановлен; иной ключ или null — отзыв не состоялся. */
 export class SignerStopped extends Error {
   override readonly name = "SignerStopped";
+  readonly revokedKid: string | null;
   constructor(
     readonly reason: SignerStopReason,
-    options?: ErrorOptions,
+    options?: ErrorOptions & { revokedKid?: string },
   ) {
     super(`подпись остановлена: ${reason}`, options);
+    this.revokedKid = options?.revokedKid ?? null;
   }
 }

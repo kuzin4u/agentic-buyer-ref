@@ -8,6 +8,7 @@ import { mandateDraftToPao } from "../../src/agent/adapters/pao/map.js";
 import { loadParams, type StandParams } from "../../src/shared/config.js";
 import { PlatformFailure, type CredentialDraft } from "../../src/shared/domain.js";
 import type { RequestSigning } from "../../src/agent/ports/index.js";
+import { SignerSuspended } from "../../src/agent/signer/index.js";
 import { Consents, INTENT } from "../support/consents.js";
 
 const AGENT = "nspk:agent:buyref-01:v1";
@@ -607,39 +608,43 @@ describe("NO_RESPONSE: повтор тем же ключом (Р48 п. 4)", () =
   });
 });
 
-describe("Р50 п. 6 (а): 403 AGENT_SUSPENDED на GET операции — подпись агента остановлена (оговорка ревью КТ1 Р49 снята)", () => {
-  it("readOperation (стадия 5, событие operation.*) — остановка подписи AGENT_SUSPENDED, без повтора", async () => {
+describe("Р50 п. 6 (а), Р60 п. 1: 403 AGENT_SUSPENDED на GET операции — подпись агента приостановлена, не остановлена", () => {
+  it("readOperation (стадия 5, событие operation.*) — приостановка подписи AGENT_SUSPENDED, без повтора и без остановки", async () => {
     const stopped: string[] = [];
+    const suspended: string[] = [];
     stub = new PaoStub({ agents: [{ agentCode: AGENT, keys: [{ kid: "kid_test", alg: "ed25519", publicKey, status: "ACTIVE" }] }] });
     stub.fail("GET /pao/v1/operations/{op_ref}", { code: "AGENT_SUSPENDED" });
     const platform = new PaoPlatform({
       journal: new MemoryJournal(),
       baseUrl: await stub.start(),
       agentCode: AGENT,
-      signing: { ...signing, stop: (r: string) => void stopped.push(r) },
+      signing: { ...signing, stop: (r: string) => void stopped.push(r), suspend: (r: string) => void suspended.push(r) },
       params,
       sleep: async () => {},
     });
     await expect(platform.readOperation("op_1")).rejects.toMatchObject({ code: "AGENT_SUSPENDED", httpStatus: 403 });
-    expect(stopped).toEqual(["AGENT_SUSPENDED"]);
+    expect(suspended).toEqual(["AGENT_SUSPENDED"]);
+    expect(stopped).toEqual([]);
     expect(stub.calls.filter((c) => c.op === "GET /pao/v1/operations/{op_ref}")).toHaveLength(1);
   });
 
-  it("Р51 п. 5: readOperations (поиск по CART) — 403 AGENT_SUSPENDED останавливает подпись, без повтора; 404 MANDATE_NOT_FOUND — отказ без остановки", async () => {
-    for (const [code, status, stops] of [["AGENT_SUSPENDED", 403, true], ["MANDATE_NOT_FOUND", 404, false]] as const) {
+  it("Р51 п. 5: readOperations (поиск по CART) — 403 AGENT_SUSPENDED приостанавливает подпись, без повтора; 404 MANDATE_NOT_FOUND — отказ без приостановки", async () => {
+    for (const [code, status, halts] of [["AGENT_SUSPENDED", 403, true], ["MANDATE_NOT_FOUND", 404, false]] as const) {
       const stopped: string[] = [];
+      const suspended: string[] = [];
       stub = new PaoStub({ agents: [{ agentCode: AGENT, keys: [{ kid: "kid_test", alg: "ed25519", publicKey, status: "ACTIVE" }] }] });
       stub.fail("GET /pao/v1/operations", { code });
       const platform = new PaoPlatform({
         journal: new MemoryJournal(),
         baseUrl: await stub.start(),
         agentCode: AGENT,
-        signing: { ...signing, stop: (r: string) => void stopped.push(r) },
+        signing: { ...signing, stop: (r: string) => void stopped.push(r), suspend: (r: string) => void suspended.push(r) },
         params,
         sleep: async () => {},
       });
       await expect(platform.readOperations("m_cart_1")).rejects.toMatchObject({ code, httpStatus: status });
-      expect(stopped, code).toEqual(stops ? [code] : []);
+      expect(suspended, code).toEqual(halts ? [code] : []);
+      expect(stopped, code).toEqual([]);
       expect(stub.calls.filter((c) => c.op === "GET /pao/v1/operations")).toHaveLength(1);
       await stub.close();
       stub = undefined;
@@ -704,10 +709,18 @@ describe("Р53 ревью К2.1 № 8 (Р58, К1.3): сбой журнала н�
     return { platform, stopped, revoked, suspended };
   }
 
-  it("403 AGENT_SUSPENDED — сбой записи pao.call, подпись всё равно остановлена", async () => {
+  it("403 AGENT_SUSPENDED — сбой записи pao.call, подпись всё равно приостановлена (Р60 п. 1)", async () => {
     const r = on(() => new Response(body("AGENT_SUSPENDED", "never"), { status: 403, headers: { "content-type": "application/json" } }), "pao.call");
     await expect(r.platform.getMandate("m_1")).rejects.toThrow("журнал недоступен");
-    expect(r.stopped).toEqual([["AGENT_SUSPENDED", undefined]]);
+    expect(r.suspended).toEqual(["AGENT_SUSPENDED"]);
+    expect(r.stopped).toEqual([]);
+  });
+
+  it("403 AGENT_UNKNOWN — сбой записи pao.call, подпись всё равно остановлена", async () => {
+    const r = on(() => new Response(body("AGENT_UNKNOWN", "never"), { status: 401, headers: { "content-type": "application/json" } }), "pao.call");
+    await expect(r.platform.getMandate("m_1")).rejects.toThrow("журнал недоступен");
+    expect(r.stopped).toEqual([["AGENT_UNKNOWN", undefined]]);
+    expect(r.suspended).toEqual([]);
   });
 
   it("401 AGENT_KEY_REVOKED — сбой записи pao.call, ключ всё равно отмечен отозванным (смена ключа)", async () => {
@@ -971,5 +984,145 @@ describe("Р58 п. 5 и доп. 1: сверка одним чтением пос
     const sub = on({ "PUT /pao/v1/subscription": () => new Response("{", { status: 200, headers: { "content-type": "application/json" } }) });
     await expect(sub.platform.subscribe("https://agent.test/push", ["operation.settled"], { idempotencyKey: "idem_s" })).rejects.toMatchObject({ code: "BAD_RESPONSE" });
     expect(sub.calls).toEqual(["PUT /pao/v1/subscription"]);
+  });
+});
+
+describe("Р60 п. 7: отзыв своего ключа — revokeKey (AG-14 ч. 1, К2.1)", () => {
+  const json = (status: number, body: unknown) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+  const refusal = (status: number, code: string, retry: string) => () => json(status, { code, message: "отказ", retry });
+  const keyOf = (kid: string, status: string) => ({ kid, alg: "ed25519", public_key: `pk_${kid}`, status, valid_from: "2026-10-01T00:00:00Z", valid_to: "2026-12-30T00:00:00Z" });
+  const self = (keys: unknown[]) => ({ agent_code: AGENT, status: "ACTIVE", class: "BUYER", keys });
+  const A = "kid_a";
+  const B = "kid_b";
+  const REVOKE_A = `POST /pao/v1/agent/keys/${A}/revoke`;
+  const REVOKE_B = `POST /pao/v1/agent/keys/${B}/revoke`;
+  /** Два подтверждённых ключа (действующий — A); keyRevoked отмечает ключ и переводит с действующего на другой; другого
+   *  нет — `noOther` (как SignerStopped NO_ACTIVE_KEY связки — signer-ring, на стенде — revoke-stand). Ответы — очередью
+   *  по маршруту; у обращения — маршрут, kid подписи, Idempotency-Key и тело. */
+  function on(routes: Record<string, (() => Response)[]>, o: { other?: boolean; suspended?: boolean } = {}) {
+    const keys = new Map([A, B].map((kid) => [kid, newEd25519Signer(kid).signer]));
+    let current = A;
+    const revoked: string[] = [];
+    const noOther = new Error("нет другого действующего ключа");
+    const sig = () => {
+      const s = keys.get(current)!;
+      return { kid: s.kid, alg: s.alg, sign: s.sign.bind(s) };
+    };
+    const signing: RequestSigning = {
+      current: () => {
+        if (o.suspended) throw new SignerSuspended("AGENT_SUSPENDED");
+        return sig();
+      },
+      keyRevoked: (kid: string) => {
+        revoked.push(kid);
+        if (kid === current) {
+          if (o.other === false) throw noOther;
+          current = kid === A ? B : A;
+        }
+        return sig();
+      },
+      stop: () => {},
+      suspend: () => {},
+    };
+    const calls: { route: string; kid: string | undefined; idem: string | null; body: unknown }[] = [];
+    const platform = new PaoPlatform({
+      journal: new MemoryJournal(),
+      baseUrl: "http://pao.test",
+      agentCode: AGENT,
+      signing,
+      params,
+      sleep: async () => {},
+      pace: quietPace(),
+      // лента недоступна (обязательства запрещены, Р60 нюанс К1.2): отзыв ключа — не обязательство
+      hold: () => {
+        throw new Error("hold: обязательство при недоступной ленте");
+      },
+      fetch: async (url, init) => {
+        const route = `${init?.method ?? "GET"} ${new URL(String(url)).pathname}`;
+        const h = new Headers(init?.headers);
+        calls.push({ route, kid: /keyid="([^"]+)"/.exec(h.get("signature-input") ?? "")?.[1], idem: h.get("idempotency-key"), body: init?.body });
+        const next = routes[route]?.shift();
+        if (next === undefined) throw new Error(`нет ответа на ${route}`);
+        return next();
+      },
+    });
+    return { platform, calls, revoked, noOther, current: () => current };
+  }
+
+  it("200 Key REVOKED — ключ отмечен в связке; пустое тело, Idempotency-Key вызывающего; лента недоступна — отзыв разрешён", async () => {
+    const r = on({ [REVOKE_B]: [() => json(200, keyOf(B, "REVOKED"))] });
+    await expect(r.platform.revokeKey(B, { idempotencyKey: "idem-revoke-b" })).resolves.toMatchObject({ kid: B, status: "REVOKED" });
+    expect(r.calls).toEqual([{ route: REVOKE_B, kid: A, idem: "idem-revoke-b", body: "" }]);
+    expect(r.revoked).toEqual([B]);
+    expect(r.current()).toBe(A);
+  });
+
+  it("200 по действующему ключу — отмечен, связка перешла на другой", async () => {
+    const r = on({ [REVOKE_A]: [() => json(200, keyOf(A, "REVOKED"))] });
+    await expect(r.platform.revokeKey(A, { idempotencyKey: "idem-revoke-a" })).resolves.toMatchObject({ kid: A, status: "REVOKED" });
+    expect(r.revoked).toEqual([A]);
+    expect(r.current()).toBe(B);
+  });
+
+  it.each([
+    ["kid ответа — другой", () => json(200, keyOf(A, "REVOKED"))],
+    ["статус не REVOKED", () => json(200, keyOf(B, "ACTIVE"))],
+  ])("200: %s — BAD_RESPONSE never, ключ не отмечен", async (_, reply) => {
+    const r = on({ [REVOKE_B]: [reply] });
+    await expect(r.platform.revokeKey(B, { idempotencyKey: "idem-revoke-b" })).rejects.toMatchObject({ code: "BAD_RESPONSE", retry: "never", httpStatus: 200 });
+    expect(r.revoked).toEqual([]);
+  });
+
+  it("(а) 401 AGENT_KEY_REVOKED на отзыв ключа, которым подписан запрос, — отзыв состоялся: пометка, переход, одно GET /pao/v1/agent другим ключом, без повтора POST", async () => {
+    const r = on({
+      [REVOKE_A]: [refusal(401, "AGENT_KEY_REVOKED", "new_key")],
+      "GET /pao/v1/agent": [() => json(200, self([keyOf(A, "REVOKED"), keyOf(B, "ACTIVE")]))],
+    });
+    await expect(r.platform.revokeKey(A, { idempotencyKey: "idem-revoke-a" })).resolves.toMatchObject({ kid: A, status: "REVOKED" });
+    expect(r.calls.map((c) => [c.route, c.kid])).toEqual([
+      [REVOKE_A, A],
+      ["GET /pao/v1/agent", B],
+    ]);
+    expect(r.revoked).toEqual([A]);
+  });
+
+  it.each([
+    ["чтение показало ключ ACTIVE", () => json(200, self([keyOf(A, "ACTIVE"), keyOf(B, "ACTIVE")]))],
+    ["ключа нет в чтении", () => json(200, self([keyOf(B, "ACTIVE")]))],
+    ["чтение отказало", refusal(503, "STATE_UNAVAILABLE", "same_key")],
+  ])("(а): %s — BAD_RESPONSE never (отзыв не подтверждён), POST не повторяется", async (_, read) => {
+    const r = on({ [REVOKE_A]: [refusal(401, "AGENT_KEY_REVOKED", "new_key")], "GET /pao/v1/agent": [read, read, read] });
+    await expect(r.platform.revokeKey(A, { idempotencyKey: "idem-revoke-a" })).rejects.toMatchObject({ code: "BAD_RESPONSE", retry: "never", httpStatus: 401 });
+    expect(r.calls.filter((c) => c.route === REVOKE_A)).toHaveLength(1);
+  });
+
+  it("(а) без другого ключа — остановка связки наружу как есть, чтения нет", async () => {
+    const r = on({ [REVOKE_A]: [refusal(401, "AGENT_KEY_REVOKED", "new_key")] }, { other: false });
+    await expect(r.platform.revokeKey(A, { idempotencyKey: "idem-revoke-a" })).rejects.toBe(r.noOther);
+    expect(r.calls.map((c) => c.route)).toEqual([REVOKE_A]);
+    expect(r.revoked).toEqual([A]);
+  });
+
+  it("401 AGENT_KEY_REVOKED при отзыве другого ключа — по общему правилу: ключ подписи отмечен, повтор другим ключом тем же Idempotency-Key", async () => {
+    const r = on({ [REVOKE_B]: [refusal(401, "AGENT_KEY_REVOKED", "new_key"), () => json(200, keyOf(B, "REVOKED"))] });
+    await expect(r.platform.revokeKey(B, { idempotencyKey: "idem-revoke-b" })).resolves.toMatchObject({ kid: B, status: "REVOKED" });
+    expect(r.calls.map((c) => [c.route, c.kid, c.idem])).toEqual([
+      [REVOKE_B, A, "idem-revoke-b"],
+      [REVOKE_B, B, "idem-revoke-b"],
+    ]);
+    expect(r.revoked).toEqual([A, B]);
+  });
+
+  it("(б) 422 KEY_INVALID — такого своего ключа нет: PlatformFailure KEY_INVALID never, ключ не отмечен, повтора нет", async () => {
+    const r = on({ [REVOKE_B]: [refusal(422, "KEY_INVALID", "after_fix")] });
+    await expect(r.platform.revokeKey(B, { idempotencyKey: "idem-revoke-b" })).rejects.toMatchObject({ name: "PlatformFailure", code: "KEY_INVALID", retry: "never", httpStatus: 422 });
+    expect(r.calls).toHaveLength(1);
+    expect(r.revoked).toEqual([]);
+  });
+
+  it("подпись приостановлена — SignerSuspended до обращения", async () => {
+    const r = on({ [REVOKE_B]: [() => json(200, keyOf(B, "REVOKED"))] }, { suspended: true });
+    await expect(r.platform.revokeKey(B, { idempotencyKey: "idem-revoke-b" })).rejects.toBeInstanceOf(SignerSuspended);
+    expect(r.calls).toEqual([]);
   });
 });

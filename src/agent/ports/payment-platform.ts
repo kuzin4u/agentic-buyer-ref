@@ -67,6 +67,10 @@ export interface PaymentPlatform extends MandatePort, EventsPort {
   agentSelf(): Promise<AgentSelf>;
   /** Регистрация нового ключа до перехода на него (A2 п. 5.3); платформа сокращает сроки прежних ключей сама. */
   registerKey(draft: KeyDraft, m: Mutation): Promise<AgentKey>;
+  /** Отзыв своего ключа (A2 п. 5.4; Р60 п. 7): ключ со статусом REVOKED; связка ключей отмечает его отозванным, отозван
+   *  действующий — переход на другой подтверждённый, нет — SignerStopped NO_ACTIVE_KEY с `revokedKid`. Отказ в отзыве —
+   *  PlatformFailure (чужой или неизвестный ключ — KEY_INVALID, без повтора). */
+  revokeKey(kid: string, m: Mutation): Promise<AgentKey>;
 
   issueCredential(draft: CredentialDraft, m: Mutation): Promise<Credential>;
   /** Реквизит и запечатанный пакет агентской оплаты по нему (Р45 п. 3): `payload` — только в пакете, ядру — `Credential`.

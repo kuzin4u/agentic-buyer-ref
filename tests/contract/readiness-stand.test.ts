@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { MERCHANT_FIXTURES } from "agentic-ps-platform/fixtures";
 import { startFailureCode } from "../../src/agent/compose.js";
 import { PurchaseStopped } from "../../src/agent/pipeline/index.js";
+import { SignerSuspended } from "../../src/agent/signer/index.js";
 import { INTENT } from "../support/consents.js";
 import { shopBy, type Contour } from "../support/contour.js";
 import { one } from "../support/purchase.js";
@@ -112,7 +113,7 @@ describe("знак готовности по ПАО на стенде (Р53)", {
     expect(r.c.issuedSecrets()).toEqual([]);
   });
 
-  it("агент приостановлен оператором, пока шли ворота (после verify, до знака), — 403 AGENT_SUSPENDED на знак: подпись остановлена, STOPPED тем же кодом, реквизита нет (Р53 п. 5; ревью КТ1 № 4)", async () => {
+  it("агент приостановлен оператором, пока шли ворота (после verify, до знака), — 403 AGENT_SUSPENDED на знак: подпись приостановлена (Р60 п. 1), STOPPED тем же кодом, реквизита нет (Р53 п. 5; ревью КТ1 № 4)", async () => {
     // знак после заказа — только в воротах: перед ним оператор приостанавливает агента, запрос уходит на стенд как есть
     const hook: { beforeMark?: () => Promise<unknown> } = {};
     const f: typeof fetch = async (input, init) => {
@@ -139,5 +140,9 @@ describe("знак готовности по ПАО на стенде (Р53)", {
       [readinessCall(NORMAL.merchant_id), 403, "AGENT_SUSPENDED"],
     ]);
     expect(r.stand.tsp.issued.size).toBe(0);
+    // приостановка, а не остановка (Р60 п. 1; ревью К1.1 № 3): рабочая подпись — SignerSuspended, обращения нет
+    const before = r.c.agentCalls().length;
+    await expect(r.c.platform.agentSelf()).rejects.toBeInstanceOf(SignerSuspended);
+    expect(r.c.agentCalls()).toHaveLength(before);
   });
 });

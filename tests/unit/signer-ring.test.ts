@@ -266,6 +266,66 @@ describe("сверка с реестром (fail-closed)", () => {
       expect(k.j.entries.map((e) => e.kind)).not.toContain("signing.resumed");
     });
 
+    // Р60 п. 1: приостановление оператором — сильнее прочих причин; до допуска — остановка, как прежде.
+    it("AGENT_SUSPENDED заменяет AGENT_SELF_UNKNOWN (запись signing.suspended); повтор AGENT_SUSPENDED — без записи; прочая причина его не заменяет", async () => {
+      const k = ring();
+      await k.r.start(k.self([k.key()]));
+      k.r.port().suspend("AGENT_SELF_UNKNOWN");
+      k.r.port().suspend("AGENT_SUSPENDED");
+      k.r.port().suspend("AGENT_SUSPENDED");
+      k.r.port().suspend("EVENTS_UNAVAILABLE");
+      expect(k.r.suspendReason).toBe("AGENT_SUSPENDED");
+      expect(k.j.entries.filter((e) => e.kind === "signing.suspended").map((e) => e.reason)).toEqual(["AGENT_SELF_UNKNOWN", "AGENT_SUSPENDED"]);
+      expect(() => k.r.port().current()).toThrow(expect.objectContaining({ reason: "AGENT_SUSPENDED" }));
+    });
+
+    it("гонка: AGENT_SUSPENDED во время сверки, начатой при AGENT_SELF_UNKNOWN, её ответом ACTIVE не снимается", async () => {
+      const k = ring();
+      await k.r.start(k.self([k.key()]));
+      k.r.port().suspend("AGENT_SELF_UNKNOWN");
+      await k.r.recheck(async () => {
+        k.r.port().suspend("AGENT_SUSPENDED"); // параллельное обращение получило 403 AGENT_SUSPENDED
+        return { agentCode: AGENT, status: "ACTIVE", agentClass: "BUYER", keys: [k.key()] };
+      });
+      expect(k.r.suspendReason).toBe("AGENT_SUSPENDED");
+      expect(k.j.entries.map((e) => e.kind)).not.toContain("signing.resumed");
+    });
+
+    it("гонка (ревью К1.1 № 2): повторный AGENT_SUSPENDED во время сверки, начатой при AGENT_SUSPENDED, её ответом ACTIVE не снимается", async () => {
+      const k = ring();
+      await k.r.start(k.self([k.key()]));
+      k.r.port().suspend("AGENT_SUSPENDED");
+      await k.r.recheck(async () => {
+        k.r.port().suspend("AGENT_SUSPENDED"); // 403 на запрос, подписанный до приостановки, пришёл после ответа сверки
+        return { agentCode: AGENT, status: "ACTIVE", agentClass: "BUYER", keys: [k.key()] };
+      });
+      expect(k.r.suspendReason).toBe("AGENT_SUSPENDED");
+      expect(k.j.entries.filter((e) => e.kind === "signing.suspended")).toHaveLength(1);
+      expect(k.j.entries.map((e) => e.kind)).not.toContain("signing.resumed");
+    });
+
+    it("AGENT_SUSPENDED до допуска — остановка (допуск не состоялся, Р60 п. 1); AGENT_SELF_UNKNOWN до допуска — без действия", async () => {
+      const k = ring();
+      k.r.port().suspend("AGENT_SELF_UNKNOWN");
+      expect(k.r.stopReason).toBeNull();
+      k.r.port().suspend("AGENT_SUSPENDED");
+      expect(k.r.stopReason).toBe("AGENT_SUSPENDED");
+      expect(k.j.entries.at(-1)).toMatchObject({ kind: "agent.stopped", reason: "AGENT_SUSPENDED" });
+    });
+
+    it("сверка: SUSPENDED — приостановка AGENT_SUSPENDED (SignerSuspended), ключи не трогаются; ACTIVE — снятие; EXCLUDED — остановка", async () => {
+      const k = ring();
+      await k.r.start(k.self([k.key()]));
+      await expect(k.r.recheck(k.self([k.key()], "SUSPENDED"))).rejects.toMatchObject({ name: "SignerSuspended", reason: "AGENT_SUSPENDED" });
+      expect(k.r.suspendReason).toBe("AGENT_SUSPENDED");
+      expect(k.r.stopReason).toBeNull();
+      await k.r.recheck(k.self([k.key()]));
+      expect(k.r.suspendReason).toBeNull();
+      expect(k.j.entries.at(-1)).toMatchObject({ kind: "signing.resumed" });
+      expect(() => k.r.port().current()).not.toThrow();
+      await expect(k.r.recheck(k.self([k.key()], "EXCLUDED"))).rejects.toMatchObject({ name: "SignerStopped", reason: "AGENT_EXCLUDED" });
+    });
+
     it("ротация при приостановке: регистрации нет, POST /pao/v1/agent/keys не отправляется", async () => {
       const k = ring();
       await k.r.start(k.self([k.key()]));

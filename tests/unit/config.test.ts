@@ -52,6 +52,16 @@ describe("стендовые параметры", () => {
     expect(() => parseParams({ ...stand, operation_outcome_max_delay_sec: stand.registry_cache_ttl_sec })).not.toThrow();
   });
 
+  it("Р60 п. 6: agent_recheck_interval_sec — обязателен, целое > 0, срок таймера Node и не больше registry_cache_ttl_sec", () => {
+    const without = { ...stand };
+    delete without.agent_recheck_interval_sec;
+    expect(() => parseParams(without)).toThrow(/agent_recheck_interval_sec/);
+    expect(() => parseParams({ ...stand, agent_recheck_interval_sec: 0 })).toThrow(ConfigError);
+    expect(() => parseParams({ ...stand, agent_recheck_interval_sec: 1.5 })).toThrow(ConfigError);
+    expect(() => parseParams({ ...stand, agent_recheck_interval_sec: stand.registry_cache_ttl_sec + 1 })).toThrow(/registry_cache_ttl_sec/);
+    expect(() => parseParams({ ...stand, agent_recheck_interval_sec: stand.registry_cache_ttl_sec })).not.toThrow();
+  });
+
   it("Р51 п. 2: operation_reread_interval_sec и reservation_ttl_sec — целые > 0, перечитывание — срок таймера и не больше границы; равны стенду Платформы", () => {
     for (const key of ["operation_reread_interval_sec", "reservation_ttl_sec"]) {
       const without = { ...stand };

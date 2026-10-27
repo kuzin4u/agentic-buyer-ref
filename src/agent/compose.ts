@@ -80,8 +80,9 @@ export interface AgentCore {
    *  (дополнение Р34 п. 1) — events.subscription: warn. Коды остановки агента и остановленная подпись на подписке —
    *  events.subscription: fail, AgentNotReady (ревью К2.2 № 4, дополнение 2 п. 5). */
   start(): Promise<AgentSelf>;
-  /** Повторная сверка с реестром (Р27): снимает приостановку подписи при ACTIVE и BUYER; не ACTIVE или не BUYER — остановка;
-   *  ответ снова не по схеме или сбой — приостановка остаётся. Расписание сверок — за вызывающим (AG-12). */
+  /** Повторная сверка с реестром (Р27): снимает приостановку подписи при ACTIVE и BUYER; SUSPENDED — приостановка
+   *  остаётся (SignerSuspended, Р60 п. 2); иной статус или не BUYER — остановка; ответ снова не по схеме или сбой —
+   *  приостановка остаётся. Расписание сверок — за вызывающим (до К1.2 AG-14, Р60 п. 4). */
   recheck(): Promise<AgentSelf>;
   /** плановая ротация ключа, если до valid_to (по данным платформы) осталось не больше key_overlap_days; ротация
    *  остановлена (новый ключ не принят подряд сверх предела) — SignerRotationStopped: нужен человек, не повторять (Р58 п. 4) */
@@ -176,7 +177,7 @@ export function createAgentCore(o: AgentCoreOptions): AgentCore {
     throw notReady({ "config.params": OK, "core.pao": { status: "fail", code: "CORE_PAO_MISMATCH" } }, e);
   }
   if (nested(o.stateDir, o.keysDir)) throw new ConfigError("каталог состояния совпадает с каталогом ключей или вложен в него (или наоборот)");
-  const ring = new KeyRing({ dir: o.keysDir, params, journal, ...(o.now && { now: o.now }) });
+  const ring = new KeyRing({ dir: o.keysDir, params, journal, ...(o.now && { now: o.now }), onState: () => syncRecheck() });
   // Рабочий адаптер получает порт, закрытый до допуска; запрос допуска идёт через отдельный адаптер с портом допуска.
   // События версии ПАО (Р33 п. 10) и попытки обращений (pao.call) пишет адаптер — через ту же обёртку; журнал получают и
   // адаптеры допуска и сверки с реестром (ревью К2.1 № 2).
@@ -189,7 +190,12 @@ export function createAgentCore(o: AgentCoreOptions): AgentCore {
     ...(o.pao.sleep && { sleep: o.pao.sleep }),
     ...(o.pao.monotonic && { monotonic: o.pao.monotonic }),
   });
-  const platform = new PaoPlatform({ ...o.pao, params, signing: ring.port(), journal, pace });
+  // Лента недоступна дольше срока и не прочитана полностью — обязательств агент не берёт, даже после снятия приостановки
+  // сверкой (Р60 п. 4, нюанс К1.2; Т14): мандат, реквизит, подтверждение, заказ у витрины; защитные и ротация — можно.
+  const hold = (): void => {
+    if (events.failing) throw new SignerSuspended("EVENTS_UNAVAILABLE");
+  };
+  const platform = new PaoPlatform({ ...o.pao, params, signing: ring.port(), journal, pace, hold });
   const at = (): string => now().toISOString();
   // Остановка по курсору — через порт подписи: агент целиком, запись agent.stopped — у связки ключей (Р34 п. 4).
   const signing = ring.port();
@@ -213,7 +219,8 @@ export function createAgentCore(o: AgentCoreOptions): AgentCore {
       await platform.subscribe(url, types, { idempotencyKey });
       return OK;
     } catch (e) {
-      // остановка агента (AGENT_SUSPENDED и др.) и дефекты — наружу; адрес и тело в журнал не идут
+      // остановка или приостановка агента (AGENT_SUSPENDED — приостановка, Р60 п. 1) и дефекты — наружу; адрес и тело
+      // в журнал не идут
       if (!(e instanceof PlatformFailure) || AGENT_STOP_CODES.has(e.code)) throw e;
       const kind = e.code === "REQUEST_INVALID" ? "events.subscription_rejected" : "events.subscription_failed";
       journal.record({ at: at(), kind, reason: e.code });
@@ -226,6 +233,69 @@ export function createAgentCore(o: AgentCoreOptions): AgentCore {
     (rechecking ??= ring.recheck((s) => new PaoPlatform({ ...o.pao, params, signing: s, journal, pace }).agentSelf()).finally(() => {
       rechecking = null;
     }));
+  // Сверка по расписанию и по push (Р60 п. 4–5а): итог — прочитанный статус (ACTIVE, SUSPENDED) или null — сверка не
+  // прошла или агент остановлен. Отказ не роняет процесс и не глушится: запись agent.recheck_failed с кодом — первая в
+  // серии и при смене кода; серию закрывает прочитанный статус (Р-645). Остановку записывает связка ключей.
+  let recheckFailure: DiagCode | null = null;
+  const scheduledRecheck = (): Promise<"ACTIVE" | "SUSPENDED" | null> =>
+    recheck().then(
+      () => {
+        recheckFailure = null;
+        return "ACTIVE" as const;
+      },
+      (e: unknown) => {
+        if (e instanceof SignerStopped) return null;
+        if (e instanceof SignerSuspended && e.reason === "AGENT_SUSPENDED") {
+          recheckFailure = null;
+          return "SUSPENDED" as const;
+        }
+        const code: DiagCode = e instanceof PlatformFailure ? e.code : "UNKNOWN";
+        if (recheckFailure !== code) {
+          recheckFailure = code;
+          // сбой журнала здесь отдать некому (таймер): сверка повторится следующим тиком, запись — при следующем отказе
+          try {
+            journal.record({ at: at(), kind: "agent.recheck_failed", reason: code });
+          } catch {
+            recheckFailure = null;
+          }
+        }
+        return null;
+      },
+    );
+  // Расписание (Р60 п. 4): пока подпись приостановлена (любая причина), раз в agent_recheck_interval_sec — recheck();
+  // таймер только вызывает сверку, время GET задаёт общий Pace (условие (а)), сверка одна на ядро (rechecking). Ставится
+  // при приостановке, снимается при снятии, остановке и close() (onState связки ключей); процесс не держит.
+  let recheckTimer: ReturnType<typeof setInterval> | null = null;
+  let wasSuspended = false;
+  const syncRecheck = (): void => {
+    const suspended = ring.stopReason === null && ring.suspendReason !== null;
+    if (suspended && recheckTimer === null) {
+      recheckTimer = setInterval(() => void scheduledRecheck(), params.agent_recheck_interval_sec * 1000);
+      recheckTimer.unref();
+    } else if (!suspended && recheckTimer !== null) {
+      clearInterval(recheckTimer);
+      recheckTimer = null;
+    }
+    // Снятие — лента с сохранённого курсора (Р60 п. 2); после EVENTS_UNAVAILABLE только это чтение закрывает серию
+    // (нюанс К1.2). Отказ чтения записывает и считает сама лента (events.unavailable).
+    if (wasSuspended && !suspended && ring.stopReason === null) void events.signal().catch(() => undefined);
+    wasSuspended = suspended;
+  };
+  // Push при приостановке (Р60 п. 5): лента и подписка — 403, поэтому сразу сверка, а не чтение ленты. Тип push — из
+  // неподписанного тела, только ожидание (п. 5а): прочитано иное — ещё одна сверка через тот же Pace (версии статуса в
+  // ПАО 1.4.0 нет); дальше — расписание. Подделка — не больше двух GET.
+  const PUSH_EXPECTS: ReadonlyMap<string, "ACTIVE" | "SUSPENDED"> = new Map([
+    ["agent.suspended", "SUSPENDED"],
+    ["agent.reinstated", "ACTIVE"],
+  ]);
+  const wake = async (type: string): Promise<void> => {
+    if (ring.stopReason !== null || ring.suspendReason === null) return events.signal();
+    const read = await scheduledRecheck();
+    const expected = PUSH_EXPECTS.get(type);
+    if (expected === undefined || read === null || read === expected) return;
+    while (rechecking) await rechecking.catch(() => undefined);
+    await scheduledRecheck();
+  };
   // agent.key_revoked / agent.suspended / agent.reinstated — сигнал: статус и ключи — по GET /pao/v1/agent (Р34 п. 5).
   // Идёт чужая сверка — её GET мог уйти до смены статуса: дождаться её и сверить заново (ревью К2.4 № 4).
   // Сверка не прошла (503, остановка) — слушатель падает, курсор на месте, событие прочитается снова (Р34 п. 3).
@@ -260,7 +330,7 @@ export function createAgentCore(o: AgentCoreOptions): AgentCore {
     journal,
     diag: DIAG,
     events,
-    acceptPush: (body, headers) => acceptPush({ wake: () => events.signal(), journal, now }, body, headers),
+    acceptPush: (body, headers) => acceptPush({ wake, journal, now }, body, headers),
     selfCheck: () => lastReport,
     // остановленная подпись и курсор — код как у отказа старта; штатное закрытие (CLOSED) — UNKNOWN у конвейера.
     // Порты вызывающего — поимённо: лишнее поле объекта не подменит допуск, клиент мандатов или журнал (ревью К2.2 № 3).
@@ -274,6 +344,8 @@ export function createAgentCore(o: AgentCoreOptions): AgentCore {
           if (stopped !== null) return stopped === "CLOSED" ? "UNKNOWN" : stopped;
           // приостановка (AGENT_SELF_UNKNOWN, EVENTS_UNAVAILABLE) — отказ стадии 0 без обращения (Р50 дополнение 1 п. 2)
           if (ring.suspendReason !== null) return ring.suspendReason;
+          // снята сверкой, а лента после EVENTS_UNAVAILABLE ещё не прочитана полностью (Р60 п. 4, нюанс К1.2)
+          if (events.failing) return "EVENTS_UNAVAILABLE";
           return lastReport?.ready === true ? null : "NOT_ADMITTED";
         },
         failureCode: startFailureCode,
@@ -294,7 +366,13 @@ export function createAgentCore(o: AgentCoreOptions): AgentCore {
         baseUrl: s.baseUrl,
         ...(s.fetch !== undefined && { fetch: s.fetch }),
         agentCode: o.pao.agentCode,
-        signing: { sign: (req) => signRequest(req, signing.current()) },
+        // заказ и оплата у витрины — обязательство: при недоступной ленте не идут (Р60 п. 4, нюанс К1.2); чтение — можно
+        signing: {
+          sign: (req) => {
+            if (req.method.toUpperCase() !== "GET") hold();
+            return signRequest(req, signing.current());
+          },
+        },
         // знак готовности по ПАО (Р53 п. 1, 5): адрес Платформы и порт подписи — те же, что у адаптера ПАО
         platform: { baseUrl: o.pao.baseUrl, signing, ...(o.pao.fetch !== undefined && { fetch: o.pao.fetch }) },
         params,

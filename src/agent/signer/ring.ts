@@ -3,7 +3,8 @@
 // Fail-closed (инвариант 4): до подтверждённого допуска рабочий порт не подписывает ничего — запрос допуска идёт через
 // отдельный порт, который есть только у start; после допуска — только ключом, подтверждённым платформой как ACTIVE
 // в пределах [valid_from, valid_to). Ответ реестра не по схеме после допуска — рабочая подпись приостановлена до
-// успешной повторной сверки (Р27): сверку подписывает отдельный порт, действующий только на время recheck.
+// успешной повторной сверки (Р27): сверку подписывает отдельный порт, действующий только на время recheck. Так же —
+// приостановление агента оператором (AGENT_SUSPENDED, Р60 п. 1): снимает его только сверка с ACTIVE.
 // Состояние ключей хранится в хранилище (keystore): новый ключ — под временным именем
 // до подтверждения регистрации; ключ допуска — с самым поздним подтверждённым valid_from из метаданных хранилища.
 import type { Signer } from "@kuzin4u/agentic-core";
@@ -27,6 +28,9 @@ export interface KeyRingOptions {
   params: Pick<StandParams, "key_overlap_days">;
   journal: Journal;
   now?: () => Date;
+  /** смена состояния подписи — приостановка, снятие, остановка (расписание повторной сверки — место сборки, Р60 п. 4);
+   *  вызывается и при сбое журнала: запись не отменяет действие */
+  onState?: () => void;
 }
 
 interface Held {
@@ -107,8 +111,9 @@ export class KeyRing {
 
   /**
    * Повторная сверка с реестром (Р27): GET /pao/v1/agent подписывается и при приостановке; ACTIVE и BUYER по
-   * разобранному ответу — подпись возобновляется; не ACTIVE или не BUYER — остановка (#reconcile); ответ снова не по
-   * схеме или сбой — приостановка остаётся. Когда и как часто сверять — решает вызывающий (STATUS, «Открыто», AG-12).
+   * разобранному ответу — подпись возобновляется; SUSPENDED — приостановка AGENT_SUSPENDED остаётся (SignerSuspended,
+   * Р60 п. 2); иной статус или не BUYER — остановка (#reconcile); ответ снова не по схеме или сбой — приостановка
+   * остаётся. Когда и как часто сверять — решает вызывающий (расписание — место сборки, Р60 п. 4).
    */
   async recheck(admit: Admit): Promise<AgentSelf> {
     if (this.#stopped !== null) throw new SignerStopped(this.#stopped);
@@ -129,7 +134,11 @@ export class KeyRing {
       this.#reconcile(self);
       if (this.#suspended !== null && this.#suspensions === before) {
         this.#suspended = null;
-        this.#record("signing.resumed");
+        try {
+          this.#record("signing.resumed");
+        } finally {
+          this.#o.onState?.();
+        }
       }
       return self;
     } finally {
@@ -149,7 +158,7 @@ export class KeyRing {
    * без остановки — остановка без повтора (fail-closed).
    * Прочие сбои (503, тайм-аут) — допуск не состоялся; можно ли повторить, решает место сборки по действию кода в реестре
    * (ответ не по схеме — BAD_RESPONSE, остановка по дополнению 2 к Р36; нет ответа — NO_RESPONSE, допуск можно повторить,
-   * Р48 п. 3); AGENT_UNKNOWN / AGENT_SUSPENDED — остановка (адаптер);
+   * Р48 п. 3); AGENT_UNKNOWN / AGENT_SUSPENDED — остановка (адаптер; AGENT_SUSPENDED до допуска — через #suspend, Р60 п. 1);
    * класс в реестре не BUYER — остановка AGENT_CLASS_MISMATCH (Р27, после проверки статуса).
    */
   async start(admit: Admit): Promise<AgentSelf> {
@@ -306,25 +315,45 @@ export class KeyRing {
     try {
       if (kid === this.#currentKid) this.#switchTo(this.#pick());
     } catch (e) {
-      if (e instanceof SignerStopped) throw new SignerStopped(e.reason, { cause: failure });
+      // ключ уже отмечен отозванным (key.revoked — до остановки, Р-645): его kid — в признаке остановки (Р60 п. 7)
+      if (e instanceof SignerStopped) throw new SignerStopped(e.reason, { cause: failure, revokedKid: kid });
       throw e;
     }
     return this.#current(admitting, rechecking);
   }
 
   #suspend(reason: DiagCode): void {
-    if (this.#stopped !== null || this.#admission !== "admitted" || this.#suspended !== null) return;
-    this.#suspended = reason;
+    if (this.#stopped !== null) return;
+    const operator = reason === "AGENT_SUSPENDED";
+    // Приостановлен оператором до допуска — допуск не состоялся, остановка, как прежде (Р60 п. 1; ч. 2 AG-14).
+    if (this.#admission !== "admitted") {
+      if (operator) this.#stop(reason);
+      return;
+    }
+    // AGENT_SUSPENDED сильнее прочих причин: заменяет причину, и сверка, начатая до него, его не снимет (Р60 п. 1).
+    // Повтор AGENT_SUSPENDED — без записи, но со счётом: 403 мог прийти после ответа идущей сверки (снятие и новое
+    // приостановление), и её ACTIVE уже устарел (ревью К1.1 № 2).
+    if (this.#suspended !== null && !operator) return;
     this.#suspensions++;
-    this.#record("signing.suspended", undefined, reason);
+    if (this.#suspended === reason) return;
+    this.#suspended = reason;
+    try {
+      this.#record("signing.suspended", undefined, reason);
+    } finally {
+      this.#o.onState?.();
+    }
   }
 
   #stop(reason: SignerStopReason, detail?: string): void {
     if (this.#stopped !== null) return;
     this.#stopped = reason;
-    // штатное закрытие — не код реестра (Р36 (в)): своя запись без причины (Р37 п. 3)
-    if (reason === "CLOSED") this.#record("agent.closed");
-    else this.#record("agent.stopped", undefined, reason, detail);
+    try {
+      // штатное закрытие — не код реестра (Р36 (в)): своя запись без причины (Р37 п. 3)
+      if (reason === "CLOSED") this.#record("agent.closed");
+      else this.#record("agent.stopped", undefined, reason, detail);
+    } finally {
+      this.#o.onState?.();
+    }
   }
 
   /** Завершение: подпись и запись в хранилище останавливаются (CLOSED), затем каталог освобождается. */
@@ -394,6 +423,12 @@ export class KeyRing {
    * потом применяется); действующий — новейший ACTIVE в пределах срока по данным платформы.
    */
   #reconcile(self: AgentSelf): void {
+    // SUSPENDED после допуска — приостановка до следующей сверки (Р60 п. 1); при допуске — остановка (#suspend)
+    if (self.status === "SUSPENDED") {
+      this.#suspend("AGENT_SUSPENDED");
+      if (this.#stopped !== null) throw new SignerStopped(this.#stopped);
+      throw new SignerSuspended("AGENT_SUSPENDED");
+    }
     if (self.status !== "ACTIVE") this.#halt(`AGENT_${self.status}`);
     // Р27: причина остановки ядра, не код ПАО — в таблицу отказов не входит; повторов нет.
     if (self.agentClass !== "BUYER") this.#halt("AGENT_CLASS_MISMATCH", undefined, self.agentClass);

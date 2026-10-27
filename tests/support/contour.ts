@@ -111,6 +111,10 @@ export interface Contour {
   readonly platform: PaymentPlatform;
   /** стадия 0 — как AgentCore.start */
   start(): Promise<AgentSelf>;
+  /** повторная сверка с реестром — та же сверка связки ключей, что у ядра (`KeyRing.recheck`, Р27, Р60 п. 2), вызывает
+   *  тест: расписания и push в контуре нет (STATUS «Открыто» — перевод на createAgentCore); проверяется поведение
+   *  покупки, не расписание */
+  recheck(): Promise<AgentSelf>;
   /** допуск для конвейера — как у места сборки (compose.ts): подпись остановлена — её код (CLOSED — UNKNOWN), иначе
    *  последний start() не дал допуска — NOT_ADMITTED; допуск есть — null (Р38 п. 2, К6) */
   admission(): DiagCode | null;
@@ -199,18 +203,23 @@ function agent(o: { dir: string; baseUrl: string; agentCode: string; params: Sta
   const pao = { baseUrl: o.baseUrl, agentCode: o.agentCode, params: o.params, sleep, journal: o.journal, pace, ...(o.paoNow && { now: o.paoNow }) };
   const platform = new PaoPlatform({ ...pao, signing: ring.port() });
   let admitted = false;
+  // один запрос реестра для допуска и для сверки — как у места сборки (compose.ts)
+  const admit = (signing: RequestSigning) => new PaoPlatform({ ...pao, signing }).agentSelf();
   return {
     ring,
     platform,
     start: async () => {
       admitted = false;
-      const self = await ring.start((signing) => new PaoPlatform({ ...pao, signing }).agentSelf());
+      const self = await ring.start(admit);
       admitted = true;
       return self;
     },
+    recheck: () => ring.recheck(admit),
     admission: (): DiagCode | null => {
       const stopped = ring.stopReason;
       if (stopped !== null) return stopped === "CLOSED" ? "UNKNOWN" : stopped;
+      // приостановка (AGENT_SUSPENDED, AGENT_SELF_UNKNOWN, EVENTS_UNAVAILABLE) — как у места сборки (Р60 п. 1)
+      if (ring.suspendReason !== null) return ring.suspendReason;
       return admitted ? null : "NOT_ADMITTED";
     },
   };
@@ -258,6 +267,7 @@ async function stubContour(opts: StandOptions | undefined): Promise<Contour> {
     journal,
     platform: a.platform,
     start: a.start,
+    recheck: a.recheck,
     admission: a.admission,
     paoStand,
     calls: stubCalls,
@@ -366,6 +376,7 @@ async function standContour(paoNow?: () => Date, adpUntilPs11 = false, aoiSuppor
       journal,
       platform: a.platform,
       start: a.start,
+      recheck: a.recheck,
       admission: a.admission,
       merchants,
       shopSigning: { sign: (req) => signRequest(req, signing.current()) },

@@ -61,6 +61,8 @@ export class EventFeed {
   #lastStart = Number.NEGATIVE_INFINITY;
   /** начало серии неудачных чтений (Р50 п. 2); null — последнее чтение дошло до пустой страницы */
   #failingSince: number | null = null;
+  /** серия дошла до приостановки (failing) */
+  #overdue = false;
   /** число чтений ленты (первых страниц) — для проверки слияния сигналов */
   reads = 0;
 
@@ -78,6 +80,13 @@ export class EventFeed {
   listen(l: FeedListener): () => void {
     this.#listeners.add(l);
     return () => this.#listeners.delete(l);
+  }
+
+  /** Серия неудачных чтений дошла до приостановки EVENTS_UNAVAILABLE (Р50 п. 2) и не закрыта полным чтением. Снятие
+   *  приостановки сверкой серию не закрывает — до полного чтения обязательств агент не берёт (Р60 п. 4, нюанс К1.2;
+   *  Т14). Короткая серия (меньше registry_cache_ttl_sec) признак не ставит. */
+  get failing(): boolean {
+    return this.#overdue;
   }
 
   /** Курсор, на котором стоит лента (null — с начала); до первого чтения — загрузка из хранилища. */
@@ -132,6 +141,7 @@ export class EventFeed {
         this.#lastStart = this.#now().getTime();
         await this.#readToEnd();
         this.#failingSince = null;
+        this.#overdue = false;
         if (!this.#again) {
           this.#running = null;
           return;
@@ -154,7 +164,10 @@ export class EventFeed {
       this.#failingSince = now;
       this.#o.journal.record({ at: this.#at(), kind: "events.unavailable", reason: "EVENTS_UNAVAILABLE", detail: e instanceof PlatformFailure ? e.code : "UNKNOWN" });
     }
-    if (now - this.#failingSince >= this.#o.params.registry_cache_ttl_sec * 1000) this.#o.suspend("EVENTS_UNAVAILABLE");
+    if (now - this.#failingSince >= this.#o.params.registry_cache_ttl_sec * 1000) {
+      this.#overdue = true;
+      this.#o.suspend("EVENTS_UNAVAILABLE");
+    }
   }
 
   /** Самопроверка при старте (Р36 п. 6): курсор читается до обращений к Платформе; не читается — остановка агента

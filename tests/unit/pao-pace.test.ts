@@ -145,8 +145,12 @@ describe("ограничитель в адаптере ПАО (Р59 п. 1–2)",
     expect(calls).toHaveLength(2);
   });
 
-  it("сбой журнала на pao.rate_limit не отменяет остановку агента не ACTIVE (Р-645, ревью КТ1 № 1 сессии 38)", async () => {
+  it.each([
+    ["EXCLUDED", ["AGENT_EXCLUDED"], []],
+    ["SUSPENDED", [], ["AGENT_SUSPENDED"]],
+  ])("сбой журнала на pao.rate_limit не отменяет остановку агента не ACTIVE (Р-645, ревью КТ1 № 1 сессии 38): %s — остановка %j, приостановка %j (Р60 п. 1)", async (status, stopsWanted, suspendsWanted) => {
     const stops: string[] = [];
+    const suspends: string[] = [];
     const journal = {
       record: (e: { kind: string }) => {
         if (e.kind === "pao.rate_limit") throw new Error("журнал недоступен");
@@ -156,13 +160,14 @@ describe("ограничитель в адаптере ПАО (Р59 п. 1–2)",
       journal,
       baseUrl: "http://pao.test",
       agentCode: AGENT,
-      signing: { ...signing, stop: (reason) => void stops.push(reason) },
+      signing: { ...signing, stop: (reason) => void stops.push(reason), suspend: (reason) => void suspends.push(reason) },
       params,
       sleep: async () => {},
-      fetch: async () => json(200, { agent_code: AGENT, status: "SUSPENDED", class: "BUYER", keys: [], rate_limit_per_min: 3000 }),
+      fetch: async () => json(200, { agent_code: AGENT, status, class: "BUYER", keys: [], rate_limit_per_min: 3000 }),
     });
     await expect(platform.agentSelf()).rejects.toThrow("журнал недоступен");
-    expect(stops).toEqual(["AGENT_SUSPENDED"]);
+    expect(stops).toEqual(stopsWanted);
+    expect(suspends).toEqual(suspendsWanted);
   });
 
   it.each([

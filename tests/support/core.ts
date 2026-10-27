@@ -32,7 +32,10 @@ export const CREDENTIALS: PaoStubOptions["handlers"] = {
 
 /** fetch — подмена транспорта адаптера (ответы, которых PaoStub не отдаёт: битый JSON, тайм-аут); paramsPath — свои
  *  стендовые параметры. */
-export async function coreOn(stand: PaoStand, o: { fetch?: typeof fetch; paramsPath?: string } = {}) {
+export async function coreOn(
+  stand: PaoStand,
+  o: { fetch?: typeof fetch; paramsPath?: string; sleep?: (ms: number) => Promise<void>; monotonic?: () => number } = {},
+) {
   const baseUrl = await stand.stub.start();
   const journal = new MemoryJournal();
   const core = createAgentCore({
@@ -42,7 +45,7 @@ export async function coreOn(stand: PaoStand, o: { fetch?: typeof fetch; paramsP
     journal,
     now: () => stand.clock,
     ...(o.paramsPath && { paramsPath: o.paramsPath }),
-    pao: { baseUrl, agentCode: AGENT, sleep: async () => {}, ...(o.fetch && { fetch: o.fetch }) },
+    pao: { baseUrl, agentCode: AGENT, sleep: o.sleep ?? (async () => {}), ...(o.fetch && { fetch: o.fetch }), ...(o.monotonic && { monotonic: o.monotonic }) },
   });
   return { core, journal };
 }

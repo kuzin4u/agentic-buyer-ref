@@ -40,7 +40,7 @@ async function setup() {
   stand = s;
   const dirA = tmp("revoke-keys-a-");
   const a = generateKey(dirA);
-  const decision = s.admit(
+  const decision = await s.admit(
     { agent_code: AGENT, class: "BUYER", model: "buyer-agent-ref", runtime: "node-20", alg: "ed25519", public_key: a.descriptor.public_key },
     "buyref-operator",
   );

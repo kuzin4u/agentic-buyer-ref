@@ -45,7 +45,7 @@ async function setup() {
   const dir = mkdtempSync(join(tmpdir(), "transport-keys-"));
   dirs.push(dir);
   const { descriptor } = generateKey(dir);
-  const decision = s.admit(
+  const decision = await s.admit(
     { agent_code: AGENT, class: "BUYER", model: "buyer-agent-ref", runtime: "node-20", alg: "ed25519", public_key: descriptor.public_key },
     "buyref-operator",
   );

@@ -93,6 +93,11 @@ export class KeyRing {
     return this.#suspended;
   }
 
+  /** Допуск пройден. До него приостановку снимает только повторный start (Р63 п. 1): расписания сверки нет. */
+  get admitted(): boolean {
+    return this.#admission === "admitted";
+  }
+
   constructor(o: KeyRingOptions) {
     this.#o = o;
     this.#now = o.now ?? (() => new Date());
@@ -158,7 +163,8 @@ export class KeyRing {
    * без остановки — остановка без повтора (fail-closed).
    * Прочие сбои (503, тайм-аут) — допуск не состоялся; можно ли повторить, решает место сборки по действию кода в реестре
    * (ответ не по схеме — BAD_RESPONSE, остановка по дополнению 2 к Р36; нет ответа — NO_RESPONSE, допуск можно повторить,
-   * Р48 п. 3); AGENT_UNKNOWN / AGENT_SUSPENDED — остановка (адаптер; AGENT_SUSPENDED до допуска — через #suspend, Р60 п. 1);
+   * Р48 п. 3); AGENT_UNKNOWN — остановка (адаптер); AGENT_SUSPENDED (403 или SUSPENDED в ответе) — приостановка без
+   * остановки, допуск не состоялся, start можно повторить; допуск, прочитавший ACTIVE, снимает её (Р63 п. 1);
    * класс в реестре не BUYER — остановка AGENT_CLASS_MISMATCH (Р27, после проверки статуса).
    */
   async start(admit: Admit): Promise<AgentSelf> {
@@ -192,12 +198,22 @@ export class KeyRing {
       }
       this.#reconcile(self);
       this.#admission = "admitted";
+      // приостановка прошлой попытки допуска (Р63 п. 1) снята прочитанным ACTIVE
+      if (this.#suspended !== null) {
+        this.#suspended = null;
+        try {
+          this.#record("signing.resumed");
+        } finally {
+          this.#o.onState?.();
+        }
+      }
       return self;
     } catch (e) {
       if (this.#admission === "admitting") {
         this.#admission = "none";
         this.#admissionSwitched = false; // повторный start — новый допуск со своим одним переходом
-        if (this.#stopped === null && !(e instanceof PlatformFailure)) this.#record("admission.failed", undefined, "KEY_REJECTED");
+        if (this.#stopped === null && e instanceof SignerSuspended) this.#record("admission.failed", this.#currentKid ?? undefined, e.reason);
+        else if (this.#stopped === null && !(e instanceof PlatformFailure)) this.#record("admission.failed", undefined, "KEY_REJECTED");
       }
       throw e;
     }
@@ -325,11 +341,9 @@ export class KeyRing {
   #suspend(reason: DiagCode): void {
     if (this.#stopped !== null) return;
     const operator = reason === "AGENT_SUSPENDED";
-    // Приостановлен оператором до допуска — допуск не состоялся, остановка, как прежде (Р60 п. 1; ч. 2 AG-14).
-    if (this.#admission !== "admitted") {
-      if (operator) this.#stop(reason);
-      return;
-    }
+    // До допуска прочие причины — без действия (допуск и так не состоялся); приостановлен оператором — приостановка без
+    // остановки, снимает её повторный start (Р63 п. 1).
+    if (this.#admission !== "admitted" && !operator) return;
     // AGENT_SUSPENDED сильнее прочих причин: заменяет причину, и сверка, начатая до него, его не снимет (Р60 п. 1).
     // Повтор AGENT_SUSPENDED — без записи, но со счётом: 403 мог прийти после ответа идущей сверки (снятие и новое
     // приостановление), и её ACTIVE уже устарел (ревью К1.1 № 2).
@@ -423,7 +437,7 @@ export class KeyRing {
    * потом применяется); действующий — новейший ACTIVE в пределах срока по данным платформы.
    */
   #reconcile(self: AgentSelf): void {
-    // SUSPENDED после допуска — приостановка до следующей сверки (Р60 п. 1); при допуске — остановка (#suspend)
+    // SUSPENDED — приостановка до следующей сверки (Р60 п. 1), при допуске — до повторного start (Р63 п. 1)
     if (self.status === "SUSPENDED") {
       this.#suspend("AGENT_SUSPENDED");
       if (this.#stopped !== null) throw new SignerStopped(this.#stopped);

@@ -72,9 +72,10 @@ export interface AgentCore {
    *  определена — предупреждение platform.version_unknown и допуск), затем сверка с реестром (GET /pao/v1/agent); до
    *  успеха никакие обращения, кроме допуска, не подписываются. Отчёт — в журнал (agent.selfcheck) и в selfCheck().
    *  Отказ — AgentNotReady с отчётом, исходная ошибка (SignerStopped, PlatformFailure, EventsStopped, SignerKeyRejected) — в
-   *  cause; действие кода в реестре stop (нет ключа, EXCLUDED / SUSPENDED, класс не BUYER, AGENT_UNKNOWN, BAD_RESPONSE —
-   *  ответ не по схеме, UNKNOWN) — подписант остановлен; иначе (503, NO_RESPONSE — нет ответа, Р48 п. 3; KEY_REJECTED) агент
-   *  не допущен и start() можно повторить. После допуска — подписка на push, если задан `pushUrl` (Р34 п. 8): адрес отвергнут (400) —
+   *  cause; действие кода в реестре stop (нет ключа, EXCLUDED, класс не BUYER, AGENT_UNKNOWN, BAD_RESPONSE — ответ не по
+   *  схеме, UNKNOWN) — подписант остановлен; иначе (503, NO_RESPONSE — нет ответа, Р48 п. 3; KEY_REJECTED) агент не допущен
+   *  и start() можно повторить. AGENT_SUSPENDED на допуске (403 или SUSPENDED) — подпись приостановлена без остановки,
+   *  start() можно повторить (Р63 п. 1; повтор — за вызывающим, не чаще agent_recheck_interval_sec). После допуска — подписка на push, если задан `pushUrl` (Р34 п. 8): адрес отвергнут (400) —
    *  events.subscription_rejected; прочий отказ Платформы после повторов адаптера (503, NO_RESPONSE, BAD_RESPONSE) —
    *  events.subscription_failed; в обоих случаях старт успешен, работа по ленте, повтор подписки — при следующем старте
    *  (дополнение Р34 п. 1) — events.subscription: warn. Коды остановки агента и остановленная подпись на подписке —
@@ -264,11 +265,12 @@ export function createAgentCore(o: AgentCoreOptions): AgentCore {
     );
   // Расписание (Р60 п. 4): пока подпись приостановлена (любая причина), раз в agent_recheck_interval_sec — recheck();
   // таймер только вызывает сверку, время GET задаёт общий Pace (условие (а)), сверка одна на ядро (rechecking). Ставится
-  // при приостановке, снимается при снятии, остановке и close() (onState связки ключей); процесс не держит.
+  // при приостановке, снимается при снятии, остановке и close() (onState связки ключей); процесс не держит. До допуска
+  // расписания нет: приостановку при допуске снимает повторный start (Р63 п. 1).
   let recheckTimer: ReturnType<typeof setInterval> | null = null;
   let wasSuspended = false;
   const syncRecheck = (): void => {
-    const suspended = ring.stopReason === null && ring.suspendReason !== null;
+    const suspended = ring.stopReason === null && ring.suspendReason !== null && ring.admitted;
     if (suspended && recheckTimer === null) {
       recheckTimer = setInterval(() => void scheduledRecheck(), params.agent_recheck_interval_sec * 1000);
       recheckTimer.unref();
@@ -289,7 +291,7 @@ export function createAgentCore(o: AgentCoreOptions): AgentCore {
     ["agent.reinstated", "ACTIVE"],
   ]);
   const wake = async (type: string): Promise<void> => {
-    if (ring.stopReason !== null || ring.suspendReason === null) return events.signal();
+    if (ring.stopReason !== null || ring.suspendReason === null || !ring.admitted) return events.signal();
     const read = await scheduledRecheck();
     const expected = PUSH_EXPECTS.get(type);
     if (expected === undefined || read === null || read === expected) return;
@@ -389,7 +391,10 @@ export function createAgentCore(o: AgentCoreOptions): AgentCore {
       // остановиться сам — SIGNATURE_INVALID, SPEC §7а); отчёт — в журнал; наружу — AgentNotReady с исходной ошибкой.
       const fail = (check: SelfCheckName, code: DiagCode, cause: unknown): AgentNotReady => {
         results[check] = { status: "fail", code };
-        if (stopsAgent(DIAG, code)) signing.stop(code);
+        // приостановление при допуске — без остановки, start можно повторить (Р63 п. 1); на подписке — остановка, как
+        // прежде (нюанс К1.1 Р63)
+        const suspendedAtAdmission = check === "platform.admission" && code === "AGENT_SUSPENDED";
+        if (stopsAgent(DIAG, code) && !suspendedAtAdmission) signing.stop(code);
         lastReport = selfCheckReport(results, now());
         recordReport(journal, lastReport, results);
         return new AgentNotReady(lastReport, { cause });

@@ -377,8 +377,10 @@ describe("после допуска", () => {
     stand.agentClass = "SELLER";
     const { core, journal } = await coreOn(stand);
     await expect(startCause(core.start())).rejects.toMatchObject({ reason: "AGENT_SUSPENDED" });
-    // причину в журнал пишет первым адаптер — порядок «статус → класс» проверяется и там
-    expect(journal.entries.filter((e) => e.kind === "agent.stopped")).toEqual([expect.objectContaining({ reason: "AGENT_SUSPENDED" })]);
+    // причину в журнал пишет первым адаптер — порядок «статус → класс» проверяется и там; при допуске — приостановка без
+    // остановки (Р63 п. 1)
+    expect(journal.entries.filter((e) => e.kind === "signing.suspended")).toEqual([expect.objectContaining({ reason: "AGENT_SUSPENDED" })]);
+    expect(journal.entries.map((e) => e.kind)).not.toContain("agent.stopped");
   });
 
   it("порядок в адаптере на прямом запросе после допуска: SUSPENDED и SELLER — приостановка AGENT_SUSPENDED, не остановка (Р60 п. 1)", async () => {

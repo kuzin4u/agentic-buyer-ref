@@ -26,6 +26,8 @@ export interface MandateJournal {
       | { at: string; kind: "mandate.revocation_order_missing"; reason: "MANDATE_REVOCATION_ORDER_MISSING" }
       /** держимый мандат отозван (Т15) — не держится (Р37 п. 4) */
       | { at: string; kind: "mandate.revoked"; mandate?: string }
+      /** агент отказался от мандата (Р63, дополнение 1 п. 5); detail — статус в ответе (REVOKED или уже конечный) */
+      | { at: string; kind: "mandate.relinquished"; mandate?: string; detail: MandateStatus }
       /** держимый мандат больше не ACTIVE — не держится; detail — статус по GET (Р37 п. 4) */
       | { at: string; kind: "mandate.status_changed"; mandate?: string; detail: MandateStatus }
       /** аномалия: держимый ACTIVE-мандат пропал у Платформы (GET 404) — решение владельца по К2.3, вариант (а) */
@@ -182,6 +184,25 @@ export class MandateClient {
       this.#held.delete(id);
       this.#revoked.delete(id);
     }
+  }
+
+  /**
+   * Отказ от мандата (Т13; Р63 п. 7, дополнение 1 п. 5): защитное обращение — идёт и при приостановке подписи (Р63 п. 2).
+   * Ответ — мандат REVOKED; уже конечный (REVOKED, REJECTED, EXPIRED, EXHAUSTED) — 200 с текущим статусом (ПАО);
+   * BAD_RESPONSE на 2xx — сверка одним GET у адаптера (Р58 п. 5). Мандат без порядка отзыва при подтверждённой версии —
+   * mandate.revocation_order_missing и отказ (#mandate; ревью К2.2 № 2–4 Р33); перечитывать GET незачем — его ответ без
+   * порядка отзыва даёт тот же отказ. Другой мандат в ответе — MANDATE_REPLY_MISMATCH. Успех — запись
+   * mandate.relinquished со статусом ответа, мандат снят с удержания; прочие отказы — наружу как есть.
+   */
+  async relinquish(id: string, m: Mutation): Promise<Mandate> {
+    const got = await this.#mandate(() => this.o.port.relinquishMandate(id, m), id);
+    if (got.id !== id) throw this.#refuse("MANDATE_REPLY_MISMATCH", "платформа вернула другой мандат", id);
+    try {
+      this.o.journal.record({ at: this.now().toISOString(), kind: "mandate.relinquished", ...masked(id), detail: got.status });
+    } finally {
+      this.release(id); // отказ состоялся у Платформы: сбой журнала его не отменяет
+    }
+    return got;
   }
 
   #hold(m: Mandate): Mandate {

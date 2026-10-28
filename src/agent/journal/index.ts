@@ -92,6 +92,8 @@ export type JournalKind =
   | "pao.contract_violation"
   /** держимый мандат отозван — особое событие Т15 (Р37 п. 4); мандат больше не держится */
   | "mandate.revoked"
+  /** агент отказался от мандата (Р63, дополнение 1 п. 5); detail — статус мандата в ответе */
+  | "mandate.relinquished"
   /** держимый мандат не ACTIVE (истёк, исчерпан и т. п.) — больше не держится; detail — статус (Р37 п. 4) */
   | "mandate.status_changed"
   /** аномалия: держимый ACTIVE-мандат пропал у Платформы — GET 404, reason MANDATE_NOT_FOUND; больше не держится, лента

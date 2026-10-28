@@ -969,8 +969,9 @@ export class Purchase {
         this.#log({ kind: "cart.relinquish_skipped", detail: "STOPPED", ...maskedMandate(id) });
         return "SKIPPED";
       }
+      let got: Mandate;
       try {
-        await this.o.mandates.relinquish(id, { idempotencyKey: `cart-relinquish-${id}` });
+        got = await this.o.mandates.relinquish(id, { idempotencyKey: `cart-relinquish-${id}` });
       } catch (e) {
         if (this.o.signingStopped?.() === true) {
           this.#log({ kind: "cart.relinquish_skipped", detail: "STOPPED", ...maskedMandate(id) });
@@ -980,6 +981,12 @@ export class Purchase {
           e instanceof PlatformFailure ? e.code : e instanceof MandateRefused ? e.reason : (this.o.failureCode?.(e) ?? "UNKNOWN");
         this.#log({ kind: "cart.relinquish_failed", reason, ...maskedMandate(id) });
         return "FAILED";
+      }
+      // ответ или сверка GET — конечный статус (адаптер): отозван — отказ состоялся; иной конечный (EXPIRED, EXHAUSTED) —
+      // CART уже не действует, отказ не нужен (решение владельца 28.10, КТ1 сессии 46 № 3)
+      if (got.status !== "REVOKED") {
+        this.#log({ kind: "cart.relinquish_skipped", detail: "NOT_NEEDED", ...maskedMandate(id) });
+        return "NOT_NEEDED";
       }
       this.#log({ kind: "cart.relinquished", ...maskedMandate(id) });
       return "RELINQUISHED";

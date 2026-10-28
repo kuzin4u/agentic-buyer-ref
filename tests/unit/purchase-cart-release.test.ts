@@ -139,6 +139,38 @@ describe("отказ от CART после остановки (Р63 п. 7, доп
     r.stand.stub.violations.splice(0);
   });
 
+  it.each([
+    // ответ 200 сразу с конечным статусом: CART истёк до отказа (ПАО: уже конечный — 200 с текущим статусом)
+    ["ответ 200 EXPIRED", "NOT_NEEDED", "EXPIRED", false, 1],
+    // ответ 200 ACTIVE не подтверждает отказ — сверка GET
+    ["ответ ACTIVE, по GET EXPIRED", "NOT_NEEDED", "EXPIRED", true, 2],
+    ["ответ ACTIVE, по GET REVOKED", "RELINQUISHED", "REVOKED", true, 2],
+    ["ответ ACTIVE, по GET ACTIVE", "FAILED", "ACTIVE", true, 2],
+  ] as const)("статус ответа отказа (КТ1 сессии 46 № 3): %s — %s", async (_, result, stored, shownActive, reads) => {
+    const r = await setup();
+    const open = gated(r);
+    const cart = await stoppedAtGate(r);
+    const pao = r.consents.mandates.get(cart.id)!;
+    if (stored === "EXPIRED") pao.status = "EXPIRED";
+    // подмена ответа отказа: стенд хранит `stored`, а в ответе — ACTIVE
+    if (shownActive) {
+      r.consents.tamper = (m) => {
+        const after = { ...m };
+        m.status = stored;
+        return { ...after, status: "ACTIVE" };
+      };
+    }
+    const from = r.stand.stub.calls.length;
+    open();
+    expect(await r.purchase.cartReleased()).toBe(result);
+    const ops = r.stand.stub.calls.slice(from).map((c) => c.op);
+    expect(ops).toEqual(reads === 1 ? [RELINQUISH] : [RELINQUISH, "GET /pao/v1/mandates/{id}"]);
+    if (result === "NOT_NEEDED") expect(of(r, "cart.relinquish_skipped")).toEqual([expect.objectContaining({ mandate: cart.id, detail: "NOT_NEEDED" })]);
+    if (result === "RELINQUISHED") expect(of(r, "cart.relinquished")).toEqual([expect.objectContaining({ mandate: cart.id })]);
+    if (result === "FAILED") expect(of(r, "cart.relinquish_failed")).toEqual([expect.objectContaining({ mandate: cart.id, reason: "BAD_RESPONSE" })]);
+    expect(r.stand.stub.violations).toEqual([]);
+  });
+
   it("отказ Платформы на отказе от CART — FAILED, cart.relinquish_failed с кодом", async () => {
     const r = await setup();
     r.stand.stub.fail(RELINQUISH, { code: "UPSTREAM_UNAVAILABLE" }, 10);

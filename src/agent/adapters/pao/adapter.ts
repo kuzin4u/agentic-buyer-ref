@@ -16,7 +16,7 @@ import {
   type PaoOperations,
 } from "@kuzin4u/agentic-core/pao";
 import { PAO_RETRY_AFTER_MAX_SEC, type StandParams } from "../../../shared/config.js";
-import { PlatformFailure, type AgentKey, type AgentSelf, type FailureCode, type MandateRef, type PlatformEventType } from "../../../shared/domain.js";
+import { PlatformFailure, type AgentKey, type AgentSelf, type FailureCode, type Mandate, type MandateRef, type PlatformEventType } from "../../../shared/domain.js";
 import type { PaymentPlatform, PlatformCapabilities, ProtocolCheck, Mutation } from "../../ports/payment-platform.js";
 import { haltAgent, type RequestSigning } from "../../ports/request-signing.js";
 import { AGENT_STOP_CODES, ruleForFailure } from "../../declines/index.js";
@@ -205,6 +205,9 @@ const retriesNoResponse = (op: PaoOperationKey): boolean => KEYED_OPERATIONS.has
 
 /** Исход обращения не подтверждён (а не отказ Платформы) — в журнале попытка unknown. */
 const UNCONFIRMED: ReadonlySet<FailureCode> = new Set<FailureCode>(["UNKNOWN", "NO_RESPONSE", "BAD_RESPONSE"]);
+
+/** Мандат в конечном статусе: отказ от него состоялся или не нужен (ПАО, отказ от мандата). */
+const finalMandate = (m: Mandate): boolean => m.status !== "ACTIVE" && m.status !== "PENDING_SIGNATURE";
 
 /** Retry-After в секундах; по копии ПАО — integer ≥ 0. Дату и мусор не принимаем: повтора не будет. */
 function retryAfterSec(v: string | null): number | undefined {
@@ -711,14 +714,19 @@ export class PaoPlatform implements PaymentPlatform {
     return this.call("GET /pao/v1/mandates/{id}/verify", { path: { id: ref.id } }, (r) => map.mandateCheckFromPao(r, ref));
   }
 
-  /** Сверка отказа (Р58 п. 5): мандат по GET — REVOKED, отказ состоялся. */
+  /** Отказ от мандата: 200 — мандат в конечном статусе (REVOKED; уже конечный — его статус, ПАО). Неконечный статус
+   *  (ACTIVE, PENDING_SIGNATURE) отказа не подтверждает — BAD_RESPONSE (КТ1 сессии 46 № 3) и, как битый 2xx, сверка одним
+   *  GET (Р58 п. 5): конечный по GET — он, иначе прежний BAD_RESPONSE. Что значит конечный статус — у вызывающего. */
   async relinquishMandate(id: string, m: Mutation) {
+    const idempotencyKey = keyOf(m);
     try {
-      return await this.call("POST /pao/v1/mandates/{id}/relinquish", { path: { id }, idempotencyKey: keyOf(m) }, this.mandate);
+      const got = await this.call("POST /pao/v1/mandates/{id}/relinquish", { path: { id }, idempotencyKey }, this.mandate);
+      if (!finalMandate(got)) throw new PlatformFailure("BAD_RESPONSE", "never", null, 200, idempotencyKey, "ответ отказа от мандата — статус не конечный");
+      return got;
     } catch (e) {
       return this.reconciled(e, async () => {
         const got = await this.getMandate(id);
-        return got.id === id && got.status === "REVOKED" ? got : undefined;
+        return got.id === id && finalMandate(got) ? got : undefined;
       });
     }
   }

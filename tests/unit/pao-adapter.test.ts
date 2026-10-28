@@ -978,6 +978,28 @@ describe("Р58 п. 5 и доп. 1: сверка одним чтением пос
     expect(no.calls).toEqual(["POST /pao/v1/mandates/m_1/relinquish", "GET /pao/v1/mandates/m_1"]);
   });
 
+  it.each([
+    ["REVOKED", "resolves"],
+    ["EXPIRED", "resolves"],
+    ["EXHAUSTED", "resolves"],
+    ["ACTIVE", "BAD_RESPONSE"],
+    ["PENDING_SIGNATURE", "BAD_RESPONSE"],
+  ] as const)("отказ от мандата: 200 с неконечным статусом — BAD_RESPONSE и сверка GET; по GET %s — %s (КТ1 сессии 46 № 3)", async (status, outcome) => {
+    for (const shown of ["ACTIVE", "PENDING_SIGNATURE"] as const) {
+      const r = on({ "POST /pao/v1/mandates/m_1/relinquish": () => json(200, mandate(shown)), "GET /pao/v1/mandates/m_1": () => json(200, mandate(status)) });
+      const call = r.platform.relinquishMandate("m_1", { idempotencyKey: "idem_r" });
+      if (outcome === "resolves") await expect(call).resolves.toMatchObject({ id: "m_1", status });
+      else await expect(call).rejects.toMatchObject({ code: "BAD_RESPONSE", httpStatus: 200, retry: "never", idempotencyKey: "idem_r" });
+      expect(r.calls).toEqual(["POST /pao/v1/mandates/m_1/relinquish", "GET /pao/v1/mandates/m_1"]);
+    }
+  });
+
+  it("отказ от мандата: 200 с конечным статусом (уже EXPIRED) — как есть, без сверки", async () => {
+    const r = on({ "POST /pao/v1/mandates/m_1/relinquish": () => json(200, mandate("EXPIRED")) });
+    await expect(r.platform.relinquishMandate("m_1", { idempotencyKey: "idem_r" })).resolves.toMatchObject({ id: "m_1", status: "EXPIRED" });
+    expect(r.calls).toEqual(["POST /pao/v1/mandates/m_1/relinquish"]);
+  });
+
   it("отказ Платформы (не BAD_RESPONSE на 2xx) — как есть, без чтения; подписка — без сверки (доп. 1)", async () => {
     const refused = on({ "POST /pao/v1/mandates/m_1/relinquish": () => json(404, { code: "MANDATE_NOT_FOUND", message: "x", retry: "never" }) });
     await expect(refused.platform.relinquishMandate("m_1", { idempotencyKey: "idem_r" })).rejects.toMatchObject({ code: "MANDATE_NOT_FOUND" });

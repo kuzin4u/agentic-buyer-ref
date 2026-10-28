@@ -164,8 +164,8 @@ export interface PaoPlatformOptions {
   monotonic?: () => number;
   /** ограничитель частоты, общий для всех адаптеров ПАО агента (Р59 п. 1); не передан — свой у адаптера */
   pace?: Pace;
-  /** перед обращением из OBLIGATION_OPERATIONS: бросает, если брать обязательство сейчас нельзя (лента недоступна,
-   *  Р60 п. 4, нюанс К1.2) — обращения нет */
+  /** перед обращением из OBLIGATION_OPERATIONS, после подписанта: бросает, если брать обязательство сейчас нельзя (лента
+   *  недоступна, Р60 п. 4, нюанс К1.2) — обращения нет; на повторе наружу — отказ прошлой попытки (Р63 п. 4) */
   hold?: () => void;
 }
 
@@ -435,11 +435,21 @@ export class PaoPlatform implements PaymentPlatform {
     const fits = (waitMs: number) => !credentials || spentMs + waitMs + timeoutMs <= this.o.params.registry_cache_ttl_sec * 1000;
     // попытки обращения для журнала: повторы тем же ключом и переход на другой ключ (Т15)
     let tries = 0;
+    // отказ прошлой попытки: повтор, которому hold не дал уйти, отдаёт его (Р63 п. 4)
+    let prior: PlatformFailure | undefined;
     for (let attempt = 1; ; ) {
       const last: Last = {};
-      if (OBLIGATION_OPERATIONS.has(op)) this.o.hold?.();
       // остановлен — SignerStopped, обращения нет; приостановлен — SignerSuspended, кроме защитных (Р63 п. 2)
       const signer = protective ? this.o.signing.protective() : this.o.signing.current();
+      // обязательство при недоступной ленте — после подписанта (остановка сильнее, КТ1 сессии 44 № 6 (а)); на повторе —
+      // исходный отказ: исход прошлой попытки неизвестен, «обращения не было» неверно (№ 6 (б)); обращения нет
+      if (OBLIGATION_OPERATIONS.has(op)) {
+        try {
+          this.o.hold?.();
+        } catch (e) {
+          throw prior ?? e;
+        }
+      }
       // ожидание ограничителя частоты — в сроке выдачи (Р59 п. 2): не помещается — отказ до сети, место в очереди не занято
       if (!fits(this.pace.delay())) {
         throw new PlatformFailure("RATE_LIMITED", "same_key", null, 0, key, "ожидание ограничителя частоты не помещается в срок выдачи");
@@ -494,6 +504,7 @@ export class PaoPlatform implements PaymentPlatform {
         return out;
       }
       spentMs += clock() - began;
+      prior = failure;
       const rule = ruleForFailure(failure.code);
       // Подпись не принята (SPEC §7а, Р58 п. 3): часы вне signature_skew_sec по Date ответа — повтор не поможет, остановка
       // сразу; иначе один повтор за обращение новой подписью и тем же Idempotency-Key, затем остановка агента.

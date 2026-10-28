@@ -8,7 +8,7 @@ import { mandateDraftToPao } from "../../src/agent/adapters/pao/map.js";
 import { loadParams, type StandParams } from "../../src/shared/config.js";
 import { PlatformFailure, type CredentialDraft } from "../../src/shared/domain.js";
 import type { RequestSigning } from "../../src/agent/ports/index.js";
-import { SignerSuspended } from "../../src/agent/signer/index.js";
+import { SignerStopped, SignerSuspended } from "../../src/agent/signer/index.js";
 import { Consents, INTENT } from "../support/consents.js";
 
 const AGENT = "nspk:agent:buyref-01:v1";
@@ -1162,5 +1162,62 @@ describe("Р60 п. 7: отзыв своего ключа — revokeKey (AG-14 ч
     for (const op of PROTECTIVE_OPERATIONS) expect(OBLIGATION_OPERATIONS.has(op)).toBe(false);
     expect([...OBLIGATION_OPERATIONS].sort()).toEqual(["POST /pao/v1/confirmations", "POST /pao/v1/credentials", "POST /pao/v1/mandates"]);
     expect([...PROTECTIVE_OPERATIONS].sort()).toEqual(["POST /pao/v1/agent/keys/{kid}/revoke", "POST /pao/v1/mandates/{id}/relinquish"]);
+  });
+});
+
+describe("Р63 п. 4 (КТ1 сессии 44 № 6): hold() — после signing.current(), на повторе — исходный отказ", () => {
+  /** Адаптер с недоступной лентой по признаку `failing` (как hold места сборки) и счётом обращений к сети. */
+  function held(o: { stopped?: boolean; failing: () => boolean; fetch: typeof fetch }) {
+    const sent: string[] = [];
+    const platform = new PaoPlatform({
+      journal: new MemoryJournal(),
+      baseUrl: "http://pao.test",
+      agentCode: AGENT,
+      params,
+      sleep: async () => {},
+      pace: quietPace(),
+      signing: {
+        ...signing,
+        current: () => {
+          if (o.stopped) throw new SignerStopped("CLOSED");
+          return signer;
+        },
+      },
+      hold: () => {
+        if (o.failing()) throw new SignerSuspended("EVENTS_UNAVAILABLE");
+      },
+      fetch: async (url, init) => {
+        sent.push(`${init?.method ?? "GET"} ${new URL(String(url)).pathname}`);
+        return o.fetch(url, init);
+      },
+    });
+    return { platform, sent };
+  }
+
+  it("(а) остановленный агент при недоступной ленте — SignerStopped, а не SignerSuspended EVENTS_UNAVAILABLE; обращения нет", async () => {
+    const h = held({ stopped: true, failing: () => true, fetch: async () => new Response(null, { status: 500 }) });
+    await expect(h.platform.requestMandate(INTENT, { idempotencyKey: "idem-hold-1" })).rejects.toBeInstanceOf(SignerStopped);
+    expect(h.sent).toEqual([]);
+  });
+
+  it("первая попытка при недоступной ленте — SignerSuspended EVENTS_UNAVAILABLE, обращения нет", async () => {
+    const h = held({ failing: () => true, fetch: async () => new Response(null, { status: 500 }) });
+    await expect(h.platform.requestMandate(INTENT, { idempotencyKey: "idem-hold-2" })).rejects.toMatchObject({ name: "SignerSuspended", reason: "EVENTS_UNAVAILABLE" });
+    expect(h.sent).toEqual([]);
+  });
+
+  it("(б) нет ответа, к повтору лента стала недоступна — повтора нет, наружу исходный NO_RESPONSE", async () => {
+    let failing = false;
+    const h = held({
+      failing: () => failing,
+      fetch: async () => {
+        failing = true; // запрос ушёл, ответ потерян; к повтору лента недоступна дольше registry_cache_ttl_sec
+        throw new TypeError("fetch failed");
+      },
+    });
+    const err = await h.platform.requestMandate(INTENT, { idempotencyKey: "idem-hold-3" }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(PlatformFailure);
+    expect(err).toMatchObject({ code: "NO_RESPONSE", idempotencyKey: "idem-hold-3" });
+    expect(h.sent).toEqual(["POST /pao/v1/mandates"]);
   });
 });

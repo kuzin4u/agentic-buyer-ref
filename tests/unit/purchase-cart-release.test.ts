@@ -1,14 +1,16 @@
 // Отказ от CART после остановки покупки и при оставлении CART (Т13; Р63 п. 7, дополнение 1; К3.2) на PaoStub: таблица
 // причин, `cartRelease` и `cartReleased()`, фоновая цепочка — отчёт её не ждёт, ошибки не уходят необработанными.
 import { afterEach, describe, expect, it } from "vitest";
-import { PurchaseStopped, type Offer } from "../../src/agent/pipeline/index.js";
+import { PurchaseStopped, PurchaseTransitionForbidden, type Offer } from "../../src/agent/pipeline/index.js";
 import { PaymentFailure, type PaymentContext } from "../../src/agent/ports/index.js";
+import { isSpent } from "../../src/agent/policy/a5-issued.js";
+import { humanA5Decision } from "../../src/agent/shell/index.js";
 import { PAO_RETRY_AFTER_MAX_SEC, loadParams } from "../../src/shared/config.js";
 import type { JournalEntry } from "../../src/agent/journal/index.js";
 import { event } from "../support/consents.js";
 import type { PaoStand } from "../support/pao-stand.js";
-import { one, purchaseOn, signedIntent, type PurchaseRun, type PurchaseSetup } from "../support/purchase.js";
-import { payments } from "../support/shop.js";
+import { SHOP, one, purchaseOn, signedIntent, type PurchaseRun, type PurchaseSetup } from "../support/purchase.js";
+import { bakery, payments } from "../support/shop.js";
 
 let stand: PaoStand | undefined;
 afterEach(async () => {
@@ -206,6 +208,35 @@ describe("отказ от прежнего CART при оставлении (Р6
     expect(r.purchase.cartRelease).toBe("NONE");
     expect(of(r, "cart.relinquished")).toEqual([expect.objectContaining({ mandate: old.id })]);
     expect(fresh.id).not.toBe(old.id);
+  });
+
+  it("остановка во время ожидания прежнего отказа — до ворот, verify и живой проверки: CART не запрошен, решение A5 не потрачено (КТ1 сессии 46 № 1)", async () => {
+    // сигнал A5 у товара: без решения человека CART не запрашивается (Р39 п. 5)
+    const r = await setup({ shops: [{ ...SHOP, profile: bakery({ returns: { days: 0, text: "Возврат в течение 14 дней" } }) }] });
+    await signedIntent(r);
+    const shown = { intentId: r.purchase.intentMandate!.id };
+    const first = await tartine(r);
+    const old = await r.purchase.cart(one(first, 1, humanA5Decision(shown, first, first.a5)), { idempotencyKey: "idem-cart-old" });
+    r.setFeed({ kind: "event", event: r.consents.sign(old.id) });
+    await r.purchase.awaitCart();
+    const open = gated(r);
+    const offer = await tartine(r); // новый поиск: прежний CART оставлен, отказ идёт
+    expect(r.purchase.cartRelease).toBe("PENDING");
+    const decision = humanA5Decision(shown, offer, offer.a5);
+    const from = r.stand.stub.calls.length;
+    const lives = r.live.calls!.length;
+    const next = r.purchase.cart(one(offer, 2, decision), { idempotencyKey: "idem-cart-new" });
+    // время дойти до траты решений, если ожидание стоит после неё; здесь стадия ждёт в начале — исход от паузы не зависит
+    await new Promise((res) => setTimeout(res, 50));
+    // параллельный вызов во время ожидания — запрещённый переход, покупка остановлена
+    await expect(r.purchase.search()).rejects.toBeInstanceOf(PurchaseTransitionForbidden);
+    expect(r.purchase.state).toBe("STOPPED");
+    open();
+    await expect(next).rejects.toBeInstanceOf(PurchaseStopped);
+    expect(isSpent(decision)).toBe(false);
+    expect(r.live.calls!.length).toBe(lives);
+    expect(r.stand.stub.calls.slice(from).map((c) => c.op)).toEqual([RELINQUISH]);
+    expect(await r.purchase.cartReleased()).toBe("RELINQUISHED");
   });
 
   it("итог прежнего отказа FAILED — новый CART всё равно запрашивается (решение за Платформой), запись в журнале", async () => {

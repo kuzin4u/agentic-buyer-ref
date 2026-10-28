@@ -424,6 +424,14 @@ export class Purchase {
       const verdicts = offers.map((o): Extract<OfferVerdict, { kind: "AVAILABLE" }> => ({ kind: "AVAILABLE", merchantId: o.merchantId, sku: o.sku, price: { ...o.product.price }, a5: [...o.a5] }));
       const purchase: CartPurchase = { intentId: intent.id, mode: intent.confirmationMode };
       verdicts.forEach((v, i) => this.#draftable(v, purchase, choice.lines[i]!.decision));
+      // отказ от прежнего CART ещё идёт — стадия ждёт его итога в начале, до ворот, verify, живой проверки и траты решений
+      // A5: цены — непосредственно перед CART, держимые — после ожидания (Р43 п. 1, Р38 п. 3); остановка во время ожидания —
+      // без траты (Р63, дополнение 1 п. 6; предел — п. 3; КТ1 сессии 46 № 1). FAILED — новый CART всё равно запрашивается:
+      // решение за Платформой, итог прежнего — в журнале
+      if (this.#cartRelease === "PENDING") {
+        await this.cartReleased();
+        this.#alive();
+      }
       this.#held(intent);
       // verify INTENT — до обращения к витрине: без действующего INTENT ни одного обращения к витринам (П05, как в search();
       // решение владельца по ревью К1 № 5)
@@ -447,10 +455,6 @@ export class Purchase {
         const { decision } = choice.lines[i]!;
         if (v.a5.length > 0 && issuedByShell(decision)) spend(decision);
       }
-      // отказ от прежнего CART ещё идёт — новый CART после его итога (Р63, дополнение 1 п. 6; предел — п. 3); FAILED — новый
-      // CART всё равно запрашивается: решение за Платформой, итог прежнего — в журнале
-      if (this.#cartRelease === "PENDING") await this.cartReleased();
-      this.#alive();
       this.#cartRequested = true;
       const cart = snapshot(await this.#guard(() => this.o.mandates.request(cartDraft(intent, choice, keyLines(lines), total), m, intent)));
       this.#cartRequested = false;

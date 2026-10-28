@@ -161,6 +161,9 @@ describe("приостановление и снятие агента на ст�
     await reinstated(r.s, AGENT);
     await r.c.start();
     expect(r.kinds("signing.resumed")).toHaveLength(1);
+    // передача #61 п. 6: после снятия ядро само читает ленту с прежнего курсора (тест чтения не запускает) — стенд записал
+    // в неё agent.suspended и agent.reinstated
+    await vi.waitFor(() => expect(r.kinds("event.handled").map((e) => String(e.detail)).filter((t) => t.startsWith("agent."))).toEqual(["agent.suspended", "agent.reinstated"]));
     await expect(r.c.platform.requestMandate(INTENT, { idempotencyKey: "idem-susp-m7" })).resolves.toMatchObject({ status: "PENDING_SIGNATURE" });
   });
 

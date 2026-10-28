@@ -305,6 +305,9 @@ export function createAgentCore(o: AgentCoreOptions): AgentCore {
   // Идёт чужая сверка — её GET мог уйти до смены статуса: дождаться её и сверить заново (ревью К2.4 № 4).
   // Сверка не прошла (503, остановка) — слушатель падает, курсор на месте, событие прочитается снова (Р34 п. 3).
   let lastReport: SelfCheckReport | null = null;
+  // допуск отказал с AGENT_SUSPENDED (Р63 п. 1): снятие — следующий успешный start(), а не расписание сверки (его до допуска
+  // нет), поэтому чтение ленты с сохранённого курсора запускает он (Р60 п. 2, передача #61 п. 6; К5.5)
+  let suspendedAtAdmission = false;
   events.listen(async (item) => {
     if (item.kind !== "event" || !item.event.type.startsWith("agent.")) return;
     while (rechecking) await rechecking.catch(() => undefined);
@@ -398,8 +401,9 @@ export function createAgentCore(o: AgentCoreOptions): AgentCore {
         results[check] = { status: "fail", code };
         // приостановление при допуске — без остановки, start можно повторить (Р63 п. 1); на подписке — остановка, как
         // прежде (нюанс К1.1 Р63)
-        const suspendedAtAdmission = check === "platform.admission" && code === "AGENT_SUSPENDED";
-        if (stopsAgent(DIAG, code) && !suspendedAtAdmission) signing.stop(code);
+        const suspended = check === "platform.admission" && code === "AGENT_SUSPENDED";
+        if (suspended) suspendedAtAdmission = true;
+        if (stopsAgent(DIAG, code) && !suspended) signing.stop(code);
         lastReport = selfCheckReport(results, now());
         recordReport(journal, lastReport, results);
         return new AgentNotReady(lastReport, { cause });
@@ -448,6 +452,12 @@ export function createAgentCore(o: AgentCoreOptions): AgentCore {
       }
       lastReport = selfCheckReport(results, now());
       recordReport(journal, lastReport, results);
+      // снятие приостановки допуска — лента с курсора, как syncRecheck при снятии после допуска; отказ чтения записывает и
+      // считает сама лента (events.unavailable). Обычный старт ленту не читает
+      if (suspendedAtAdmission) {
+        suspendedAtAdmission = false;
+        void events.signal().catch(() => undefined);
+      }
       return self;
     },
     recheck,

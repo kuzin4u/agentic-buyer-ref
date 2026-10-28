@@ -48,8 +48,14 @@ describe("покупка при приостановлении агента на
     expect(r.purchase.state).toBe("STOPPED");
     expect(r.purchase.reason).toBe("AGENT_SUSPENDED");
     expect(r.c.admission()).toBe("AGENT_SUSPENDED");
+    // отказ от CART после остановки — защитным входом и при приостановке (Р63 п. 2, 7, дополнение 1): стенд его исполнил
+    expect(await r.purchase.cartReleased()).toBe("RELINQUISHED");
     const paused = r.c.agentCalls().slice(start).filter((x) => !x.route.startsWith("GET /pao/v1/events"));
-    expect(paused.map((x) => [x.route.replaceAll(first.intent.id, "{intent}"), x.status, x.code])).toEqual([["GET /pao/v1/mandates/{intent}/verify", 403, "AGENT_SUSPENDED"]]);
+    const masked = (route: string) => route.replaceAll(first.intent.id, "{intent}").replaceAll(first.cart.id, "{cart}");
+    expect(paused.map((x) => [masked(x.route), x.status, x.code])).toEqual([
+      ["GET /pao/v1/mandates/{intent}/verify", 403, "AGENT_SUSPENDED"],
+      ["POST /pao/v1/mandates/{cart}/relinquish", 200, undefined],
+    ]);
     // реквизита нет: ни обращения агента, ни выпуска у эмулятора токенов стенда
     expect(r.c.agentCalls().filter((x) => x.route === CREDENTIALS)).toEqual([]);
     expect(r.stand.tsp.issued.size).toBe(0);

@@ -120,6 +120,12 @@ export type JournalKind =
   /** прежний CART больше не используется (Т15, Р46 п. 3): mandate — id CART, detail — NEW_SEARCH или
    *  REFUSED_BEFORE_ORDER; сумм, позиций и продавца нет; пишет конвейер */
   | "cart.abandoned"
+  /** отказ от CART после остановки или оставления подтверждён Платформой (Р63, дополнение 1 п. 5) */
+  | "cart.relinquished"
+  /** отказ от CART не подтверждён; reason — код отказа или UNKNOWN */
+  | "cart.relinquish_failed"
+  /** отказа от CART не было; detail — STOPPED, UNKNOWN_CART, NOT_NEEDED или KEPT */
+  | "cart.relinquish_skipped"
   /** попытка обращения к витрине (Т15, Р42): method — шаблон пути, attempt > 1 — попытка повтора, ref — id витрины по
    *  маске, mandate — мандат корзины у заказа; detail — код витрины из перечня, BAD_RESPONSE или NO_RESPONSE; код вне
    *  перечня — reason MERCHANT_CODE_UNKNOWN; обращение прервано общим сроком поиска — reason SHOP_SEARCH_DEADLINE (Р44 п. 6);

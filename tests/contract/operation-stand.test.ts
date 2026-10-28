@@ -91,7 +91,7 @@ describe("стадии 5–6 на стенде v0.20.0: итог из событ
     for (const s of r.c.issuedSecrets!()) expect(out.includes(s)).toBe(false);
   });
 
-  it("риск 4а (авторизация): новый CART при ACTIVE прежнем — операция привязана к новому CART, прежний остаётся ACTIVE и не используется", async () => {
+  it("риск 4а (авторизация): новый CART после нового поиска — операция привязана к новому CART; от прежнего агент отказался (Р63, дополнение 1 п. 6), он не используется", async () => {
     const r = await standPurchase({ contourPayment: true, adpUntilPs11: true });
     c = r.c;
     const intent = await r.purchase.intent({ ...INTENT, merchantScope: [NORMAL.merchant_id] }, { idempotencyKey: "idem-intent-4a2" });
@@ -103,7 +103,7 @@ describe("стадии 5–6 на стенде v0.20.0: итог из событ
     const cart = await r.purchase.cart(one(offer, 2), { idempotencyKey: "idem-cart-4a2-new" });
     await r.signWhileWaiting(cart.id, () => r.purchase.awaitCart());
     await r.purchase.placeOrder({ idempotencyKey: "idem-order-4a2" });
-    expect((await r.c.platform.getMandate(old.id)).status).toBe("ACTIVE");
+    expect((await r.c.platform.getMandate(old.id)).status).toBe("REVOKED");
 
     const authorizing = r.purchase.authorize({ idempotencyKey: "idem-pay-4a2" });
     const d = await decided(r);
@@ -112,9 +112,17 @@ describe("стадии 5–6 на стенде v0.20.0: итог из событ
     const op = await authorizing;
     expect(op).toMatchObject({ status: "AUTHORIZED", amount: cart.cart!.total, indicator: { mandateId: cart.id } });
     expect(r.c.journal.entries.some((e) => e.kind === "operation.mismatch")).toBe(false);
-    // прежний CART — ACTIVE и с полным остатком: операция по нему не шла
-    expect((await r.c.platform.getMandate(old.id)).status).toBe("ACTIVE");
-    expect((await r.c.platform.verifyMandate({ id: old.id, currency: "RUB" })).amountLeft).toEqual(old.cart!.total);
+    // было: прежний CART ACTIVE с полным остатком (операция по нему не шла); стало (Р63, дополнение 1 п. 6): прежний отозван
+    // агентом — verify отозванного отдаёт 0, поэтому остаток — после итога отказа: по прежнему операций нет, остаток INTENT
+    // уменьшен ровно на новый CART
+    expect(await r.purchase.cartReleased()).toBe("NONE"); // новый CART сбросил итог прежнего — он в журнале
+    expect(r.c.journal.entries.filter((e) => e.kind === "cart.relinquished").map((e) => e.mandate)).toEqual([old.id]);
+    expect((await r.c.platform.getMandate(old.id)).status).toBe("REVOKED");
+    expect(await r.c.platform.readOperations(old.id)).toEqual([]);
+    expect((await r.c.platform.verifyMandate({ id: intent.id, currency: "RUB" })).amountLeft).toEqual({
+      amount: intent.amountLimit.amount - cart.cart!.total.amount,
+      currency: "RUB",
+    });
   });
 
   it("Р51 п. 5: реверсал до ответа эмитента — событий нет вовсе; итог находит поиск GET ?mandate_id по CART — STOPPED OPERATION_REVERSED, текст Р51 п. 3; бюджет CART освобождён", async () => {

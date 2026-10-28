@@ -354,6 +354,8 @@ export function createAgentCore(o: AgentCoreOptions): AgentCore {
           return lastReport?.ready === true ? null : "NOT_ADMITTED";
         },
         failureCode: startFailureCode,
+        // подпись остановлена (не приостановлена) — отказ от CART не пытается (Р63, дополнение 1 п. 1: SKIPPED STOPPED)
+        signingStopped: () => ring.stopReason !== null,
         now,
         offers: p.offers,
         live: p.live,

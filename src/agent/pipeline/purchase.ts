@@ -25,6 +25,20 @@ import { PurchaseMachine, PurchaseTransitionForbidden, allowed, type PurchaseJou
 /** Почему оставлен CART (Р46 п. 3): новый поиск из CART_ACTIVE или отказ живой проверки перед заказом. */
 export type CartAbandoned = "NEW_SEARCH" | "REFUSED_BEFORE_ORDER";
 
+/** Итог отказа от CART после остановки покупки или оставления CART (Р63, дополнение 1 п. 1, 6) — для оболочки:
+ *  `cartRelease`, `cartReleased()`. NONE — отказа нет и не начат; PENDING — идёт; RELINQUISHED — подтверждён; FAILED — не
+ *  подтверждён; NOT_NEEDED — CART уже не действует; SKIPPED — нельзя (подпись остановлена, CART не известен); KEPT —
+ *  пакет оплаты ушёл, CART оставлен намеренно. */
+export type CartRelease = "NONE" | "PENDING" | "RELINQUISHED" | "FAILED" | "NOT_NEEDED" | "SKIPPED" | "KEPT";
+
+/** Почему отказа от CART не было (Р63, дополнение 1 п. 5): detail записи cart.relinquish_skipped. */
+export type CartReleaseSkip = "STOPPED" | "UNKNOWN_CART" | "NOT_NEEDED" | "KEPT";
+
+/** Остановка, при которой CART уже не действует — отказ не нужен (Р63 п. 7). */
+const CART_NOT_NEEDED: ReadonlySet<DiagCode> = new Set<DiagCode>(["MANDATE_REVOKED", "MANDATE_NOT_ACTIVE", "MANDATE_EXPIRED"]);
+/** Исход создания CART не подтверждён — CART агенту не известен (Р63, дополнение 1 п. 1). */
+const CART_UNCONFIRMED: ReadonlySet<DiagCode> = new Set<DiagCode>(["NO_RESPONSE", "BAD_RESPONSE", "UNKNOWN"]);
+
 /** Записи конвейера сверх записей машины (Р38 п. 5, Р37 п. 5). */
 export interface PipelineJournal extends PurchaseJournal {
   record(
@@ -48,6 +62,12 @@ export interface PipelineJournal extends PurchaseJournal {
       /** прежний CART больше не используется (Т15, Р46 п. 3): mandate — id CART по маске, detail — причина закрытым
        *  перечнем; сумм, позиций и продавца нет. У Платформы CART остаётся ACTIVE (риск 4а) */
       | { at: string; kind: "cart.abandoned"; detail: CartAbandoned; mandate?: string }
+      /** отказ от CART подтверждён Платформой (Р63, дополнение 1 п. 5) */
+      | { at: string; kind: "cart.relinquished"; mandate?: string }
+      /** отказ от CART не подтверждён: reason — код отказа или UNKNOWN */
+      | { at: string; kind: "cart.relinquish_failed"; reason: DiagCode; mandate?: string }
+      /** отказа от CART не было: detail — почему, закрытым перечнем */
+      | { at: string; kind: "cart.relinquish_skipped"; detail: CartReleaseSkip; mandate?: string }
       /** ворота: держимый мандат вышел (отзыв, иной статус) — отказ действовать (Р38 п. 3) */
       | { at: string; kind: "agent.refused"; reason: "MANDATE_NOT_ACTIVE"; mandate?: string }
       /** ворота: остатка Платформы по мандату не хватает на итог CART (Р38 п. 3, К4а) */
@@ -193,6 +213,9 @@ export interface PurchaseOptions {
   admission: () => DiagCode | null;
   /** код остановки по ошибке вне ядра (остановленная подпись — у места сборки); null — не знает */
   failureCode?: (e: unknown) => DiagCode | null;
+  /** подпись остановлена, а не приостановлена (у места сборки): отказ от CART не пытается — SKIPPED STOPPED (Р63,
+   *  дополнение 1 п. 1); не передана — попытка, отказ порта — FAILED */
+  signingStopped?: () => boolean;
   /** регион человека из профиля; нет — доступен только самовывоз (Р32 п. 5) */
   region?: string;
   /** уведомление оболочки (Р47 п. 5, В3; Р49 п. 7): CONFIRMATION_PENDING — один раз на запрос подтверждения, без link;
@@ -241,10 +264,19 @@ export class Purchase {
   #authorizedAt: number | null = null;
   /** стадия идёт: повторный вход до её окончания — запрещённый переход (ревью К3 № 4) */
   #busy = false;
+  /** итог отказа от последнего оставленного CART (Р63, дополнение 1) */
+  #cartRelease: CartRelease = "NONE";
+  /** идущий или завершённый фоновый отказ от CART; null — не начат */
+  #cartReleasing: Promise<CartRelease> | null = null;
+  /** запрос CART ушёл, ответа ещё нет: остановка с неподтверждённым исходом — CART не известен (UNKNOWN_CART) */
+  #cartRequested = false;
 
   constructor(private readonly o: PurchaseOptions) {
     this.now = o.now ?? (() => new Date());
     this.#machine = new PurchaseMachine({ journal: o.journal, now: this.now });
+    // любая остановка (шаг, ворота, сбой журнала, запрещённый переход) — решение об отказе от CART после записи STOPPED;
+    // отчёт человеку его не ждёт (Р63 п. 7, дополнение 1 п. 2)
+    this.#machine.stopped.addEventListener("abort", () => queueMicrotask(() => this.#releaseOnStop()), { once: true });
   }
 
   get state(): PurchaseState {
@@ -278,6 +310,16 @@ export class Purchase {
 
   get cartMandate(): Mandate | null {
     return copy(this.#cart);
+  }
+
+  /** Итог отказа от CART после остановки или оставления CART (Р63, дополнение 1 п. 1). */
+  get cartRelease(): CartRelease {
+    return this.#cartRelease;
+  }
+
+  /** Итог отказа (не PENDING); не отклоняется. Отказа нет — текущее значение сразу (до остановки — NONE: итога не ждёт). */
+  cartReleased(): Promise<CartRelease> {
+    return this.#cartRelease === "PENDING" && this.#cartReleasing !== null ? this.#cartReleasing : Promise.resolve(this.#cartRelease);
   }
 
   get order(): ShopOrder | null {
@@ -331,6 +373,7 @@ export class Purchase {
       // оставленный CART — в журнал до смены выдачи и снимка: сбой записи — STOPPED с прежними выдачей и CART (Р46 п. 3,
       // инвариант 4; ревью reviewer К3 № 1)
       this.#abandon("NEW_SEARCH");
+      if (this.#cart !== null) this.#relinquishCart(this.#cart.id); // Р63, дополнение 1 п. 6
       this.#zones = zones;
       // выдача сменилась — прежний CART наружу как текущий не отдаётся и не исполняется: новый CART — по новому выбору
       // (общее правило с отказом перед заказом; решение владельца 21.10, К2а)
@@ -404,9 +447,18 @@ export class Purchase {
         const { decision } = choice.lines[i]!;
         if (v.a5.length > 0 && issuedByShell(decision)) spend(decision);
       }
+      // отказ от прежнего CART ещё идёт — новый CART после его итога (Р63, дополнение 1 п. 6; предел — п. 3); FAILED — новый
+      // CART всё равно запрашивается: решение за Платформой, итог прежнего — в журнале
+      if (this.#cartRelease === "PENDING") await this.cartReleased();
+      this.#alive();
+      this.#cartRequested = true;
       const cart = snapshot(await this.#guard(() => this.o.mandates.request(cartDraft(intent, choice, keyLines(lines), total), m, intent)));
+      this.#cartRequested = false;
       this.#lines = Object.freeze(offers);
       this.#cart = cart;
+      // новый CART — итог прежнего отказа только в журнале (Р63, дополнение 1 п. 1)
+      this.#cartRelease = "NONE";
+      this.#cartReleasing = null;
       this.#machine.to("CART_PENDING");
       if (cart.status === "ACTIVE") this.#machine.to("CART_ACTIVE");
       return copy(cart);
@@ -843,6 +895,7 @@ export class Purchase {
     // прежний CART больше не используется ничем и наружу как текущий не отдаётся — после любого отказа (Р44 п. 4,
     // выбор 4а; решение владельца по ревью КТ1 п. 1); новая цена — и выдача: новый CART только после нового поиска (Т6)
     this.#abandon("REFUSED_BEFORE_ORDER");
+    if (this.#cart !== null) this.#relinquishCart(this.#cart.id); // Р63, дополнение 1 п. 1
     this.#cart = null;
     this.#lines = null;
     if (d.next === "NEW_CART_MANDATE") this.#zones = null;
@@ -854,6 +907,68 @@ export class Purchase {
    *  id не по маске — запись без mandate, а не с id INTENT (ревью reviewer К3 № 2). */
   #abandon(detail: CartAbandoned): void {
     if (this.#cart !== null) this.#record({ kind: "cart.abandoned", detail, ...maskedMandate(this.#cart.id) }, false);
+  }
+
+  /** После остановки (Р63 п. 7, дополнение 1): решение об отказе от CART по таблице; один раз на CART. Не бросает: сбой
+   *  записи пропуска — без действия (остановка уже состоялась, отчёт ушёл). */
+  #releaseOnStop(): void {
+    if (this.#cartRelease !== "NONE" || this.#cartReleasing !== null) return;
+    const cart = this.#cart;
+    if (cart === null) {
+      if (this.#cartRequested && CART_UNCONFIRMED.has(this.#machine.reason ?? "UNKNOWN")) this.#skipCart("UNKNOWN_CART");
+      return;
+    }
+    if (this.#machine.paid) this.#skipCart("KEPT", cart.id);
+    else if (CART_NOT_NEEDED.has(this.#machine.reason ?? "UNKNOWN")) this.#skipCart("NOT_NEEDED", cart.id);
+    else this.#relinquishCart(cart.id);
+  }
+
+  #skipCart(detail: CartReleaseSkip, id?: string): void {
+    this.#cartRelease = detail === "KEPT" ? "KEPT" : detail === "NOT_NEEDED" ? "NOT_NEEDED" : "SKIPPED";
+    try {
+      this.#log({ kind: "cart.relinquish_skipped", detail, ...(id !== undefined && maskedMandate(id)) });
+    } catch {
+      // журнал недоступен: итог — в cartRelease
+    }
+  }
+
+  /** Фоновый отказ от CART (Р63, дополнение 1 п. 2–4): защитное обращение с ключом cart-relinquish-<id>; цепочка ловит
+   *  все ошибки — итог и ошибка в журнал и cartRelease (FAILED), необработанного отклонения нет. Предел времени — у
+   *  адаптера и ограничителя (п. 3), своего таймера нет. */
+  #relinquishCart(id: string): void {
+    this.#cartRelease = "PENDING";
+    const run = async (): Promise<CartRelease> => {
+      if (this.o.signingStopped?.() === true) {
+        this.#log({ kind: "cart.relinquish_skipped", detail: "STOPPED", ...maskedMandate(id) });
+        return "SKIPPED";
+      }
+      try {
+        await this.o.mandates.relinquish(id, { idempotencyKey: `cart-relinquish-${id}` });
+      } catch (e) {
+        if (this.o.signingStopped?.() === true) {
+          this.#log({ kind: "cart.relinquish_skipped", detail: "STOPPED", ...maskedMandate(id) });
+          return "SKIPPED";
+        }
+        const reason: DiagCode =
+          e instanceof PlatformFailure ? e.code : e instanceof MandateRefused ? e.reason : (this.o.failureCode?.(e) ?? "UNKNOWN");
+        this.#log({ kind: "cart.relinquish_failed", reason, ...maskedMandate(id) });
+        return "FAILED";
+      }
+      this.#log({ kind: "cart.relinquished", ...maskedMandate(id) });
+      return "RELINQUISHED";
+    };
+    const releasing: Promise<CartRelease> = run()
+      .catch((): CartRelease => "FAILED")
+      .then((r) => {
+        if (this.#cartReleasing === releasing) this.#cartRelease = r;
+        return r;
+      });
+    this.#cartReleasing = releasing;
+  }
+
+  /** Запись фонового отказа: прямо в журнал, без остановки машины (#record останавливает и бросает — фону нельзя). */
+  #log(e: DistributiveOmit<Parameters<PipelineJournal["record"]>[0], "at">): void {
+    this.o.journal.record({ at: this.now().toISOString(), ...e } as Parameters<PipelineJournal["record"]>[0]);
   }
 
   /** Оплата отменена (Р51 п. 3): снимок операции REVERSED — до остановки, чтобы `purchase.operation` отдал op_ref и

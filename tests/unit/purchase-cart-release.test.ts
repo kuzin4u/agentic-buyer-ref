@@ -6,6 +6,7 @@ import { PaymentFailure, type PaymentContext } from "../../src/agent/ports/index
 import { isSpent } from "../../src/agent/policy/a5-issued.js";
 import { humanA5Decision } from "../../src/agent/shell/index.js";
 import { PAO_RETRY_AFTER_MAX_SEC, loadParams } from "../../src/shared/config.js";
+import { PlatformFailure } from "../../src/shared/domain.js";
 import type { JournalEntry } from "../../src/agent/journal/index.js";
 import { event } from "../support/consents.js";
 import type { PaoStand } from "../support/pao-stand.js";
@@ -237,6 +238,41 @@ describe("отказ от прежнего CART при оставлении (Р6
     expect(r.live.calls!.length).toBe(lives);
     expect(r.stand.stub.calls.slice(from).map((c) => c.op)).toEqual([RELINQUISH]);
     expect(await r.purchase.cartReleased()).toBe("RELINQUISHED");
+  });
+
+  it("прежний отказ завершён, новый CART без ответа (NO_RESPONSE) — итог прежнего сброшен: SKIPPED UNKNOWN_CART по новому (КТ1 сессии 46 № 2 (а))", async () => {
+    const r = await setup();
+    const old = await cartActive(r, "idem-cart-old");
+    const offer = await tartine(r);
+    expect(await r.purchase.cartReleased()).toBe("RELINQUISHED");
+    r.core.mandates.request = async () => {
+      throw new PlatformFailure("NO_RESPONSE", "same_key", null, 0, "idem-cart-new", "нет ответа");
+    };
+    await expect(r.purchase.cart(one(offer, 2), { idempotencyKey: "idem-cart-new" })).rejects.toMatchObject({ code: "NO_RESPONSE" });
+    expect(await r.purchase.cartReleased()).toBe("SKIPPED");
+    expect(of(r, "cart.relinquished")).toEqual([expect.objectContaining({ mandate: old.id })]);
+    expect(of(r, "cart.relinquish_skipped")).toEqual([expect.objectContaining({ detail: "UNKNOWN_CART" })]);
+  });
+
+  it("остановка во время запроса CART, ответ пришёл после неё — созданный CART отозван: RELINQUISHED (КТ1 сессии 46 № 2 (б))", async () => {
+    const r = await setup();
+    await signedIntent(r);
+    const offer = await tartine(r);
+    const original = r.core.mandates.request.bind(r.core.mandates);
+    let created: string | undefined;
+    r.core.mandates.request = async (...a: Parameters<typeof original>) => {
+      const got = await original(...a);
+      created = got.id;
+      // параллельный вызов, пока ответ ещё не дошёл до стадии, — запрещённый переход, покупка остановлена
+      await expect(r.purchase.search()).rejects.toBeInstanceOf(PurchaseTransitionForbidden);
+      return got;
+    };
+    await expect(r.purchase.cart(one(offer, 1), { idempotencyKey: "idem-cart-1" })).rejects.toBeInstanceOf(PurchaseStopped);
+    expect(r.purchase.cartMandate).toBeNull();
+    expect(await r.purchase.cartReleased()).toBe("RELINQUISHED");
+    expect(r.stand.calls(RELINQUISH)).toMatchObject([{ status: 200, idempotencyKey: `cart-relinquish-${created}` }]);
+    expect(r.consents.mandates.get(created!)!.status).toBe("REVOKED");
+    expect(of(r, "cart.relinquished")).toEqual([expect.objectContaining({ mandate: created })]);
   });
 
   it("итог прежнего отказа FAILED — новый CART всё равно запрашивается (решение за Платформой), запись в журнале", async () => {

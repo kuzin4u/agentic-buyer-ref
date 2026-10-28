@@ -455,14 +455,21 @@ export class Purchase {
         const { decision } = choice.lines[i]!;
         if (v.a5.length > 0 && issuedByShell(decision)) spend(decision);
       }
+      // запрос нового CART уходит — итог прежнего отказа только в журнале: решение об отказе после остановки — по новому
+      // CART (Р63, дополнение 1 п. 1; КТ1 сессии 46 № 2 (а))
+      this.#cartRelease = "NONE";
+      this.#cartReleasing = null;
       this.#cartRequested = true;
-      const cart = snapshot(await this.#guard(() => this.o.mandates.request(cartDraft(intent, choice, keyLines(lines), total), m, intent)));
+      const cart = snapshot(
+        await this.#guard(async () => {
+          const got = await this.o.mandates.request(cartDraft(intent, choice, keyLines(lines), total), m, intent);
+          if (this.#machine.state === "STOPPED") this.#releaseLate(got);
+          return got;
+        }),
+      );
       this.#cartRequested = false;
       this.#lines = Object.freeze(offers);
       this.#cart = cart;
-      // новый CART — итог прежнего отказа только в журнале (Р63, дополнение 1 п. 1)
-      this.#cartRelease = "NONE";
-      this.#cartReleasing = null;
       this.#machine.to("CART_PENDING");
       if (cart.status === "ACTIVE") this.#machine.to("CART_ACTIVE");
       return copy(cart);
@@ -922,9 +929,25 @@ export class Purchase {
       if (this.#cartRequested && CART_UNCONFIRMED.has(this.#machine.reason ?? "UNKNOWN")) this.#skipCart("UNKNOWN_CART");
       return;
     }
-    if (this.#machine.paid) this.#skipCart("KEPT", cart.id);
-    else if (CART_NOT_NEEDED.has(this.#machine.reason ?? "UNKNOWN")) this.#skipCart("NOT_NEEDED", cart.id);
-    else this.#relinquishCart(cart.id);
+    this.#releaseCart(cart.id);
+  }
+
+  /** Ответ на запрос CART пришёл после остановки (КТ1 сессии 46 № 2 (б)): CART создан, а покупка его не использует —
+   *  решение об отказе по нему, в том числе поверх UNKNOWN_CART (CART стал известен). При STOP_ALL — снят с удержания,
+   *  как мандаты покупки в #stopAll (Р50 п. 4). Порядок с #releaseOnStop любой: решение одно. */
+  #releaseLate(cart: Mandate): void {
+    this.#cartRequested = false;
+    const reason = this.#machine.reason;
+    if (reason !== null && stopNext(reason) === "STOP_ALL") this.o.mandates.release(cart.id);
+    if (this.#cartReleasing !== null || (this.#cartRelease !== "NONE" && this.#cartRelease !== "SKIPPED")) return;
+    this.#releaseCart(cart.id);
+  }
+
+  /** Таблица причин (Р63 п. 7): пакет ушёл — KEPT; CART уже не действует — NOT_NEEDED; иначе фоновый отказ. */
+  #releaseCart(id: string): void {
+    if (this.#machine.paid) this.#skipCart("KEPT", id);
+    else if (CART_NOT_NEEDED.has(this.#machine.reason ?? "UNKNOWN")) this.#skipCart("NOT_NEEDED", id);
+    else this.#relinquishCart(id);
   }
 
   #skipCart(detail: CartReleaseSkip, id?: string): void {

@@ -9,6 +9,7 @@ import { join } from "node:path";
 import { createStand, type Stand } from "agentic-ps-platform/stand";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createAgentCore, type AgentCore } from "../../src/agent/compose.js";
+import { AgentNotReady } from "../../src/agent/declines/index.js";
 import { MemoryJournal } from "../../src/agent/journal/index.js";
 import { SignerSuspended, generateKey } from "../../src/agent/signer/index.js";
 import { loadParams } from "../../src/shared/config.js";
@@ -22,6 +23,7 @@ import { reinstated } from "../support/stand-purchase.js";
 const STAND_TIMEOUT_MS = 20_000;
 const TICK = loadParams().agent_recheck_interval_sec * 1000;
 const AGENT_GET = "GET /pao/v1/agent";
+const CONFIG = "GET /.well-known/pao-configuration";
 
 let stand: Stand | undefined;
 const cores: AgentCore[] = [];
@@ -43,8 +45,9 @@ const tmp = (p: string) => {
   return d;
 };
 
-/** Ядро на стенде с подпиской: допуск заявлением оператора, журнал обращений агента — метод, путь, статус (без тел). */
-async function admitted() {
+/** Ядро на стенде с подпиской: допуск заявлением оператора, журнал обращений агента — метод, путь, статус (без тел).
+ *  `start: false` — без start() ядра (приостановление до допуска, Р63 п. 1). */
+async function admitted({ start = true } = {}) {
   const s = createStand();
   stand = s;
   const keysDir = tmp("susp-keys-");
@@ -65,7 +68,7 @@ async function admitted() {
   const pushUrl = `https://${s.params.event_subscription_allow_hosts[0]}/pao/events`;
   const c = createAgentCore({ keysDir, stateDir: join(tmp("susp-state-"), "state"), journal, pushUrl, pao: { baseUrl, agentCode: AGENT, sleep: async () => {}, fetch: fetchLog } });
   cores.push(c);
-  await c.start();
+  if (start) await c.start();
   const gets = () => calls.filter((x) => x.route === AGENT_GET).length;
   const kinds = (kind: string) => journal.entries.filter((e) => e.kind === kind);
   /** После снятия ядро читает ленту с курсора (Р60 п. 2): стенд пишет в неё agent.suspended и agent.reinstated, по каждому —
@@ -133,6 +136,55 @@ describe("приостановление и снятие агента на ст�
     expect(r.gets()).toBe(g + 1 + 2);
     expect(vi.getTimerCount()).toBe(0);
     await expect(r.c.platform.requestMandate(INTENT, { idempotencyKey: "idem-susp-m4" })).resolves.toMatchObject({ status: "PENDING_SIGNATURE" });
+  });
+
+  it("Р63 п. 1: приостановлен до start() — AgentNotReady AGENT_SUSPENDED без остановки; при допуске — только конфигурация и GET /pao/v1/agent; повтор — то же; после reinstateAgent start() проходит", async () => {
+    const r = await admitted({ start: false });
+    await r.s.suspendAgent(AGENT, "OUT_OF_MANDATE");
+    // из подписанных — только GET /pao/v1/agent; неподписанная конфигурация — проверка версии ПАО (нюанс К1.1 Р63)
+    const admission = [
+      { route: CONFIG, status: 200 },
+      { route: AGENT_GET, status: 200 },
+    ];
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const before = r.calls.length;
+      const err = await r.c.start().catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(AgentNotReady);
+      expect((err as AgentNotReady).report.checks.at(-1)).toEqual({ check: "platform.admission", status: "fail", code: "AGENT_SUSPENDED" });
+      expect(r.calls.slice(before)).toEqual(admission);
+    }
+    expect(r.kinds("agent.stopped")).toEqual([]);
+    expect(r.kinds("signing.suspended").map((e) => e.reason)).toEqual(["AGENT_SUSPENDED"]);
+    expect(vi.getTimerCount()).toBe(0); // до допуска расписания сверки нет
+    await expect(r.c.platform.requestMandate(INTENT, { idempotencyKey: "idem-susp-m6" })).rejects.toMatchObject({ reason: "NOT_ADMITTED" });
+
+    await reinstated(r.s, AGENT);
+    await r.c.start();
+    expect(r.kinds("signing.resumed")).toHaveLength(1);
+    // передача #61 п. 6: после снятия ядро само читает ленту с прежнего курсора (тест чтения не запускает) — стенд записал
+    // в неё agent.suspended и agent.reinstated
+    await vi.waitFor(() => expect(r.kinds("event.handled").map((e) => String(e.detail)).filter((t) => t.startsWith("agent."))).toEqual(["agent.suspended", "agent.reinstated"]));
+    await expect(r.c.platform.requestMandate(INTENT, { idempotencyKey: "idem-susp-m7" })).resolves.toMatchObject({ status: "PENDING_SIGNATURE" });
+  });
+
+  it("Р63 п. 2: при приостановке у стенда — отказ от INTENT и отзыв второго ключа уходят и исполняются; прочие обращения — SignerSuspended без обращения", async () => {
+    const r = await admitted();
+    const intent = await r.c.platform.requestMandate(INTENT, { idempotencyKey: "idem-susp-p2" });
+    // второй ключ B — регистрация по ПАО ключом допуска; в связке ядра его нет (отзыв — по kid)
+    const b = generateKey(tmp("susp-keys-b-")).descriptor;
+    await r.c.platform.registerKey({ alg: "ed25519", publicKey: b.public_key }, { idempotencyKey: "idem-susp-key-b" });
+    await r.suspended();
+    const before = r.calls.length;
+    await expect(r.c.platform.relinquishMandate(intent.id, { idempotencyKey: "idem-susp-rel" })).resolves.toMatchObject({ id: intent.id, status: "REVOKED" });
+    await expect(r.c.platform.revokeKey(b.kid, { idempotencyKey: "idem-susp-rev" })).resolves.toMatchObject({ kid: b.kid, status: "REVOKED" });
+    expect(r.calls.slice(before)).toEqual([
+      { route: `POST /pao/v1/mandates/${intent.id}/relinquish`, status: 200 },
+      { route: `POST /pao/v1/agent/keys/${b.kid}/revoke`, status: 200 },
+    ]);
+    await expect(r.c.platform.requestMandate(INTENT, { idempotencyKey: "idem-susp-m8" })).rejects.toBeInstanceOf(SignerSuspended);
+    expect(r.calls.length).toBe(before + 2);
+    expect(r.kinds("signing.suspended")).toHaveLength(1);
+    expect(r.kinds("agent.stopped")).toEqual([]);
   });
 
   it("поддельный push agent.reinstated при SUSPENDED у стенда — ничего не открывает: две сверки, обе SUSPENDED", async () => {

@@ -159,7 +159,8 @@ describe("записи ядра (Р37 п. 3)", () => {
   });
 
   it("отказы: reason и detail — коды реестра и перечни; без значений обращений", async () => {
-    // версия не определена (404 конфигурации) — предупреждение; затем допуск: AGENT_SUSPENDED — остановка
+    // версия не определена (404 конфигурации) — предупреждение; затем допуск: AGENT_SUSPENDED — приостановка без
+    // остановки (Р63 п. 1)
     const { core, journal, stand: s } = await setup({ handlers: { "GET /.well-known/pao-configuration": () => ({ status: 404, body: {} }) } });
     s.stub.fail("GET /pao/v1/agent", { code: "AGENT_SUSPENDED" });
     await expect(startCause(core.start())).rejects.toMatchObject({ code: "AGENT_SUSPENDED" });
@@ -167,7 +168,8 @@ describe("записи ядра (Р37 п. 3)", () => {
     expect(withReason).toEqual(
       expect.arrayContaining([
         ["platform.version_unknown", "PLATFORM_VERSION_UNKNOWN", "NO_RESPONSE"],
-        ["agent.stopped", "AGENT_SUSPENDED", undefined],
+        ["signing.suspended", "AGENT_SUSPENDED", undefined],
+        ["admission.failed", "AGENT_SUSPENDED", undefined],
         ["agent.selfcheck", "PLATFORM_VERSION_UNKNOWN", undefined],
         ["agent.selfcheck", "AGENT_SUSPENDED", undefined],
       ]),

@@ -72,9 +72,10 @@ export interface AgentCore {
    *  определена — предупреждение platform.version_unknown и допуск), затем сверка с реестром (GET /pao/v1/agent); до
    *  успеха никакие обращения, кроме допуска, не подписываются. Отчёт — в журнал (agent.selfcheck) и в selfCheck().
    *  Отказ — AgentNotReady с отчётом, исходная ошибка (SignerStopped, PlatformFailure, EventsStopped, SignerKeyRejected) — в
-   *  cause; действие кода в реестре stop (нет ключа, EXCLUDED / SUSPENDED, класс не BUYER, AGENT_UNKNOWN, BAD_RESPONSE —
-   *  ответ не по схеме, UNKNOWN) — подписант остановлен; иначе (503, NO_RESPONSE — нет ответа, Р48 п. 3; KEY_REJECTED) агент
-   *  не допущен и start() можно повторить. После допуска — подписка на push, если задан `pushUrl` (Р34 п. 8): адрес отвергнут (400) —
+   *  cause; действие кода в реестре stop (нет ключа, EXCLUDED, класс не BUYER, AGENT_UNKNOWN, BAD_RESPONSE — ответ не по
+   *  схеме, UNKNOWN) — подписант остановлен; иначе (503, NO_RESPONSE — нет ответа, Р48 п. 3; KEY_REJECTED) агент не допущен
+   *  и start() можно повторить. AGENT_SUSPENDED на допуске (403 или SUSPENDED) — подпись приостановлена без остановки,
+   *  start() можно повторить (Р63 п. 1; повтор — за вызывающим, не чаще agent_recheck_interval_sec). После допуска — подписка на push, если задан `pushUrl` (Р34 п. 8): адрес отвергнут (400) —
    *  events.subscription_rejected; прочий отказ Платформы после повторов адаптера (503, NO_RESPONSE, BAD_RESPONSE) —
    *  events.subscription_failed; в обоих случаях старт успешен, работа по ленте, повтор подписки — при следующем старте
    *  (дополнение Р34 п. 1) — events.subscription: warn. Коды остановки агента и остановленная подпись на подписке —
@@ -84,8 +85,11 @@ export interface AgentCore {
    *  остаётся (SignerSuspended, Р60 п. 2); иной статус или не BUYER — остановка; ответ снова не по схеме или сбой —
    *  приостановка остаётся. Расписание сверок — за вызывающим (до К1.2 AG-14, Р60 п. 4). */
   recheck(): Promise<AgentSelf>;
-  /** плановая ротация ключа, если до valid_to (по данным платформы) осталось не больше key_overlap_days; ротация
-   *  остановлена (новый ключ не принят подряд сверх предела) — SignerRotationStopped: нужен человек, не повторять (Р58 п. 4) */
+  /** сначала отзыв брошенных ключей, которые реестр показал действующими (Р63 п. 6: key.revoked с причиной ABANDONED;
+   *  отказ отзыва ротацию не блокирует, повтор — при следующем вызове; идёт и при приостановке), затем плановая ротация
+   *  ключа, если до valid_to (по данным платформы) осталось не больше key_overlap_days; при приостановке — SignerSuspended,
+   *  ротации нет; ротация остановлена (новый ключ не принят подряд сверх предела) — SignerRotationStopped: нужен человек,
+   *  не повторять (Р58 п. 4) */
   maintainKeys(): Promise<void>;
   /** освободить каталог ключей (один процесс на каталог) */
   close(): void;
@@ -264,11 +268,12 @@ export function createAgentCore(o: AgentCoreOptions): AgentCore {
     );
   // Расписание (Р60 п. 4): пока подпись приостановлена (любая причина), раз в agent_recheck_interval_sec — recheck();
   // таймер только вызывает сверку, время GET задаёт общий Pace (условие (а)), сверка одна на ядро (rechecking). Ставится
-  // при приостановке, снимается при снятии, остановке и close() (onState связки ключей); процесс не держит.
+  // при приостановке, снимается при снятии, остановке и close() (onState связки ключей); процесс не держит. До допуска
+  // расписания нет: приостановку при допуске снимает повторный start (Р63 п. 1).
   let recheckTimer: ReturnType<typeof setInterval> | null = null;
   let wasSuspended = false;
   const syncRecheck = (): void => {
-    const suspended = ring.stopReason === null && ring.suspendReason !== null;
+    const suspended = ring.stopReason === null && ring.suspendReason !== null && ring.admitted;
     if (suspended && recheckTimer === null) {
       recheckTimer = setInterval(() => void scheduledRecheck(), params.agent_recheck_interval_sec * 1000);
       recheckTimer.unref();
@@ -289,7 +294,7 @@ export function createAgentCore(o: AgentCoreOptions): AgentCore {
     ["agent.reinstated", "ACTIVE"],
   ]);
   const wake = async (type: string): Promise<void> => {
-    if (ring.stopReason !== null || ring.suspendReason === null) return events.signal();
+    if (ring.stopReason !== null || ring.suspendReason === null || !ring.admitted) return events.signal();
     const read = await scheduledRecheck();
     const expected = PUSH_EXPECTS.get(type);
     if (expected === undefined || read === null || read === expected) return;
@@ -300,6 +305,9 @@ export function createAgentCore(o: AgentCoreOptions): AgentCore {
   // Идёт чужая сверка — её GET мог уйти до смены статуса: дождаться её и сверить заново (ревью К2.4 № 4).
   // Сверка не прошла (503, остановка) — слушатель падает, курсор на месте, событие прочитается снова (Р34 п. 3).
   let lastReport: SelfCheckReport | null = null;
+  // допуск отказал с AGENT_SUSPENDED (Р63 п. 1): снятие — следующий успешный start(), а не расписание сверки (его до допуска
+  // нет), поэтому чтение ленты с сохранённого курсора запускает он (Р60 п. 2, передача #61 п. 6; К5.5)
+  let suspendedAtAdmission = false;
   events.listen(async (item) => {
     if (item.kind !== "event" || !item.event.type.startsWith("agent.")) return;
     while (rechecking) await rechecking.catch(() => undefined);
@@ -349,6 +357,8 @@ export function createAgentCore(o: AgentCoreOptions): AgentCore {
           return lastReport?.ready === true ? null : "NOT_ADMITTED";
         },
         failureCode: startFailureCode,
+        // подпись остановлена (не приостановлена) — отказ от CART не пытается (Р63, дополнение 1 п. 1: SKIPPED STOPPED)
+        signingStopped: () => ring.stopReason !== null,
         now,
         offers: p.offers,
         live: p.live,
@@ -389,7 +399,11 @@ export function createAgentCore(o: AgentCoreOptions): AgentCore {
       // остановиться сам — SIGNATURE_INVALID, SPEC §7а); отчёт — в журнал; наружу — AgentNotReady с исходной ошибкой.
       const fail = (check: SelfCheckName, code: DiagCode, cause: unknown): AgentNotReady => {
         results[check] = { status: "fail", code };
-        if (stopsAgent(DIAG, code)) signing.stop(code);
+        // приостановление при допуске — без остановки, start можно повторить (Р63 п. 1); на подписке — остановка, как
+        // прежде (нюанс К1.1 Р63)
+        const suspended = check === "platform.admission" && code === "AGENT_SUSPENDED";
+        if (suspended) suspendedAtAdmission = true;
+        if (stopsAgent(DIAG, code) && !suspended) signing.stop(code);
         lastReport = selfCheckReport(results, now());
         recordReport(journal, lastReport, results);
         return new AgentNotReady(lastReport, { cause });
@@ -438,6 +452,12 @@ export function createAgentCore(o: AgentCoreOptions): AgentCore {
       }
       lastReport = selfCheckReport(results, now());
       recordReport(journal, lastReport, results);
+      // снятие приостановки допуска — лента с курсора, как syncRecheck при снятии после допуска; отказ чтения записывает и
+      // считает сама лента (events.unavailable). Обычный старт ленту не читает
+      if (suspendedAtAdmission) {
+        suspendedAtAdmission = false;
+        void events.signal().catch(() => undefined);
+      }
       return self;
     },
     recheck,

@@ -279,8 +279,8 @@ describe("ядро и события на стенде v0.11.0 (Р34)", { timeou
     expect((err as AgentNotReady).cause).toMatchObject({ code: "AGENT_SUSPENDED" });
     expect(a.c.selfCheck()).toBe(report);
     await expect(a.c.platform.agentSelf()).rejects.toThrow(SignerStopped);
-    // Р60 п. 0, ревью К1.1 № 4: адаптер сначала приостанавливает подпись, затем старт останавливает её (приостановление
-    // на старте — ч. 2 AG-14) — в журнале обе записи по порядку
+    // Р60 п. 0, ревью К1.1 № 4: адаптер сначала приостанавливает подпись, затем старт останавливает её — в журнале обе
+    // записи по порядку. На подписке так и остаётся (нюанс К1.1 Р63); без остановки — только на допуске (Р63 п. 1)
     expect(a.journal.entries.filter((e) => e.kind === "signing.suspended" || e.kind === "agent.stopped").map((e) => [e.kind, e.reason])).toEqual([
       ["signing.suspended", "AGENT_SUSPENDED"],
       ["agent.stopped", "AGENT_SUSPENDED"],

@@ -74,6 +74,13 @@ export class Consents {
         const m = this.mandates.get(path.id!);
         return m ? { body: m } : { error: { code: "MANDATE_NOT_FOUND" } };
       },
+      // отказ агента от мандата (ПАО): REVOKED; уже конечный — 200 с текущим статусом без записи; подмена — как у создания
+      "POST /pao/v1/mandates/{id}/relinquish": ({ path }) => {
+        const m = this.mandates.get(path.id!);
+        if (!m) return { error: { code: "MANDATE_NOT_FOUND" } };
+        if (m.status === "PENDING_SIGNATURE" || m.status === "ACTIVE") m.status = "REVOKED";
+        return { body: this.tamper ? this.tamper(m) : m };
+      },
       "GET /pao/v1/mandates/{id}/verify": ({ path }) => {
         const m = this.mandates.get(path.id!);
         if (!m) return { error: { code: "MANDATE_NOT_FOUND" } };

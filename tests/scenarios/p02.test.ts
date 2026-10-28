@@ -20,7 +20,7 @@ describe("П02 — обращение с отозванным ключом", () 
     const { signer } = loadKey(stand.dir, stand.descriptors[0]!.kid);
     stand.revoke(signer.kid);
     // Подпись одним и тем же ключом без перехода — чтобы увидеть ответ платформы на повтор.
-    const fixed = { current: () => signer, keyRevoked: () => signer, stop: () => {}, suspend: () => {} };
+    const fixed = { current: () => signer, protective: () => signer, keyRevoked: () => signer, stop: () => {}, suspend: () => {} };
     const platform = new PaoPlatform({ baseUrl, agentCode: AGENT, signing: fixed, params: loadParams(), journal: new MemoryJournal() });
     for (let i = 0; i < 2; i++) {
       await expect(platform.issueCredential(DRAFT, { idempotencyKey: "idem-p02" })).rejects.toMatchObject({

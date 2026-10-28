@@ -109,6 +109,7 @@ function platform(marks: Record<string, Answer[]>) {
   };
   const signing: RequestSigning = {
     current: () => signer,
+    protective: () => signer,
     keyRevoked: (kid) => (rotations.push(kid), signer),
     stop: (r) => void stops.push(r),
     suspend: (r) => void suspends.push(r),

@@ -14,8 +14,9 @@ import { afterEach, describe, expect, it } from "vitest";
 import { PaoPlatform } from "../../src/agent/adapters/pao/index.js";
 import { createAgentCore, type AgentCore } from "../../src/agent/compose.js";
 import { MemoryJournal } from "../../src/agent/journal/index.js";
-import { SignerStopped, generateKey } from "../../src/agent/signer/index.js";
+import { SignerStopped, SignerSuspended, generateKey } from "../../src/agent/signer/index.js";
 import { loadParams } from "../../src/shared/config.js";
+import { INTENT } from "../support/consents.js";
 import { startCause } from "../support/core.js";
 import { AGENT } from "../support/pao-stand.js";
 
@@ -85,7 +86,7 @@ describe("отзыв своего ключа по ПАО и предел час�
     // временный ключ B — регистрация по ПАО ключом допуска A (адаптер агента, POST /pao/v1/agent/keys)
     const dirB = tmp("revoke-keys-b-");
     const b = generateKey(dirB);
-    const fixedA = { current: () => a.signer, keyRevoked: () => a.signer, stop: () => {}, suspend: () => {} };
+    const fixedA = { current: () => a.signer, protective: () => a.signer, keyRevoked: () => a.signer, stop: () => {}, suspend: () => {} };
     const platform = new PaoPlatform({ baseUrl, agentCode: AGENT, signing: fixedA, params: loadParams(), journal: new MemoryJournal() });
     expect(await platform.registerKey({ alg: "ed25519", publicKey: b.descriptor.public_key }, { idempotencyKey: "idem-key-b" })).toMatchObject({
       kid: b.descriptor.kid,
@@ -189,6 +190,47 @@ describe("отзыв своего ключа по ПАО и предел час�
     const err = await c.platform.revokeKey(other, { idempotencyKey: "idem-revoke-y" }).catch((e: unknown) => e);
     stoppedAfterRevoke(err, journal, a.descriptor.kid);
     expect((err as SignerStopped).revokedKid).not.toBe(other);
+  });
+
+  /** Брошенный временный ключ B прошлого запуска в хранилище A: регистрация по ПАО прошла (ключом A), ответ «потерян» —
+   *  файл остался временным. Ядро на каталоге A с журналом обращений (маршрут, Idempotency-Key). */
+  async function abandonedOnStand() {
+    const env = await setup();
+    const b = generateKey(env.dirA, "pending").descriptor;
+    const fixedA = { current: () => env.a.signer, protective: () => env.a.signer, keyRevoked: () => env.a.signer, stop: () => {}, suspend: () => {} };
+    const platform = new PaoPlatform({ baseUrl: env.baseUrl, agentCode: AGENT, signing: fixedA, params: loadParams(), journal: new MemoryJournal() });
+    await platform.registerKey({ alg: "ed25519", publicKey: b.public_key }, { idempotencyKey: "idem-key-b-abandoned" });
+    const calls: { route: string; idem: string | null }[] = [];
+    const log: typeof fetch = async (url, init) => {
+      calls.push({ route: `${init?.method ?? "GET"} ${new URL(String(url)).pathname}`, idem: new Headers(init?.headers).get("idempotency-key") });
+      return fetch(url, init);
+    };
+    const { c, journal } = env.core(env.dirA, log);
+    await c.start();
+    expect(journal.entries).toContainEqual(expect.objectContaining({ kind: "key.abandoned_registered", kid: b.kid }));
+    const revoke = `POST /pao/v1/agent/keys/${b.kid}/revoke`;
+    return { ...env, b, c, journal, calls, revokes: () => calls.filter((x) => x.route === revoke), revoke };
+  }
+
+  it("Р63 п. 6: брошенный ключ, зарегистрированный у Платформы, — maintainKeys отзывает его (ключ идемпотентности от kid, key.revoked ABANDONED); повторно не отзывает", async () => {
+    const r = await abandonedOnStand();
+    await r.c.maintainKeys();
+    expect(r.revokes()).toEqual([{ route: r.revoke, idem: `agent-key-revoke-${r.b.kid}` }]);
+    expect(r.journal.entries).toContainEqual(expect.objectContaining({ kind: "key.revoked", kid: r.b.kid, reason: "ABANDONED" }));
+    expect((await r.s.keys.list(AGENT)).find((k) => k.kid === r.b.kid)).toMatchObject({ status: "REVOKED" });
+    await r.c.maintainKeys();
+    expect(r.revokes()).toHaveLength(1);
+    await expect(r.c.platform.agentSelf()).resolves.toMatchObject({ status: "ACTIVE" });
+  });
+
+  it("Р63 п. 6: при приостановке у стенда maintainKeys отзывает брошенный ключ защитным входом, ротации нет — SignerSuspended", async () => {
+    const r = await abandonedOnStand();
+    await r.s.suspendAgent(AGENT, "KEY_COMPROMISE");
+    await expect(r.c.platform.requestMandate(INTENT, { idempotencyKey: "idem-rev-susp-m" })).rejects.toMatchObject({ code: "AGENT_SUSPENDED", httpStatus: 403 });
+    await expect(r.c.maintainKeys()).rejects.toBeInstanceOf(SignerSuspended);
+    expect(r.revokes()).toEqual([{ route: r.revoke, idem: `agent-key-revoke-${r.b.kid}` }]);
+    expect((await r.s.keys.list(AGENT)).find((k) => k.kid === r.b.kid)).toMatchObject({ status: "REVOKED" });
+    expect(r.calls.filter((x) => x.route === "POST /pao/v1/agent/keys")).toEqual([]);
   });
 
   it("GET /pao/v1/agent отдаёт rate_limit_per_min — предел второго слоя уровня 1 из параметров стенда (РП63 п. 1; AG-08)", async () => {

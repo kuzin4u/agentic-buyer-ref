@@ -305,22 +305,24 @@ describe("стадия 5 на стенде: реквизит по ПАО и па
     expect(r.c.calls().slice(start).map((x) => `${x.target} ${x.route} ${x.status} ${x.code}`)).toEqual([`${CREDENTIALS} 409 MANDATE_SCOPE`]);
   });
 
-  it("риск 4а (выдача): новый CART при ACTIVE прежнем — реквизит и пакет по новому CART, прежний остаётся ACTIVE и не используется", async () => {
+  it("риск 4а (выдача): новый CART после нового поиска — реквизит и пакет по новому CART; от прежнего агент отказался (Р63, дополнение 1 п. 6), он не используется", async () => {
     const r = await run();
     const intent = await r.purchase.intent({ ...INTENT, merchantScope: [NORMAL.merchant_id] }, { idempotencyKey: "idem-intent-4a" });
     await r.signWhileWaiting(intent.id, () => r.purchase.awaitIntent());
     const first = (await r.purchase.search()).contour.find((o) => o.shopId === NORMAL.id)!;
     const old = await r.purchase.cart(one(first, 1), { idempotencyKey: "idem-cart-4a-old" });
     await r.signWhileWaiting(old.id, () => r.purchase.awaitCart());
-    // новая выдача из CART_ACTIVE (К2а): снимок прежнего CART стёрт, у Платформы он остаётся ACTIVE (выбор 4а Р44)
+    // новая выдача из CART_ACTIVE (К2а): снимок прежнего CART стёрт, от него — фоновый отказ (Р63, дополнение 1 п. 6;
+    // прежде — выбор 4а Р44, CART оставался ACTIVE); стадия 3 ждёт его итога перед новым CART
     const offer = (await r.purchase.search()).contour.find((o) => o.shopId === NORMAL.id)!;
     const cart = await r.purchase.cart(one(offer, 2), { idempotencyKey: "idem-cart-4a-new" });
     await r.signWhileWaiting(cart.id, () => r.purchase.awaitCart());
     const order = await r.purchase.placeOrder({ idempotencyKey: "idem-order-4a" });
-    expect((await r.c.platform.getMandate(old.id)).status).toBe("ACTIVE");
+    expect((await r.c.platform.getMandate(old.id)).status).toBe("REVOKED");
+    expect(r.c.journal.entries.filter((e) => e.kind === "cart.relinquished").map((e) => e.mandate)).toEqual([old.id]);
     const start = r.c.agentCalls().length;
     await expect(r.purchase.authorize({ idempotencyKey: "idem-pay-4a" })).rejects.toMatchObject({ code: "OPERATION_RESULT_UNCONFIRMED" });
-    // ворота — по новому CART; реквизит выдан (201) при ACTIVE прежнем; витрина приняла пакет — cart_mandate_id пакета
+    // ворота — по новому CART; реквизит выдан (201); витрина приняла пакет — cart_mandate_id пакета
     // совпал с мандатом заказа (новый CART)
     expect(
       r.c
@@ -338,6 +340,6 @@ describe("стадия 5 на стенде: реквизит по ПАО и па
       "pao GET /pao/v1/operations 200",
     ]);
     expect(r.c.journal.entries.filter((e) => e.kind === "shop.call" && e.method?.endsWith("/payment")).map((e) => [e.mandate, e.detail])).toEqual([[cart.id, "PAID"]]);
-    expect((await r.c.platform.getMandate(old.id)).status).toBe("ACTIVE");
+    expect((await r.c.platform.getMandate(old.id)).status).toBe("REVOKED");
   });
 });

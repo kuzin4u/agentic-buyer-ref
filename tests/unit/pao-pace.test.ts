@@ -119,6 +119,7 @@ describe("ограничитель в адаптере ПАО (Р59 п. 1–2)",
   const { signer } = newEd25519Signer("kid_test");
   const signing: RequestSigning = {
     current: () => signer,
+    protective: () => signer,
     keyRevoked: () => {
       throw new Error("в этих тестах ключ не отзывается");
     },

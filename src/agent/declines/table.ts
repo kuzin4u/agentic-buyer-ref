@@ -89,8 +89,8 @@ export const FAILURE_RULES: Readonly<Record<FailureCode, DeclineRule>> = {
 };
 
 /** Отказ в допуске (SPEC §7а: AGENT_UNKNOWN, AGENT_SUSPENDED) и несовместимая Платформа (PLATFORM_PROTOCOL_UNSUPPORTED,
- *  Р33 п. 10): агент не действует целиком, а не одно обращение (П03). AGENT_SUSPENDED после допуска — приостановка подписи
- *  до сверки с реестром, а не остановка (Р60 п. 1; `haltAgent`), прочие — остановка. */
+ *  Р33 п. 10): агент не действует целиком, а не одно обращение (П03). AGENT_SUSPENDED — приостановка подписи до сверки с
+ *  реестром (после допуска) или до повторного допуска, а не остановка (Р60 п. 1, Р63 п. 1; `haltAgent`), прочие — остановка. */
 export const AGENT_STOP_CODES: ReadonlySet<FailureCode> = new Set<FailureCode>([
   "AGENT_UNKNOWN",
   "AGENT_SUSPENDED",

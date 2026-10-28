@@ -20,8 +20,12 @@ export type JournalKind =
   | "key.registered"
   /** временный файл ключа прошлого запуска (регистрация не подтверждена) — не используется */
   | "key.abandoned"
-  /** брошенный временный ключ оказался зарегистрированным (ответ на регистрацию был потерян); отзыв — после PS-05 */
+  /** брошенный временный ключ оказался зарегистрированным (ответ на регистрацию был потерян); отзыв — maintainKeys
+   *  (Р63 п. 6), успех — key.revoked с причиной ABANDONED */
   | "key.abandoned_registered"
+  /** отзыв брошенного ключа снят с очереди: 422 KEY_INVALID на ключ, который сверка показала ACTIVE, — аномалия
+   *  Платформы для оператора (Р63 п. 6); kid, reason KEY_INVALID */
+  | "key.revoke_dropped"
   /** подпись переведена на другой ключ */
   | "key.switched"
   /** платформа сообщила, что ключ отозван */
@@ -88,6 +92,8 @@ export type JournalKind =
   | "pao.contract_violation"
   /** держимый мандат отозван — особое событие Т15 (Р37 п. 4); мандат больше не держится */
   | "mandate.revoked"
+  /** агент отказался от мандата (Р63, дополнение 1 п. 5); detail — статус мандата в ответе */
+  | "mandate.relinquished"
   /** держимый мандат не ACTIVE (истёк, исчерпан и т. п.) — больше не держится; detail — статус (Р37 п. 4) */
   | "mandate.status_changed"
   /** аномалия: держимый ACTIVE-мандат пропал у Платформы — GET 404, reason MANDATE_NOT_FOUND; больше не держится, лента
@@ -114,6 +120,12 @@ export type JournalKind =
   /** прежний CART больше не используется (Т15, Р46 п. 3): mandate — id CART, detail — NEW_SEARCH или
    *  REFUSED_BEFORE_ORDER; сумм, позиций и продавца нет; пишет конвейер */
   | "cart.abandoned"
+  /** отказ от CART после остановки или оставления подтверждён Платформой (Р63, дополнение 1 п. 5) */
+  | "cart.relinquished"
+  /** отказ от CART не подтверждён; reason — код отказа или UNKNOWN */
+  | "cart.relinquish_failed"
+  /** отказа от CART не было; detail — STOPPED, UNKNOWN_CART, NOT_NEEDED или KEPT */
+  | "cart.relinquish_skipped"
   /** попытка обращения к витрине (Т15, Р42): method — шаблон пути, attempt > 1 — попытка повтора, ref — id витрины по
    *  маске, mandate — мандат корзины у заказа; detail — код витрины из перечня, BAD_RESPONSE или NO_RESPONSE; код вне
    *  перечня — reason MERCHANT_CODE_UNKNOWN; обращение прервано общим сроком поиска — reason SHOP_SEARCH_DEADLINE (Р44 п. 6);

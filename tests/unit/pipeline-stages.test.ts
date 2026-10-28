@@ -36,6 +36,8 @@ const verified = (r: PurchaseRun) => r.stand.stub.calls.filter((c) => c.op === "
 /** все обращения к контуру после `from` — лишнее обращение к любому методу видно (ревью К2 В5) */
 const opsFrom = (r: PurchaseRun, from: number) => r.stand.stub.calls.slice(from).map((c) => c.op);
 const VERIFY = "GET /pao/v1/mandates/{id}/verify";
+/** фоновый отказ от CART после остановки (Р63 п. 7): в списке обращений — после `await cartReleased()` (КТ1 сессии 46 № 4) */
+const RELINQUISH = "POST /pao/v1/mandates/{id}/relinquish";
 const { split_min_ops: MIN_OPS } = loadParams();
 /** Занять в окне дробления `n` мест (одобрены) на сумму `sum` в целом: каждое — не меньше доли суммы, целыми копейками;
  *  `floor` — каждое не больше доли (сумма не превышает `sum`). Число операций — от `split_min_ops` из конфигурации. */
@@ -165,7 +167,7 @@ describe("стадия 3 — проект корзины (Р32 п. 2): отка�
       const choice = pick === "market" ? key(zones.market[0]!) : { merchantId: "shop_1", sku: "нет такого" };
       await expect(r.purchase.cart(one(choice, 1), { idempotencyKey: "idem-cart-1" })).rejects.toBeInstanceOf(PurchaseStopped);
       expect(r.purchase.reason).toBe("OFFER_NOT_IN_CONTOUR");
-      expect(r.tail().slice(-2).map((e) => [e.kind, e.reason, e.ref])).toEqual([
+      expect(r.atStop().slice(-2).map((e) => [e.kind, e.reason, e.ref])).toEqual([
         ["agent.refused", "OFFER_NOT_IN_CONTOUR", pick === "market" ? "tartine" : undefined],
         ["purchase.stage", "OFFER_NOT_IN_CONTOUR", undefined],
       ]);
@@ -511,7 +513,7 @@ describe("стадия 3 — корзина по живой цене перед 
       const before = r.stand.log().length;
       await expect(r.purchase.cart(one(offer, qty), { idempotencyKey: "idem-cart-1" })).rejects.toBeInstanceOf(PurchaseStopped);
       expect(r.purchase.reason).toBe("CART_QTY_INVALID");
-      expect(r.tail().slice(-2).map((e) => [e.kind, e.reason, e.ref])).toEqual([
+      expect(r.atStop().slice(-2).map((e) => [e.kind, e.reason, e.ref])).toEqual([
         ["agent.refused", "CART_QTY_INVALID", "tartine"],
         ["purchase.stage", "CART_QTY_INVALID", undefined],
       ]);
@@ -1256,7 +1258,7 @@ describe("ворота перед стадией 5 (Р38 п. 3, К4): оба м�
     await r.core.mandates.refreshHeld({ kind: "event", event: event("mandate.revoked", id) });
     const before = verified(r).length;
     await expect(r.purchase.authorize({ idempotencyKey: "idem-pay-1" })).rejects.toBeInstanceOf(PurchaseStopped);
-    expect(r.tail().slice(-3).map((e) => [e.kind, e.reason])).toEqual([
+    expect(r.atStop().slice(-3).map((e) => [e.kind, e.reason])).toEqual([
       ["agent.refused", "MANDATE_NOT_ACTIVE"],
       ["purchase.stage", "MANDATE_REVOKED"],
       ["purchase.unfinished", "MANDATE_REVOKED"],
@@ -1434,6 +1436,7 @@ describe("ворота перед стадией 5 (Р38 п. 3, К4): оба м�
       const id = which === "INTENT" ? intentId : cartId;
       r.consents.left.set(id, left);
       const before = verified(r).length;
+      const from = r.stand.stub.calls.length;
       const call = r.purchase.authorize({ idempotencyKey: "idem-pay-1" });
       if (!stop) {
         await call;
@@ -1443,12 +1446,14 @@ describe("ворота перед стадией 5 (Р38 п. 3, К4): оба м�
         return;
       }
       await expect(call).rejects.toMatchObject({ code: "MANDATE_AMOUNT_LEFT_INSUFFICIENT" });
-      expect(r.tail().slice(-2).map((e) => [e.kind, e.reason, e.mandate])).toEqual([
+      expect(r.atStop().slice(-2).map((e) => [e.kind, e.reason, e.mandate])).toEqual([
         ["agent.refused", "MANDATE_AMOUNT_LEFT_INSUFFICIENT", id],
         ["purchase.stage", "MANDATE_AMOUNT_LEFT_INSUFFICIENT", intentId],
       ]);
       // по INTENT не хватает — CART уже не проверяется
       expect(verified(r).slice(before)).toEqual(which === "INTENT" ? [intentId] : [intentId, cartId]);
+      expect(await r.purchase.cartReleased()).toBe("RELINQUISHED");
+      expect(opsFrom(r, from)).toEqual(which === "INTENT" ? [VERIFY, RELINQUISH] : [VERIFY, VERIFY, RELINQUISH]);
       expect(r.payment.calls).toEqual([]);
     });
   }
@@ -1510,9 +1515,10 @@ describe("проверка по мандату до стадии 4 (Р40 п. 5, 
       const from = r.stand.stub.calls.length;
       await expect(r.purchase.authorize({ idempotencyKey: "idem-pay-1" })).rejects.toMatchObject({ code: "MANDATE_AMOUNT_LEFT_INSUFFICIENT" });
       // по INTENT не хватает — CART уже не проверяется
-      expect(opsFrom(r, from)).toEqual(which === "INTENT" ? [VERIFY] : [VERIFY, VERIFY]);
+      expect(await r.purchase.cartReleased()).toBe("RELINQUISHED");
+      expect(opsFrom(r, from)).toEqual(which === "INTENT" ? [VERIFY, RELINQUISH] : [VERIFY, VERIFY, RELINQUISH]);
       expect(r.purchase.state).toBe("STOPPED");
-      expect(r.tail().slice(-2).map((e) => [e.kind, e.reason, e.mandate])).toEqual([
+      expect(r.atStop().slice(-2).map((e) => [e.kind, e.reason, e.mandate])).toEqual([
         ["agent.refused", "MANDATE_AMOUNT_LEFT_INSUFFICIENT", id],
         ["purchase.stage", "MANDATE_AMOUNT_LEFT_INSUFFICIENT", intentId],
       ]);
@@ -1531,7 +1537,8 @@ describe("проверка по мандату до стадии 4 (Р40 п. 5, 
       const from = r.stand.stub.calls.length;
       await expect(r.purchase.authorize({ idempotencyKey: "idem-pay-1" })).rejects.toBeInstanceOf(MandateRefused);
       expect(r.purchase.reason).toBe("MANDATE_OUT_OF_SCOPE");
-      expect(opsFrom(r, from)).toEqual(which === "INTENT" ? [VERIFY] : [VERIFY, VERIFY]);
+      expect(await r.purchase.cartReleased()).toBe("RELINQUISHED");
+      expect(opsFrom(r, from)).toEqual(which === "INTENT" ? [VERIFY, RELINQUISH] : [VERIFY, VERIFY, RELINQUISH]);
       expect(r.tail().filter((e) => e.kind === "agent.refused").map((e) => [e.reason, e.mandate])).toEqual([["MANDATE_OUT_OF_SCOPE", id]]);
       expect(stages(r)).not.toContain("CONFIRMING");
       expect(r.payment.calls).toEqual([]);
@@ -1546,6 +1553,8 @@ describe("проверка по мандату до стадии 4 (Р40 п. 5, 
     await r.core.mandates.refreshHeld({ kind: "event", event: event("mandate.revoked", id) });
     const from = r.stand.stub.calls.length;
     await expect(r.purchase.authorize({ idempotencyKey: "idem-pay-1" })).rejects.toMatchObject({ code: "MANDATE_REVOKED" });
+    // CART отозван вместе с INTENT — отказ не нужен
+    expect(await r.purchase.cartReleased()).toBe("NOT_NEEDED");
     expect(opsFrom(r, from)).toEqual([]);
     expect(r.payment.calls).toEqual([]);
   });
@@ -1563,8 +1572,9 @@ describe("политика до стадий 4–5 (Р39): отказ — agent.
       const from = r.stand.stub.calls.length;
       await expect(r.purchase.authorize({ idempotencyKey: "idem-pay-1" })).rejects.toMatchObject({ code: "MANDATE_OUT_OF_SCOPE" });
       // по INTENT вне пределов — verify CART не делается
-      expect(opsFrom(r, from)).toEqual(which === "INTENT" ? [VERIFY] : [VERIFY, VERIFY]);
-      expect(r.tail().slice(-2).map((e) => [e.kind, e.reason, e.mandate])).toEqual([
+      expect(await r.purchase.cartReleased()).toBe("RELINQUISHED");
+      expect(opsFrom(r, from)).toEqual(which === "INTENT" ? [VERIFY, RELINQUISH] : [VERIFY, VERIFY, RELINQUISH]);
+      expect(r.atStop().slice(-2).map((e) => [e.kind, e.reason, e.mandate])).toEqual([
         ["agent.refused", "MANDATE_OUT_OF_SCOPE", id],
         ["purchase.stage", "MANDATE_OUT_OF_SCOPE", intentId],
       ]);
@@ -1586,7 +1596,7 @@ describe("политика до стадий 4–5 (Р39): отказ — agent.
     expect(r.shop.calls).toEqual([]);
     expect(verified(r).slice(before)).toEqual([]);
     expect(opsFrom(r, from)).toEqual([]);
-    expect(r.tail().slice(-2).map((e) => [e.kind, e.reason, e.mandate])).toEqual([
+    expect(r.atStop().slice(-2).map((e) => [e.kind, e.reason, e.mandate])).toEqual([
       ["agent.refused", "MANDATE_OUT_OF_SCOPE", intentId],
       ["purchase.stage", "MANDATE_OUT_OF_SCOPE", intentId],
     ]);
@@ -1606,11 +1616,12 @@ describe("политика до стадий 4–5 (Р39): отказ — agent.
     fillWindow(r, intentId, MIN_OPS - 1, THRESHOLD - TARTINE + 1);
     const from = r.stand.stub.calls.length;
     await expect(r.purchase.authorize({ idempotencyKey: "idem-pay-1" })).rejects.toMatchObject({ code: "SPLIT_WINDOW" });
-    expect(r.tail().slice(-2).map((e) => [e.kind, e.reason, e.mandate])).toEqual([
+    expect(r.atStop().slice(-2).map((e) => [e.kind, e.reason, e.mandate])).toEqual([
       ["agent.refused", "SPLIT_WINDOW", intentId],
       ["purchase.stage", "SPLIT_WINDOW", intentId],
     ]);
-    expect(opsFrom(r, from)).toEqual([]);
+    expect(await r.purchase.cartReleased()).toBe("RELINQUISHED");
+    expect(opsFrom(r, from)).toEqual([RELINQUISH]);
     expect(r.payment.calls).toEqual([]);
   });
 
@@ -1628,9 +1639,10 @@ describe("политика до стадий 4–5 (Р39): отказ — agent.
     };
     const from = r.stand.stub.calls.length;
     await expect(r.purchase.authorize({ idempotencyKey: "idem-pay-1" })).rejects.toMatchObject({ code: "SPLIT_WINDOW" });
-    expect(opsFrom(r, from)).toEqual([VERIFY, VERIFY]);
+    expect(await r.purchase.cartReleased()).toBe("RELINQUISHED");
+    expect(opsFrom(r, from)).toEqual([VERIFY, VERIFY, RELINQUISH]);
     expect(verified(r).slice(-2)).toEqual([intentId, cartId]);
-    expect(r.tail().slice(-2).map((e) => [e.kind, e.reason])).toEqual([
+    expect(r.atStop().slice(-2).map((e) => [e.kind, e.reason])).toEqual([
       ["agent.refused", "SPLIT_WINDOW"],
       ["purchase.stage", "SPLIT_WINDOW"],
     ]);

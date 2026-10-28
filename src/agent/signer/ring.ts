@@ -52,6 +52,7 @@ type WriteContext = { detail: DiagCode; cause?: unknown };
 /** Запрос допуска через данный порт подписи (адаптер платформы, собранный для допуска). */
 export type Admit = (signing: RequestSigning) => Promise<AgentSelf>;
 type Registrar = Pick<PaymentPlatform, "registerKey" | "agentSelf">;
+type Maintainer = Registrar & Pick<PaymentPlatform, "revokeKey">;
 
 export class KeyRing {
   readonly #o: KeyRingOptions;
@@ -77,6 +78,9 @@ export class KeyRing {
   #admissionSwitched = false;
   /** брошенные временные ключи прошлых запусков (не загружаются) */
   readonly #abandoned = new Set<string>();
+  /** очередь отзыва: брошенные ключи, которые реестр показал ACTIVE (Р63 п. 6); в памяти — после перезапуска её
+   *  восстанавливает сверка при допуске по файлам abandoned хранилища */
+  readonly #toRevoke = new Set<string>();
   /** Новый ключ не принят подряд при регистрации — KEY_INVALID или зарегистрирован не ACTIVE (Р31, Р58 п. 4); успешная
    *  регистрация сбрасывает. Счёт — в процессе: перезапуск — решение человека */
   #keyInvalidStreak = 0;
@@ -93,6 +97,11 @@ export class KeyRing {
     return this.#suspended;
   }
 
+  /** Допуск пройден. До него приостановку снимает только повторный start (Р63 п. 1): расписания сверки нет. */
+  get admitted(): boolean {
+    return this.#admission === "admitted";
+  }
+
   constructor(o: KeyRingOptions) {
     this.#o = o;
     this.#now = o.now ?? (() => new Date());
@@ -103,7 +112,8 @@ export class KeyRing {
   port(): RequestSigning {
     return Object.freeze({
       current: () => this.#current(false),
-      keyRevoked: (kid: string, failure?: unknown) => this.#keyRevoked(kid, failure, false),
+      protective: () => this.#current(false, false, true),
+      keyRevoked: (kid: string, failure?: unknown, protective = false) => this.#keyRevoked(kid, failure, false, false, protective),
       stop: (reason: DiagCode, detail?: string) => this.#stop(reason, detail),
       suspend: (reason: DiagCode) => this.#suspend(reason),
     });
@@ -123,7 +133,8 @@ export class KeyRing {
     const live = () => this.#recheckToken === token;
     const signing: RequestSigning = Object.freeze({
       current: () => this.#current(false, live()),
-      keyRevoked: (kid: string, failure?: unknown) => this.#keyRevoked(kid, failure, false, live()),
+      protective: () => this.#current(false, live(), true),
+      keyRevoked: (kid: string, failure?: unknown, protective = false) => this.#keyRevoked(kid, failure, false, live(), protective),
       stop: (reason: DiagCode, detail?: string) => this.#stop(reason, detail),
       suspend: (reason: DiagCode) => this.#suspend(reason),
     });
@@ -158,7 +169,8 @@ export class KeyRing {
    * без остановки — остановка без повтора (fail-closed).
    * Прочие сбои (503, тайм-аут) — допуск не состоялся; можно ли повторить, решает место сборки по действию кода в реестре
    * (ответ не по схеме — BAD_RESPONSE, остановка по дополнению 2 к Р36; нет ответа — NO_RESPONSE, допуск можно повторить,
-   * Р48 п. 3); AGENT_UNKNOWN / AGENT_SUSPENDED — остановка (адаптер; AGENT_SUSPENDED до допуска — через #suspend, Р60 п. 1);
+   * Р48 п. 3); AGENT_UNKNOWN — остановка (адаптер); AGENT_SUSPENDED (403 или SUSPENDED в ответе) — приостановка без
+   * остановки, допуск не состоялся, start можно повторить; допуск, прочитавший ACTIVE, снимает её (Р63 п. 1);
    * класс в реестре не BUYER — остановка AGENT_CLASS_MISMATCH (Р27, после проверки статуса).
    */
   async start(admit: Admit): Promise<AgentSelf> {
@@ -166,6 +178,7 @@ export class KeyRing {
     if (this.#admission !== "none") throw new Error("допуск уже идёт или пройден");
     const signing: RequestSigning = Object.freeze({
       current: () => this.#current(true),
+      protective: () => this.#current(true),
       keyRevoked: (kid: string, failure?: unknown) => this.#keyRevoked(kid, failure, true),
       stop: (reason: DiagCode, detail?: string) => this.#stop(reason, detail),
       suspend: (reason: DiagCode) => this.#suspend(reason),
@@ -192,12 +205,22 @@ export class KeyRing {
       }
       this.#reconcile(self);
       this.#admission = "admitted";
+      // приостановка прошлой попытки допуска (Р63 п. 1) снята прочитанным ACTIVE
+      if (this.#suspended !== null) {
+        this.#suspended = null;
+        try {
+          this.#record("signing.resumed");
+        } finally {
+          this.#o.onState?.();
+        }
+      }
       return self;
     } catch (e) {
       if (this.#admission === "admitting") {
         this.#admission = "none";
         this.#admissionSwitched = false; // повторный start — новый допуск со своим одним переходом
-        if (this.#stopped === null && !(e instanceof PlatformFailure)) this.#record("admission.failed", undefined, "KEY_REJECTED");
+        if (this.#stopped === null && e instanceof SignerSuspended) this.#record("admission.failed", this.#currentKid ?? undefined, e.reason);
+        else if (this.#stopped === null && !(e instanceof PlatformFailure)) this.#record("admission.failed", undefined, "KEY_REJECTED");
       }
       throw e;
     }
@@ -222,8 +245,37 @@ export class KeyRing {
     return this.#rotating;
   }
 
-  async maintain(platform: Registrar): Promise<void> {
+  /** Обслуживание ключей: сначала отзыв брошенных ключей из очереди (Р63 п. 6), затем плановая ротация, если пора. */
+  async maintain(platform: Maintainer): Promise<void> {
+    await this.#revokeAbandoned(platform);
     if (this.rotationDue()) await this.rotate(platform);
+  }
+
+  /**
+   * Отзыв брошенных ключей (Р63 п. 6; Р58 п. 2): `revokeKey` с ключом идемпотентности от kid — повтор тем же ключом
+   * (инвариант 9); защитное обращение — идёт и при приостановке (п. 2). Успех — запись key.revoked с причиной ABANDONED,
+   * kid снят с очереди; 422 KEY_INVALID — снят с записью key.revoke_dropped; прочие отказы Платформы — kid остаётся до
+   * следующего maintain и ротацию не блокируют (отказ — в pao.call). Остановка подписи и прочие ошибки — наружу.
+   */
+  async #revokeAbandoned(platform: Pick<PaymentPlatform, "revokeKey">): Promise<void> {
+    for (const kid of [...this.#toRevoke]) {
+      try {
+        await platform.revokeKey(kid, { idempotencyKey: `agent-key-revoke-${kid}` });
+      } catch (e) {
+        if (!(e instanceof PlatformFailure)) throw e;
+        // ключ был ACTIVE по сверке, а Платформа его не знает — аномалия для оператора; снятие — и при сбое журнала
+        if (e.code === "KEY_INVALID") {
+          try {
+            this.#record("key.revoke_dropped", kid, "KEY_INVALID");
+          } finally {
+            this.#toRevoke.delete(kid);
+          }
+        }
+        continue;
+      }
+      this.#toRevoke.delete(kid);
+      this.#record("key.revoked", kid, "ABANDONED");
+    }
   }
 
   async #doRotate(platform: Registrar): Promise<void> {
@@ -285,10 +337,11 @@ export class KeyRing {
     }
   }
 
-  #current(admitting: boolean, rechecking = false): Signer {
+  /** `protective` — защитное обращение (Р63 п. 2): приостановку обходит, остановку и проверку срока ключа — нет. */
+  #current(admitting: boolean, rechecking = false, protective = false): Signer {
     if (this.#stopped !== null) throw new SignerStopped(this.#stopped);
     if (this.#admission !== (admitting ? "admitting" : "admitted")) throw new SignerStopped("NOT_ADMITTED");
-    if (this.#suspended !== null && !admitting && !rechecking) throw new SignerSuspended(this.#suspended);
+    if (this.#suspended !== null && !admitting && !rechecking && !protective) throw new SignerSuspended(this.#suspended);
     // После допуска — только подтверждённый платформой действующий ключ; срок мог истечь (A2 п. 5.3).
     if (!admitting && !this.#usable(this.#held.get(this.#currentKid!)!)) this.#switchTo(this.#pick());
     const h = this.#held.get(this.#currentKid!)!;
@@ -301,9 +354,16 @@ export class KeyRing {
     return Object.freeze({ kid, alg, sign });
   }
 
-  #keyRevoked(kid: string, failure: unknown, admitting: boolean, rechecking = false): Signer {
-    if (this.#held.get(kid)?.state === "active") this.#mark(kid, "revoked", "AGENT_KEY_REVOKED");
-    if (this.#stopped !== null) throw new SignerStopped(this.#stopped, { cause: failure });
+  /** Отзыв kid подтверждён Платформой: `revokedKid` — у каждой остановки отсюда, в том числе при сбое записи отметки
+   *  (KEYSTORE_WRITE_FAILED) и если подпись уже остановлена (Р63 п. 5). */
+  #keyRevoked(kid: string, failure: unknown, admitting: boolean, rechecking = false, protective = false): Signer {
+    try {
+      if (this.#held.get(kid)?.state === "active") this.#mark(kid, "revoked", "AGENT_KEY_REVOKED");
+    } catch (e) {
+      if (e instanceof SignerStopped) throw new SignerStopped(e.reason, { cause: e.cause ?? failure, revokedKid: kid });
+      throw e;
+    }
+    if (this.#stopped !== null) throw new SignerStopped(this.#stopped, { cause: failure, revokedKid: kid });
     // При допуске — один переход на ключ, подтверждённый в метаданных; неподтверждённые не пробуются (без перебора).
     if (admitting) {
       const alt = this.#admissionSwitched ? undefined : this.#confirmedAlternative(kid);
@@ -319,17 +379,15 @@ export class KeyRing {
       if (e instanceof SignerStopped) throw new SignerStopped(e.reason, { cause: failure, revokedKid: kid });
       throw e;
     }
-    return this.#current(admitting, rechecking);
+    return this.#current(admitting, rechecking, protective);
   }
 
   #suspend(reason: DiagCode): void {
     if (this.#stopped !== null) return;
     const operator = reason === "AGENT_SUSPENDED";
-    // Приостановлен оператором до допуска — допуск не состоялся, остановка, как прежде (Р60 п. 1; ч. 2 AG-14).
-    if (this.#admission !== "admitted") {
-      if (operator) this.#stop(reason);
-      return;
-    }
+    // До допуска прочие причины — без действия (допуск и так не состоялся); приостановлен оператором — приостановка без
+    // остановки, снимает её повторный start (Р63 п. 1).
+    if (this.#admission !== "admitted" && !operator) return;
     // AGENT_SUSPENDED сильнее прочих причин: заменяет причину, и сверка, начатая до него, его не снимет (Р60 п. 1).
     // Повтор AGENT_SUSPENDED — без записи, но со счётом: 403 мог прийти после ответа идущей сверки (снятие и новое
     // приостановление), и её ACTIVE уже устарел (ревью К1.1 № 2).
@@ -423,7 +481,7 @@ export class KeyRing {
    * потом применяется); действующий — новейший ACTIVE в пределах срока по данным платформы.
    */
   #reconcile(self: AgentSelf): void {
-    // SUSPENDED после допуска — приостановка до следующей сверки (Р60 п. 1); при допуске — остановка (#suspend)
+    // SUSPENDED — приостановка до следующей сверки (Р60 п. 1), при допуске — до повторного start (Р63 п. 1)
     if (self.status === "SUSPENDED") {
       this.#suspend("AGENT_SUSPENDED");
       if (this.#stopped !== null) throw new SignerStopped(this.#stopped);
@@ -447,7 +505,9 @@ export class KeyRing {
     // или чужой — признак регистрации в обход агента (A2 п. 5).
     for (const k of self.keys) {
       if (this.#held.has(k.kid) || k.status !== "ACTIVE") continue;
-      this.#record(this.#abandoned.has(k.kid) ? "key.abandoned_registered" : "key.foreign", k.kid);
+      const abandoned = this.#abandoned.has(k.kid);
+      if (abandoned) this.#toRevoke.add(k.kid); // отзыв — maintainKeys (Р63 п. 6); до записи: сбой журнала её не отменяет
+      this.#record(abandoned ? "key.abandoned_registered" : "key.foreign", k.kid);
     }
     for (const h of this.#held.values()) h.info = null; // ключ, которого нет в ответе, не подтверждён
     for (const k of ours) {

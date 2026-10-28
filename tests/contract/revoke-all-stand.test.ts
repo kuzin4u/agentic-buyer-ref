@@ -73,6 +73,10 @@ describe("revoke-all на стенде (Р60 п. 8, К2.2; #41)", { timeout: STA
     expect(UNFINISHED_TEXT.PAYMENT).toContain("итог проверьте в приложении банка");
     for (const id of ids) expect(r.mandates.held().map((m) => m.id)).not.toContain(id);
     expect(r.c.journal.entries.filter((e) => e.kind === "purchase.unfinished").map((e) => [e.reason, e.detail])).toEqual([["MANDATE_REVOKED", "PAYMENT"]]);
+    // CART уже не действует (отзыв клиентом) — отказ не нужен: обращения нет, запись — NOT_NEEDED (Р63 п. 7, дополнение 1)
+    expect(await r.purchase.cartReleased()).toBe("NOT_NEEDED");
+    expect(r.c.agentCalls().filter((x) => x.route.endsWith("/relinquish"))).toEqual([]);
+    expect(r.c.journal.entries.filter((e) => e.kind === "cart.relinquish_skipped").map((e) => e.detail)).toEqual(["NOT_NEEDED"]);
 
     // со стороны стенда: mandate.revoked — по каждому мандату, в том числе CART (РП46 (а)); статус — по GET (Р34 п. 5)
     const events = (await r.c.platform.listEvents(null)).flatMap((i) => (i.kind === "event" && i.event.type === "mandate.revoked" ? [i.event.mandateId] : []));

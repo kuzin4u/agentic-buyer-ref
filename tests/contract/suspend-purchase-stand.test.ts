@@ -48,8 +48,14 @@ describe("покупка при приостановлении агента на
     expect(r.purchase.state).toBe("STOPPED");
     expect(r.purchase.reason).toBe("AGENT_SUSPENDED");
     expect(r.c.admission()).toBe("AGENT_SUSPENDED");
+    // отказ от CART после остановки — защитным входом и при приостановке (Р63 п. 2, 7, дополнение 1): стенд его исполнил
+    expect(await r.purchase.cartReleased()).toBe("RELINQUISHED");
     const paused = r.c.agentCalls().slice(start).filter((x) => !x.route.startsWith("GET /pao/v1/events"));
-    expect(paused.map((x) => [x.route.replaceAll(first.intent.id, "{intent}"), x.status, x.code])).toEqual([["GET /pao/v1/mandates/{intent}/verify", 403, "AGENT_SUSPENDED"]]);
+    const masked = (route: string) => route.replaceAll(first.intent.id, "{intent}").replaceAll(first.cart.id, "{cart}");
+    expect(paused.map((x) => [masked(x.route), x.status, x.code])).toEqual([
+      ["GET /pao/v1/mandates/{intent}/verify", 403, "AGENT_SUSPENDED"],
+      ["POST /pao/v1/mandates/{cart}/relinquish", 200, undefined],
+    ]);
     // реквизита нет: ни обращения агента, ни выпуска у эмулятора токенов стенда
     expect(r.c.agentCalls().filter((x) => x.route === CREDENTIALS)).toEqual([]);
     expect(r.stand.tsp.issued.size).toBe(0);
@@ -79,6 +85,16 @@ describe("покупка при приостановлении агента на
     await processing(r.c, { op_ref: d.op_ref, msg_type: "ISSUER_RESPONSE", issuer_approved: true });
     await expect(authorizing).resolves.toMatchObject({ opRef: d.op_ref, orderRef: second.order.orderId, status: "AUTHORIZED" });
     const paid = r.c.agentCalls().slice(from);
+    // полный список обращений второй покупки (ленту не считаем; КТ1 сессии 44 № 9): лишнее — к прежнему CART или заказу —
+    // видно, а не отфильтровано
+    expect(paid.filter((x) => !x.route.startsWith("GET /pao/v1/events")).map((x) => `${x.target} ${x.route} ${x.status}`)).toEqual([
+      `pao GET /pao/v1/mandates/${second.intent.id}/verify 200`,
+      `pao GET /pao/v1/mandates/${second.cart.id}/verify 200`,
+      `pao GET /pao/v1/merchants/${NORMAL.merchant_id}/readiness 200`,
+      `pao ${CREDENTIALS} 201`,
+      `merchants POST /v1/shops/${NORMAL.id}/orders/${second.order.orderId}/payment 200`,
+      `pao GET /pao/v1/operations/${d.op_ref} 200`,
+    ]);
     expect(paid.filter((x) => x.route === CREDENTIALS).map((x) => [x.status, x.idempotencyKey])).toEqual([[201, "idem-pay-s2"]]);
     // пакет — витрине по новому заказу; по прежнему заказу обращений нет
     expect(paid.filter((x) => x.target === "merchants").map((x) => x.route)).toEqual([`POST /v1/shops/${NORMAL.id}/orders/${second.order.orderId}/payment`]);

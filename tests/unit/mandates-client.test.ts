@@ -342,6 +342,49 @@ describe("клиент мандатов на PaoStub", () => {
   });
 });
 
+describe("отказ от мандата — MandateClient.relinquish (Р63, дополнение 1 п. 5; К3.1)", () => {
+  it("держимый ACTIVE — REVOKED, запись mandate.relinquished со статусом, мандат снят с удержания", async () => {
+    const { core, journal, consents, stand } = await setup();
+    const m = await core.mandates.request(INTENT, { idempotencyKey: "idem_rel_1" });
+    const signed = await core.mandates.awaitSigned(m, feed(consents.sign(m.id)));
+    expect(core.mandates.held().map((x) => x.id)).toEqual([signed.id]);
+    await expect(core.mandates.relinquish(signed.id, { idempotencyKey: "idem_rel_r1" })).resolves.toMatchObject({ id: signed.id, status: "REVOKED" });
+    expect(journal.entries.filter((e) => e.kind === "mandate.relinquished")).toEqual([expect.objectContaining({ mandate: signed.id, detail: "REVOKED" })]);
+    expect(core.mandates.held()).toEqual([]);
+    expect(stand.calls("POST /pao/v1/mandates/{id}/relinquish")).toMatchObject([{ status: 200, idempotencyKey: "idem_rel_r1" }]);
+    expect(stand.stub.violations).toEqual([]);
+  });
+
+  it("уже конечный мандат — 200 с текущим статусом: запись со статусом ответа", async () => {
+    const { core, journal, consents } = await setup();
+    const m = await core.mandates.request(INTENT, { idempotencyKey: "idem_rel_2" });
+    consents.mandates.get(m.id)!.status = "EXPIRED";
+    await expect(core.mandates.relinquish(m.id, { idempotencyKey: "idem_rel_r2" })).resolves.toMatchObject({ status: "EXPIRED" });
+    expect(journal.entries.filter((e) => e.kind === "mandate.relinquished")).toEqual([expect.objectContaining({ mandate: m.id, detail: "EXPIRED" })]);
+  });
+
+  it("ответ без revocation_order при подтверждённой версии — mandate.revocation_order_missing и отказ (ревью К2.2 № 2–4 Р33)", async () => {
+    const { core, journal, consents } = await setup({ versions: ["1.4.0"] });
+    const m = await core.mandates.request(INTENT, { idempotencyKey: "idem_rel_3" });
+    consents.tamper = (x) => {
+      const r = { ...x };
+      delete r.revocation_order;
+      return r;
+    };
+    await expect(core.mandates.relinquish(m.id, { idempotencyKey: "idem_rel_r3" })).rejects.toMatchObject({ name: "MandateRefused", reason: "MANDATE_REVOCATION_ORDER_MISSING" });
+    expect(journal.entries.filter((e) => e.kind === "mandate.revocation_order_missing")).toHaveLength(1);
+    expect(journal.entries.filter((e) => e.kind === "mandate.relinquished")).toEqual([]);
+  });
+
+  it("в ответе другой мандат — MANDATE_REPLY_MISMATCH, записи об отказе нет", async () => {
+    const { core, journal, consents } = await setup();
+    const m = await core.mandates.request(INTENT, { idempotencyKey: "idem_rel_4" });
+    consents.tamper = (x) => ({ ...x, id: "m_other" });
+    await expect(core.mandates.relinquish(m.id, { idempotencyKey: "idem_rel_r4" })).rejects.toMatchObject({ reason: "MANDATE_REPLY_MISMATCH" });
+    expect(journal.entries.filter((e) => e.kind === "mandate.relinquished")).toEqual([]);
+  });
+});
+
 describe("проект мандата — своей копией до обращения (ревью К1а)", () => {
   it("геттер предела отдаёт 5 000 ₽, затем 50 000 ₽ — проверен, отправлен и сверен один предел; мандат с ним", async () => {
     const { core, consents, stand } = await setup();

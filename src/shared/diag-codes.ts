@@ -34,6 +34,8 @@ export const AGENT_DIAG_CODES = [
   "KEY_NOT_ACTIVE",
   "KEY_REVOKED",
   "KEY_EXPIRED",
+  // отзыв брошенного ключа, зарегистрированного у Платформы (причина записи key.revoked, Р63 п. 6)
+  "ABANDONED",
   // клиент мандатов (MandateRefusal; порядок отзыва — MANDATE_REVOCATION_ORDER_MISSING выше)
   "MANDATE_DRAFT_INVALID",
   "MANDATE_REPLY_MISMATCH",

@@ -9,6 +9,7 @@ import { KeyRing, SignerKeyRejected, SignerRotationStopped, SignerStopped, Signe
 import { lockDir, readMeta, writeMeta } from "../../src/agent/signer/keystore.js";
 import { PlatformFailure, type AgentKey, type AgentSelf } from "../../src/shared/domain.js";
 import { ruleForFailure } from "../../src/agent/declines/index.js";
+import { PaoPlatform } from "../../src/agent/adapters/pao/index.js";
 import { coreOn } from "../support/core.js";
 import { AGENT, PaoStand } from "../support/pao-stand.js";
 
@@ -153,10 +154,40 @@ describe("сверка с реестром (fail-closed)", () => {
     expect(() => k.r.port().current()).toThrow(SignerStopped);
   });
 
-  it("агент SUSPENDED по ответу GET /pao/v1/agent — остановка", async () => {
+  it("Р63 п. 1: агент SUSPENDED по ответу GET /pao/v1/agent при допуске — приостановка без остановки; повторный допуск с ACTIVE её снимает", async () => {
     const k = ring();
-    await expect(k.r.start(k.self([k.key()], "SUSPENDED"))).rejects.toThrow(SignerStopped);
-    expect(k.j.entries.at(-1)).toMatchObject({ kind: "agent.stopped", reason: "AGENT_SUSPENDED" });
+    await expect(k.r.start(k.self([k.key()], "SUSPENDED"))).rejects.toMatchObject({ name: "SignerSuspended", reason: "AGENT_SUSPENDED" });
+    expect(k.r.stopReason).toBeNull();
+    expect(k.r.suspendReason).toBe("AGENT_SUSPENDED");
+    expect(k.r.admitted).toBe(false);
+    expect(k.j.entries.map((e) => e.kind)).not.toContain("agent.stopped");
+    expect(k.j.entries.filter((e) => e.kind === "admission.failed")).toMatchObject([{ reason: "AGENT_SUSPENDED", kid: k.d.kid }]);
+    expect(() => k.r.port().current()).toThrow(expect.objectContaining({ reason: "NOT_ADMITTED" })); // рабочий порт — до допуска
+    // повтор при той же приостановке — снова приостановка; затем ACTIVE — допуск и снятие
+    await expect(k.r.start(k.self([k.key()], "SUSPENDED"))).rejects.toThrow(SignerSuspended);
+    expect(k.j.entries.filter((e) => e.kind === "signing.suspended")).toHaveLength(1);
+    await k.r.start(k.self([k.key()]));
+    expect(k.r.admitted).toBe(true);
+    expect(k.r.suspendReason).toBeNull();
+    expect(k.j.entries.filter((e) => e.kind === "signing.resumed")).toHaveLength(1);
+    expect(k.r.port().current().kid).toBe(k.d.kid);
+  });
+
+  it("Р63 п. 1: 403 AGENT_SUSPENDED на допуске — приостановка без остановки, admission.failed с кодом, start можно повторить", async () => {
+    const k = ring();
+    const failure = new PlatformFailure("AGENT_SUSPENDED", "never", "AGENT_SUSPENDED", 403, null);
+    await expect(
+      k.r.start(async (signing) => {
+        signing.current();
+        signing.suspend("AGENT_SUSPENDED"); // так делает адаптер (haltAgent)
+        throw failure;
+      }),
+    ).rejects.toBe(failure);
+    expect(k.r.stopReason).toBeNull();
+    expect(k.r.suspendReason).toBe("AGENT_SUSPENDED");
+    expect(k.j.entries.filter((e) => e.kind === "admission.failed")).toMatchObject([{ reason: "AGENT_SUSPENDED" }]);
+    await k.r.start(k.self([k.key()]));
+    expect(k.r.suspendReason).toBeNull();
   });
 
   // Р27: класс — после статуса; класс из реестра — в detail записи об остановке.
@@ -184,10 +215,202 @@ describe("сверка с реестром (fail-closed)", () => {
     expect(k.j.entries.at(-1)).toMatchObject({ kind: "agent.stopped", reason: "SIGNATURE_INVALID" });
   });
 
-  it("SUSPENDED и SELLER — остановка по статусу, класс не проверяется", async () => {
+  it("Р63 п. 2: защитный вход подписывает при приостановке (три причины); до допуска, при остановке и без действующего ключа — SignerStopped", async () => {
+    const clock = { now: new Date("2026-10-12T09:00:00Z") };
+    const k = ring(new MemoryJournal(), clock);
+    expect(() => k.r.port().protective()).toThrow(expect.objectContaining({ reason: "NOT_ADMITTED" }));
+    await k.r.start(k.self([k.key()]));
+    for (const reason of ["AGENT_SELF_UNKNOWN", "EVENTS_UNAVAILABLE", "AGENT_SUSPENDED"] as const) {
+      k.r.port().suspend(reason);
+      expect(k.r.suspendReason).toBe(reason);
+      expect(() => k.r.port().current()).toThrow(SignerSuspended);
+      expect(k.r.port().protective().kid).toBe(k.d.kid);
+      await k.r.recheck(k.self([k.key()]));
+      expect(k.r.suspendReason).toBeNull();
+    }
+    // срок ключа защитный вход не обходит (#usable)
+    k.r.port().suspend("AGENT_SUSPENDED");
+    clock.now = new Date("2026-12-30T00:00:00Z");
+    expect(() => k.r.port().protective()).toThrow(expect.objectContaining({ name: "SignerStopped", reason: "NO_ACTIVE_KEY" }));
+    expect(() => k.r.port().protective()).toThrow(SignerStopped);
+  });
+
+  /** Связка с двумя подтверждёнными ключами: A — ключ допуска (метаданные), B — второй действующий. */
+  async function twoKeys() {
     const k = ring();
-    await expect(k.r.start(k.self([k.key()], "SUSPENDED", "SELLER"))).rejects.toMatchObject({ reason: "AGENT_SUSPENDED" });
-    expect(k.j.entries.filter((e) => e.kind === "agent.stopped")).toEqual([expect.objectContaining({ reason: "AGENT_SUSPENDED" })]);
+    const d2 = generateKey(dir!).descriptor;
+    writeMeta(dir!, { [k.d.kid]: { valid_from: "2026-10-01T00:00:00Z", valid_to: "2026-12-30T00:00:00Z" } });
+    const b = k.key({ kid: d2.kid, publicKey: d2.public_key, validFrom: "2026-09-01T00:00:00Z" });
+    await k.r.start(k.self([k.key(), b]));
+    expect(k.r.port().current().kid).toBe(k.d.kid);
+    return { ...k, b: d2.kid };
+  }
+
+  it("Р63 п. 3: приостановка до локальной отметки — keyRevoked защитным путём отмечает ключ и не бросает; обычный путь — SignerSuspended", async () => {
+    const k = await twoKeys();
+    k.r.port().suspend("AGENT_SUSPENDED"); // пришла между 200 на отзыв и отметкой
+    expect(k.r.port().keyRevoked(k.b, undefined, true).kid).toBe(k.d.kid);
+    expect(k.j.entries).toContainEqual(expect.objectContaining({ kind: "key.revoked", kid: k.b, reason: "AGENT_KEY_REVOKED" }));
+    expect(listKeys(dir!)).toContainEqual(expect.objectContaining({ kid: k.b, state: "revoked" }));
+    expect(k.r.stopReason).toBeNull();
+    expect(k.r.suspendReason).toBe("AGENT_SUSPENDED");
+    expect(() => k.r.port().keyRevoked(k.b)).toThrow(SignerSuspended);
+  });
+
+  /** Адаптер ПАО на связке `k` и подставном fetch: отзыв ключа A — 401 AGENT_KEY_REVOKED (подписан им же, Р60 п. 7 (а)),
+   *  подтверждающее GET /pao/v1/agent — статус агента `status`, A — REVOKED. У обращения — маршрут и kid подписи. */
+  function selfRevoke(k: Awaited<ReturnType<typeof twoKeys>>, status: string, agentClass = "BUYER") {
+    const calls: [string, string | undefined][] = [];
+    const key = (kid: string, s: string) => ({ kid, alg: "ed25519", public_key: `pk_${kid}`, status: s, valid_from: "2026-10-01T00:00:00Z", valid_to: "2026-12-30T00:00:00Z" });
+    const platform = new PaoPlatform({
+      baseUrl: "http://pao.test",
+      agentCode: AGENT,
+      signing: k.r.port(),
+      params,
+      journal: k.j,
+      sleep: async () => {},
+      fetch: async (url, init) => {
+        const route = `${init?.method ?? "GET"} ${new URL(String(url)).pathname}`;
+        const kid = /keyid="([^"]+)"/.exec(new Headers(init?.headers).get("signature-input") ?? "")?.[1];
+        calls.push([route, kid]);
+        const json = (s: number, body: unknown) => new Response(JSON.stringify(body), { status: s, headers: { "content-type": "application/json" } });
+        if (route.endsWith("/revoke")) return json(401, { code: "AGENT_KEY_REVOKED", message: "отозван", retry: "new_key" });
+        return json(200, { agent_code: AGENT, status, class: agentClass, keys: [key(k.d.kid, "REVOKED"), key(k.b, "ACTIVE")] });
+      },
+    });
+    return { platform, calls };
+  }
+
+  it("Р63 К1.2 (а): при приостановке отзыв своего ключа подписи — 401, подтверждающее чтение защитным входом другим ключом; ACTIVE приостановку не снимает", async () => {
+    const k = await twoKeys();
+    k.r.port().suspend("AGENT_SUSPENDED");
+    const { platform, calls } = selfRevoke(k, "ACTIVE");
+    await expect(platform.revokeKey(k.d.kid, { idempotencyKey: "idem-revoke-a" })).resolves.toMatchObject({ kid: k.d.kid, status: "REVOKED" });
+    expect(calls).toEqual([
+      [`POST /pao/v1/agent/keys/${k.d.kid}/revoke`, k.d.kid],
+      ["GET /pao/v1/agent", k.b],
+    ]);
+    expect(k.j.entries).toContainEqual(expect.objectContaining({ kind: "key.revoked", kid: k.d.kid }));
+    // снятие — только сверкой (Р60 п. 2): подтверждающее чтение ACTIVE его не делает
+    expect(k.r.suspendReason).toBe("AGENT_SUSPENDED");
+    expect(k.j.entries.map((e) => e.kind)).not.toContain("signing.resumed");
+    expect(() => k.r.port().current()).toThrow(SignerSuspended);
+  });
+
+  it.each([
+    ["EXCLUDED", "BUYER", "AGENT_EXCLUDED"],
+    ["ACTIVE", "SELLER", "AGENT_CLASS_MISMATCH"],
+  ])("Р63 К1.2 (а): подтверждающее чтение при приостановке — %s / %s: обычная остановка %s", async (status, cls, reason) => {
+    const k = await twoKeys();
+    k.r.port().suspend("AGENT_SUSPENDED");
+    const { platform } = selfRevoke(k, status, cls);
+    await platform.revokeKey(k.d.kid, { idempotencyKey: "idem-revoke-a" }).catch(() => undefined);
+    expect(k.r.stopReason).toBe(reason);
+  });
+
+  // chmod 0500 не мешает записи от root — тест зависит от среды (ревью КТ1 № 9)
+  it.skipIf(process.getuid?.() === 0)("Р63 п. 5 (КТ1 сессии 44 № 5): сбой записи отметки — SignerStopped KEYSTORE_WRITE_FAILED с revokedKid; подпись уже остановлена — тоже с revokedKid", async () => {
+    const k = await twoKeys();
+    chmodSync(dir!, 0o500); // запись состояния ключа не пройдёт
+    try {
+      let err: unknown;
+      try {
+        k.r.port().keyRevoked(k.b, undefined, true);
+      } catch (e) {
+        err = e;
+      }
+      expect(err).toMatchObject({ name: "SignerStopped", reason: "KEYSTORE_WRITE_FAILED", revokedKid: k.b });
+      expect(k.j.entries).toContainEqual(expect.objectContaining({ kind: "agent.stopped", reason: "KEYSTORE_WRITE_FAILED" }));
+      // подпись уже остановлена: подтверждение отзыва ключа, которого связка не держит (отметки нет), — признак тоже
+      let again: unknown;
+      try {
+        k.r.port().keyRevoked("kid_not_held");
+      } catch (e) {
+        again = e;
+      }
+      expect(again).toMatchObject({ name: "SignerStopped", reason: "KEYSTORE_WRITE_FAILED", revokedKid: "kid_not_held" });
+    } finally {
+      chmodSync(dir!, 0o700);
+    }
+  });
+
+  describe("Р63 п. 6: отзыв брошенного ключа в maintain", () => {
+    /** Связка с ключом допуска A и брошенным временным ключом B прошлого запуска, который реестр показывает ACTIVE. */
+    async function abandoned(clock = { now: new Date("2026-10-12T09:00:00Z") }) {
+      const k = ring(new MemoryJournal(), clock);
+      const b = generateKey(dir!, "pending").descriptor;
+      const bKey = k.key({ kid: b.kid, publicKey: b.public_key });
+      await k.r.start(k.self([k.key(), bKey]));
+      expect(k.j.entries).toContainEqual(expect.objectContaining({ kind: "key.abandoned_registered", kid: b.kid }));
+      const revokes: string[] = [];
+      const failure = (code: "UPSTREAM_UNAVAILABLE" | "KEY_INVALID") => new PlatformFailure(code, code === "KEY_INVALID" ? "never" : "same_key", code, code === "KEY_INVALID" ? 422 : 503, "x");
+      /** платформа: revokeKey по очереди ответов (нет — успех), регистрация ключа — 503 (ротация отказала) */
+      const platform = (replies: ("ok" | "UPSTREAM_UNAVAILABLE" | "KEY_INVALID")[] = []) => ({
+        revokeKey: async (kid: string, o: { idempotencyKey: string }): Promise<AgentKey> => {
+          revokes.push(`${kid}|${o.idempotencyKey}`);
+          const r = replies.shift() ?? "ok";
+          if (r !== "ok") throw failure(r);
+          return { ...bKey, status: "REVOKED" };
+        },
+        registerKey: async (): Promise<AgentKey> => {
+          throw failure("UPSTREAM_UNAVAILABLE");
+        },
+        agentSelf: k.self([k.key(), bKey]),
+      });
+      return { ...k, b: b.kid, bKey, revokes, platform, clock };
+    }
+
+    it("успех — key.revoked с причиной ABANDONED, ключ идемпотентности от kid; повторно не отзывается", async () => {
+      const k = await abandoned();
+      const p = k.platform();
+      await k.r.maintain(p);
+      expect(k.revokes).toEqual([`${k.b}|agent-key-revoke-${k.b}`]);
+      expect(k.j.entries).toContainEqual(expect.objectContaining({ kind: "key.revoked", kid: k.b, reason: "ABANDONED" }));
+      await k.r.maintain(p);
+      expect(k.revokes).toHaveLength(1);
+    });
+
+    it("отказ отзыва (503) не блокирует ротацию; повтор — при следующем maintain тем же ключом; KEY_INVALID — снят с очереди", async () => {
+      const k = await abandoned();
+      const p = k.platform(["UPSTREAM_UNAVAILABLE", "KEY_INVALID"]);
+      k.clock.now = new Date(Date.parse("2026-12-30T00:00:00Z") - OVERLAP); // пора ротировать
+      // наружу — ошибка ротации, а не отзыва: ротация шла после отказа отзыва
+      await expect(k.r.maintain(p)).rejects.toMatchObject({ code: "UPSTREAM_UNAVAILABLE", httpStatus: 503, idempotencyKey: "x" });
+      expect(k.j.entries.filter((e) => e.kind === "key.created")).toHaveLength(1);
+      await expect(k.r.maintain(p)).rejects.toMatchObject({ code: "UPSTREAM_UNAVAILABLE" });
+      expect(k.revokes).toEqual([`${k.b}|agent-key-revoke-${k.b}`, `${k.b}|agent-key-revoke-${k.b}`]);
+      await k.r.maintain(p).catch(() => undefined);
+      expect(k.revokes).toHaveLength(2); // после KEY_INVALID — не отзывается
+      expect(k.j.entries.filter((e) => e.kind === "key.revoked" && e.reason === "ABANDONED")).toEqual([]);
+      // снят с записью для оператора: ключ был ACTIVE по сверке, Платформа его не знает
+      expect(k.j.entries.filter((e) => e.kind === "key.revoke_dropped")).toEqual([expect.objectContaining({ kid: k.b, reason: "KEY_INVALID" })]);
+    });
+
+    it("при приостановке — отзыв идёт, ротации нет: SignerSuspended, как прежде", async () => {
+      const k = await abandoned();
+      k.r.port().suspend("AGENT_SUSPENDED");
+      await expect(k.r.maintain(k.platform())).rejects.toBeInstanceOf(SignerSuspended);
+      expect(k.revokes).toHaveLength(1);
+      expect(k.j.entries).toContainEqual(expect.objectContaining({ kind: "key.revoked", kid: k.b, reason: "ABANDONED" }));
+    });
+
+    it("перезапуск до отзыва: новая связка на том же каталоге — сверка при допуске снова ставит ключ в очередь (нюанс п. 6)", async () => {
+      const k = await abandoned();
+      k.r.close(); // упал до maintain
+      const j2 = new MemoryJournal();
+      const r2 = new KeyRing({ dir: dir!, params, journal: j2, now: () => k.clock.now });
+      await r2.start(k.self([k.key(), k.bKey]));
+      await r2.maintain(k.platform());
+      expect(k.revokes).toEqual([`${k.b}|agent-key-revoke-${k.b}`]);
+      expect(j2.entries).toContainEqual(expect.objectContaining({ kind: "key.revoked", kid: k.b, reason: "ABANDONED" }));
+      r2.close();
+    });
+  });
+
+  it("SUSPENDED и SELLER — приостановка по статусу (Р63 п. 1), класс не проверяется", async () => {
+    const k = ring();
+    await expect(k.r.start(k.self([k.key()], "SUSPENDED", "SELLER"))).rejects.toMatchObject({ name: "SignerSuspended", reason: "AGENT_SUSPENDED" });
+    expect(k.j.entries.map((e) => e.kind)).not.toContain("agent.stopped");
   });
 
   it("сверка после ротации: класс в реестре стал SELLER — остановка AGENT_CLASS_MISMATCH", async () => {
@@ -304,13 +527,14 @@ describe("сверка с реестром (fail-closed)", () => {
       expect(k.j.entries.map((e) => e.kind)).not.toContain("signing.resumed");
     });
 
-    it("AGENT_SUSPENDED до допуска — остановка (допуск не состоялся, Р60 п. 1); AGENT_SELF_UNKNOWN до допуска — без действия", async () => {
+    it("AGENT_SUSPENDED до допуска — приостановка без остановки (Р63 п. 1); AGENT_SELF_UNKNOWN до допуска — без действия", async () => {
       const k = ring();
       k.r.port().suspend("AGENT_SELF_UNKNOWN");
-      expect(k.r.stopReason).toBeNull();
+      expect(k.r.suspendReason).toBeNull();
       k.r.port().suspend("AGENT_SUSPENDED");
-      expect(k.r.stopReason).toBe("AGENT_SUSPENDED");
-      expect(k.j.entries.at(-1)).toMatchObject({ kind: "agent.stopped", reason: "AGENT_SUSPENDED" });
+      expect(k.r.stopReason).toBeNull();
+      expect(k.r.suspendReason).toBe("AGENT_SUSPENDED");
+      expect(k.j.entries.at(-1)).toMatchObject({ kind: "signing.suspended", reason: "AGENT_SUSPENDED" });
     });
 
     it("сверка: SUSPENDED — приостановка AGENT_SUSPENDED (SignerSuspended), ключи не трогаются; ACTIVE — снятие; EXCLUDED — остановка", async () => {

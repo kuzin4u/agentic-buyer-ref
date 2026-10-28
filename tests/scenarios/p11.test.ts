@@ -1,8 +1,9 @@
 // П11 (профиль contour): цена изменилась после согласования. Т6; A7 п. 5.2; Р5, Р44 п. 4. На стенде Платформы и витринах
 // эмулятора: корзина из двух позиций витрины NORMAL; эмулятор цену не меняет, поэтому «прежняя» цена — подмена ответа
 // каталога витрины поверх настоящего обращения (как П08): до подписи CART позиция дешевле, после — настоящая цена витрины.
-// Живая проверка перед заказом видит рост цены — заказа нет; прежний CART не используется (выбор 4а: у Платформы он
-// остаётся ACTIVE); новый поиск → новый CART по новой цене → заказ, Order.total = итогу нового CART → оплата только по нему.
+// Живая проверка перед заказом видит рост цены — заказа нет; прежний CART не используется, агент отказывается от него
+// в фоне (Р63, дополнение 1; прежде — выбор 4а, CART оставался ACTIVE); новый поиск → новый CART по новой цене → заказ,
+// Order.total = итогу нового CART → оплата только по нему.
 // Риск 4а (ACTIVE CART резервирует остаток INTENT → LIMIT_EXCEEDED на новом CART) проверяется суммой: оба CART вместе
 // больше предела INTENT, каждый — в пределе.
 import { afterEach, describe, expect, it } from "vitest";
@@ -72,8 +73,10 @@ describe("П11 — цена изменилась после согласован
     // живая проверка позиции A — ok, позиции B — рост цены; заказа нет
     expect(r.c.calls().slice(before).filter((x) => x.target === "merchants").map((x) => `${x.route} ${x.status}`)).toEqual([`GET ${catalog} 200`, `GET ${catalog} 200`]);
     expect(r.c.journal.entries.filter((e) => e.kind === "order.live_refused").map((e) => [e.reason, e.detail, e.ref])).toEqual([["LIVE_PRICE_UP", "NEW_CART_MANDATE", B!.sku]]);
-    // выбор 4а: прежний CART у Платформы — ACTIVE, агент его не отзывает
-    expect((await r.c.platform.getMandate(old.id)).status).toBe("ACTIVE");
+    // прежний CART больше не нужен: агент отказывается от него в фоне (Р63 п. 7, дополнение 1; прежде — выбор 4а, CART
+    // оставался ACTIVE); отчёт об отказе перед заказом итога не ждал
+    expect(await r.purchase.cartReleased()).toBe("RELINQUISHED");
+    expect((await r.c.platform.getMandate(old.id)).status).toBe("REVOKED");
 
     const zones = await r.purchase.search();
     expect(zones.contour.find((o) => o.sku === B!.sku)!.product.price).toEqual(RUB(B!.price!));
@@ -93,7 +96,7 @@ describe("П11 — цена изменилась после согласован
     expect(r.payment.calls).toEqual(["authorize"]);
     expect(r.payment.carts).toEqual([paid]);
     // полный журнал обращений от первого заказа (ленту не считаем): по прежнему CART после отказа — ни verify, ни заказа,
-    // ни отзыва, ни повторного запроса; единственное чтение прежнего CART — проверка теста (выбор 4а)
+    // ни повторного запроса; отказ от него — один (Р63, дополнение 1), затем чтение — проверка теста
     const ids = (x: string) => x.replaceAll(intent.id, "{intent}").replaceAll(old.id, "{old}").replaceAll(fresh.id, "{fresh}");
     const all = r.c.calls().slice(before).filter((x) => !x.route.startsWith("GET /pao/v1/events")).map((x) => ids(`${x.target} ${x.route} ${x.status}`));
     const shop = (id: string) => `merchants GET /v1/shops/${id}/catalog 200`;
@@ -102,6 +105,7 @@ describe("П11 — цена изменилась после согласован
     expect(all).toEqual([
       shop(NORMAL.id),
       shop(NORMAL.id),
+      "pao POST /pao/v1/mandates/{old}/relinquish 200",
       "pao GET /pao/v1/mandates/{old} 200",
       "pao GET /pao/v1/mandates/{intent}/verify 200",
       ...search,

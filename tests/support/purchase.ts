@@ -44,6 +44,8 @@ export interface PurchaseSetup {
   notify?: (code: PurchaseNotice, amount?: NoticeAmount) => void | Promise<void>;
   /** код остановки по ошибке вне ядра — как у места сборки (`startFailureCode`); нет — UNKNOWN */
   failureCode?: (e: unknown) => DiagCode | null;
+  /** подпись остановлена — как у места сборки (Р63, дополнение 1: отказ от CART не пытается); нет — не передаётся */
+  signingStopped?: () => boolean;
 }
 
 /** `track` получает стенд до первого обращения — тест закрывает его и проверяет нарушения схемы в afterEach. */
@@ -74,12 +76,23 @@ export async function purchaseOn(o: PurchaseSetup, track: (s: PaoStand) => void)
     journal: { record: (e) => (o.tap?.(e), core.journal.record(e)) },
     admission: () => o.admission ?? null,
     ...(o.failureCode !== undefined && { failureCode: o.failureCode }),
+    ...(o.signingStopped !== undefined && { signingStopped: o.signingStopped }),
     ...(o.region !== null && { region: o.region ?? "77" }),
     ...(o.notify !== undefined && { notify: o.notify }),
     now: () => s.clock,
   });
   const start = journal.entries.length;
   const tail = () => journal.entries.slice(start);
+  /** хвост до остановки: по запись STOPPED и следующие за ней purchase.unfinished — без фонового отказа от CART после
+   *  неё (Р63, дополнение 1 п. 2); остановки нет — весь хвост */
+  const atStop = () => {
+    const t = tail();
+    const i = t.findIndex((e) => e.kind === "purchase.stage" && String(e.detail).startsWith("STOPPED"));
+    if (i < 0) return t;
+    let end = i + 1;
+    while (t[end]?.kind === "purchase.unfinished") end++;
+    return t.slice(0, end);
+  };
   return {
     core,
     journal,
@@ -92,6 +105,7 @@ export async function purchaseOn(o: PurchaseSetup, track: (s: PaoStand) => void)
     purchase,
     split,
     tail,
+    atStop,
     setFeed: (...x: FeedItem[]) => ((items = x), (stream = null)),
     /** лента с действиями по ходу ожидания (отзыв посреди ожидания подписи) */
     setStream: (x: () => AsyncIterable<FeedItem>) => (stream = x),

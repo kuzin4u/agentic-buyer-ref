@@ -59,7 +59,7 @@ async function setup(routes: Record<string, Answer>, over: Partial<ReturnType<ty
     // знак готовности по ПАО (Р53): здесь всегда ACTIVE — стадия 2 проверяется на витринах; знак — shops-adapter.test
     platform: {
       baseUrl: "http://pao.test",
-      signing: { current: () => signer, keyRevoked: () => signer, stop: () => {}, suspend: () => {} },
+      signing: { current: () => signer, protective: () => signer, keyRevoked: () => signer, stop: () => {}, suspend: () => {} },
       fetch: async (input) => {
         const id = /\/pao\/v1\/merchants\/([^/]+)\/readiness$/.exec(new URL(String(input)).pathname)?.[1];
         return new Response(JSON.stringify({ merchant_id: id, status: "ACTIVE", since: null }), { status: 200 });

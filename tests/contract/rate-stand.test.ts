@@ -68,7 +68,7 @@ describe("429 второго слоя на стенде v0.28.0 (Р59 п. 4–5)
     // время агента не ждёт: ожидания записываются (окно стенда — по настоящим часам)
     const pace = new Pace({ fallbackPerMin: params.pao_rate_limit_fallback_per_min, journal, sleep });
     const sent: { method: string; path: string; status: number; nonce: string | null; key: string | null; retryAfter: string | null }[] = [];
-    const fixedA = { current: () => a.signer, keyRevoked: () => a.signer, stop: () => {}, suspend: () => {} };
+    const fixedA = { current: () => a.signer, protective: () => a.signer, keyRevoked: () => a.signer, stop: () => {}, suspend: () => {} };
     const platform = new PaoPlatform({
       baseUrl,
       agentCode: AGENT,

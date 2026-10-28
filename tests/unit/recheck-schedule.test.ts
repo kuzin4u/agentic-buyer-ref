@@ -14,7 +14,7 @@ import { SHOP } from "../support/purchase.js";
 import { feedOffers, liveOffers, payments, shopOrders } from "../support/shop.js";
 
 let stand: PaoStand;
-const { agent_recheck_interval_sec: INTERVAL_SEC, registry_cache_ttl_sec: TTL_SEC, pao_max_attempts: ATTEMPTS } = loadParams();
+const { agent_recheck_interval_sec: INTERVAL_SEC, registry_cache_ttl_sec: TTL_SEC, pao_max_attempts: ATTEMPTS, event_poll_interval_ms: POLL_MS } = loadParams();
 /** лента пуста: чтение после снятия (Р60 п. 2) доходит до пустой страницы */
 const HANDLERS = { ...CREDENTIALS, "GET /pao/v1/events": () => ({ status: 200, body: [] }) };
 const TICK = INTERVAL_SEC * 1000;
@@ -319,6 +319,9 @@ describe("К1.2 — EVENTS_UNAVAILABLE: до полного чтения лен�
     // два неудачных чтения feedDown (в каждом — повторы адаптера), затем лента доступна
     await feedDown(core, { code: "UPSTREAM_UNAVAILABLE" }, 2 * ATTEMPTS);
     const reads = stand.calls(EVENTS).length;
+    // пауза ленты между чтениями (event_poll_interval_ms) — на поддельном setTimeout: окно до чтения после снятия держит
+    // тест, а не настоящая пауза (КТ1 сессии 44 № 10)
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval", "setTimeout", "clearTimeout"] });
     await core.recheck();
     expect(core.events.failing).toBe(true);
 
@@ -327,10 +330,15 @@ describe("К1.2 — EVENTS_UNAVAILABLE: до полного чтения лен�
     await expect(purchase.intent(INTENT, { idempotencyKey: "idem-k12-p" })).rejects.toMatchObject({ code: "EVENTS_UNAVAILABLE" });
     expect(stand.stub.calls.length).toBe(before);
 
-    // чтение после снятия начато самим ядром (Р60 п. 2): ещё до signal() теста
+    // чтение после снятия начато самим ядром (Р60 п. 2): ещё до signal() теста — после паузы ленты из конфигурации
     expect(stand.calls(EVENTS).length).toBe(reads);
-    await vi.waitFor(() => expect(stand.calls(EVENTS).length).toBeGreaterThan(reads), { timeout: 3000 });
-    await core.events.signal();
+    await vi.advanceTimersByTimeAsync(POLL_MS);
+    await vi.waitFor(() => expect(stand.calls(EVENTS).length).toBeGreaterThan(reads));
+    // следующее чтение — тоже не раньше паузы ленты: сдвиг поддельного времени, а не ожидание
+    const read = core.events.signal();
+    await vi.advanceTimersByTimeAsync(POLL_MS);
+    await read;
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
     expect(core.events.failing).toBe(false);
     await expect(core.platform.issueCredential(DRAFT, { idempotencyKey: "idem-k12-c2" })).resolves.toMatchObject({ credentialRef: "cr_1" });
   });

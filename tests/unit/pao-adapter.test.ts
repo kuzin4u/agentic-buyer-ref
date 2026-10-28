@@ -8,7 +8,7 @@ import { mandateDraftToPao } from "../../src/agent/adapters/pao/map.js";
 import { loadParams, type StandParams } from "../../src/shared/config.js";
 import { PlatformFailure, type CredentialDraft } from "../../src/shared/domain.js";
 import type { RequestSigning } from "../../src/agent/ports/index.js";
-import { SignerSuspended } from "../../src/agent/signer/index.js";
+import { SignerStopped, SignerSuspended } from "../../src/agent/signer/index.js";
 import { Consents, INTENT } from "../support/consents.js";
 
 const AGENT = "nspk:agent:buyref-01:v1";
@@ -25,6 +25,7 @@ const { signer, publicKey } = newEd25519Signer("kid_test");
 /** Порт подписи с одним ключом: отказы по ключу и допуску здесь не проверяются (см. signer-ring и сценарии П01–П03). */
 const signing: RequestSigning = {
   current: () => signer,
+  protective: () => signer,
   keyRevoked: () => {
     throw new Error("в этих тестах ключ не отзывается");
   },
@@ -977,6 +978,28 @@ describe("Р58 п. 5 и доп. 1: сверка одним чтением пос
     expect(no.calls).toEqual(["POST /pao/v1/mandates/m_1/relinquish", "GET /pao/v1/mandates/m_1"]);
   });
 
+  it.each([
+    ["REVOKED", "resolves"],
+    ["EXPIRED", "resolves"],
+    ["EXHAUSTED", "resolves"],
+    ["ACTIVE", "BAD_RESPONSE"],
+    ["PENDING_SIGNATURE", "BAD_RESPONSE"],
+  ] as const)("отказ от мандата: 200 с неконечным статусом — BAD_RESPONSE и сверка GET; по GET %s — %s (КТ1 сессии 46 № 3)", async (status, outcome) => {
+    for (const shown of ["ACTIVE", "PENDING_SIGNATURE"] as const) {
+      const r = on({ "POST /pao/v1/mandates/m_1/relinquish": () => json(200, mandate(shown)), "GET /pao/v1/mandates/m_1": () => json(200, mandate(status)) });
+      const call = r.platform.relinquishMandate("m_1", { idempotencyKey: "idem_r" });
+      if (outcome === "resolves") await expect(call).resolves.toMatchObject({ id: "m_1", status });
+      else await expect(call).rejects.toMatchObject({ code: "BAD_RESPONSE", httpStatus: 200, retry: "never", idempotencyKey: "idem_r" });
+      expect(r.calls).toEqual(["POST /pao/v1/mandates/m_1/relinquish", "GET /pao/v1/mandates/m_1"]);
+    }
+  });
+
+  it("отказ от мандата: 200 с конечным статусом (уже EXPIRED) — как есть, без сверки", async () => {
+    const r = on({ "POST /pao/v1/mandates/m_1/relinquish": () => json(200, mandate("EXPIRED")) });
+    await expect(r.platform.relinquishMandate("m_1", { idempotencyKey: "idem_r" })).resolves.toMatchObject({ id: "m_1", status: "EXPIRED" });
+    expect(r.calls).toEqual(["POST /pao/v1/mandates/m_1/relinquish"]);
+  });
+
   it("отказ Платформы (не BAD_RESPONSE на 2xx) — как есть, без чтения; подписка — без сверки (доп. 1)", async () => {
     const refused = on({ "POST /pao/v1/mandates/m_1/relinquish": () => json(404, { code: "MANDATE_NOT_FOUND", message: "x", retry: "never" }) });
     await expect(refused.platform.relinquishMandate("m_1", { idempotencyKey: "idem_r" })).rejects.toMatchObject({ code: "MANDATE_NOT_FOUND" });
@@ -1013,7 +1036,10 @@ describe("Р60 п. 7: отзыв своего ключа — revokeKey (AG-14 ч
         if (o.suspended) throw new SignerSuspended("AGENT_SUSPENDED");
         return sig();
       },
-      keyRevoked: (kid: string) => {
+      // защитный вход (Р63 п. 2): приостановку обходит
+      protective: () => sig(),
+      keyRevoked: (kid: string, _failure?: unknown, protective = false) => {
+        if (o.suspended && !protective) throw new SignerSuspended("AGENT_SUSPENDED");
         revoked.push(kid);
         if (kid === current) {
           if (o.other === false) throw noOther;
@@ -1120,9 +1146,100 @@ describe("Р60 п. 7: отзыв своего ключа — revokeKey (AG-14 ч
     expect(r.revoked).toEqual([]);
   });
 
-  it("подпись приостановлена — SignerSuspended до обращения", async () => {
+  it("Р63 п. 2, 3: подпись приостановлена — отзыв идёт защитным входом, 200 — Key, ключ отмечен; прочие обращения — SignerSuspended до обращения", async () => {
     const r = on({ [REVOKE_B]: [() => json(200, keyOf(B, "REVOKED"))] }, { suspended: true });
-    await expect(r.platform.revokeKey(B, { idempotencyKey: "idem-revoke-b" })).rejects.toBeInstanceOf(SignerSuspended);
-    expect(r.calls).toEqual([]);
+    await expect(r.platform.revokeKey(B, { idempotencyKey: "idem-revoke-b" })).resolves.toMatchObject({ kid: B, status: "REVOKED" });
+    expect(r.calls.map((c) => [c.route, c.kid])).toEqual([[REVOKE_B, A]]);
+    expect(r.revoked).toEqual([B]);
+    await expect(r.platform.agentSelf()).rejects.toBeInstanceOf(SignerSuspended);
+    expect(r.calls).toHaveLength(1);
+  });
+
+  it("Р63 п. 3: гонка — приостановка между 200 на отзыв и локальной отметкой: Key, ключ отмечен", async () => {
+    const o = { suspended: false };
+    const r = on(
+      {
+        [REVOKE_B]: [
+          () => {
+            o.suspended = true; // 403 параллельного обращения пришёл, пока ответ на отзыв в пути
+            return json(200, keyOf(B, "REVOKED"));
+          },
+        ],
+      },
+      o,
+    );
+    await expect(r.platform.revokeKey(B, { idempotencyKey: "idem-revoke-b" })).resolves.toMatchObject({ kid: B, status: "REVOKED" });
+    expect(r.revoked).toEqual([B]);
+    await expect(r.platform.agentSelf()).rejects.toBeInstanceOf(SignerSuspended);
+  });
+
+  it("Р63 п. 2: отказ от мандата при приостановке — защитным входом, обращение уходит", async () => {
+    const r = on({ "POST /pao/v1/mandates/m_1/relinquish": [refusal(404, "MANDATE_NOT_FOUND", "never")] }, { suspended: true });
+    await expect(r.platform.relinquishMandate("m_1", { idempotencyKey: "idem-rel-1" })).rejects.toMatchObject({ code: "MANDATE_NOT_FOUND" });
+    expect(r.calls.map((c) => c.route)).toEqual(["POST /pao/v1/mandates/m_1/relinquish"]);
+  });
+
+  it("Р63 п. 2: перечень ч. 1 при недоступной ленте не сужается — защитные обращения не берут обязательства", async () => {
+    const { OBLIGATION_OPERATIONS, PROTECTIVE_OPERATIONS } = await import("../../src/agent/adapters/pao/adapter.js");
+    for (const op of PROTECTIVE_OPERATIONS) expect(OBLIGATION_OPERATIONS.has(op)).toBe(false);
+    expect([...OBLIGATION_OPERATIONS].sort()).toEqual(["POST /pao/v1/confirmations", "POST /pao/v1/credentials", "POST /pao/v1/mandates"]);
+    expect([...PROTECTIVE_OPERATIONS].sort()).toEqual(["POST /pao/v1/agent/keys/{kid}/revoke", "POST /pao/v1/mandates/{id}/relinquish"]);
+  });
+});
+
+describe("Р63 п. 4 (КТ1 сессии 44 № 6): hold() — после signing.current(), на повторе — исходный отказ", () => {
+  /** Адаптер с недоступной лентой по признаку `failing` (как hold места сборки) и счётом обращений к сети. */
+  function held(o: { stopped?: boolean; failing: () => boolean; fetch: typeof fetch }) {
+    const sent: string[] = [];
+    const platform = new PaoPlatform({
+      journal: new MemoryJournal(),
+      baseUrl: "http://pao.test",
+      agentCode: AGENT,
+      params,
+      sleep: async () => {},
+      pace: quietPace(),
+      signing: {
+        ...signing,
+        current: () => {
+          if (o.stopped) throw new SignerStopped("CLOSED");
+          return signer;
+        },
+      },
+      hold: () => {
+        if (o.failing()) throw new SignerSuspended("EVENTS_UNAVAILABLE");
+      },
+      fetch: async (url, init) => {
+        sent.push(`${init?.method ?? "GET"} ${new URL(String(url)).pathname}`);
+        return o.fetch(url, init);
+      },
+    });
+    return { platform, sent };
+  }
+
+  it("(а) остановленный агент при недоступной ленте — SignerStopped, а не SignerSuspended EVENTS_UNAVAILABLE; обращения нет", async () => {
+    const h = held({ stopped: true, failing: () => true, fetch: async () => new Response(null, { status: 500 }) });
+    await expect(h.platform.requestMandate(INTENT, { idempotencyKey: "idem-hold-1" })).rejects.toBeInstanceOf(SignerStopped);
+    expect(h.sent).toEqual([]);
+  });
+
+  it("первая попытка при недоступной ленте — SignerSuspended EVENTS_UNAVAILABLE, обращения нет", async () => {
+    const h = held({ failing: () => true, fetch: async () => new Response(null, { status: 500 }) });
+    await expect(h.platform.requestMandate(INTENT, { idempotencyKey: "idem-hold-2" })).rejects.toMatchObject({ name: "SignerSuspended", reason: "EVENTS_UNAVAILABLE" });
+    expect(h.sent).toEqual([]);
+  });
+
+  it("(б) нет ответа, к повтору лента стала недоступна — повтора нет, наружу исходный NO_RESPONSE", async () => {
+    let failing = false;
+    const h = held({
+      failing: () => failing,
+      fetch: async () => {
+        failing = true; // запрос ушёл, ответ потерян; к повтору лента недоступна дольше registry_cache_ttl_sec
+        throw new TypeError("fetch failed");
+      },
+    });
+    const err = await h.platform.requestMandate(INTENT, { idempotencyKey: "idem-hold-3" }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(PlatformFailure);
+    expect(err).toMatchObject({ code: "NO_RESPONSE", idempotencyKey: "idem-hold-3" });
+    expect(h.sent).toEqual(["POST /pao/v1/mandates"]);
   });
 });

@@ -52,6 +52,7 @@ type WriteContext = { detail: DiagCode; cause?: unknown };
 /** Запрос допуска через данный порт подписи (адаптер платформы, собранный для допуска). */
 export type Admit = (signing: RequestSigning) => Promise<AgentSelf>;
 type Registrar = Pick<PaymentPlatform, "registerKey" | "agentSelf">;
+type Maintainer = Registrar & Pick<PaymentPlatform, "revokeKey">;
 
 export class KeyRing {
   readonly #o: KeyRingOptions;
@@ -77,6 +78,9 @@ export class KeyRing {
   #admissionSwitched = false;
   /** брошенные временные ключи прошлых запусков (не загружаются) */
   readonly #abandoned = new Set<string>();
+  /** очередь отзыва: брошенные ключи, которые реестр показал ACTIVE (Р63 п. 6); в памяти — после перезапуска её
+   *  восстанавливает сверка при допуске по файлам abandoned хранилища */
+  readonly #toRevoke = new Set<string>();
   /** Новый ключ не принят подряд при регистрации — KEY_INVALID или зарегистрирован не ACTIVE (Р31, Р58 п. 4); успешная
    *  регистрация сбрасывает. Счёт — в процессе: перезапуск — решение человека */
   #keyInvalidStreak = 0;
@@ -241,8 +245,37 @@ export class KeyRing {
     return this.#rotating;
   }
 
-  async maintain(platform: Registrar): Promise<void> {
+  /** Обслуживание ключей: сначала отзыв брошенных ключей из очереди (Р63 п. 6), затем плановая ротация, если пора. */
+  async maintain(platform: Maintainer): Promise<void> {
+    await this.#revokeAbandoned(platform);
     if (this.rotationDue()) await this.rotate(platform);
+  }
+
+  /**
+   * Отзыв брошенных ключей (Р63 п. 6; Р58 п. 2): `revokeKey` с ключом идемпотентности от kid — повтор тем же ключом
+   * (инвариант 9); защитное обращение — идёт и при приостановке (п. 2). Успех — запись key.revoked с причиной ABANDONED,
+   * kid снят с очереди; 422 KEY_INVALID — снят с записью key.revoke_dropped; прочие отказы Платформы — kid остаётся до
+   * следующего maintain и ротацию не блокируют (отказ — в pao.call). Остановка подписи и прочие ошибки — наружу.
+   */
+  async #revokeAbandoned(platform: Pick<PaymentPlatform, "revokeKey">): Promise<void> {
+    for (const kid of [...this.#toRevoke]) {
+      try {
+        await platform.revokeKey(kid, { idempotencyKey: `agent-key-revoke-${kid}` });
+      } catch (e) {
+        if (!(e instanceof PlatformFailure)) throw e;
+        // ключ был ACTIVE по сверке, а Платформа его не знает — аномалия для оператора; снятие — и при сбое журнала
+        if (e.code === "KEY_INVALID") {
+          try {
+            this.#record("key.revoke_dropped", kid, "KEY_INVALID");
+          } finally {
+            this.#toRevoke.delete(kid);
+          }
+        }
+        continue;
+      }
+      this.#toRevoke.delete(kid);
+      this.#record("key.revoked", kid, "ABANDONED");
+    }
   }
 
   async #doRotate(platform: Registrar): Promise<void> {
@@ -472,7 +505,9 @@ export class KeyRing {
     // или чужой — признак регистрации в обход агента (A2 п. 5).
     for (const k of self.keys) {
       if (this.#held.has(k.kid) || k.status !== "ACTIVE") continue;
-      this.#record(this.#abandoned.has(k.kid) ? "key.abandoned_registered" : "key.foreign", k.kid);
+      const abandoned = this.#abandoned.has(k.kid);
+      if (abandoned) this.#toRevoke.add(k.kid); // отзыв — maintainKeys (Р63 п. 6); до записи: сбой журнала её не отменяет
+      this.#record(abandoned ? "key.abandoned_registered" : "key.foreign", k.kid);
     }
     for (const h of this.#held.values()) h.info = null; // ключ, которого нет в ответе, не подтверждён
     for (const k of ours) {

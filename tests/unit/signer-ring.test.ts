@@ -334,6 +334,79 @@ describe("сверка с реестром (fail-closed)", () => {
     }
   });
 
+  describe("Р63 п. 6: отзыв брошенного ключа в maintain", () => {
+    /** Связка с ключом допуска A и брошенным временным ключом B прошлого запуска, который реестр показывает ACTIVE. */
+    async function abandoned(clock = { now: new Date("2026-10-12T09:00:00Z") }) {
+      const k = ring(new MemoryJournal(), clock);
+      const b = generateKey(dir!, "pending").descriptor;
+      const bKey = k.key({ kid: b.kid, publicKey: b.public_key });
+      await k.r.start(k.self([k.key(), bKey]));
+      expect(k.j.entries).toContainEqual(expect.objectContaining({ kind: "key.abandoned_registered", kid: b.kid }));
+      const revokes: string[] = [];
+      const failure = (code: "UPSTREAM_UNAVAILABLE" | "KEY_INVALID") => new PlatformFailure(code, code === "KEY_INVALID" ? "never" : "same_key", code, code === "KEY_INVALID" ? 422 : 503, "x");
+      /** платформа: revokeKey по очереди ответов (нет — успех), регистрация ключа — 503 (ротация отказала) */
+      const platform = (replies: ("ok" | "UPSTREAM_UNAVAILABLE" | "KEY_INVALID")[] = []) => ({
+        revokeKey: async (kid: string, o: { idempotencyKey: string }): Promise<AgentKey> => {
+          revokes.push(`${kid}|${o.idempotencyKey}`);
+          const r = replies.shift() ?? "ok";
+          if (r !== "ok") throw failure(r);
+          return { ...bKey, status: "REVOKED" };
+        },
+        registerKey: async (): Promise<AgentKey> => {
+          throw failure("UPSTREAM_UNAVAILABLE");
+        },
+        agentSelf: k.self([k.key(), bKey]),
+      });
+      return { ...k, b: b.kid, bKey, revokes, platform, clock };
+    }
+
+    it("успех — key.revoked с причиной ABANDONED, ключ идемпотентности от kid; повторно не отзывается", async () => {
+      const k = await abandoned();
+      const p = k.platform();
+      await k.r.maintain(p);
+      expect(k.revokes).toEqual([`${k.b}|agent-key-revoke-${k.b}`]);
+      expect(k.j.entries).toContainEqual(expect.objectContaining({ kind: "key.revoked", kid: k.b, reason: "ABANDONED" }));
+      await k.r.maintain(p);
+      expect(k.revokes).toHaveLength(1);
+    });
+
+    it("отказ отзыва (503) не блокирует ротацию; повтор — при следующем maintain тем же ключом; KEY_INVALID — снят с очереди", async () => {
+      const k = await abandoned();
+      const p = k.platform(["UPSTREAM_UNAVAILABLE", "KEY_INVALID"]);
+      k.clock.now = new Date(Date.parse("2026-12-30T00:00:00Z") - OVERLAP); // пора ротировать
+      // наружу — ошибка ротации, а не отзыва: ротация шла после отказа отзыва
+      await expect(k.r.maintain(p)).rejects.toMatchObject({ code: "UPSTREAM_UNAVAILABLE", httpStatus: 503, idempotencyKey: "x" });
+      expect(k.j.entries.filter((e) => e.kind === "key.created")).toHaveLength(1);
+      await expect(k.r.maintain(p)).rejects.toMatchObject({ code: "UPSTREAM_UNAVAILABLE" });
+      expect(k.revokes).toEqual([`${k.b}|agent-key-revoke-${k.b}`, `${k.b}|agent-key-revoke-${k.b}`]);
+      await k.r.maintain(p).catch(() => undefined);
+      expect(k.revokes).toHaveLength(2); // после KEY_INVALID — не отзывается
+      expect(k.j.entries.filter((e) => e.kind === "key.revoked" && e.reason === "ABANDONED")).toEqual([]);
+      // снят с записью для оператора: ключ был ACTIVE по сверке, Платформа его не знает
+      expect(k.j.entries.filter((e) => e.kind === "key.revoke_dropped")).toEqual([expect.objectContaining({ kid: k.b, reason: "KEY_INVALID" })]);
+    });
+
+    it("при приостановке — отзыв идёт, ротации нет: SignerSuspended, как прежде", async () => {
+      const k = await abandoned();
+      k.r.port().suspend("AGENT_SUSPENDED");
+      await expect(k.r.maintain(k.platform())).rejects.toBeInstanceOf(SignerSuspended);
+      expect(k.revokes).toHaveLength(1);
+      expect(k.j.entries).toContainEqual(expect.objectContaining({ kind: "key.revoked", kid: k.b, reason: "ABANDONED" }));
+    });
+
+    it("перезапуск до отзыва: новая связка на том же каталоге — сверка при допуске снова ставит ключ в очередь (нюанс п. 6)", async () => {
+      const k = await abandoned();
+      k.r.close(); // упал до maintain
+      const j2 = new MemoryJournal();
+      const r2 = new KeyRing({ dir: dir!, params, journal: j2, now: () => k.clock.now });
+      await r2.start(k.self([k.key(), k.bKey]));
+      await r2.maintain(k.platform());
+      expect(k.revokes).toEqual([`${k.b}|agent-key-revoke-${k.b}`]);
+      expect(j2.entries).toContainEqual(expect.objectContaining({ kind: "key.revoked", kid: k.b, reason: "ABANDONED" }));
+      r2.close();
+    });
+  });
+
   it("SUSPENDED и SELLER — приостановка по статусу (Р63 п. 1), класс не проверяется", async () => {
     const k = ring();
     await expect(k.r.start(k.self([k.key()], "SUSPENDED", "SELLER"))).rejects.toMatchObject({ name: "SignerSuspended", reason: "AGENT_SUSPENDED" });

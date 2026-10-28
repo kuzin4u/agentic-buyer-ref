@@ -85,7 +85,7 @@ describe("отзыв своего ключа по ПАО и предел час�
     // временный ключ B — регистрация по ПАО ключом допуска A (адаптер агента, POST /pao/v1/agent/keys)
     const dirB = tmp("revoke-keys-b-");
     const b = generateKey(dirB);
-    const fixedA = { current: () => a.signer, keyRevoked: () => a.signer, stop: () => {}, suspend: () => {} };
+    const fixedA = { current: () => a.signer, protective: () => a.signer, keyRevoked: () => a.signer, stop: () => {}, suspend: () => {} };
     const platform = new PaoPlatform({ baseUrl, agentCode: AGENT, signing: fixedA, params: loadParams(), journal: new MemoryJournal() });
     expect(await platform.registerKey({ alg: "ed25519", publicKey: b.descriptor.public_key }, { idempotencyKey: "idem-key-b" })).toMatchObject({
       kid: b.descriptor.kid,

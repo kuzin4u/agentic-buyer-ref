@@ -108,7 +108,8 @@ export class KeyRing {
   port(): RequestSigning {
     return Object.freeze({
       current: () => this.#current(false),
-      keyRevoked: (kid: string, failure?: unknown) => this.#keyRevoked(kid, failure, false),
+      protective: () => this.#current(false, false, true),
+      keyRevoked: (kid: string, failure?: unknown, protective = false) => this.#keyRevoked(kid, failure, false, false, protective),
       stop: (reason: DiagCode, detail?: string) => this.#stop(reason, detail),
       suspend: (reason: DiagCode) => this.#suspend(reason),
     });
@@ -128,7 +129,8 @@ export class KeyRing {
     const live = () => this.#recheckToken === token;
     const signing: RequestSigning = Object.freeze({
       current: () => this.#current(false, live()),
-      keyRevoked: (kid: string, failure?: unknown) => this.#keyRevoked(kid, failure, false, live()),
+      protective: () => this.#current(false, live(), true),
+      keyRevoked: (kid: string, failure?: unknown, protective = false) => this.#keyRevoked(kid, failure, false, live(), protective),
       stop: (reason: DiagCode, detail?: string) => this.#stop(reason, detail),
       suspend: (reason: DiagCode) => this.#suspend(reason),
     });
@@ -172,6 +174,7 @@ export class KeyRing {
     if (this.#admission !== "none") throw new Error("допуск уже идёт или пройден");
     const signing: RequestSigning = Object.freeze({
       current: () => this.#current(true),
+      protective: () => this.#current(true),
       keyRevoked: (kid: string, failure?: unknown) => this.#keyRevoked(kid, failure, true),
       stop: (reason: DiagCode, detail?: string) => this.#stop(reason, detail),
       suspend: (reason: DiagCode) => this.#suspend(reason),
@@ -301,10 +304,11 @@ export class KeyRing {
     }
   }
 
-  #current(admitting: boolean, rechecking = false): Signer {
+  /** `protective` — защитное обращение (Р63 п. 2): приостановку обходит, остановку и проверку срока ключа — нет. */
+  #current(admitting: boolean, rechecking = false, protective = false): Signer {
     if (this.#stopped !== null) throw new SignerStopped(this.#stopped);
     if (this.#admission !== (admitting ? "admitting" : "admitted")) throw new SignerStopped("NOT_ADMITTED");
-    if (this.#suspended !== null && !admitting && !rechecking) throw new SignerSuspended(this.#suspended);
+    if (this.#suspended !== null && !admitting && !rechecking && !protective) throw new SignerSuspended(this.#suspended);
     // После допуска — только подтверждённый платформой действующий ключ; срок мог истечь (A2 п. 5.3).
     if (!admitting && !this.#usable(this.#held.get(this.#currentKid!)!)) this.#switchTo(this.#pick());
     const h = this.#held.get(this.#currentKid!)!;
@@ -317,9 +321,16 @@ export class KeyRing {
     return Object.freeze({ kid, alg, sign });
   }
 
-  #keyRevoked(kid: string, failure: unknown, admitting: boolean, rechecking = false): Signer {
-    if (this.#held.get(kid)?.state === "active") this.#mark(kid, "revoked", "AGENT_KEY_REVOKED");
-    if (this.#stopped !== null) throw new SignerStopped(this.#stopped, { cause: failure });
+  /** Отзыв kid подтверждён Платформой: `revokedKid` — у каждой остановки отсюда, в том числе при сбое записи отметки
+   *  (KEYSTORE_WRITE_FAILED) и если подпись уже остановлена (Р63 п. 5). */
+  #keyRevoked(kid: string, failure: unknown, admitting: boolean, rechecking = false, protective = false): Signer {
+    try {
+      if (this.#held.get(kid)?.state === "active") this.#mark(kid, "revoked", "AGENT_KEY_REVOKED");
+    } catch (e) {
+      if (e instanceof SignerStopped) throw new SignerStopped(e.reason, { cause: e.cause ?? failure, revokedKid: kid });
+      throw e;
+    }
+    if (this.#stopped !== null) throw new SignerStopped(this.#stopped, { cause: failure, revokedKid: kid });
     // При допуске — один переход на ключ, подтверждённый в метаданных; неподтверждённые не пробуются (без перебора).
     if (admitting) {
       const alt = this.#admissionSwitched ? undefined : this.#confirmedAlternative(kid);
@@ -335,7 +346,7 @@ export class KeyRing {
       if (e instanceof SignerStopped) throw new SignerStopped(e.reason, { cause: failure, revokedKid: kid });
       throw e;
     }
-    return this.#current(admitting, rechecking);
+    return this.#current(admitting, rechecking, protective);
   }
 
   #suspend(reason: DiagCode): void {

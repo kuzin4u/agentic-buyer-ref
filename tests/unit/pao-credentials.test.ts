@@ -15,6 +15,7 @@ const draft: CredentialDraft = { mandate: { id: "m_cart", currency: "RUB" }, ord
 const { signer } = newEd25519Signer("kid_test");
 const signing: RequestSigning = {
   current: () => signer,
+  protective: () => signer,
   keyRevoked: () => {
     throw new Error("в этих тестах ключ не отзывается");
   },

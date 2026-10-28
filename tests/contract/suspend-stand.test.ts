@@ -164,6 +164,26 @@ describe("приостановление и снятие агента на ст�
     await expect(r.c.platform.requestMandate(INTENT, { idempotencyKey: "idem-susp-m7" })).resolves.toMatchObject({ status: "PENDING_SIGNATURE" });
   });
 
+  it("Р63 п. 2: при приостановке у стенда — отказ от INTENT и отзыв второго ключа уходят и исполняются; прочие обращения — SignerSuspended без обращения", async () => {
+    const r = await admitted();
+    const intent = await r.c.platform.requestMandate(INTENT, { idempotencyKey: "idem-susp-p2" });
+    // второй ключ B — регистрация по ПАО ключом допуска; в связке ядра его нет (отзыв — по kid)
+    const b = generateKey(tmp("susp-keys-b-")).descriptor;
+    await r.c.platform.registerKey({ alg: "ed25519", publicKey: b.public_key }, { idempotencyKey: "idem-susp-key-b" });
+    await r.suspended();
+    const before = r.calls.length;
+    await expect(r.c.platform.relinquishMandate(intent.id, { idempotencyKey: "idem-susp-rel" })).resolves.toMatchObject({ id: intent.id, status: "REVOKED" });
+    await expect(r.c.platform.revokeKey(b.kid, { idempotencyKey: "idem-susp-rev" })).resolves.toMatchObject({ kid: b.kid, status: "REVOKED" });
+    expect(r.calls.slice(before)).toEqual([
+      { route: `POST /pao/v1/mandates/${intent.id}/relinquish`, status: 200 },
+      { route: `POST /pao/v1/agent/keys/${b.kid}/revoke`, status: 200 },
+    ]);
+    await expect(r.c.platform.requestMandate(INTENT, { idempotencyKey: "idem-susp-m8" })).rejects.toBeInstanceOf(SignerSuspended);
+    expect(r.calls.length).toBe(before + 2);
+    expect(r.kinds("signing.suspended")).toHaveLength(1);
+    expect(r.kinds("agent.stopped")).toEqual([]);
+  });
+
   it("поддельный push agent.reinstated при SUSPENDED у стенда — ничего не открывает: две сверки, обе SUSPENDED", async () => {
     const r = await admitted();
     await r.suspended();

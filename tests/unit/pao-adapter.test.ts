@@ -25,6 +25,7 @@ const { signer, publicKey } = newEd25519Signer("kid_test");
 /** Порт подписи с одним ключом: отказы по ключу и допуску здесь не проверяются (см. signer-ring и сценарии П01–П03). */
 const signing: RequestSigning = {
   current: () => signer,
+  protective: () => signer,
   keyRevoked: () => {
     throw new Error("в этих тестах ключ не отзывается");
   },
@@ -1013,7 +1014,10 @@ describe("Р60 п. 7: отзыв своего ключа — revokeKey (AG-14 ч
         if (o.suspended) throw new SignerSuspended("AGENT_SUSPENDED");
         return sig();
       },
-      keyRevoked: (kid: string) => {
+      // защитный вход (Р63 п. 2): приостановку обходит
+      protective: () => sig(),
+      keyRevoked: (kid: string, _failure?: unknown, protective = false) => {
+        if (o.suspended && !protective) throw new SignerSuspended("AGENT_SUSPENDED");
         revoked.push(kid);
         if (kid === current) {
           if (o.other === false) throw noOther;
@@ -1120,9 +1124,43 @@ describe("Р60 п. 7: отзыв своего ключа — revokeKey (AG-14 ч
     expect(r.revoked).toEqual([]);
   });
 
-  it("подпись приостановлена — SignerSuspended до обращения", async () => {
+  it("Р63 п. 2, 3: подпись приостановлена — отзыв идёт защитным входом, 200 — Key, ключ отмечен; прочие обращения — SignerSuspended до обращения", async () => {
     const r = on({ [REVOKE_B]: [() => json(200, keyOf(B, "REVOKED"))] }, { suspended: true });
-    await expect(r.platform.revokeKey(B, { idempotencyKey: "idem-revoke-b" })).rejects.toBeInstanceOf(SignerSuspended);
-    expect(r.calls).toEqual([]);
+    await expect(r.platform.revokeKey(B, { idempotencyKey: "idem-revoke-b" })).resolves.toMatchObject({ kid: B, status: "REVOKED" });
+    expect(r.calls.map((c) => [c.route, c.kid])).toEqual([[REVOKE_B, A]]);
+    expect(r.revoked).toEqual([B]);
+    await expect(r.platform.agentSelf()).rejects.toBeInstanceOf(SignerSuspended);
+    expect(r.calls).toHaveLength(1);
+  });
+
+  it("Р63 п. 3: гонка — приостановка между 200 на отзыв и локальной отметкой: Key, ключ отмечен", async () => {
+    const o = { suspended: false };
+    const r = on(
+      {
+        [REVOKE_B]: [
+          () => {
+            o.suspended = true; // 403 параллельного обращения пришёл, пока ответ на отзыв в пути
+            return json(200, keyOf(B, "REVOKED"));
+          },
+        ],
+      },
+      o,
+    );
+    await expect(r.platform.revokeKey(B, { idempotencyKey: "idem-revoke-b" })).resolves.toMatchObject({ kid: B, status: "REVOKED" });
+    expect(r.revoked).toEqual([B]);
+    await expect(r.platform.agentSelf()).rejects.toBeInstanceOf(SignerSuspended);
+  });
+
+  it("Р63 п. 2: отказ от мандата при приостановке — защитным входом, обращение уходит", async () => {
+    const r = on({ "POST /pao/v1/mandates/m_1/relinquish": [refusal(404, "MANDATE_NOT_FOUND", "never")] }, { suspended: true });
+    await expect(r.platform.relinquishMandate("m_1", { idempotencyKey: "idem-rel-1" })).rejects.toMatchObject({ code: "MANDATE_NOT_FOUND" });
+    expect(r.calls.map((c) => c.route)).toEqual(["POST /pao/v1/mandates/m_1/relinquish"]);
+  });
+
+  it("Р63 п. 2: перечень ч. 1 при недоступной ленте не сужается — защитные обращения не берут обязательства", async () => {
+    const { OBLIGATION_OPERATIONS, PROTECTIVE_OPERATIONS } = await import("../../src/agent/adapters/pao/adapter.js");
+    for (const op of PROTECTIVE_OPERATIONS) expect(OBLIGATION_OPERATIONS.has(op)).toBe(false);
+    expect([...OBLIGATION_OPERATIONS].sort()).toEqual(["POST /pao/v1/confirmations", "POST /pao/v1/credentials", "POST /pao/v1/mandates"]);
+    expect([...PROTECTIVE_OPERATIONS].sort()).toEqual(["POST /pao/v1/agent/keys/{kid}/revoke", "POST /pao/v1/mandates/{id}/relinquish"]);
   });
 });

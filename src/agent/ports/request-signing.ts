@@ -11,9 +11,13 @@ export interface RequestSigning {
   /** Подписант действующего ключа; агент остановлен или не допущен — SignerStopped; подпись приостановлена (Р27) —
    *  SignerSuspended. */
   current(): Signer;
-  /** Платформа ответила AGENT_KEY_REVOKED на подпись kid: следующий действующий ключ или остановка
-   *  (SignerStopped, исходный отказ — в cause). */
-  keyRevoked(kid: string, failure?: unknown): Signer;
+  /** Подписант для защитных обращений — отказ от мандата и отзыв своего ключа (Р63 п. 2): и при приостановке подписи
+   *  (любая причина); агент остановлен или не допущен — SignerStopped. Только действующий подтверждённый ключ. */
+  protective(): Signer;
+  /** Платформа подтвердила отзыв kid (AGENT_KEY_REVOKED на его подпись, 200 на отзыв): следующий действующий ключ или
+   *  остановка (SignerStopped с `revokedKid`, исходный отказ — в cause). `protective` — на пути защитного обращения:
+   *  приостановка не бросает (Р63 п. 3). */
+  keyRevoked(kid: string, failure?: unknown, protective?: boolean): Signer;
   /** Отказ в допуске или нет действующего ключа: остановка агента; дальнейшая подпись — SignerStopped.
    *  detail — уточнение для журнала: только значение перечня ПАО (класс при AGENT_CLASS_MISMATCH, Р27) или версия вида
    *  1.x.y, собранная из чисел (PLATFORM_PROTOCOL_UNSUPPORTED, Р33 п. 10), или значение SIGNER_STOP_DETAILS. */

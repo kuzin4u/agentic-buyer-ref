@@ -23,6 +23,8 @@ const setup = (o: PurchaseSetup = {}) => purchaseOn(o, (s) => (stand = s));
 const TARTINE = feedPrice(SHOP, "tartine").amount;
 const ZAVARNOY = feedPrice(SHOP, "zavarnoy").amount;
 const VERIFY = "GET /pao/v1/mandates/{id}/verify";
+const RELINQUISH = "POST /pao/v1/mandates/{id}/relinquish";
+/** обращения после `from`; после остановки — с фоновым отказом от CART: сначала дождаться `cartReleased()` (Р63 п. 7) */
 const opsFrom = (r: PurchaseRun, from: number) => r.stand.stub.calls.slice(from).map((c) => c.op);
 const shownIn = (r: PurchaseRun) => ({ intentId: r.purchase.intentMandate!.id });
 
@@ -397,7 +399,9 @@ describe("Р44 п. 5 — проверка по мандату непосредс
       expect(r.purchase.state).toBe("STOPPED");
       // живые проверки обеих позиций прошли, затем verify INTENT — и стоп: по INTENT вне пределов CART уже не проверяется
       expect(r.live.calls!.length).toBe(4);
-      expect(opsFrom(r, from)).toEqual([VERIFY]);
+      // CART не использован — фоновый отказ от него (Р63 п. 7; КТ1 сессии 46 № 4)
+      expect(await r.purchase.cartReleased()).toBe("RELINQUISHED");
+      expect(opsFrom(r, from)).toEqual([VERIFY, RELINQUISH]);
       expect(r.shop.calls).toEqual([]);
       expect(payment.calls).toEqual([]);
       expect(r.atStop().slice(-2).map((e) => [e.kind, e.reason, e.mandate])).toEqual([
@@ -416,7 +420,8 @@ describe("Р44 п. 5 — проверка по мандату непосредс
     const from = r.stand.stub.calls.length;
     await expect(r.purchase.placeOrder({ idempotencyKey: "idem-order-1" })).rejects.toMatchObject({ code: "MANDATE_AMOUNT_LEFT_INSUFFICIENT" });
     expect(r.purchase.state).toBe("STOPPED");
-    expect(opsFrom(r, from)).toEqual([VERIFY, VERIFY]);
+    expect(await r.purchase.cartReleased()).toBe("RELINQUISHED");
+    expect(opsFrom(r, from)).toEqual([VERIFY, VERIFY, RELINQUISH]);
     expect(r.shop.calls).toEqual([]);
     expect(r.atStop().slice(-2).map((e) => [e.kind, e.reason, e.mandate])).toEqual([
       ["agent.refused", "MANDATE_AMOUNT_LEFT_INSUFFICIENT", cart.id],

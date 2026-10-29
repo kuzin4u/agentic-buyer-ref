@@ -104,6 +104,18 @@ describe("канал mTLS в compose (Р64 п. 5–7)", () => {
     expect(seen).toHaveLength(3);
   });
 
+  it("знак готовности витрин (ПАО) — тоже через канал; витрины — своим транспортом", async () => {
+    issueClient(pki, stand.dir, ca, "root", AGENT);
+    const url = await tlsProxy();
+    const c = core(url, { caPem: ca.pem, caFingerprint: ca.fingerprint });
+    await c.start();
+    const shopCalls: string[] = [];
+    const shops = c.shops({ baseUrl: "http://shops.test", fetch: async (u) => (shopCalls.push(String(u)), new Response(null, { status: 404 })) });
+    await shops.readiness("merchant-1").catch(() => undefined);
+    expect(seen.at(-1)).toEqual({ path: "/pao/v1/merchants/merchant-1/readiness", san: `URI:urn:${AGENT}` });
+    expect(shopCalls).toEqual([]);
+  });
+
   it("отпечаток не совпал — TLS_TRUST_MISMATCH на start(): platform.tls fail, остановка, обращений нет", async () => {
     issueClient(pki, stand.dir, ca, "root", AGENT);
     const url = await tlsProxy();

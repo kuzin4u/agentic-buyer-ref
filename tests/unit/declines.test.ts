@@ -9,11 +9,20 @@ const spec = readFileSync("docs/core/SPEC.md", "utf8");
 const AGENT_CODES = ["MANDATE_REVOCATION_ORDER_MISSING", "PLATFORM_PROTOCOL_UNSUPPORTED"];
 /** разделение UNKNOWN (Р48 п. 3) */
 const SPLIT_CODES = ["NO_RESPONSE", "BAD_RESPONSE", "AGENT_REQUEST_DEFECT"];
+/** отказы канала mTLS посреди работы (Р64 п. 7): остановка агента без повтора */
+const TLS_CODES = ["TLS_SERVER_UNTRUSTED", "TLS_CERT_EXPIRED"];
 const specRows = [...spec.matchAll(/^\| ([A-Z_]+) \| (\d{3}) \| (\w+) \|/gm)].map((m) => ({ code: m[1]!, http: Number(m[2]), retry: m[3]! }));
 
 describe("таблица отказов", () => {
   it("коды ядра = коды ПАО 1.4.0 + коды агента вне ПАО (Р33, Р48 п. 3) + коды клиента ПАО (Р37 п. 1) + UNKNOWN", () => {
-    expect(Object.keys(FAILURE_RULES).sort()).toEqual([...Object.keys(PAO_ERRORS), ...AGENT_CODES, ...SPLIT_CODES, ...PAO_CLIENT_CODES, "UNKNOWN"].sort());
+    expect(Object.keys(FAILURE_RULES).sort()).toEqual([...Object.keys(PAO_ERRORS), ...AGENT_CODES, ...SPLIT_CODES, ...TLS_CODES, ...PAO_CLIENT_CODES, "UNKNOWN"].sort());
+  });
+
+  it("Р64 п. 7: отказы канала mTLS — стоп без повтора, событие в журнал, остановка агента целиком", () => {
+    for (const c of TLS_CODES) {
+      expect(ruleForFailure(c as "TLS_SERVER_UNTRUSTED")).toMatchObject({ action: "STOP", retry: "never", maxRetries: 0, defect: false, journal: true });
+      expect(AGENT_STOP_CODES.has(c as "TLS_SERVER_UNTRUSTED")).toBe(true);
+    }
   });
 
   it("Р33 п. 4: MANDATE_REVOCATION_ORDER_MISSING — стоп без повтора, событие в журнал; строка в SPEC §7а", () => {

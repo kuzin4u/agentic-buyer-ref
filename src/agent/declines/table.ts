@@ -84,6 +84,9 @@ export const FAILURE_RULES: Readonly<Record<FailureCode, DeclineRule>> = {
   NO_RESPONSE: rule("RETRY_SAME_KEY", "same_key", null, false, true),
   BAD_RESPONSE: rule("STOP", "never", 0, false, true),
   AGENT_REQUEST_DEFECT: rule("STOP", "never", 0, true),
+  // Р64 п. 7: отказы канала mTLS — остановка агента целиком (AGENT_STOP_CODES) без повтора; не дефект агента.
+  TLS_SERVER_UNTRUSTED: rule("STOP", "never", 0, false, true),
+  TLS_CERT_EXPIRED: rule("STOP", "never", 0, false, true),
   // Неопознанный код платформы — не дефект агента, но остановка и событие в журнал (SPEC §7а).
   UNKNOWN: rule("STOP", "never", 0, false, true),
 };
@@ -95,6 +98,9 @@ export const AGENT_STOP_CODES: ReadonlySet<FailureCode> = new Set<FailureCode>([
   "AGENT_UNKNOWN",
   "AGENT_SUSPENDED",
   "PLATFORM_PROTOCOL_UNSUPPORTED",
+  // канал mTLS (Р64 п. 7): сервер не прошёл проверку, срок сертификата канала истёк
+  "TLS_SERVER_UNTRUSTED",
+  "TLS_CERT_EXPIRED",
 ]);
 
 export function ruleForFailure(code: FailureCode): DeclineRule {

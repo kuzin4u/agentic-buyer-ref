@@ -40,6 +40,8 @@ export const AGENT_DIAG_CODES = [
   "TLS_TRUST_MISMATCH",
   "TLS_CERT_MISSING",
   "TLS_CERT_EXPIRED",
+  // канал mTLS (Р64 п. 7): сервер не прошёл проверку — остановка без повтора
+  "TLS_SERVER_UNTRUSTED",
   // клиент мандатов (MandateRefusal; порядок отзыва — MANDATE_REVOCATION_ORDER_MISSING выше)
   "MANDATE_DRAFT_INVALID",
   "MANDATE_REPLY_MISMATCH",

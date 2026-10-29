@@ -1,11 +1,13 @@
 // Ключ канала mTLS к ПАО (Р64 п. 2–3): P-256, свой на каждого агента, отдельно от ключа подписи ed25519.
 // Закрытый ключ — PKCS8 в `<каталог ключей>/tls/client.key.pem` (0600, каталог 0700) и не покидает модуль signer
-// (инвариант 2): наружу — описатель (открытый ключ) и CSR для заявления на допуск. Сертификат и канал — К2.2, К3.1.
+// (инвариант 2): наружу — описатель (открытый ключ) и CSR для заявления на допуск. Сертификат канала — DER в
+// `tls/client.cert.der` (0600) после сверок п. 4; корень УЦ — только из настройки со сверкой отпечатка (п. 6). Канал — К3.1.
 // CSR собирается своим DER без зависимостей: в node:crypto сборки CSR нет (как РП65 п. 2 Платформы).
-import { createPrivateKey, createPublicKey, generateKeyPairSync, sign, type KeyObject } from "node:crypto";
-import { writeFileSync } from "node:fs";
+import { createHash, createPrivateKey, createPublicKey, generateKeyPairSync, sign, X509Certificate, type KeyObject } from "node:crypto";
+import { renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { SignerKeyRejected } from "./errors.js";
+import type { Journal } from "../journal/index.js";
+import { SignerKeyRejected, TlsCertificateRejected, TlsConfigInvalid, TlsTrustMismatch } from "./errors.js";
 import { privateDir, readOwnerFile } from "./keystore.js";
 
 /** Описатель ключа TLS: только открытые сведения. */
@@ -103,4 +105,127 @@ export function tlsCsr(dir: string): string {
   const der = tlv(SEQUENCE, info, ECDSA_SHA256, tlv(0x03, Buffer.from([0x00]), signature));
   if (der.length > CSR_MAX_DER_BYTES) throw new SignerKeyRejected("CSR длиннее предела");
   return der.toString("base64");
+}
+
+/** Закреплённый корень УЦ песочницы: только открытые сведения, отпечаток сверен с настройкой (Р64 п. 6). */
+export interface TlsRoot {
+  /** корень в PEM — единственный УЦ доверия канала (без публичных УЦ) */
+  readonly pem: string;
+  /** SHA-256 от DER корня, 64 знака hex в нижнем регистре */
+  readonly fingerprint: string;
+}
+
+/**
+ * Отпечаток из настройки: только полный SHA-256 — 64 знака hex; регистр и разделители «:» не учитываются (вывод
+ * `npm run ca:init` и `fingerprint256` Node — «AB:CD:…»). Иной формат — TlsConfigInvalid; частичного сравнения нет.
+ */
+export function parseFingerprint(value: unknown): string {
+  if (typeof value !== "string") throw new TlsConfigInvalid("отпечаток корня УЦ: не строка");
+  const hex = value.replaceAll(":", "").toLowerCase();
+  if (!/^[0-9a-f]{64}$/.test(hex)) throw new TlsConfigInvalid("отпечаток корня УЦ: не полный SHA-256 (64 знака hex)");
+  return hex;
+}
+
+/** Ровно один сертификат PEM; иное — TlsConfigInvalid. */
+function rootCertificate(pem: unknown): X509Certificate {
+  if (typeof pem !== "string" || (pem.match(/-----BEGIN CERTIFICATE-----/g) ?? []).length !== 1) {
+    throw new TlsConfigInvalid("корень УЦ: не один сертификат PEM");
+  }
+  let cert: X509Certificate;
+  try {
+    cert = new X509Certificate(pem);
+  } catch {
+    throw new TlsConfigInvalid("корень УЦ: сертификат не разбирается");
+  }
+  if (!cert.checkIssued(cert) || !cert.verify(cert.publicKey)) throw new TlsConfigInvalid("корень УЦ: не самоподписанный");
+  return cert;
+}
+
+/**
+ * Закрепление корня при загрузке настройки (Р64 п. 6): сначала форма отпечатка и корня (TlsConfigInvalid), затем
+ * сверка SHA-256 от DER корня с отпечатком — не совпал: TlsTrustMismatch (TLS_TRUST_MISMATCH, остановка до обращений).
+ */
+export function pinRoot(caPem: unknown, caFingerprint: unknown): TlsRoot {
+  const expected = parseFingerprint(caFingerprint);
+  const cert = rootCertificate(caPem);
+  const actual = createHash("sha256").update(cert.raw).digest("hex");
+  if (actual !== expected) throw new TlsTrustMismatch();
+  return Object.freeze({ pem: cert.toString(), fingerprint: actual });
+}
+
+const CERT_FILE = "client.cert.der";
+const CLIENT_AUTH = "1.3.6.1.5.5.7.3.2";
+
+export interface InstallTlsOptions {
+  /** код агента из реестра; SAN сертификата — ровно `URI:urn:<код>` (РП27 п. 2 Платформы, `urn:nspk:agent:<id>:v<N>`) */
+  readonly agentCode: string;
+  readonly root: TlsRoot;
+  readonly journal: Journal;
+  readonly now?: () => Date;
+}
+
+/** Установленный сертификат: только открытые сведения для журнала и оператора. */
+export interface InstalledTlsCertificate {
+  /** серийный номер hex в нижнем регистре — как в решении о допуске */
+  readonly serial: string;
+  readonly not_after: string;
+}
+
+/** Сертификат канала по сверкам Р64 п. 4; первое несовпадение — TlsCertificateRejected с причиной. */
+function checkCertificate(der: unknown, key: KeyObject, o: InstallTlsOptions): X509Certificate {
+  if (typeof der !== "string" || der.length === 0 || Buffer.from(der, "base64").toString("base64") !== der) {
+    throw new TlsCertificateRejected("MALFORMED");
+  }
+  let cert: X509Certificate;
+  try {
+    cert = new X509Certificate(Buffer.from(der, "base64"));
+  } catch {
+    throw new TlsCertificateRejected("MALFORMED");
+  }
+  const spki = (k: KeyObject) => createPublicKey(k).export({ type: "spki", format: "der" });
+  if (!cert.publicKey.export({ type: "spki", format: "der" }).equals(spki(key))) throw new TlsCertificateRejected("KEY_MISMATCH");
+  if (cert.subjectAltName !== `URI:urn:${o.agentCode}`) throw new TlsCertificateRejected("SAN_MISMATCH");
+  if (!(cert.keyUsage ?? []).includes(CLIENT_AUTH)) throw new TlsCertificateRejected("NOT_CLIENT_AUTH");
+  const root = new X509Certificate(o.root.pem);
+  if (!cert.checkIssued(root) || !cert.verify(root.publicKey)) throw new TlsCertificateRejected("NOT_ISSUED_BY_ROOT");
+  // not_before с моментом допуска на равенство не сверяется (передача #86 п. 5): запас Платформы — назад
+  if ((o.now ?? (() => new Date()))().getTime() >= new Date(cert.validTo).getTime()) throw new TlsCertificateRejected("EXPIRED");
+  return cert;
+}
+
+/**
+ * Установка сертификата из решения о допуске (`certificate.der`, base64; Р64 п. 4). Сверки — ключ наш, SAN — код
+ * агента, EKU clientAuth, выдан закреплённым корнем, срок не истёк; иначе — TlsCertificateRejected, прежний сертификат
+ * остаётся, агент не останавливается. Запись — временный файл (wx, 0600) и переименование поверх прежнего; затем
+ * журнал `tls.certificate_installed` с серийным номером (без DER и ключа). Сбой журнала установку не отменяет.
+ */
+export function installTlsCertificate(dir: string, der: unknown, o: InstallTlsOptions): InstalledTlsCertificate {
+  const abs = tlsDir(dir, false);
+  const cert = checkCertificate(der, loadTlsKey(dir), o);
+  const tmp = join(abs, `${CERT_FILE}.${process.pid}.tmp`);
+  try {
+    try {
+      unlinkSync(tmp); // остаток прерванной записи
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
+    }
+    writeFileSync(tmp, cert.raw, { mode: 0o600, flag: "wx" });
+    renameSync(tmp, join(abs, CERT_FILE));
+  } catch (e) {
+    throw new SignerKeyRejected("сертификат канала не записан", { cause: e });
+  }
+  const installed: InstalledTlsCertificate = Object.freeze({ serial: cert.serialNumber.toLowerCase(), not_after: new Date(cert.validTo).toISOString() });
+  o.journal.record({ at: (o.now ?? (() => new Date()))().toISOString(), kind: "tls.certificate_installed", ref: installed.serial });
+  return installed;
+}
+
+/** Установленный сертификат канала; нет — null (TLS_CERT_MISSING решает вызывающий, К3.1). */
+export function loadTlsCertificate(dir: string): X509Certificate | null {
+  const raw = readOwnerFile(join(tlsDir(dir, false), CERT_FILE), "файл сертификата канала", true);
+  if (raw === null) return null;
+  try {
+    return new X509Certificate(raw);
+  } catch {
+    throw new SignerKeyRejected("файл сертификата канала не разбирается");
+  }
 }

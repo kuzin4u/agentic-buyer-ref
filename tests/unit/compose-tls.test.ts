@@ -25,9 +25,10 @@ let ca: Ca;
 let seen: { path: string; san: string }[];
 beforeEach(() => {
   pki = mkdtempSync(join(tmpdir(), "buyref-pki-"));
-  // часы — «сейчас»: корень и сертификаты openssl выпущены по настоящему времени (корень вне срока — TlsConfigInvalid)
-  stand = new PaoStand({ clock: new Date() });
+  // сначала корень, потом часы «сейчас»: начало срока корня openssl округлено до секунды, часы стенда взятые раньше
+  // выпуска могут оказаться в предыдущей секунде — корень «ещё не действует», TlsConfigInvalid (К4.4, CI Node 20.19)
   ca = makeCa(pki, "root");
+  stand = new PaoStand({ clock: new Date() });
   seen = [];
 });
 afterEach(async () => {

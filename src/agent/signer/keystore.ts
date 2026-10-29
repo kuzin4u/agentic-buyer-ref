@@ -67,8 +67,9 @@ function assertOwnerOnly(st: Stats, expected: number, what: string): void {
 /**
  * Каталог ключей: последний компонент — настоящий каталог, не символическая ссылка (resolve снимает завершающий «/»,
  * иначе lstat пошёл бы по ссылке). При create — создаётся с правами 0700; при загрузке не создаётся.
+ * Внутри signer — и для каталога ключа TLS (tls.ts); через index.ts наружу не выходит.
  */
-function privateDir(dir: string, create: boolean): string {
+export function privateDir(dir: string, create: boolean): string {
   const abs = resolve(dir);
   let st: Stats;
   try {
@@ -110,7 +111,7 @@ export function generateKey(dir: string, state: "active" | "pending" = "active")
 }
 
 /** Чтение файла хранилища: обычный файл, владелец — процесс, права 0600; null — файла нет (если допустимо). */
-function readOwnerFile(path: string, what: string, missingOk = false): Buffer | null {
+export function readOwnerFile(path: string, what: string, missingOk = false): Buffer | null {
   let fd: number | undefined;
   try {
     // O_NOFOLLOW и проверка по дескриптору: между проверкой и чтением файл не подменить ссылкой;

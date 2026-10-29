@@ -43,6 +43,9 @@ export interface StandOptions {
   handlers?: PaoStubOptions["handlers"];
   /** ответ GET /.well-known/pao-configuration (Р33 п. 10); по умолчанию PaoStub отдаёт versions ["v1"] */
   configuration?: PaoStubOptions["configuration"];
+  /** часы стенда и агента; по умолчанию 2026-10-12T09:00Z. Тесты канала mTLS — «сейчас»: сертификаты openssl выпускаются
+   *  по настоящему времени, корень вне срока по часам агента не закрепляется (КТ1 № 6 сессии 49) */
+  clock?: Date;
 }
 
 /** Р33 п. 10: чтение конфигурации на стадии 0 — первое обращение каждого допуска (PaoStub отдаёт versions ["v1"]). */
@@ -64,6 +67,7 @@ export class PaoStand {
   private readonly overlap: number;
 
   constructor(o: StandOptions = {}) {
+    if (o.clock !== undefined) this.clock = o.clock;
     // По умолчанию платформа стенда работает по тем же стендовым параметрам, что и агент (config/params.stand.json).
     const params = loadParams();
     this.ttl = (o.ttlDays ?? params.key_ttl_days) * DAY;

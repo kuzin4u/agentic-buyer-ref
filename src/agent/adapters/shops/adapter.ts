@@ -22,7 +22,7 @@ import { readShop, type CatalogFacts, type CatalogIssueCode, type CatalogProduct
 import type { Journal, JournalResult } from "../../journal/index.js";
 import type { LiveOffer, LiveOfferRequest, LiveOfferSource } from "../../ports/catalog.js";
 import { haltAgent, type HttpRequestSigning, type RequestSigning } from "../../ports/request-signing.js";
-import { AGENT_STOP_CODES, ruleForFailure } from "../../declines/index.js";
+import { AGENT_STOP_CODES, channelFailure, ruleForFailure } from "../../declines/index.js";
 import {
   ShopFailure,
   type OfferSource,
@@ -294,7 +294,9 @@ export class ShopsAdapter implements OfferSource, LiveOfferSource, ShopPort, Sho
    *  общим правилом обращений к ПАО (Р53 п. 5): код из `AGENT_STOP_CODES` — остановка подписи (`AGENT_SUSPENDED` —
    *  приостановка, Р60 п. 1), `AGENT_KEY_REVOKED` — смена
    *  ключа; затем PlatformFailure наружу (сделка STOPPED тем же кодом); 401 без кода по перечню — BAD_RESPONSE. Другого
-   *  действующего ключа нет — `keyRevoked` сам бросает SignerStopped (`NO_ACTIVE_KEY`), он и уходит наружу. Нет ответа, прочий
+   *  действующего ключа нет — `keyRevoked` сам бросает SignerStopped (`NO_ACTIVE_KEY`), он и уходит наружу. Отказ канала
+   *  mTLS — тем же закрытым перечнем, что у адаптера ПАО (Р64 п. 7; КТ1 № 1 сессии 49): `AGENT_UNKNOWN`,
+   *  `TLS_SERVER_UNTRUSTED`, `TLS_CERT_EXPIRED` — остановка подписи без смены ключа и PlatformFailure наружу. Нет ответа, прочий
    *  отказ (400, 414, 503 …), ответ не по схеме, чужой merchant_id, merchant_id не по маске (без обращения) — «знак не
    *  проверен» (Р53 п. 4). */
   async readiness(merchantId: string, signal?: AbortSignal): Promise<Readiness> {
@@ -307,7 +309,29 @@ export class ShopsAdapter implements OfferSource, LiveOfferSource, ShopPort, Sho
     // обращения нет; kid — для смены ключа по AGENT_KEY_REVOKED (Р53 п. 5)
     const { kid } = this.o.platform.signing.current();
     const signed = this.o.signing.sign({ method: "GET", path, query: "", headers: this.#headers(), body: "" });
-    const reply = await this.#request(this.o.platform.fetch ?? this.fetchImpl, `${this.o.platform.baseUrl}${path}`, "GET", signed.headers, undefined, this.o.params.pao_request_timeout_ms, signal);
+    // причина исключения fetch — для перечня отказов канала; #request её не отдаёт (сеть — «не проверено»)
+    const platformFetch = this.o.platform.fetch ?? this.fetchImpl;
+    let cause: unknown;
+    const watched = (async (url: string | URL | Request, init?: RequestInit) => {
+      try {
+        return await platformFetch(url, init);
+      } catch (e) {
+        cause = e;
+        throw e;
+      }
+    }) as typeof fetch;
+    const reply = await this.#request(watched, `${this.o.platform.baseUrl}${path}`, "GET", signed.headers, undefined, this.o.params.pao_request_timeout_ms, signal);
+    const tls = reply === null ? channelFailure(cause) : null;
+    if (tls !== null) {
+      const failure = new PlatformFailure(tls, ruleForFailure(tls).retry, null, 0, null, "знак готовности: отказ канала mTLS");
+      try {
+        this.#record("shop.readiness", merchantId, tls, "refused");
+      } finally {
+        // остановка — и при сбое журнала (Р58 п. 0); ключ подписи не меняется (Р64 п. 7)
+        haltAgent(this.o.platform.signing, tls);
+      }
+      throw failure;
+    }
     if (reply === null) {
       this.#record("shop.readiness", merchantId, "NO_RESPONSE", "unknown");
       return { unverified: "NO_RESPONSE" };

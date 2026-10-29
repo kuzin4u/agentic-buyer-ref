@@ -9,6 +9,52 @@ export class SignerKeyRejected extends Error {
   override readonly name: string = "SignerKeyRejected";
 }
 
+/** Настройка канала mTLS не по форме (Р64 п. 6): отпечаток корня — не полный SHA-256 (64 знака hex), корень не PEM
+ *  самоподписанного сертификата. Отказ при загрузке параметров — до обращений, частичного сравнения нет. */
+export class TlsConfigInvalid extends Error {
+  override readonly name = "TlsConfigInvalid";
+}
+
+/** Отпечаток корня УЦ из настройки не совпал с корнем (Р64 п. 6): TLS_TRUST_MISMATCH — остановка до первого обращения
+ *  (fail-closed). Отпечатков в сообщении нет: оба — в настройке оператора. */
+export class TlsTrustMismatch extends SignerKeyRejected {
+  override readonly name = "TlsTrustMismatch";
+  readonly code = "TLS_TRUST_MISMATCH" as const;
+  constructor() {
+    super("отпечаток корня УЦ не совпал с настройкой");
+  }
+}
+
+/** `pao.tls` задан, сертификат канала не установлен (Р64 п. 6): TLS_CERT_MISSING — допуска нет, обращения не было. */
+export class TlsCertMissing extends SignerKeyRejected {
+  override readonly name = "TlsCertMissing";
+  readonly code = "TLS_CERT_MISSING" as const;
+  constructor() {
+    super("сертификат канала не установлен");
+  }
+}
+
+/** `not_after` сертификата канала прошёл по часам агента (Р64 п. 7): TLS_CERT_EXPIRED — остановка до обращения. */
+export class TlsCertExpired extends SignerKeyRejected {
+  override readonly name = "TlsCertExpired";
+  readonly code = "TLS_CERT_EXPIRED" as const;
+  constructor() {
+    super("срок сертификата канала истёк");
+  }
+}
+
+/** Причина отказа в установке сертификата канала (Р64 п. 4). */
+export type TlsCertRejection = "MALFORMED" | "KEY_MISMATCH" | "SAN_MISMATCH" | "NOT_CLIENT_AUTH" | "NOT_ISSUED_BY_ROOT" | "EXPIRED";
+
+/** Сертификат из решения о допуске не установлен (Р64 п. 4): прежний остаётся, агент не останавливается — действие
+ *  оператора (новый допуск, другой сертификат). */
+export class TlsCertificateRejected extends SignerKeyRejected {
+  override readonly name = "TlsCertificateRejected";
+  constructor(readonly reason: TlsCertRejection) {
+    super(`сертификат канала не установлен: ${reason}`);
+  }
+}
+
 /** Ротация остановлена: новый ключ не принят подряд сверх предела таблицы отказов (KEY_INVALID, KEY_NOT_ACTIVE; Р31,
  *  Р58 п. 4). Не временный отказ: нужен человек (снятие — перезапуск, команда оператора — AG-14); подпись прежним
  *  подтверждённым ключом продолжается, пока он действителен. */

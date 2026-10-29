@@ -4,7 +4,7 @@
 // ПАО 1.4.0 и неразобранное — UNKNOWN (never, инвариант 4).
 import { PAO_ERRORS, PaoCallError, type ErrorCode } from "@kuzin4u/agentic-core/pao";
 import { PlatformFailure, type FailureCode } from "../../../shared/domain.js";
-import { FAILURE_RULES } from "../../declines/index.js";
+import { FAILURE_RULES, channelFailure } from "../../declines/index.js";
 
 /** Полный перевод кодов ПАО 1.4.0; новый код в agentic-core без строки здесь не соберётся. */
 const CODES: Record<ErrorCode, FailureCode> = {
@@ -51,7 +51,12 @@ export function toFailure(e: unknown, idempotencyKey: string | null = null): Pla
     const code = raw !== null && Object.hasOwn(CODES, raw) ? CODES[raw as ErrorCode] : undefined;
     const key = e.idempotencyKey ?? idempotencyKey;
     if (code === undefined) {
-      if (e.status === 0) return new PlatformFailure("NO_RESPONSE", FAILURE_RULES.NO_RESPONSE.retry, null, 0, key, "нет ответа");
+      if (e.status === 0) {
+        // отказ канала mTLS (Р64 п. 7): по закрытому перечню; прочее — сетевой сбой по прежним правилам
+        const tls = channelFailure(e.cause);
+        if (tls !== null) return new PlatformFailure(tls, FAILURE_RULES[tls].retry, null, 0, key, "отказ канала mTLS");
+        return new PlatformFailure("NO_RESPONSE", FAILURE_RULES.NO_RESPONSE.retry, null, 0, key, "нет ответа");
+      }
       if (!e.body) return new PlatformFailure("BAD_RESPONSE", "never", null, e.status, key, "ответ без тела ПАО");
       return new PlatformFailure("UNKNOWN", "never", raw, e.status, key, "код не из ПАО 1.4.0");
     }

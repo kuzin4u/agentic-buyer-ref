@@ -58,7 +58,8 @@ function gtinLuhn13(): string {
   }
 }
 
-type Answer = { status: number; body?: unknown; headers?: Record<string, string> } | "hang" | "fail";
+/** Error — исключение fetch как есть (отказ канала mTLS, Р64 п. 7). */
+type Answer = { status: number; body?: unknown; headers?: Record<string, string> } | "hang" | "fail" | Error;
 interface Seen {
   method: string;
   path: string;
@@ -77,6 +78,7 @@ function vitrine(routes: Record<string, Answer[]>) {
     seen.push({ method: init?.method ?? "GET", path: url.pathname, headers: { ...(init?.headers as Record<string, string>) }, redirect: init?.redirect, body: typeof init?.body === "string" ? init.body : undefined, query: url.search });
     const q = routes[`${init?.method ?? "GET"} ${url.pathname}`] ?? [{ status: 404, body: { code: "SHOP_NOT_FOUND" } }];
     const a = q.length > 1 ? q.shift()! : q[0]!;
+    if (a instanceof Error) throw a;
     if (a === "fail") throw new TypeError("fetch failed");
     if (a === "hang")
       return new Promise<Response>((_, reject) => init?.signal?.addEventListener("abort", () => reject(init.signal!.reason)));
@@ -102,6 +104,7 @@ function platform(marks: Record<string, Answer[]>) {
     const id = /^\/pao\/v1\/merchants\/([^/]+)\/readiness$/.exec(url.pathname)?.[1] ?? "";
     const q = marks[id] ?? [READY(id)];
     const a = q.length > 1 ? q.shift()! : q[0]!;
+    if (a instanceof Error) throw a;
     if (a === "fail") throw new TypeError("fetch failed");
     if (a === "hang")
       return new Promise<Response>((_, reject) => init?.signal?.addEventListener("abort", () => reject(init.signal!.reason)));
@@ -856,6 +859,62 @@ describe("знак готовности продавца по ПАО (Р53)", ()
       await expect(a.readiness("MER-S1")).rejects.toThrow("журнал недоступен");
       expect([pao.stops, pao.suspends, pao.rotations]).toEqual([stops, suspends, rotations]);
     }
+  });
+
+  describe("отказ канала mTLS — тем же закрытым перечнем, что у адаптера ПАО (Р64 п. 7; КТ1 № 1, 7 сессии 49)", () => {
+    const nodeError = (message: string, code?: string) => Object.assign(new Error(message), code === undefined ? {} : { code });
+    const STOP: [string, Error, string][] = [
+      ["алерт о сертификате клиента (код Node)", nodeError("alert", "ERR_SSL_TLSV13_ALERT_CERTIFICATE_REQUIRED"), "AGENT_UNKNOWN"],
+      ["алерт о сертификате клиента (номер в тексте OpenSSL)", nodeError("error:0A000418:SSL routines::tlsv1 alert unknown ca:SSL alert number 48\n", "EPROTO"), "AGENT_UNKNOWN"],
+      ["чужой УЦ сервера", nodeError("unable to verify the first certificate", "UNABLE_TO_VERIFY_LEAF_SIGNATURE"), "TLS_SERVER_UNTRUSTED"],
+      ["имя сервера не совпало", nodeError("Hostname/IP does not match", "ERR_TLS_CERT_ALTNAME_INVALID"), "TLS_SERVER_UNTRUSTED"],
+      ["сервер не TLS 1.3 (алерт 70)", nodeError("error:0A00042E:SSL routines::tlsv1 alert protocol version:SSL alert number 70\n", "EPROTO"), "TLS_SERVER_UNTRUSTED"],
+      ["срок сертификата канала истёк (код канала signer)", nodeError("срок сертификата канала истёк", "TLS_CERT_EXPIRED"), "TLS_CERT_EXPIRED"],
+    ];
+    for (const [what, error, code] of STOP) {
+      it(`${what} → ${code}: остановка подписи без смены ключа, PlatformFailure наружу, в журнале — refused`, async () => {
+        const { a, pao, journal } = adapter({}, {}, { "MER-S1": [error] });
+        const err = await a.readiness("MER-S1").catch((e: unknown) => e);
+        expect(err).toBeInstanceOf(PlatformFailure);
+        expect(err).toMatchObject({ code, retry: "never", httpStatus: 0 });
+        expect([pao.stops, pao.suspends, pao.rotations, pao.seen.length]).toEqual([[code], [], [], 1]);
+        expect(readiness(journal)).toEqual([["GET /pao/v1/merchants/{merchant_id}/readiness", "MER-S1", "refused", code]]);
+      });
+    }
+
+    it("через поиск — отказ наружу, каталогов нет, к следующим витринам не обращаются", async () => {
+      const { a, seen, pao } = adapter(
+        { ...LIST(shop("S1"), shop("S2")), ...catalog("S1", ok(ITEM)), ...catalog("S2", ok(ITEM)) },
+        {},
+        { "MER-S1": [nodeError("unable to verify the first certificate", "UNABLE_TO_VERIFY_LEAF_SIGNATURE")] },
+      );
+      await expect(a.search()).rejects.toMatchObject({ name: "PlatformFailure", code: "TLS_SERVER_UNTRUSTED" });
+      expect(pao.stops).toEqual(["TLS_SERVER_UNTRUSTED"]);
+      expect(pao.seen.map((s) => s.path)).toEqual(["/pao/v1/merchants/MER-S1/readiness"]);
+      expect(seen.map((s) => s.path)).toEqual(["/v1/shops"]);
+    });
+
+    it("сбой журнала не отменяет остановку", async () => {
+      const broken = { record: (e: { kind: string }) => { if (e.kind === "shop.readiness") throw new Error("журнал недоступен"); } };
+      const { a, pao } = adapter({}, { journal: broken }, { "MER-S1": [nodeError("alert", "ERR_SSL_SSLV3_ALERT_BAD_CERTIFICATE")] });
+      await expect(a.readiness("MER-S1")).rejects.toThrow("журнал недоступен");
+      expect(pao.stops).toEqual(["AGENT_UNKNOWN"]);
+    });
+
+    it("сеть — не отказ канала: сброс, сброс при рукопожатии, чужой номер алерта, текст без шаблона — «не проверено» NO_RESPONSE, без остановки", async () => {
+      for (const error of [
+        nodeError("read ECONNRESET", "ECONNRESET"),
+        nodeError("Client network socket disconnected before secure TLS connection was established", "ECONNRESET"),
+        nodeError("error:0A000410:SSL routines::sslv3 alert handshake failure:SSL alert number 40\n", "EPROTO"),
+        nodeError("SSL alert number 48 и ещё текст", "EPROTO"),
+        new TypeError("fetch failed"),
+      ]) {
+        const { a, pao, journal } = adapter({}, {}, { "MER-S1": [error] });
+        expect(await a.readiness("MER-S1")).toEqual({ unverified: "NO_RESPONSE" });
+        expect([pao.stops, pao.suspends, pao.rotations]).toEqual([[], [], []]);
+        expect(readiness(journal).map((r) => [r[2], r[3]])).toEqual([["unknown", "NO_RESPONSE"]]);
+      }
+    });
   });
 
   it("нет ответа в pao_request_timeout_ms (не shop_request_timeout_ms) — знак не проверен NO_RESPONSE", async () => {

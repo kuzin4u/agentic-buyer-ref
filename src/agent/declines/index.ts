@@ -3,3 +3,4 @@ export * from "./table.js";
 export * from "./registry.js";
 export * from "./selfcheck.js";
 export * from "./merchant.js";
+export * from "./channel-failure.js";

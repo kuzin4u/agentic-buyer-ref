@@ -111,7 +111,8 @@ describe("канал mTLS в compose (Р64 п. 5–7)", () => {
     await c.start();
     const shopCalls: string[] = [];
     const shops = c.shops({ baseUrl: "http://shops.test", fetch: async (u) => (shopCalls.push(String(u)), new Response(null, { status: 404 })) });
-    await shops.readiness("merchant-1").catch(() => undefined);
+    // у PaoStub пути знака нет — ответ сервера за каналом: «не проверено», не отказ канала (КТ1 № 7 сессии 49)
+    expect(await shops.readiness("merchant-1")).toEqual({ unverified: "HTTP_404" });
     expect(seen.at(-1)).toEqual({ path: "/pao/v1/merchants/merchant-1/readiness", san: `URI:urn:${AGENT}` });
     expect(shopCalls).toEqual([]);
   });

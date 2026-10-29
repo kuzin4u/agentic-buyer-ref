@@ -5,3 +5,5 @@ export { assertKid, kidOf, type Ed25519Jwk } from "./kid.js";
 export { assertStrongEd25519 } from "./weak.js";
 export { generateKey, listKeys, loadKey, type KeyState, type LoadedKey, type SignerDescriptor } from "./keystore.js";
 export { KeyRing, type Admit, type KeyRingOptions } from "./ring.js";
+// Ключ канала mTLS (Р64): наружу — описатель и CSR для заявления на допуск; закрытый ключ — только внутри signer.
+export { generateTlsKey, tlsCsr, tlsKeyDescriptor, type TlsKeyDescriptor } from "./tls.js";

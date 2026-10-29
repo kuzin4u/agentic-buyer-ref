@@ -25,6 +25,24 @@ export class TlsTrustMismatch extends SignerKeyRejected {
   }
 }
 
+/** `pao.tls` задан, сертификат канала не установлен (Р64 п. 6): TLS_CERT_MISSING — допуска нет, обращения не было. */
+export class TlsCertMissing extends SignerKeyRejected {
+  override readonly name = "TlsCertMissing";
+  readonly code = "TLS_CERT_MISSING" as const;
+  constructor() {
+    super("сертификат канала не установлен");
+  }
+}
+
+/** `not_after` сертификата канала прошёл по часам агента (Р64 п. 7): TLS_CERT_EXPIRED — остановка до обращения. */
+export class TlsCertExpired extends SignerKeyRejected {
+  override readonly name = "TlsCertExpired";
+  readonly code = "TLS_CERT_EXPIRED" as const;
+  constructor() {
+    super("срок сертификата канала истёк");
+  }
+}
+
 /** Причина отказа в установке сертификата канала (Р64 п. 4). */
 export type TlsCertRejection = "MALFORMED" | "KEY_MISMATCH" | "SAN_MISMATCH" | "NOT_CLIENT_AUTH" | "NOT_ISSUED_BY_ROOT" | "EXPIRED";
 

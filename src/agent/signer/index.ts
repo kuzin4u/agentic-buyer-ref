@@ -5,6 +5,8 @@ export {
   SignerRotationStopped,
   SignerStopped,
   SignerSuspended,
+  TlsCertExpired,
+  TlsCertMissing,
   TlsCertificateRejected,
   TlsConfigInvalid,
   TlsTrustMismatch,
@@ -28,3 +30,5 @@ export {
   type TlsKeyDescriptor,
   type TlsRoot,
 } from "./tls.js";
+// Канал mTLS к ПАО (Р64 п. 5): наружу — fetch и срок сертификата; ключ и сертификат остаются в замыкании канала.
+export { tlsChannel, type TlsChannel, type TlsChannelOptions } from "./channel.js";

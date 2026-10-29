@@ -13,7 +13,19 @@ import { CATALOG_DIAG } from "./catalog/index.js";
 import { MemoryJournal, type Journal } from "./journal/index.js";
 import { MandateClient } from "./mandates/index.js";
 import { EventFeed, EventsStopped, FileCursorStore, acceptPush, type PushReply } from "./events/index.js";
-import { KeyRing, SignerKeyRejected, SignerStopped, SignerSuspended } from "./signer/index.js";
+import {
+  KeyRing,
+  SignerKeyRejected,
+  SignerStopped,
+  SignerSuspended,
+  TlsCertExpired,
+  TlsCertMissing,
+  TlsTrustMismatch,
+  pinRoot,
+  tlsChannel,
+  type TlsChannel,
+  type TlsRoot,
+} from "./signer/index.js";
 import { Purchase } from "./pipeline/index.js";
 import { OrderPriceMismatches, SplitWindow } from "./policy/index.js";
 import type { LiveOfferSource } from "./ports/catalog.js";
@@ -123,7 +135,15 @@ export interface AgentCoreOptions {
   pushUrl?: string;
   journal?: Journal;
   now?: () => Date;
-  pao: Omit<PaoPlatformOptions, "params" | "signing" | "journal" | "pace">;
+  pao: Omit<PaoPlatformOptions, "params" | "signing" | "journal" | "pace"> & { tls?: PaoTlsOptions };
+}
+
+/** Канал mTLS к ПАО (Р64 п. 5–6): корень УЦ песочницы в PEM и его отпечаток — только полный SHA-256 (64 знака hex,
+ *  регистр и «:» не учитываются). Ключ TLS и сертификат — из `keysDir` (`tls/`, К2.1; отдельного каталога нет — решение
+ *  владельца 29.10). Задан — все обращения к ПАО идут через канал, свой `pao.fetch` не используется; нет — прежний транспорт. */
+export interface PaoTlsOptions {
+  caPem: string;
+  caFingerprint: string;
 }
 
 /** Один каталог внутри другого или они совпадают (по пути; символические ссылки — забота оператора, Р34 нюансы К2.3). */
@@ -144,6 +164,8 @@ export function startFailureCode(e: unknown): DiagCode | null {
   if (e instanceof SignerSuspended) return e.reason;
   if (e instanceof PlatformFailure) return e.code;
   if (e instanceof EventsStopped) return "EVENTS_CURSOR_INVALID";
+  // коды канала mTLS — раньше общего отказа ключа: их классы — наследники SignerKeyRejected (Р64 п. 6–7)
+  if (e instanceof TlsTrustMismatch || e instanceof TlsCertMissing || e instanceof TlsCertExpired) return e.code;
   if (e instanceof SignerKeyRejected) return "KEY_REJECTED";
   return null;
 }
@@ -181,6 +203,23 @@ export function createAgentCore(o: AgentCoreOptions): AgentCore {
     throw notReady({ "config.params": OK, "core.pao": { status: "fail", code: "CORE_PAO_MISMATCH" } }, e);
   }
   if (nested(o.stateDir, o.keysDir)) throw new ConfigError("каталог состояния совпадает с каталогом ключей или вложен в него (или наоборот)");
+  // Канал mTLS (Р64 п. 5–6): форма настройки — при сборке (TlsConfigInvalid наружу, до start()); несовпадение отпечатка —
+  // отказ start() до первого обращения; сертификат и его срок — на каждом start() (сертификат мог быть переустановлен).
+  // Канал подставляется во все адаптеры ПАО — основной, допуска, сверки — и в знак готовности витрин (п. 5).
+  const { tls, ...paoBase } = o.pao;
+  let root: TlsRoot | TlsTrustMismatch | null = null;
+  if (tls !== undefined) {
+    try {
+      root = pinRoot(tls.caPem, tls.caFingerprint);
+    } catch (e) {
+      if (!(e instanceof TlsTrustMismatch)) throw e;
+      root = e;
+    }
+  }
+  let channel: TlsChannel | null = null;
+  const channelFetch = ((url: string | URL | Request, init?: RequestInit) =>
+    channel === null ? Promise.reject(new TlsCertMissing()) : channel.fetch(url, init)) as typeof fetch;
+  const pao = tls === undefined ? paoBase : { ...paoBase, fetch: channelFetch };
   const ring = new KeyRing({ dir: o.keysDir, params, journal, ...(o.now && { now: o.now }), onState: () => syncRecheck() });
   // Рабочий адаптер получает порт, закрытый до допуска; запрос допуска идёт через отдельный адаптер с портом допуска.
   // События версии ПАО (Р33 п. 10) и попытки обращений (pao.call) пишет адаптер — через ту же обёртку; журнал получают и
@@ -199,7 +238,7 @@ export function createAgentCore(o: AgentCoreOptions): AgentCore {
   const hold = (): void => {
     if (events.failing) throw new SignerSuspended("EVENTS_UNAVAILABLE");
   };
-  const platform = new PaoPlatform({ ...o.pao, params, signing: ring.port(), journal, pace, hold });
+  const platform = new PaoPlatform({ ...pao, params, signing: ring.port(), journal, pace, hold });
   const at = (): string => now().toISOString();
   // Остановка по курсору — через порт подписи: агент целиком, запись agent.stopped — у связки ключей (Р34 п. 4).
   const signing = ring.port();
@@ -234,7 +273,7 @@ export function createAgentCore(o: AgentCoreOptions): AgentCore {
   // Сверка с реестром одна на всех (Р27): событие agent.* и вызов recheck() снаружи ждут одну и ту же.
   let rechecking: Promise<AgentSelf> | null = null;
   const recheck = (): Promise<AgentSelf> =>
-    (rechecking ??= ring.recheck((s) => new PaoPlatform({ ...o.pao, params, signing: s, journal, pace }).agentSelf()).finally(() => {
+    (rechecking ??= ring.recheck((s) => new PaoPlatform({ ...pao, params, signing: s, journal, pace }).agentSelf()).finally(() => {
       rechecking = null;
     }));
   // Сверка по расписанию и по push (Р60 п. 4–5а): итог — прочитанный статус (ACTIVE, SUSPENDED) или null — сверка не
@@ -384,7 +423,7 @@ export function createAgentCore(o: AgentCoreOptions): AgentCore {
           },
         },
         // знак готовности по ПАО (Р53 п. 1, 5): адрес Платформы и порт подписи — те же, что у адаптера ПАО
-        platform: { baseUrl: o.pao.baseUrl, signing, ...(o.pao.fetch !== undefined && { fetch: o.pao.fetch }) },
+        platform: { baseUrl: pao.baseUrl, signing, ...(pao.fetch !== undefined && { fetch: pao.fetch }) },
         params,
         journal,
         now,
@@ -408,6 +447,21 @@ export function createAgentCore(o: AgentCoreOptions): AgentCore {
         recordReport(journal, lastReport, results);
         return new AgentNotReady(lastReport, { cause });
       };
+      // Канал mTLS (Р64 п. 6–7) — до ключей и до сети: отпечаток не совпал — TLS_TRUST_MISMATCH (остановка), сертификата
+      // нет — TLS_CERT_MISSING (допуска нет, start() можно повторить после установки), срок истёк — TLS_CERT_EXPIRED
+      // (остановка). Канал прошлого start() не используется, пока не проверен заново.
+      if (root !== null) {
+        channel = null;
+        try {
+          if (root instanceof TlsTrustMismatch) throw root;
+          channel = tlsChannel(o.keysDir, { root, now });
+        } catch (e) {
+          const code = startFailureCode(e);
+          if (code === null) throw e;
+          throw fail(failedCheck(code), code, e);
+        }
+        results["platform.tls"] = OK;
+      }
       let connected = false;
       // идёт запрос конфигурации: её отказ (PlatformFailure: PAO_CLIENT_REDIRECT, PLATFORM_PROTOCOL_UNSUPPORTED) — проверка
       // platform.protocol, а не допуск (Р37 п. 2); прочее (SignerStopped) — по failedCheck (ревью К0 № 3)
@@ -428,7 +482,7 @@ export function createAgentCore(o: AgentCoreOptions): AgentCore {
             results["platform.protocol"] = p.status === "confirmed" ? OK : { status: "warn", code: "PLATFORM_VERSION_UNKNOWN" };
             connected = true;
           }
-          return new PaoPlatform({ ...o.pao, params, signing: admission, journal, pace }).agentSelf();
+          return new PaoPlatform({ ...pao, params, signing: admission, journal, pace }).agentSelf();
         });
       } catch (e) {
         const code = startFailureCode(e);

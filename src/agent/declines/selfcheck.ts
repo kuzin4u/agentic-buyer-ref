@@ -10,6 +10,8 @@ export type { SelfCheckItem, SelfCheckReport };
 export const SELF_CHECKS = [
   "config.params",
   "core.pao",
+  // только при настройке pao.tls (Р64 п. 6–7; дополнение Р36 п. 6, решение владельца 29.10): корень, сертификат, срок
+  "platform.tls",
   "keys.store",
   "keys.active",
   "events.cursor",
@@ -62,6 +64,10 @@ export function failedCheck(code: DiagCode): SelfCheckName {
       return "events.cursor";
     case "PLATFORM_PROTOCOL_UNSUPPORTED":
       return "platform.protocol";
+    case "TLS_TRUST_MISMATCH":
+    case "TLS_CERT_MISSING":
+    case "TLS_CERT_EXPIRED":
+      return "platform.tls";
     default:
       return "platform.admission";
   }

@@ -36,8 +36,10 @@ export const AGENT_DIAG_CODES = [
   "KEY_EXPIRED",
   // отзыв брошенного ключа, зарегистрированного у Платформы (причина записи key.revoked, Р63 п. 6)
   "ABANDONED",
-  // канал mTLS (Р64 п. 6): отпечаток корня УЦ не совпал с настройкой
+  // канал mTLS (Р64 п. 6, 7): отпечаток корня УЦ не совпал с настройкой; сертификата канала нет; срок его истёк
   "TLS_TRUST_MISMATCH",
+  "TLS_CERT_MISSING",
+  "TLS_CERT_EXPIRED",
   // клиент мандатов (MandateRefusal; порядок отзыва — MANDATE_REVOCATION_ORDER_MISSING выше)
   "MANDATE_DRAFT_INVALID",
   "MANDATE_REPLY_MISMATCH",

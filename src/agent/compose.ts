@@ -20,6 +20,7 @@ import {
   SignerSuspended,
   TlsCertExpired,
   TlsCertMissing,
+  TlsConfigInvalid,
   TlsTrustMismatch,
   pinRoot,
   tlsChannel,
@@ -140,7 +141,9 @@ export interface AgentCoreOptions {
 
 /** Канал mTLS к ПАО (Р64 п. 5–6): корень УЦ песочницы в PEM и его отпечаток — только полный SHA-256 (64 знака hex,
  *  регистр и «:» не учитываются). Ключ TLS и сертификат — из `keysDir` (`tls/`, К2.1; отдельного каталога нет — решение
- *  владельца 29.10). Задан — все обращения к ПАО идут через канал, свой `pao.fetch` не используется; нет — прежний транспорт. */
+ *  владельца 29.10). Задан — все обращения к ПАО идут через канал; адрес не https или свой `pao.fetch` — TlsConfigInvalid
+ *  при сборке (КТ1 № 5 сессии 49). Корень — сертификат УЦ (`CA:TRUE`) в сроке действия по часам ядра (№ 6). Нет — прежний
+ *  транспорт. */
 export interface PaoTlsOptions {
   caPem: string;
   caFingerprint: string;
@@ -209,8 +212,11 @@ export function createAgentCore(o: AgentCoreOptions): AgentCore {
   const { tls, ...paoBase } = o.pao;
   let root: TlsRoot | TlsTrustMismatch | null = null;
   if (tls !== undefined) {
+    // канал только по https и только своим fetch: иначе настройка противоречива (КТ1 № 5 сессии 49)
+    if (!/^https:\/\//i.test(paoBase.baseUrl)) throw new TlsConfigInvalid("pao.tls: адрес ПАО не https");
+    if (paoBase.fetch !== undefined) throw new TlsConfigInvalid("pao.tls: свой pao.fetch вместе с каналом mTLS");
     try {
-      root = pinRoot(tls.caPem, tls.caFingerprint);
+      root = pinRoot(tls.caPem, tls.caFingerprint, now);
     } catch (e) {
       if (!(e instanceof TlsTrustMismatch)) throw e;
       root = e;
@@ -449,9 +455,10 @@ export function createAgentCore(o: AgentCoreOptions): AgentCore {
       };
       // Канал mTLS (Р64 п. 6–7) — до ключей и до сети: отпечаток не совпал — TLS_TRUST_MISMATCH (остановка), сертификата
       // нет — TLS_CERT_MISSING (допуска нет, start() можно повторить после установки), срок истёк — TLS_CERT_EXPIRED
-      // (остановка). Канал прошлого start() не используется, пока не проверен заново.
+      // (остановка). Рабочий канал заменяется только новым, прошедшим проверку: отказ повторного start() его не снимает
+      // (КТ1 № 4 сессии 49) — срок он сверяет сам перед каждым обращением, остановку дают TLS_TRUST_MISMATCH и
+      // TLS_CERT_EXPIRED.
       if (root !== null) {
-        channel = null;
         try {
           if (root instanceof TlsTrustMismatch) throw root;
           channel = tlsChannel(o.keysDir, { root, now });

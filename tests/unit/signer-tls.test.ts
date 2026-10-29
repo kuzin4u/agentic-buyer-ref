@@ -230,6 +230,26 @@ describe("корень УЦ: отпечаток SHA-256 (Р64 п. 6, уточн�
     const leaf = new X509Certificate(Buffer.from(der, "base64"));
     expect(() => pinRoot(leaf.toString(), createHash("sha256").update(leaf.raw).digest("hex"))).toThrow(TlsConfigInvalid);
   });
+
+  it("самоподписанный, но не УЦ (CA:FALSE) — TlsConfigInvalid при верном отпечатке (КТ1 № 6 сессии 49)", () => {
+    execFileSync("openssl", ["req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1", "-nodes", "-keyout", "leaf.key", "-out", "leaf.pem", "-subj", "/CN=leaf", "-days", "2", "-addext", "basicConstraints=critical,CA:FALSE"], { cwd: dir, stdio: "pipe" });
+    const pem = readFileSync(join(dir, "leaf.pem"), "utf8");
+    const cert = new X509Certificate(pem);
+    expect([cert.ca, cert.checkIssued(cert)]).toEqual([false, true]);
+    expect(() => pinRoot(pem, createHash("sha256").update(cert.raw).digest("hex"))).toThrow(/нет CA:TRUE/);
+  });
+
+  it("корень вне срока по часам ядра — истёк или ещё не действует: TlsConfigInvalid; на границах — validFrom да, validTo нет (КТ1 № 6)", () => {
+    stand = createStand();
+    const { pem, fp } = standRoot(stand);
+    const cert = new X509Certificate(pem);
+    const from = new Date(cert.validFrom).getTime();
+    const to = new Date(cert.validTo).getTime();
+    expect(pinRoot(pem, fp, () => new Date(from)).fingerprint).toBe(fp);
+    for (const at of [to, to + 1, from - 1000]) {
+      expect(() => pinRoot(pem, fp, () => new Date(at)), new Date(at).toISOString()).toThrow(/вне срока действия/);
+    }
+  });
 });
 
 describe("установка сертификата из решения о допуске (Р64 п. 4)", () => {

@@ -126,8 +126,9 @@ export function parseFingerprint(value: unknown): string {
   return hex;
 }
 
-/** Ровно один сертификат PEM; иное — TlsConfigInvalid. */
-function rootCertificate(pem: unknown): X509Certificate {
+/** Ровно один самоподписанный сертификат УЦ (`CA:TRUE`), действующий в момент `at` (КТ1 № 6 сессии 49); иное —
+ *  TlsConfigInvalid. */
+function rootCertificate(pem: unknown, at: Date): X509Certificate {
   if (typeof pem !== "string" || (pem.match(/-----BEGIN CERTIFICATE-----/g) ?? []).length !== 1) {
     throw new TlsConfigInvalid("корень УЦ: не один сертификат PEM");
   }
@@ -138,16 +139,22 @@ function rootCertificate(pem: unknown): X509Certificate {
     throw new TlsConfigInvalid("корень УЦ: сертификат не разбирается");
   }
   if (!cert.checkIssued(cert) || !cert.verify(cert.publicKey)) throw new TlsConfigInvalid("корень УЦ: не самоподписанный");
+  if (!cert.ca) throw new TlsConfigInvalid("корень УЦ: не сертификат УЦ (нет CA:TRUE)");
+  const t = at.getTime();
+  if (t < new Date(cert.validFrom).getTime() || t >= new Date(cert.validTo).getTime()) {
+    throw new TlsConfigInvalid("корень УЦ: вне срока действия");
+  }
   return cert;
 }
 
 /**
- * Закрепление корня при загрузке настройки (Р64 п. 6): сначала форма отпечатка и корня (TlsConfigInvalid), затем
- * сверка SHA-256 от DER корня с отпечатком — не совпал: TlsTrustMismatch (TLS_TRUST_MISMATCH, остановка до обращений).
+ * Закрепление корня при загрузке настройки (Р64 п. 6): сначала форма отпечатка и корня — в т. ч. `CA:TRUE` и срок по
+ * часам `now` (TlsConfigInvalid), затем сверка SHA-256 от DER корня с отпечатком — не совпал: TlsTrustMismatch
+ * (TLS_TRUST_MISMATCH, остановка до обращений).
  */
-export function pinRoot(caPem: unknown, caFingerprint: unknown): TlsRoot {
+export function pinRoot(caPem: unknown, caFingerprint: unknown, now: () => Date = () => new Date()): TlsRoot {
   const expected = parseFingerprint(caFingerprint);
-  const cert = rootCertificate(caPem);
+  const cert = rootCertificate(caPem, now());
   const actual = createHash("sha256").update(cert.raw).digest("hex");
   if (actual !== expected) throw new TlsTrustMismatch();
   return Object.freeze({ pem: cert.toString(), fingerprint: actual });

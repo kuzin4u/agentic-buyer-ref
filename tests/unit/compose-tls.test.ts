@@ -25,7 +25,8 @@ let ca: Ca;
 let seen: { path: string; san: string }[];
 beforeEach(() => {
   pki = mkdtempSync(join(tmpdir(), "buyref-pki-"));
-  stand = new PaoStand();
+  // часы — «сейчас»: корень и сертификаты openssl выпущены по настоящему времени (корень вне срока — TlsConfigInvalid)
+  stand = new PaoStand({ clock: new Date() });
   ca = makeCa(pki, "root");
   seen = [];
 });
@@ -151,6 +152,38 @@ describe("канал mTLS в compose (Р64 п. 5–7)", () => {
     expect(() => core("https://localhost:1", { caPem: ca.pem, caFingerprint: ca.fingerprint.slice(0, 20) })).toThrow(TlsConfigInvalid);
   });
 
+  it("pao.tls с адресом не https или со своим pao.fetch — TlsConfigInvalid при сборке (КТ1 № 5 сессии 49)", () => {
+    const tls = { caPem: ca.pem, caFingerprint: ca.fingerprint };
+    expect(() => core("http://localhost:1", tls)).toThrow(/не https/);
+    const own = () =>
+      createAgentCore({
+        keysDir: stand.dir,
+        stateDir: `${stand.dir}-state`,
+        now: () => stand.clock,
+        pao: { baseUrl: "https://localhost:1", agentCode: AGENT, sleep: async () => {}, fetch: async () => new Response(), tls },
+      });
+    expect(own).toThrow(TlsConfigInvalid);
+    expect(own).toThrow(/свой pao\.fetch/);
+  });
+
+  it("корень вне срока по часам ядра — TlsConfigInvalid при сборке (КТ1 № 6 сессии 49)", () => {
+    expect(() => core("https://localhost:1", { caPem: ca.pem, caFingerprint: ca.fingerprint }, new MemoryJournal(), () => new Date(Date.now() + 3 * 86_400_000))).toThrow(/вне срока действия/);
+  });
+
+  it("отказ повторного start() (TLS_CERT_MISSING) не снимает рабочий канал: обращения идут через него (КТ1 № 4 сессии 49)", async () => {
+    issueClient(pki, stand.dir, ca, "root", AGENT);
+    const url = await tlsProxy();
+    const c = core(url, { caPem: ca.pem, caFingerprint: ca.fingerprint });
+    await c.start();
+    const before = seen.length;
+    rmSync(join(stand.dir, "tls", "client.cert.der"));
+    const { cause } = await tlsFailure(c.start());
+    expect(cause).toBeInstanceOf(TlsCertMissing);
+    expect(seen).toHaveLength(before);
+    await c.recheck();
+    expect(seen.at(-1)).toEqual({ path: "/pao/v1/agent", san: `URI:urn:${AGENT}` });
+  });
+
   it("сертификат не установлен — TLS_CERT_MISSING: допуска нет, обращений нет; после установки start() проходит", async () => {
     generateTlsKey(stand.dir);
     const url = await tlsProxy();
@@ -169,7 +202,8 @@ describe("канал mTLS в compose (Р64 п. 5–7)", () => {
   it("срок сертификата истёк по часам агента — TLS_CERT_EXPIRED: остановка до обращения", async () => {
     issueClient(pki, stand.dir, ca, "root", AGENT);
     const url = await tlsProxy();
-    const c = core(url, { caPem: ca.pem, caFingerprint: ca.fingerprint }, new MemoryJournal(), () => new Date(Date.now() + 3 * 86_400_000));
+    // сертификат клиента — сутки, корень — двое: через полтора дня корень ещё в сроке, сертификат — нет
+    const c = core(url, { caPem: ca.pem, caFingerprint: ca.fingerprint }, new MemoryJournal(), () => new Date(Date.now() + 1.5 * 86_400_000));
     const { cause, report } = await tlsFailure(c.start());
     expect(cause).toBeInstanceOf(TlsCertExpired);
     expect(report.checks.find((x) => x.status === "fail")).toMatchObject({ check: "platform.tls", code: "TLS_CERT_EXPIRED" });

@@ -40,10 +40,11 @@ afterEach(async () => {
   rmSync(stand.dir, { recursive: true, force: true });
 });
 
-/** Прокси TLS 1.3 перед PaoStub: требует клиентский сертификат от корня ca; тело и заголовки — как есть. */
-async function tlsProxy(): Promise<string> {
+/** Прокси TLS 1.3 перед PaoStub: требует клиентский сертификат от корня ca; тело и заголовки — как есть. `eku` —
+ *  назначение сертификата прокси (clientAuth — сертификат не для сервера, INVALID_PURPOSE). */
+async function tlsProxy(eku: "serverAuth" | "clientAuth" = "serverAuth"): Promise<string> {
   const target = await stand.stub.start();
-  const { key, cert } = ca.server("srv");
+  const { key, cert } = ca.server("srv", undefined, eku);
   proxy = createServer({ key, cert, ca: ca.pem, requestCert: true, rejectUnauthorized: true, minVersion: "TLSv1.3" }, (req, res) => {
     seen.push({ path: req.url ?? "", san: (req.socket as TLSSocket).getPeerCertificate().subjectaltname ?? "" });
     const chunks: Buffer[] = [];
@@ -125,6 +126,20 @@ describe("канал mTLS в compose (Р64 п. 5–7)", () => {
     const { cause, report } = await tlsFailure(c.start());
     expect(cause).toBeInstanceOf(TlsTrustMismatch);
     expect(report.checks.find((x) => x.status === "fail")).toMatchObject({ check: "platform.tls", code: "TLS_TRUST_MISMATCH" });
+    expect(seen).toEqual([]);
+    expect(stand.stub.calls).toEqual([]);
+    // остановка: повторный start() не допускает агента и в сеть не идёт
+    await expect(c.start()).rejects.toThrow();
+    expect(stand.stub.calls).toEqual([]);
+  });
+
+  it("сервер предъявил сертификат clientAuth того же УЦ — INVALID_PURPOSE → TLS_SERVER_UNTRUSTED: остановка, до PaoStub не дошло (КТ1 № 3 сессии 49)", async () => {
+    issueClient(pki, stand.dir, ca, "root", AGENT);
+    const url = await tlsProxy("clientAuth");
+    const c = core(url, { caPem: ca.pem, caFingerprint: ca.fingerprint });
+    const { cause, report } = await tlsFailure(c.start());
+    expect(cause).toMatchObject({ name: "PlatformFailure", code: "TLS_SERVER_UNTRUSTED" });
+    expect(report.checks.find((x) => x.status === "fail")).toMatchObject({ code: "TLS_SERVER_UNTRUSTED" });
     expect(seen).toEqual([]);
     expect(stand.stub.calls).toEqual([]);
     // остановка: повторный start() не допускает агента и в сеть не идёт

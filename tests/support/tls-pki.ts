@@ -11,8 +11,9 @@ export interface Ca {
   readonly pem: string;
   readonly fingerprint: string;
   readonly root: TlsRoot;
-  /** сертификат сервера от этого корня: SAN — `san` (по умолчанию DNS:localhost и IP:127.0.0.1) */
-  server(name: string, san?: string): { key: string; cert: string };
+  /** сертификат сервера от этого корня: SAN — `san` (по умолчанию DNS:localhost и IP:127.0.0.1), назначение — `eku`
+   *  (по умолчанию serverAuth; clientAuth — сертификат не для сервера, INVALID_PURPOSE, КТ1 № 3 сессии 49) */
+  server(name: string, san?: string, eku?: "serverAuth" | "clientAuth"): { key: string; cert: string };
 }
 
 const run = (dir: string, args: string[]): void => {
@@ -28,8 +29,8 @@ export function makeCa(dir: string, name: string): Ca {
     pem,
     fingerprint,
     root: pinRoot(pem, fingerprint),
-    server(srv, san = "DNS:localhost,IP:127.0.0.1") {
-      writeFileSync(join(dir, `${srv}.cnf`), `[v]\nsubjectAltName=${san}\nextendedKeyUsage=serverAuth\nbasicConstraints=CA:FALSE\n`);
+    server(srv, san = "DNS:localhost,IP:127.0.0.1", eku = "serverAuth") {
+      writeFileSync(join(dir, `${srv}.cnf`), `[v]\nsubjectAltName=${san}\nextendedKeyUsage=${eku}\nbasicConstraints=CA:FALSE\n`);
       run(dir, ["req", "-new", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1", "-nodes", "-keyout", `${srv}.key`, "-out", `${srv}.csr`, "-subj", `/CN=${srv}`]);
       run(dir, ["x509", "-req", "-in", `${srv}.csr`, "-CA", `${name}.pem`, "-CAkey", `${name}.key`, "-days", "1", "-extfile", `${srv}.cnf`, "-extensions", "v", "-out", `${srv}.pem`]);
       return { key: readFileSync(join(dir, `${srv}.key`), "utf8"), cert: readFileSync(join(dir, `${srv}.pem`), "utf8") };

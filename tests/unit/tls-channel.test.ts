@@ -48,8 +48,8 @@ interface Seen {
 }
 
 /** Локальный сервер TLS: требует клиентский сертификат от `trust` (по умолчанию — корень ca). */
-async function serve(o: { name?: string; san?: string; issuer?: Ca; trust?: Ca; maxVersion?: "TLSv1.2" | "TLSv1.3" } = {}): Promise<{ url: string; seen: Seen }> {
-  const { key, cert } = (o.issuer ?? ca).server(o.name ?? "srv", o.san);
+async function serve(o: { name?: string; san?: string; eku?: "serverAuth" | "clientAuth"; issuer?: Ca; trust?: Ca; maxVersion?: "TLSv1.2" | "TLSv1.3" } = {}): Promise<{ url: string; seen: Seen }> {
+  const { key, cert } = (o.issuer ?? ca).server(o.name ?? "srv", o.san, o.eku);
   const seen: Seen = { reused: [], clientCerts: [], versions: [] };
   const s = createServer(
     { key, cert, ca: (o.trust ?? ca).pem, requestCert: true, rejectUnauthorized: true, ...(o.maxVersion && { maxVersion: o.maxVersion }) },
@@ -145,6 +145,13 @@ describe("канал mTLS (Р64 п. 5, 8)", () => {
     issueClient(pki, keys, ca, "root", AGENT);
     const { url } = await serve({ san: "DNS:pao.example" });
     expect(await failure(tlsChannel(keys, { root: ca.root }).fetch(`${url}/x`))).toBe("ERR_TLS_CERT_ALTNAME_INVALID");
+  });
+
+  it("сертификат сервера того же УЦ, но с назначением clientAuth — отказ канала INVALID_PURPOSE (КТ1 № 3 сессии 49)", async () => {
+    issueClient(pki, keys, ca, "root", AGENT);
+    const { url, seen } = await serve({ eku: "clientAuth" });
+    expect(await failure(tlsChannel(keys, { root: ca.root }).fetch(`${url}/x`))).toBe("INVALID_PURPOSE");
+    expect(seen.clientCerts).toEqual([]);
   });
 
   it("сервер (OpenSSL) не доверяет сертификату клиента — алерт unknown_ca (48)", async () => {

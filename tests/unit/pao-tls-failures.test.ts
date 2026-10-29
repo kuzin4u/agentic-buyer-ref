@@ -42,10 +42,24 @@ describe("перевод отказа канала (Р64 п. 7)", () => {
     expect(viaClient(nodeError("EPROTO", "ssl alert number 48\n"))).toBe("NO_RESPONSE");
   });
 
-  it("сервер не прошёл проверку — TLS_SERVER_UNTRUSTED", () => {
-    for (const code of ["UNABLE_TO_VERIFY_LEAF_SIGNATURE", "ERR_TLS_CERT_ALTNAME_INVALID", "CERT_HAS_EXPIRED", "SELF_SIGNED_CERT_IN_CHAIN", "ERR_SSL_TLSV1_ALERT_PROTOCOL_VERSION"]) {
-      expect(viaClient(nodeError(code)), code).toBe("TLS_SERVER_UNTRUSTED");
-    }
+  it("сервер не прошёл проверку — TLS_SERVER_UNTRUSTED: все коды проверки X.509 Node, имя, версия (КТ1 № 2, 3 сессии 49)", () => {
+    // X509_ERROR_CODE_MAPPING Node (crypto_common.cc) без OUT_OF_MEM — 27 кодов; сверено со строками бинарника node v24.15
+    const X509 = [
+      "UNABLE_TO_GET_ISSUER_CERT", "UNABLE_TO_GET_CRL", "UNABLE_TO_DECRYPT_CERT_SIGNATURE", "UNABLE_TO_DECRYPT_CRL_SIGNATURE",
+      "UNABLE_TO_DECODE_ISSUER_PUBLIC_KEY", "CERT_SIGNATURE_FAILURE", "CRL_SIGNATURE_FAILURE", "CERT_NOT_YET_VALID",
+      "CERT_HAS_EXPIRED", "CRL_NOT_YET_VALID", "CRL_HAS_EXPIRED", "ERROR_IN_CERT_NOT_BEFORE_FIELD", "ERROR_IN_CERT_NOT_AFTER_FIELD",
+      "ERROR_IN_CRL_LAST_UPDATE_FIELD", "ERROR_IN_CRL_NEXT_UPDATE_FIELD", "DEPTH_ZERO_SELF_SIGNED_CERT", "SELF_SIGNED_CERT_IN_CHAIN",
+      "UNABLE_TO_GET_ISSUER_CERT_LOCALLY", "UNABLE_TO_VERIFY_LEAF_SIGNATURE", "CERT_CHAIN_TOO_LONG", "CERT_REVOKED", "INVALID_CA",
+      "PATH_LENGTH_EXCEEDED", "INVALID_PURPOSE", "CERT_UNTRUSTED", "CERT_REJECTED", "HOSTNAME_MISMATCH",
+    ];
+    expect(X509).toHaveLength(27);
+    const OTHER = ["UNSPECIFIED", "ERR_TLS_CERT_ALTNAME_INVALID", "ERR_TLS_CERT_ALTNAME_FORMAT", "ERR_SSL_TLSV1_ALERT_PROTOCOL_VERSION", "ERR_SSL_UNSUPPORTED_PROTOCOL"];
+    for (const code of [...X509, ...OTHER]) expect(viaClient(nodeError(code)), code).toBe("TLS_SERVER_UNTRUSTED");
+  });
+
+  it("OUT_OF_MEM — ресурс машины агента, не чужой сервер: NO_RESPONSE с повтором тем же ключом (решение владельца, сессия 50)", () => {
+    const f = toFailure(new PaoCallError(0, undefined, 1, "idem-1", { cause: nodeError("OUT_OF_MEM") }), "idem-1");
+    expect([f.code, f.retry]).toEqual(["NO_RESPONSE", "same_key"]);
   });
 
   it("срок сертификата канала (TlsCertExpired канала) — TLS_CERT_EXPIRED; обрыв, сброс, тайм-аут, прочее — NO_RESPONSE", () => {

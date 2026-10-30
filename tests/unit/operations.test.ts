@@ -382,7 +382,7 @@ describe("наблюдение после итога (Р51 п. 4; таблица
     }
   });
 
-  it("DONE по SETTLED × возврат — OPERATION_REFUNDED; повторный SETTLED — без уведомления; DONE по REFUNDED × возврат — без второго", async () => {
+  it("DONE по SETTLED × возврат — OPERATION_REFUNDED; повторный SETTLED — без уведомления; DONE по REFUNDED — под наблюдение не ставится (дополнение 1 к Р65 п. 1), возврат — без второго", async () => {
     const s = observing("SETTLED");
     s.answers.set("op_1", record("SETTLED", { fulfilment: ful("WITHIN_LIMITS") }));
     await s.event("operation.settled", "op_1");
@@ -394,6 +394,7 @@ describe("наблюдение после итога (Р51 п. 4; таблица
     r.answers.set("op_1", record("REFUNDED", { fulfilment: ful("WITHIN_LIMITS") }));
     await r.event("operation.refunded", "op_1");
     expect(r.sent).toEqual([]);
+    expect(kinds(r.journal)).toEqual(["operation.status:REFUNDED", "operation.unclaimed:"]);
   });
 
   it("условие 2 ревью чата: одно событие дважды (лента и push) — один GET и одно уведомление; второе событие с тем же итогом — без второго уведомления", async () => {
@@ -733,19 +734,23 @@ describe("фоновое чтение ленты после итога — watch
   };
 
   /** повторяющийся таймер теста: такт — tick(), снят — live false; ms — запомненный срок */
-  function background(o: { gate?: () => "RUN" | "SKIP" | "STOP"; sec?: number | undefined; wake?: () => Promise<void> } = {}) {
+  function background(o: { gate?: () => "RUN" | "SKIP" | "STOP"; sec?: number | undefined; wake?: () => Promise<void>; answer?: () => OperationRecord } = {}) {
     let wakes = 0;
+    let now = T0;
+    const journal: Record<string, unknown>[] = [];
     const timers: { fn: () => void; ms: number; live: boolean }[] = [];
     const ops = new Operations({
-      port: { readOperation: async () => record("SETTLED"), readOperations: async () => [] },
-      journal: { record: () => undefined },
+      port: { readOperation: async () => (o.answer ?? (() => record("SETTLED")))(), readOperations: async () => [] },
+      journal: { record: (e) => void journal.push(e) },
       params: {
         operation_outcome_max_delay_sec: DELAY_SEC,
         operation_reread_interval_sec: REREAD_SEC,
         registry_cache_ttl_sec: TTL_SEC,
         event_seen_max: PARAMS.event_seen_max,
+        reservation_ttl_sec: PARAMS.reservation_ttl_sec,
         ...("sec" in o ? (o.sec !== undefined && { watch_poll_interval_sec: o.sec }) : { watch_poll_interval_sec: WATCH_SEC }),
       },
+      now: () => new Date(now),
       wake: o.wake ?? (async () => void wakes++),
       every: (fn, ms) => {
         const t = { fn, ms, live: true };
@@ -758,8 +763,85 @@ describe("фоновое чтение ленты после итога — watch
       for (const t of timers.filter((x) => x.live)) t.fn();
       await tick();
     };
-    return { ops, timers, tickAll, wakes: () => wakes, live: () => timers.filter((t) => t.live).length };
+    let seq = 0;
+    const event = async (type: PlatformEventType, opRef: string) => {
+      await ops.listener({ kind: "event", event: { eventId: `evt_bg_${++seq}`, type, at: new Date(now).toISOString(), mandateId: null, opRef, confirmationId: null, declineReason: null } });
+      await tick();
+    };
+    const advance = (ms: number) => void (now += ms);
+    return { ops, timers, tickAll, journal, event, advance, wakes: () => wakes, live: () => timers.filter((t) => t.live).length };
   }
+
+  describe("срок окна и выход по конечному статусу (дополнение 1 к Р65; К2.2)", () => {
+    const TTL_MS = PARAMS.reservation_ttl_sec * 1000;
+    const kindsOf = (j: Record<string, unknown>[]) => j.map((e) => `${String(e.kind)}:${String(e.ref ?? "")}`);
+
+    it("возврат (operation.refunded → GET REFUNDED) — уведомление, операция уходит из окна, окно пустое — таймер снят", async () => {
+      const sent: string[] = [];
+      const b = background({ answer: () => record("REFUNDED") });
+      b.ops.watch(OP, "SETTLED", (code) => void sent.push(code));
+      expect(b.ops.polling).toBe(true);
+      await b.event("operation.refunded", "op_1");
+      expect(sent).toEqual(["OPERATION_REFUNDED"]);
+      expect(b.ops.polling).toBe(false);
+      expect(b.live()).toBe(0);
+      // следующее событие по ней — как по вытесненной: GET и operation.unclaimed, без второго уведомления
+      await b.event("operation.refunded", "op_1");
+      expect(sent).toEqual(["OPERATION_REFUNDED"]);
+      // GET наблюдения и GET после выхода из окна — по записи operation.status
+      expect(kindsOf(b.journal)).toEqual(["operation.status:op_1", "operation.status:op_1", "operation.unclaimed:op_1"]);
+    });
+
+    it("постановка после возврата (watch REFUNDED) — под наблюдение не ставится, таймера нет; прежняя запись уходит", () => {
+      const b = background();
+      b.ops.watch(OP, "REFUNDED", () => undefined);
+      expect(b.timers).toEqual([]);
+      const c = background();
+      c.ops.watch(OP, "SETTLED", () => undefined);
+      c.ops.watch(OP, "REFUNDED", () => undefined);
+      expect(c.ops.polling).toBe(true); // снимется на ближайшем такте: окно пустое
+      return c.tickAll().then(() => expect(c.ops.polling).toBe(false));
+    });
+
+    it("срок reservation_ttl_sec от постановки: до границы — в окне; на границе — operation.watch_expired, таймер снят; событие после — operation.unclaimed", async () => {
+      const sent: string[] = [];
+      const b = background({ answer: () => record("SETTLED") });
+      b.ops.watch({ ...OP, status: "REVERSED" }, "REVERSED", (code) => void sent.push(code));
+      b.advance(TTL_MS - 1);
+      await b.tickAll();
+      expect(b.journal).toEqual([]);
+      expect(b.wakes()).toBe(1);
+      b.advance(1);
+      await b.tickAll();
+      expect(kindsOf(b.journal)).toEqual(["operation.watch_expired:op_1"]);
+      expect(b.journal[0]).toEqual({ at: new Date(T0 + TTL_MS).toISOString(), kind: "operation.watch_expired", ref: "op_1" });
+      expect(b.ops.polling).toBe(false);
+      expect(b.wakes()).toBe(1); // окно пустое — ленту не будит
+      await b.event("operation.settled", "op_1");
+      expect(sent).toEqual([]); // поздний клиринг после срока — агент не сообщает (остаточный риск, дополнение 1 п. 6)
+      expect(kindsOf(b.journal)).toEqual(["operation.watch_expired:op_1", "operation.status:op_1", "operation.unclaimed:op_1"]);
+    });
+
+    it("событие по операции за сроком без такта — тоже выход: watch_expired, затем unclaimed", async () => {
+      const sent: string[] = [];
+      const b = background({ answer: () => record("SETTLED") });
+      b.ops.watch({ ...OP, status: "REVERSED" }, "REVERSED", (code) => void sent.push(code));
+      b.advance(TTL_MS);
+      await b.event("operation.settled", "op_1");
+      expect(sent).toEqual([]);
+      expect(kindsOf(b.journal)).toEqual(["operation.watch_expired:op_1", "operation.status:op_1", "operation.unclaimed:op_1"]);
+    });
+
+    it("повторная постановка той же операции срок не продлевает", async () => {
+      const b = background();
+      b.ops.watch(OP, "SETTLED", () => undefined);
+      b.advance(TTL_MS - 10);
+      b.ops.watch(OP, "SETTLED", () => undefined);
+      b.advance(10);
+      await b.tickAll();
+      expect(kindsOf(b.journal)).toEqual(["operation.watch_expired:op_1"]);
+    });
+  });
 
   it("до наблюдения таймера нет; первая операция под наблюдением — один таймер на watch_poll_interval_sec, такт будит ленту", async () => {
     const b = background();

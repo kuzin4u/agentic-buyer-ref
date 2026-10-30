@@ -414,6 +414,14 @@ describe("выписка — MandateClient.evidence (Т12, стадия 7; Р65 
     expect(EVIDENCE_BROKEN_TEXT).toMatch(/доказательством/);
   });
 
+  it("integrity BROKEN с непустой цепочкой — агент отдаёт пустые массивы: нарушенная цепочка не служит данными (дополнение 1 к Р65 п. 4)", async () => {
+    const { core, consents } = await setup();
+    const m = await core.mandates.request(INTENT, { idempotencyKey: "idem_ev_2b" });
+    consents.integrity = "BROKEN";
+    consents.brokenWithChain = true;
+    await expect(core.mandates.evidence(m.id)).resolves.toEqual({ mandateChain: [], operations: [], integrity: "BROKEN" });
+  });
+
   it("integrity OK, а запрошенного мандата в цепочке нет — MANDATE_REPLY_MISMATCH, записи выписки нет (инвариант 4)", async () => {
     const { core, journal, consents } = await setup();
     const m = await core.mandates.request(INTENT, { idempotencyKey: "idem_ev_3" });

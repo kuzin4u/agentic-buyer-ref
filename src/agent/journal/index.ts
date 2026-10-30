@@ -98,6 +98,8 @@ export type JournalKind =
   | "mandate.relinquished"
   /** выписка из журнала согласий получена (Р65 п. 3); detail — integrity OK или BROKEN, тела выписки нет */
   | "mandate.evidence"
+  /** операция вышла из окна наблюдения после итога по сроку reservation_ttl_sec; ref — op_ref (дополнение 1 к Р65 п. 2) */
+  | "operation.watch_expired"
   /** держимый мандат не ACTIVE (истёк, исчерпан и т. п.) — больше не держится; detail — статус (Р37 п. 4) */
   | "mandate.status_changed"
   /** аномалия: держимый ACTIVE-мандат пропал у Платформы — GET 404, reason MANDATE_NOT_FOUND; больше не держится, лента

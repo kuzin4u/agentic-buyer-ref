@@ -221,7 +221,8 @@ export class MandateClient {
       throw this.#refuse("MANDATE_REPLY_MISMATCH", "в выписке нет запрошенного мандата", id);
     }
     this.o.journal.record({ at: this.now().toISOString(), kind: "mandate.evidence", ...masked(id), detail: got.integrity });
-    return got;
+    // нарушенная цепочка не служит данными — пустые массивы, даже если Платформа прислала их (дополнение 1 к Р65 п. 4)
+    return got.integrity === "BROKEN" ? { mandateChain: [], operations: [], integrity: "BROKEN" } : got;
   }
 
   #hold(m: Mandate): Mandate {

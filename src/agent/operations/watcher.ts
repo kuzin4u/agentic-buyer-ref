@@ -33,6 +33,8 @@ export interface OperationsJournal {
     entry:
       | { at: string; kind: "operation.status"; ref: string; detail: OperationStatus }
       | { at: string; kind: "operation.foreign" | "operation.unclaimed"; ref: string }
+      /** операция вышла из окна наблюдения по сроку reservation_ttl_sec (дополнение 1 к Р65 п. 2) */
+      | { at: string; kind: "operation.watch_expired"; ref: string }
       /** reason — OPERATION_UNREAD (диагностика оператора, Р49 дополнение 1 п. 1), detail — код отказа GET */
       | { at: string; kind: "operation.unread"; ref: string; reason: "OPERATION_UNREAD"; detail: DiagCode }
       | { at: string; kind: "operation.mismatch"; ref: string; detail: MismatchField; reason: "OPERATION_REPLY_MISMATCH"; mandate?: string }
@@ -66,6 +68,8 @@ export interface OperationsOptions {
     event_poll_interval_ms?: number;
     /** фоновое чтение ленты после итога (Р65 п. 5); без него — только оболочка или push */
     watch_poll_interval_sec?: number;
+    /** срок окна наблюдения от постановки (дополнение 1 к Р65 п. 2); без него — только вытеснение по event_seen_max */
+    reservation_ttl_sec?: number;
   };
   /** прочитать ленту (`EventFeed.signal`): ожидание будит её, пока не решится; частоту чтений ограничивает лента */
   wake?: () => Promise<void>;
@@ -97,6 +101,8 @@ interface Watched {
   notice: LateNotice;
   /** уже отправленные уведомления по операции: каждое — не больше раза */
   readonly sent: Set<PurchaseNotice>;
+  /** постановка под наблюдение, мс по часам модуля: срок окна — reservation_ttl_sec от неё (дополнение 1 к Р65 п. 2) */
+  readonly since: number;
 }
 
 /** Ожидание итога по заказу (стадия 5). */
@@ -179,9 +185,26 @@ export class Operations {
     if (this.#o.gate?.() === "STOP") return;
     this.#polling = this.#every(() => {
       const gate = this.#o.gate?.() ?? "RUN";
-      if (gate === "STOP" || this.#watched.size === 0) return this.stopPolling();
+      if (gate === "STOP") return this.stopPolling();
+      try {
+        for (const opRef of [...this.#watched.keys()]) this.#live(opRef);
+      } catch {
+        // журнал недоступен: операция уже вышла из окна, записи нет — некому отказать (такт таймера)
+      }
+      if (this.#watched.size === 0) return this.stopPolling();
       if (gate === "RUN") void wake().catch(() => undefined);
     }, Math.min(sec * 1000, TIMER_MAX_MS));
+  }
+
+  /** Операция под наблюдением, если срок окна не прошёл (дополнение 1 к Р65 п. 2): прошёл — уходит из окна, запись
+   *  operation.watch_expired (сбой журнала — наружу, операция уже вышла). */
+  #live(opRef: string): Watched | undefined {
+    const w = this.#watched.get(opRef);
+    const ttl = this.#o.params.reservation_ttl_sec;
+    if (w === undefined || ttl === undefined || this.#now().getTime() - w.since < ttl * 1000) return w;
+    this.#watched.delete(opRef);
+    this.#record({ kind: "operation.watch_expired", ref: opRef });
+    return undefined;
   }
 
   /** Слушатель ленты (`EventFeed.listen`). Бросает только сбой журнала и отказ GET, после которого Платформа просит
@@ -195,7 +218,8 @@ export class Operations {
       // op_ref уже по маске (разбор ленты); иначе событие пропущено как INVALID_DATA и сюда не дошло
       if (opRef === null || !SAFE_ID.test(opRef)) return;
       const settling = this.#settling.get(opRef);
-      const watched = this.#watched.get(opRef);
+      // срок окна прошёл — дальше как у вытесненной: GET и operation.unclaimed (дополнение 1 к Р65 п. 2)
+      const watched = this.#live(opRef);
       if (settling) {
         for (const w of [...settling]) w.poke();
         // ожидание уже увидело итог и поставило операцию под наблюдение, но ещё не вышло — событие и наблюдению
@@ -300,15 +324,16 @@ export class Operations {
   /**
    * Наблюдение после итога (Р51 п. 4): операция покупки с известным op_ref после её исхода `after`; по событию operation.*
    * — GET и уведомление через `notice` той покупки. Повторный вызов по тому же op_ref обновляет исход, отправленное не
-   * повторяется. Окно — event_seen_max операций: старейшая вытесняется, событие по ней — operation.unclaimed.
+   * повторяется. Окно — event_seen_max операций: старейшая вытесняется, событие по ней — operation.unclaimed. Срок —
+   * reservation_ttl_sec от первой постановки, повторный вызов его не продлевает; REFUNDED — конечный: под наблюдение не
+   * ставится, прежняя запись уходит (возврат на стадии 6 сообщила сама покупка, Р51 п. 3; дополнение 1 к Р65 п. 1–2).
    */
   watch(op: Operation, after: WatchAfter, notice: LateNotice): void {
     const prior = this.#watched.get(op.opRef);
     this.#watched.delete(op.opRef);
+    if (after === "REFUNDED") return;
     const sent = prior?.sent ?? new Set<PurchaseNotice>();
-    // возврат на стадии 6 уже сообщила сама покупка (Р51 п. 3)
-    if (after === "REFUNDED") sent.add("OPERATION_REFUNDED");
-    this.#watched.set(op.opRef, { op: structuredClone(op), after, notice, sent });
+    this.#watched.set(op.opRef, { op: structuredClone(op), after, notice, sent, since: prior?.since ?? this.#now().getTime() });
     while (this.#watched.size > this.#o.params.event_seen_max) this.#watched.delete(this.#watched.keys().next().value!);
     this.#arm();
   }
@@ -338,7 +363,12 @@ export class Operations {
       const scope = w.after === "UNSETTLED" ? scopeNotice(op) : null;
       if (scope !== null) send(scope);
     }
-    if (op.status === "REFUNDED") send("OPERATION_REFUNDED");
+    if (op.status === "REFUNDED") {
+      send("OPERATION_REFUNDED");
+      // конечный статус — операция уходит из окна; частичного возврата ПАО 1.4.0 не различает (дополнение 1 к Р65 п. 1)
+      this.#watched.delete(w.op.opRef);
+      if (this.#watched.size === 0) this.stopPolling();
+    }
   }
 
   /** Первый привязанный итог — итог стадии 5; следующие события по заказу его не меняют. */

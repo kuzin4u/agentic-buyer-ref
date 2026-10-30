@@ -125,6 +125,8 @@ describe("стадии 5–6 на стенде v0.20.0: итог из событ
       for (let i = 0; i < 50 && notices.length === 0; i++) await new Promise((res) => setTimeout(res, 100));
       expect(notices).toEqual([["OPERATION_REFUNDED", total]]);
       expect(r.purchase.state).toBe("DONE");
+      // возврат — конечный: операция ушла из окна, окно пустое — фоновое чтение снято (дополнение 1 к Р65 п. 1, 3)
+      expect(r.operations.polling).toBe(false);
       expect(r.c.violations()).toEqual([]);
     } finally {
       r.operations.stopPolling();

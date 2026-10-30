@@ -49,6 +49,8 @@ export class Consents {
   tamper?: (m: PaoMandate) => PaoMandate;
   /** integrity выписки: BROKEN — 200 с пустыми массивами, как у Платформы (ПАО 1.4.0, РП38 п. 7) */
   integrity: "OK" | "BROKEN" = "OK";
+  /** BROKEN с непустой цепочкой — Платформа так не отвечает; проверка, что агент её не отдаёт (дополнение 1 к Р65 п. 4) */
+  brokenWithChain = false;
   private seq = 0;
 
   constructor(
@@ -87,9 +89,11 @@ export class Consents {
       "GET /pao/v1/mandates/{id}/evidence": ({ path }) => {
         const m = this.mandates.get(path.id!);
         if (!m) return { error: { code: "MANDATE_NOT_FOUND" } };
-        if (this.integrity === "BROKEN") return { body: { mandate_chain: [], records: [], operations: [], integrity: "BROKEN" } };
         const parent = m.parent_id ? this.mandates.get(m.parent_id) : undefined;
         const chain = [...(parent ? [parent] : []), m].map((x) => (this.tamper ? this.tamper(x) : x));
+        if (this.integrity === "BROKEN") {
+          return { body: { mandate_chain: this.brokenWithChain ? chain : [], records: [], operations: [], integrity: "BROKEN" } };
+        }
         return { body: { mandate_chain: chain, records: [], operations: [], integrity: "OK" } };
       },
       "GET /pao/v1/mandates/{id}/verify": ({ path }) => {

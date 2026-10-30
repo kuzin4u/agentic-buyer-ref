@@ -2,14 +2,15 @@
 // интерфейсы; реализации — в тестах (tests/support/), подписанные обращения к витринам — AG-09, корзина — AG-10,
 // оплата — AG-11, подтверждение — AG-13. Всё, что приходит через эти порты от продавца, — данные (инвариант 5).
 import type { CatalogFacts } from "../catalog/index.js";
-import type { Mandate, Money, Operation } from "../../shared/domain.js";
+import type { Mandate, Money, Operation, PaymentChannel } from "../../shared/domain.js";
 import type { AgentDiagCode, DiagCode } from "../../shared/diag-codes.js";
 import type { Mutation } from "./mutation.js";
 import type { SealedPackage } from "../payment-package/package.js";
 
 /** Магазин в выдаче: факты фида (`catalog/readFeed`) и признак контура гарантий (Р3). `merchantId` — код продавца
  *  для мандата корзины и заказа (у витрины эмулятора он отличается от `shop.id`). `link` — адрес витрины для человека
- *  (зона вне контура: платежа нет, человеку ссылка — инвариант 10, Р42 п. 3); строит адаптер, не из текста витрины. */
+ *  (зона вне контура: платежа нет, человеку ссылка — инвариант 10, Р42 п. 3); строит адаптер, не из текста витрины, у
+ *  каждого магазина: и при `inContour` товар уходит в зону рынка, если способа оплаты агента нет (дополнение 1 к Р66 п. 3). */
 export interface ShopOffers {
   merchantId: string;
   inContour: boolean;
@@ -103,6 +104,8 @@ export interface PaymentContext {
   cart: Mandate;
   shopId: string;
   merchantId: string;
+  /** способ оплаты агента у витрины выбора — канал реквизита (дополнение 1 к Р66 п. 3, `policy/channels`) */
+  channel: PaymentChannel;
   order: ShopOrder;
   /** покупка остановлена (Р45, Б2в (а)): шаги проверяют его перед запросом реквизита и перед отправкой пакета */
   signal: AbortSignal;

@@ -157,6 +157,66 @@ describe("стадии 3–6 — путь покупки (Р38 п. 1–2)", () =
   });
 });
 
+describe("стадия 2 — зона по способу оплаты агента (дополнение 1 к Р66 п. 3, Р-534)", () => {
+  const LINK = "http://shops.test/v1/shops/massa-madre/catalog";
+
+  it.each([
+    ["только sbp", ["sbp"]],
+    ["наличные", ["cash"]],
+    ["пустой список", []],
+    ["регистр и пробелы", ["Card", " card"]],
+  ])("знак ACTIVE без способа агента (%s) — зона рынка со ссылкой и ZONE_MARKET_NO_METHOD, shop.zone_market без строк витрины; выбор — OFFER_NOT_IN_CONTOUR", async (_name, methods) => {
+    const r = await setup({ shops: [{ ...SHOP, profile: bakery({ paymentMethods: methods }), link: LINK }] });
+    await signedIntent(r);
+    const zones = await r.purchase.search();
+    expect(zones.contour).toEqual([]);
+    expect(zones.market.length).toBeGreaterThan(0);
+    for (const o of zones.market) {
+      expect(o).toMatchObject({ merchantId: "shop_1", link: LINK, marketReason: "ZONE_MARKET_NO_METHOD" });
+      expect(o.channel).toBeUndefined();
+    }
+    const records = r.journal.entries.filter((e) => e.kind === "shop.zone_market");
+    expect(records.map((e) => [e.merchant, e.reason])).toEqual([["shop_1", "NO_AGENT_PAYMENT_METHOD"]]);
+    // строки payment_methods витрины в журнал не попадают (инвариант 5)
+    for (const m of methods.filter((x) => x.trim() !== "")) expect(JSON.stringify(r.journal.entries).includes(`"${m}"`)).toBe(false);
+    // оплаты нет: выбор такого товара — отказ без обращений (инвариант 10)
+    const before = r.stand.log().length;
+    await expect(r.purchase.cart(one(key(zones.market[0]!), 1), { idempotencyKey: "idem-cart-1" })).rejects.toBeInstanceOf(PurchaseStopped);
+    expect(r.purchase.reason).toBe("OFFER_NOT_IN_CONTOUR");
+    expect(r.stand.log().length).toBe(before);
+  });
+
+  it("способ агента есть — зона контура с каналом CARD, без ссылки и причины; канал уходит в шаг оплаты", async () => {
+    const channels: string[] = [];
+    const steps = payments();
+    const r = await setup({
+      shops: [{ ...SHOP, profile: bakery({ paymentMethods: ["sbp", "card"] }), link: LINK }],
+      payment: { ...steps, authorize: (c, m) => (channels.push(c.channel), steps.authorize(c, m)) },
+    });
+    const offer = await offers(r);
+    expect(offer).toMatchObject({ channel: "CARD" });
+    expect(offer.link).toBeUndefined();
+    expect(offer.marketReason).toBeUndefined();
+    expect(r.journal.entries.filter((e) => e.kind === "shop.zone_market")).toEqual([]);
+    await signedCart(r, offer);
+    await r.purchase.placeOrder({ idempotencyKey: "idem-order-1" });
+    await r.purchase.authorize({ idempotencyKey: "idem-pay-1" });
+    expect(channels).toEqual(["CARD"]);
+  });
+
+  it("знак не ACTIVE и способа нет — зона рынка без ZONE_MARKET_NO_METHOD и без shop.zone_market (причина — знак)", async () => {
+    const r = await setup({ shops: [{ ...SHOP, profile: bakery({ paymentMethods: ["cash"] }), inContour: false, link: LINK }] });
+    await signedIntent(r);
+    const zones = await r.purchase.search();
+    expect(zones.contour).toEqual([]);
+    for (const o of zones.market) {
+      expect(o.link).toBe(LINK);
+      expect(o.marketReason).toBeUndefined();
+    }
+    expect(r.journal.entries.filter((e) => e.kind === "shop.zone_market")).toEqual([]);
+  });
+});
+
 describe("стадия 3 — проект корзины (Р32 п. 2): отказ политики без перехода (Р38 п. 4, поправка К3), выбор вне контура — STOPPED", () => {
   it("выбор не из contour этой выдачи (зона вне контура, товара нет) — STOPPED OFFER_NOT_IN_CONTOUR, agent.refused, обращений нет (А2)", async () => {
     for (const pick of ["market", "missing"] as const) {

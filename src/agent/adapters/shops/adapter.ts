@@ -278,12 +278,9 @@ export class ShopsAdapter implements OfferSource, LiveOfferSource, ShopPort, Sho
       // запись не стирается: sku, найденный у другой витрины в любой выдаче, становится неоднозначным навсегда; магазин,
       // исключённый по фактам, sku не регистрирует — иначе он делал бы неоднозначным sku исправной витрины (ревью КТ1 № 3)
       if (facts.shop !== null) for (const i of items) this.#shopOf.set(i.sku, this.#shopOf.has(i.sku) && this.#shopOf.get(i.sku) !== s.id ? null : s.id);
-      out.push({
-        merchantId: s.merchant_id,
-        inContour,
-        facts,
-        ...(!inContour && { link: `${this.o.baseUrl}/v1/shops/${s.id}/catalog` }),
-      });
+      // ссылка — у каждого магазина: при ACTIVE без способа оплаты агента товар тоже уходит в зону рынка (дополнение 1 к
+      // Р66 п. 3); у товара контура её убирает конвейер
+      out.push({ merchantId: s.merchant_id, inContour, facts, link: `${this.o.baseUrl}/v1/shops/${s.id}/catalog` });
     }
     return out;
   }

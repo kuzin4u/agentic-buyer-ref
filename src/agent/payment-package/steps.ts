@@ -73,7 +73,7 @@ export class ContourPayment implements PaymentSteps {
         orderRef,
         merchantId: basket.merchantId,
         amountMax: { ...basket.total },
-        channel: "CARD",
+        channel: c.channel,
       },
       m,
     );

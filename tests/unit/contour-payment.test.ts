@@ -50,7 +50,7 @@ function steps(o: {
   return { p, log };
 }
 
-const ctx = (signal = new AbortController().signal): PaymentContext => ({ intent: { id: "m_intent" } as Mandate, cart: CART, shopId: "SHOP-1", merchantId: "shop_1", order: { orderId: "ORD-1", total: TOTAL }, signal, sending: () => {} });
+const ctx = (signal = new AbortController().signal): PaymentContext => ({ intent: { id: "m_intent" } as Mandate, cart: CART, shopId: "SHOP-1", merchantId: "shop_1", channel: "CARD", order: { orderId: "ORD-1", total: TOTAL }, signal, sending: () => {} });
 
 describe("ContourPayment: итог стадии 5 (Р49 п. 5)", () => {
   it("PAID — ожидание по order_ref до отправки пакета, срок operation_outcome_max_delay_sec; NONE — один поиск по CART (Р51 п. 5), ничего — OPERATION_RESULT_UNCONFIRMED; ожидание снято", async () => {

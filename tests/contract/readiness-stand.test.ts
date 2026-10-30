@@ -54,6 +54,16 @@ describe("знак готовности по ПАО на стенде (Р53)", {
     expect(new Set(zones.market.map((o) => o.shopId))).toEqual(new Set(MERCHANT_FIXTURES.filter((f) => marks[f.merchant_id] !== "ACTIVE").map((f) => f.id)));
     expect(zones.market.every((o) => o.link !== undefined)).toBe(true);
     expect(zones.unavailable).toEqual([]);
+    // способ оплаты агента (дополнение 1 к Р66 п. 3): витрины эмулятора — card и sbp; из контура не уходит ни одна —
+    // канал CARD без причины рынка; рынок — по знаку, не по способу; записей shop.zone_market нет
+    expect(zones.contour.length).toBeGreaterThan(0);
+    for (const o of zones.contour) {
+      expect(o.channel).toBe("CARD");
+      expect(o.marketReason).toBeUndefined();
+      expect(o.link).toBeUndefined(); // у товара контура ссылки нет (ревью КТ1 № 7)
+    }
+    for (const o of zones.market) expect(o.marketReason).toBeUndefined();
+    expect(r.c.journal.entries.filter((e) => e.kind === "shop.zone_market")).toEqual([]);
   });
 
   it("знак приостановлен оператором до поиска (suspendReadiness) — витрина в зоне рынка со ссылкой, хотя витрина говорит «контур»; расхождение — в журнал", async () => {

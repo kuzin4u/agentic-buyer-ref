@@ -97,9 +97,9 @@ describe("стадии 5–6 на стенде v0.20.0: итог из событ
     for (const s of r.c.issuedSecrets!()) expect(out.includes(s)).toBe(false);
   });
 
-  it("Р65 п. 5 (Р51 п. 4): возврат после расчёта — ленту не читают ни тест, ни оболочка; фоновое чтение по watch_poll_interval_sec → operation.refunded → GET → OPERATION_REFUNDED", async () => {
-    const notices: [string, unknown][] = [];
-    const r = await standPurchase({ contourPayment: true, adpUntilPs11: true, params: { watch_poll_interval_sec: SHORT_WATCH_SEC }, notify: (code, amount) => void notices.push([code, amount]) });
+  /** Покупка у NORMAL до расчёта (DONE) — операция под наблюдением после итога (Р65 п. 5). */
+  async function settledRun(params: { watch_poll_interval_sec: number } | undefined, notices: [string, unknown][]) {
+    const r = await standPurchase({ contourPayment: true, adpUntilPs11: true, ...(params && { params }), notify: (code, amount) => void notices.push([code, amount]) });
     c = r.c;
     const intent = await r.purchase.intent({ ...INTENT, merchantScope: [NORMAL.merchant_id] }, { idempotencyKey: "idem-intent-bg" });
     await r.signWhileWaiting(intent.id, () => r.purchase.awaitIntent());
@@ -118,6 +118,14 @@ describe("стадии 5–6 на стенде v0.20.0: итог из событ
     await settling;
     expect(r.purchase.state).toBe("DONE");
     expect(r.operations.polling).toBe(true); // операция под наблюдением — фоновое чтение идёт
+    return { r, d, total };
+  }
+
+  const afterFrom = (r: Run, from: number, route: string) => r.c.calls().slice(from).filter((x) => x.source === "agent" && x.target === "pao" && x.route.startsWith(route));
+
+  it("Р65 п. 5 (Р51 п. 4): возврат после расчёта — ленту не читают ни тест, ни оболочка; фоновое чтение по watch_poll_interval_sec → operation.refunded → GET → OPERATION_REFUNDED", async () => {
+    const notices: [string, unknown][] = [];
+    const { r, d, total } = await settledRun({ watch_poll_interval_sec: SHORT_WATCH_SEC }, notices);
 
     // возврат процессинга; тест ленту не читает (r.readFeed не вызывается) — только фоновое чтение модуля операций
     const from = r.c.calls().length;
@@ -125,14 +133,31 @@ describe("стадии 5–6 на стенде v0.20.0: итог из событ
     for (let i = 0; i < 50 && notices.length === 0; i++) await new Promise((res) => setTimeout(res, 100));
     expect(notices).toEqual([["OPERATION_REFUNDED", total]]);
     expect(r.purchase.state).toBe("DONE");
-    // фоновое чтение было; GET операции — по одному на событие (ревью КТ1 сессии 51 № 11): по возврату один, и ещё один,
-    // если operation.settled расчёта ещё не был прочитан и его прочитало уже фоновое чтение (под нагрузкой прогона) —
-    // уведомления по нему нет; больше двух — лишний GET
-    const after = (route: string) => r.c.calls().slice(from).filter((x) => x.source === "agent" && x.target === "pao" && x.route.startsWith(route));
-    expect(after("GET /pao/v1/events").length).toBeGreaterThan(0);
-    expect(after(`GET /pao/v1/operations/${d.op_ref}`).length).toBeGreaterThanOrEqual(1);
-    expect(after(`GET /pao/v1/operations/${d.op_ref}`).length).toBeLessThanOrEqual(2);
+    // фоновое чтение было; число GET операции здесь не считается: settle() узнаёт расчёт по GET и ленту не читает, так что
+    // фоновое чтение может застать непрочитанный operation.settled — второй GET (вариант (б), решение владельца 30.10);
+    // точный подсчёт — в тесте ниже
+    expect(afterFrom(r, from, "GET /pao/v1/events").length).toBeGreaterThan(0);
     // возврат — конечный: операция ушла из окна, окно пустое — фоновое чтение снято (дополнение 1 к Р65 п. 1, 3)
+    expect(r.operations.polling).toBe(false);
+    expect(r.c.violations()).toEqual([]);
+  });
+
+  it("Р65 п. 5, нюанс К2.4 (вариант (б)): без фонового чтения (стендовый watch_poll_interval_sec за время теста не срабатывает) — ленту после возврата читает тест; ровно один GET операции", async () => {
+    const notices: [string, unknown][] = [];
+    const { r, d, total } = await settledRun(undefined, notices);
+    // расчёт settle() узнаёт по GET операции, ленту не читает: operation.settled в ленте ещё не прочитан — тест дочитывает
+    // его до возврата (второй GET со статусом SETTLED), иначе первое чтение после возврата даст GET и на него
+    const settledReads = () => r.c.journal.entries.filter((e) => e.kind === "operation.status" && e.ref === d.op_ref && e.detail === "SETTLED").length;
+    for (let i = 0; i < 50 && settledReads() < 2; i++) await r.readFeed();
+    expect(settledReads()).toBe(2);
+    expect(notices).toEqual([]);
+
+    const from = r.c.calls().length;
+    await processing(r, { op_ref: d.op_ref, msg_type: "REFUND", amount: total.amount, currency: total.currency });
+    for (let i = 0; i < 50 && notices.length === 0; i++) await r.readFeed();
+    expect(notices).toEqual([["OPERATION_REFUNDED", total]]);
+    // operation.settled прочитан до from, таймер фонового чтения не сработал — по возврату ровно один GET
+    expect(afterFrom(r, from, `GET /pao/v1/operations/${d.op_ref}`).length).toBe(1);
     expect(r.operations.polling).toBe(false);
     expect(r.c.violations()).toEqual([]);
   });

@@ -86,6 +86,12 @@ describe("стадии 5–6 на стенде v0.20.0: итог из событ
     expect(r.purchase.state).toBe("DONE");
     expect(entries(r, "operation.settled")).toEqual([[d.op_ref, "WITHIN_LIMITS"]]);
     expect(notices).toEqual([]);
+    // Р65 п. 1–3 (Т12, стадия 7): выписка по CART после покупки — цепочка INTENT и CART, integrity OK, в журнале только признак
+    const ev = await r.mandates.evidence(cart.id);
+    expect(ev).toMatchObject({ integrity: "OK" });
+    expect(ev.mandateChain.map((m) => [m.id, m.kind])).toEqual([[intent.id, "INTENT"], [cart.id, "CART"]]);
+    expect(r.c.journal.entries.filter((e) => e.kind === "mandate.evidence")).toEqual([expect.objectContaining({ mandate: cart.id, detail: "OK" })]);
+    expect(r.c.calls().filter((x) => x.target === "pao" && x.route === `GET /pao/v1/mandates/${cart.id}/evidence`)).toHaveLength(1);
     // реквизит нигде не встречается (инвариант 1)
     const out = JSON.stringify([r.c.journal.entries, r.purchase.operation]);
     for (const s of r.c.issuedSecrets!()) expect(out.includes(s)).toBe(false);

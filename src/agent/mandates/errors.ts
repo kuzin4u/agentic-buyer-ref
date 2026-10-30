@@ -25,6 +25,10 @@ export type MandateRefusal = Extract<
 export const REVOCATION_ORDER_MISSING_TEXT =
   "Банк не указал порядок отзыва поручения, поэтому покупка по нему невозможна. Обратитесь в банк или создайте поручение заново.";
 
+/** Текст человеку при выписке с integrity BROKEN (Р65 п. 3): это не отказ, а признак выписки — кода реестра нет. */
+export const EVIDENCE_BROKEN_TEXT =
+  "Банк сообщил, что цепочка записей о ваших поручениях нарушена, поэтому выписка не может служить доказательством. Обратитесь в банк.";
+
 export class MandateRefused extends Error {
   constructor(
     readonly reason: MandateRefusal,

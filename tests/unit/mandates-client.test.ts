@@ -1,6 +1,6 @@
 // Клиент мандатов на PaoStub через адаптер pao (AG-05 К2): Т2, Т3, Т3а; Р29 пп. 4–5.
 import { afterEach, describe, expect, it } from "vitest";
-import { MandateRefused, REVOCATION_ORDER_MISSING_TEXT, missingTerms } from "../../src/agent/mandates/index.js";
+import { EVIDENCE_BROKEN_TEXT, MandateRefused, REVOCATION_ORDER_MISSING_TEXT, missingTerms } from "../../src/agent/mandates/index.js";
 import type { MandateDraft } from "../../src/shared/domain.js";
 import { Consents, INTENT, RUB, event, feed } from "../support/consents.js";
 import { coreOn } from "../support/core.js";
@@ -382,6 +382,66 @@ describe("отказ от мандата — MandateClient.relinquish (Р63, д�
     consents.tamper = (x) => ({ ...x, id: "m_other" });
     await expect(core.mandates.relinquish(m.id, { idempotencyKey: "idem_rel_r4" })).rejects.toMatchObject({ reason: "MANDATE_REPLY_MISMATCH" });
     expect(journal.entries.filter((e) => e.kind === "mandate.relinquished")).toEqual([]);
+  });
+});
+
+describe("выписка — MandateClient.evidence (Т12, стадия 7; Р65 п. 1–3; К1.1)", () => {
+  const evidenceOf = (j: { entries: { kind: string }[] }) => j.entries.filter((e) => e.kind === "mandate.evidence");
+
+  it("integrity OK — цепочка с запрошенным мандатом, запись mandate.evidence с признаком, держимые не меняются", async () => {
+    const { core, journal, consents, stand } = await setup();
+    const m = await core.mandates.request(INTENT, { idempotencyKey: "idem_ev_1" });
+    await core.mandates.awaitSigned(m, feed(consents.sign(m.id)));
+    const ev = await core.mandates.evidence(m.id);
+    expect(ev).toMatchObject({ integrity: "OK", operations: [] });
+    expect(ev.mandateChain.map((x) => x.id)).toEqual([m.id]);
+    expect(evidenceOf(journal)).toEqual([expect.objectContaining({ mandate: m.id, detail: "OK" })]);
+    // тела выписки в журнале нет (инвариант 1): ни предмета, ни порядка отзыва
+    expect(JSON.stringify(evidenceOf(journal))).not.toContain(INTENT.subject);
+    expect(JSON.stringify(evidenceOf(journal))).not.toContain(consents.revocationOrder);
+    expect(core.mandates.held().map((x) => x.id)).toEqual([m.id]);
+    expect(stand.calls("GET /pao/v1/mandates/{id}/evidence")).toHaveLength(1);
+    expect(stand.stub.violations).toEqual([]);
+  });
+
+  it("integrity BROKEN — не отказ: выписка с признаком, запись BROKEN, отказа агента нет; текст человеку — EVIDENCE_BROKEN_TEXT", async () => {
+    const { core, journal, consents } = await setup();
+    const m = await core.mandates.request(INTENT, { idempotencyKey: "idem_ev_2" });
+    consents.integrity = "BROKEN";
+    await expect(core.mandates.evidence(m.id)).resolves.toEqual({ mandateChain: [], operations: [], integrity: "BROKEN" });
+    expect(evidenceOf(journal)).toEqual([expect.objectContaining({ mandate: m.id, detail: "BROKEN" })]);
+    expect(journal.entries.filter((e) => e.kind === "agent.refused")).toEqual([]);
+    expect(EVIDENCE_BROKEN_TEXT).toMatch(/доказательством/);
+  });
+
+  it("integrity OK, а запрошенного мандата в цепочке нет — MANDATE_REPLY_MISMATCH, записи выписки нет (инвариант 4)", async () => {
+    const { core, journal, consents } = await setup();
+    const m = await core.mandates.request(INTENT, { idempotencyKey: "idem_ev_3" });
+    consents.tamper = (x) => ({ ...x, id: "m_other" });
+    await expect(core.mandates.evidence(m.id)).rejects.toMatchObject({ name: "MandateRefused", reason: "MANDATE_REPLY_MISMATCH" });
+    expect(evidenceOf(journal)).toEqual([]);
+    expect(journal.entries.filter((e) => e.kind === "agent.refused")).toEqual([expect.objectContaining({ reason: "MANDATE_REPLY_MISMATCH", mandate: m.id })]);
+  });
+
+  it("мандат без revocation_order при подтверждённой версии — mandate.revocation_order_missing и отказ (ревью К2.2 № 2–4 Р33)", async () => {
+    const { core, journal, consents } = await setup({ versions: ["1.4.0"] });
+    const m = await core.mandates.request(INTENT, { idempotencyKey: "idem_ev_4" });
+    consents.tamper = (x) => {
+      const r = { ...x };
+      delete r.revocation_order;
+      return r;
+    };
+    const err = await core.mandates.evidence(m.id).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(MandateRefused);
+    expect(err).toMatchObject({ reason: "MANDATE_REVOCATION_ORDER_MISSING", message: `Мандат: ${REVOCATION_ORDER_MISSING_TEXT}` });
+    expect(journal.entries.filter((e) => e.kind === "mandate.revocation_order_missing")).toHaveLength(1);
+    expect(evidenceOf(journal)).toEqual([]);
+  });
+
+  it("мандата нет у Платформы — отказ платформы наружу как есть, записи выписки нет", async () => {
+    const { core, journal } = await setup();
+    await expect(core.mandates.evidence("m_404")).rejects.toMatchObject({ code: "MANDATE_NOT_FOUND" });
+    expect(evidenceOf(journal)).toEqual([]);
   });
 });
 

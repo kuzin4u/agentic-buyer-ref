@@ -47,6 +47,8 @@ export class Consents {
   revocationOrder = "bank:pr_1:revocation:v1";
   /** подмена ответа на создание (проверка сверки ответа с проектом) */
   tamper?: (m: PaoMandate) => PaoMandate;
+  /** integrity выписки: BROKEN — 200 с пустыми массивами, как у Платформы (ПАО 1.4.0, РП38 п. 7) */
+  integrity: "OK" | "BROKEN" = "OK";
   private seq = 0;
 
   constructor(
@@ -80,6 +82,15 @@ export class Consents {
         if (!m) return { error: { code: "MANDATE_NOT_FOUND" } };
         if (m.status === "PENDING_SIGNATURE" || m.status === "ACTIVE") m.status = "REVOKED";
         return { body: this.tamper ? this.tamper(m) : m };
+      },
+      // выписка (ПАО §3): цепочка — у CART родитель и CART; записей журнала и операций здесь нет; подмена — как у создания
+      "GET /pao/v1/mandates/{id}/evidence": ({ path }) => {
+        const m = this.mandates.get(path.id!);
+        if (!m) return { error: { code: "MANDATE_NOT_FOUND" } };
+        if (this.integrity === "BROKEN") return { body: { mandate_chain: [], records: [], operations: [], integrity: "BROKEN" } };
+        const parent = m.parent_id ? this.mandates.get(m.parent_id) : undefined;
+        const chain = [...(parent ? [parent] : []), m].map((x) => (this.tamper ? this.tamper(x) : x));
+        return { body: { mandate_chain: chain, records: [], operations: [], integrity: "OK" } };
       },
       "GET /pao/v1/mandates/{id}/verify": ({ path }) => {
         const m = this.mandates.get(path.id!);

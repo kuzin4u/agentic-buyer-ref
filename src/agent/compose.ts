@@ -370,7 +370,8 @@ export function createAgentCore(o: AgentCoreOptions): AgentCore {
   // итог операции (Р49 п. 3–6): operation.* — сигнал, итог по GET; один модуль на ядро — привязка по order_ref среди всех
   // покупок агента; пока покупка ждёт, лента читается
   // после итога покупки, пока операция под наблюдением, ядро само читает ленту раз в watch_poll_interval_sec (Р65 п. 5):
-  // остановка и close() — таймер снят, приостановка подписи — такт пропущен
+  // остановка и close() — таймер снимается на ближайшем такте (до watch_poll_interval_sec), приостановка подписи — такт
+  // пропущен
   const operations = new Operations({
     port: platform,
     journal,

@@ -35,6 +35,10 @@ export const STAND_TIMEOUT_MS = 30_000;
  *  (ревью КТ1 AG-11 ч. 2 № 13; ревью КТ1 Р51 № 5). Производное от конфигурации, не литерал. */
 export const SHORT_DELAY_SEC = Math.min(loadParams().operation_outcome_max_delay_sec, 1);
 
+/** Фоновое чтение ленты после итога в тесте на стенде (Р65 п. 5): не больше 1 с от стендового, тест не ждёт час
+ *  (ревью КТ1 сессии 51 № 10). Производное от конфигурации, не литерал. */
+export const SHORT_WATCH_SEC = Math.min(loadParams().watch_poll_interval_sec, 1);
+
 export const pause = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 /** Снятие приостановления оператором стенда и ожидание, пока часы стенда пройдут метку приостановления (Р61 п. 3, Р-634):
@@ -178,6 +182,12 @@ export async function standPurchase(o: StandPurchaseOptions = {}) {
     wake,
   });
   const operations: Operations = new Operations({ port: c.platform, journal: c.journal, params, ...(o.now && { now: o.now }), wake });
+  // закрытие контура снимает фоновое чтение ленты: таймер не переживает тест (ревью КТ1 сессии 51 № 5)
+  const closeContour = c.close.bind(c);
+  c.close = async () => {
+    operations.stopPolling();
+    await closeContour();
+  };
   const steps = o.contourPayment ? new ContourPayment({ platform, shop: shops, journal: c.journal, confirmations, operations, params }) : payment;
   const split = new SplitWindow(params, () => new Date());
   // пометка Д02 — одна на ядро, как у места сборки (Р48 п. 5): следующая покупка (next) видит расхождение прежней
@@ -223,6 +233,6 @@ export async function standPurchase(o: StandPurchaseOptions = {}) {
   }
   // readFeed — одно чтение ленты тем же курсором, что у ожиданий: после итога покупки ленту читает оболочка (events.items),
   // push или фоновое чтение модуля операций по watch_poll_interval_sec (Р65 п. 5); тест с коротким сроком его проверяет,
-  // остальные читают сами (operations.stopPolling — снять таймер до закрытия контура)
+  // остальные читают сами (таймер снимает закрытие контура)
   return { c, self, stand, purchase, next, orderMismatches, payment, split, params, confirmations, operations, mandates, signWhileWaiting, signedIntent, readFeed: wake };
 }

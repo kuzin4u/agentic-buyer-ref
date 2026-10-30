@@ -2,7 +2,7 @@
 // CART (признак, продавец, сумма, канал); дубли по event_id; GET, который Платформа просит повторить, — событие читается
 // снова; стадия 6 — GET по op_ref, без события — снова GET не чаще operation_reread_interval_sec, граница — reservation_ttl_sec
 // (Р51 п. 2), прерывание — PENDING.
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { Operations, type OperationOutcome, type SettleOutcome, type WatchAfter } from "../../src/agent/operations/index.js";
 import type { FeedItem } from "../../src/agent/ports/events.js";
 import { DIAG } from "../../src/agent/compose.js";
@@ -894,6 +894,24 @@ describe("фоновое чтение ленты после итога — watch
     await b.tickAll();
     expect(calls).toBe(2);
     expect(b.ops.polling).toBe(true);
+  });
+
+  it("таймер по умолчанию не держит процесс (unref): исход покупки уже есть (ревью КТ1 сессии 51 № 12)", () => {
+    const spy = vi.spyOn(globalThis, "setInterval");
+    try {
+      const ops = new Operations({
+        port: { readOperation: async () => record("SETTLED"), readOperations: async () => [] },
+        journal: { record: () => undefined },
+        params: { operation_outcome_max_delay_sec: DELAY_SEC, operation_reread_interval_sec: REREAD_SEC, registry_cache_ttl_sec: TTL_SEC, event_seen_max: PARAMS.event_seen_max, watch_poll_interval_sec: WATCH_SEC },
+        wake: async () => undefined,
+      });
+      ops.watch(OP, "SETTLED", () => undefined);
+      const timer = spy.mock.results.at(-1)?.value as NodeJS.Timeout;
+      expect(timer.hasRef()).toBe(false);
+      ops.stopPolling();
+    } finally {
+      spy.mockRestore();
+    }
   });
 
   it("без watch_poll_interval_sec — фонового чтения нет (ленту читает оболочка или push); stopPolling снимает таймер", async () => {

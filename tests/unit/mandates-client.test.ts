@@ -1,6 +1,6 @@
 // Клиент мандатов на PaoStub через адаптер pao (AG-05 К2): Т2, Т3, Т3а; Р29 пп. 4–5.
 import { afterEach, describe, expect, it } from "vitest";
-import { EVIDENCE_BROKEN_TEXT, MandateRefused, REVOCATION_ORDER_MISSING_TEXT, missingTerms } from "../../src/agent/mandates/index.js";
+import { MandateRefused, REVOCATION_ORDER_MISSING_TEXT, missingTerms } from "../../src/agent/mandates/index.js";
 import type { MandateDraft } from "../../src/shared/domain.js";
 import { Consents, INTENT, RUB, event, feed } from "../support/consents.js";
 import { coreOn } from "../support/core.js";
@@ -404,14 +404,19 @@ describe("выписка — MandateClient.evidence (Т12, стадия 7; Р65 
     expect(stand.stub.violations).toEqual([]);
   });
 
-  it("integrity BROKEN — не отказ: выписка с признаком, запись BROKEN, отказа агента нет; текст человеку — EVIDENCE_BROKEN_TEXT", async () => {
+  // нарушений схемы ПАО нет ни в одном тесте выписки, в том числе у ответа BROKEN обёртки (ревью КТ1 сессии 51 № 7)
+  afterEach(() => {
+    expect(stand?.stub.violations ?? []).toEqual([]);
+  });
+
+  // текст человеку при BROKEN (EVIDENCE_BROKEN_TEXT) ядро не выдаёт — его показывает оболочка по признаку (Р65 п. 3)
+  it("integrity BROKEN — не отказ: выписка с признаком, запись BROKEN, отказа агента нет", async () => {
     const { core, journal, consents } = await setup();
     const m = await core.mandates.request(INTENT, { idempotencyKey: "idem_ev_2" });
     consents.integrity = "BROKEN";
     await expect(core.mandates.evidence(m.id)).resolves.toEqual({ mandateChain: [], operations: [], integrity: "BROKEN" });
     expect(evidenceOf(journal)).toEqual([expect.objectContaining({ mandate: m.id, detail: "BROKEN" })]);
     expect(journal.entries.filter((e) => e.kind === "agent.refused")).toEqual([]);
-    expect(EVIDENCE_BROKEN_TEXT).toMatch(/доказательством/);
   });
 
   it("integrity BROKEN с непустой цепочкой — агент отдаёт пустые массивы: нарушенная цепочка не служит данными (дополнение 1 к Р65 п. 4)", async () => {

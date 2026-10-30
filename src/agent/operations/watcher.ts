@@ -64,12 +64,18 @@ export interface OperationsOptions {
     registry_cache_ttl_sec: number;
     event_seen_max: number;
     event_poll_interval_ms?: number;
+    /** фоновое чтение ленты после итога (Р65 п. 5); без него — только оболочка или push */
+    watch_poll_interval_sec?: number;
   };
   /** прочитать ленту (`EventFeed.signal`): ожидание будит её, пока не решится; частоту чтений ограничивает лента */
   wake?: () => Promise<void>;
   now?: () => Date;
   /** таймер: вернуть — отмена */
   timer?: (fn: () => void, ms: number) => () => void;
+  /** повторяющийся таймер фонового чтения: вернуть — отмена; по умолчанию — setInterval без удержания процесса */
+  every?: (fn: () => void, ms: number) => () => void;
+  /** состояние ядра для фонового чтения: STOP — таймер снять, SKIP — такт пропустить (приостановка подписи) */
+  gate?: () => "RUN" | "SKIP" | "STOP";
 }
 
 /** Итог стадии 5: операция привязана и сверена; MISMATCH — привязана, но не сходится с покупкой (запись
@@ -124,6 +130,9 @@ export class Operations {
   readonly #settling = new Map<string, Set<Waker>>();
   /** op_ref → операция под наблюдением после итога (Р51 п. 4); окно event_seen_max, старейшая вытесняется (порядок Map) */
   readonly #watched = new Map<string, Watched>();
+  readonly #every: (fn: () => void, ms: number) => () => void;
+  /** отмена фонового чтения ленты; null — не идёт */
+  #polling: (() => void) | null = null;
 
   constructor(o: OperationsOptions) {
     this.#o = o;
@@ -136,6 +145,43 @@ export class Operations {
         const t = setTimeout(fn, ms);
         return () => clearTimeout(t);
       });
+    this.#every =
+      o.every ??
+      ((fn, ms) => {
+        // с unref: наблюдение после итога не держит процесс — исход покупки уже есть
+        const t = setInterval(fn, ms);
+        t.unref();
+        return () => clearInterval(t);
+      });
+  }
+
+  /** Фоновое чтение ленты идёт (Р65 п. 5). */
+  get polling(): boolean {
+    return this.#polling !== null;
+  }
+
+  /** Снять фоновое чтение ленты (закрытие ядра или тестового контура); наблюдение остаётся — его будят лента и push. */
+  stopPolling(): void {
+    this.#polling?.();
+    this.#polling = null;
+  }
+
+  /**
+   * Фоновое чтение ленты после итога (Р65 п. 5, Р51 п. 4): пока под наблюдением есть операция — раз в
+   * watch_poll_interval_sec будит ленту; без параметра или без `wake` — нет (ленту читает оболочка или push). Ядро
+   * остановлено (gate STOP) — таймер снят; подпись приостановлена (SKIP) — такт пропущен: лента отвечает 403, снятие —
+   * сверкой. Сбой чтения глотается: недоступность ленты считает и пишет сама лента (EVENTS_UNAVAILABLE, Р50 п. 2).
+   */
+  #arm(): void {
+    const sec = this.#o.params.watch_poll_interval_sec;
+    const wake = this.#o.wake;
+    if (this.#polling !== null || sec === undefined || wake === undefined || this.#watched.size === 0) return;
+    if (this.#o.gate?.() === "STOP") return;
+    this.#polling = this.#every(() => {
+      const gate = this.#o.gate?.() ?? "RUN";
+      if (gate === "STOP" || this.#watched.size === 0) return this.stopPolling();
+      if (gate === "RUN") void wake().catch(() => undefined);
+    }, Math.min(sec * 1000, TIMER_MAX_MS));
   }
 
   /** Слушатель ленты (`EventFeed.listen`). Бросает только сбой журнала и отказ GET, после которого Платформа просит
@@ -264,6 +310,7 @@ export class Operations {
     if (after === "REFUNDED") sent.add("OPERATION_REFUNDED");
     this.#watched.set(op.opRef, { op: structuredClone(op), after, notice, sent });
     while (this.#watched.size > this.#o.params.event_seen_max) this.#watched.delete(this.#watched.keys().next().value!);
+    this.#arm();
   }
 
   /** Событие по операции под наблюдением: уведомление решает статус по GET (таблица К4 в PR #66); каждое — не больше

@@ -717,3 +717,111 @@ describe("стадия 6: расчёт по operation.settled и GET (Р49 п. 6
     expect(d.out()).toMatchObject({ kind: "OPERATION" });
   });
 });
+
+describe("фоновое чтение ленты после итога — watch_poll_interval_sec (Р65 п. 5; К2.1)", () => {
+  const WATCH_SEC = PARAMS.watch_poll_interval_sec;
+  const OP: Operation = {
+    opRef: "op_1",
+    orderRef: ORDER,
+    channel: "CARD",
+    amount: { amount: 90_000, currency: "RUB" },
+    merchantId: "MER-T1",
+    indicator: { agentCode: AG, mandateId: CART.id },
+    status: "SETTLED",
+    declineReason: null,
+    fulfilment: null,
+  };
+
+  /** повторяющийся таймер теста: такт — tick(), снят — live false; ms — запомненный срок */
+  function background(o: { gate?: () => "RUN" | "SKIP" | "STOP"; sec?: number | undefined; wake?: () => Promise<void> } = {}) {
+    let wakes = 0;
+    const timers: { fn: () => void; ms: number; live: boolean }[] = [];
+    const ops = new Operations({
+      port: { readOperation: async () => record("SETTLED"), readOperations: async () => [] },
+      journal: { record: () => undefined },
+      params: {
+        operation_outcome_max_delay_sec: DELAY_SEC,
+        operation_reread_interval_sec: REREAD_SEC,
+        registry_cache_ttl_sec: TTL_SEC,
+        event_seen_max: PARAMS.event_seen_max,
+        ...("sec" in o ? (o.sec !== undefined && { watch_poll_interval_sec: o.sec }) : { watch_poll_interval_sec: WATCH_SEC }),
+      },
+      wake: o.wake ?? (async () => void wakes++),
+      every: (fn, ms) => {
+        const t = { fn, ms, live: true };
+        timers.push(t);
+        return () => void (t.live = false);
+      },
+      ...(o.gate && { gate: o.gate }),
+    });
+    const tickAll = async () => {
+      for (const t of timers.filter((x) => x.live)) t.fn();
+      await tick();
+    };
+    return { ops, timers, tickAll, wakes: () => wakes, live: () => timers.filter((t) => t.live).length };
+  }
+
+  it("до наблюдения таймера нет; первая операция под наблюдением — один таймер на watch_poll_interval_sec, такт будит ленту", async () => {
+    const b = background();
+    expect(b.ops.polling).toBe(false);
+    expect(b.timers).toEqual([]);
+    b.ops.watch(OP, "SETTLED", () => undefined);
+    b.ops.watch({ ...OP, opRef: "op_2", orderRef: "ord_2" }, "SETTLED", () => undefined);
+    expect(b.ops.polling).toBe(true);
+    expect(b.timers.map((t) => t.ms)).toEqual([WATCH_SEC * 1000]);
+    await b.tickAll();
+    await b.tickAll();
+    expect(b.wakes()).toBe(2);
+  });
+
+  it("ядро остановлено (gate STOP) — таймер снят на такте, ленту не будит; после остановки новый таймер не ставится", async () => {
+    let gate: "RUN" | "SKIP" | "STOP" = "RUN";
+    const b = background({ gate: () => gate });
+    b.ops.watch(OP, "SETTLED", () => undefined);
+    gate = "STOP";
+    await b.tickAll();
+    expect(b.wakes()).toBe(0);
+    expect(b.ops.polling).toBe(false);
+    expect(b.live()).toBe(0);
+    b.ops.watch({ ...OP, opRef: "op_2", orderRef: "ord_2" }, "SETTLED", () => undefined);
+    expect(b.timers).toHaveLength(1);
+  });
+
+  it("подпись приостановлена (gate SKIP) — такт пропущен, таймер остаётся; после снятия такт будит ленту", async () => {
+    let gate: "RUN" | "SKIP" | "STOP" = "SKIP";
+    const b = background({ gate: () => gate });
+    b.ops.watch(OP, "SETTLED", () => undefined);
+    await b.tickAll();
+    expect(b.wakes()).toBe(0);
+    expect(b.ops.polling).toBe(true);
+    gate = "RUN";
+    await b.tickAll();
+    expect(b.wakes()).toBe(1);
+  });
+
+  it("сбой чтения ленты таймер глотает (недоступность считает сама лента) — таймер остаётся", async () => {
+    let calls = 0;
+    const b = background({
+      wake: async () => {
+        calls++;
+        throw new Error("лента недоступна");
+      },
+    });
+    b.ops.watch(OP, "SETTLED", () => undefined);
+    await b.tickAll();
+    await b.tickAll();
+    expect(calls).toBe(2);
+    expect(b.ops.polling).toBe(true);
+  });
+
+  it("без watch_poll_interval_sec — фонового чтения нет (ленту читает оболочка или push); stopPolling снимает таймер", async () => {
+    const off = background({ sec: undefined });
+    off.ops.watch(OP, "SETTLED", () => undefined);
+    expect(off.timers).toEqual([]);
+    const b = background();
+    b.ops.watch(OP, "SETTLED", () => undefined);
+    b.ops.stopPolling();
+    expect(b.ops.polling).toBe(false);
+    expect(b.live()).toBe(0);
+  });
+});

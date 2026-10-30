@@ -97,6 +97,40 @@ describe("стадии 5–6 на стенде v0.20.0: итог из событ
     for (const s of r.c.issuedSecrets!()) expect(out.includes(s)).toBe(false);
   });
 
+  it("Р65 п. 5 (Р51 п. 4): возврат после расчёта — ленту не читают ни тест, ни оболочка; фоновое чтение по watch_poll_interval_sec → operation.refunded → GET → OPERATION_REFUNDED", async () => {
+    const notices: [string, unknown][] = [];
+    const r = await standPurchase({ contourPayment: true, adpUntilPs11: true, params: { watch_poll_interval_sec: 1 }, notify: (code, amount) => void notices.push([code, amount]) });
+    c = r.c;
+    try {
+      const intent = await r.purchase.intent({ ...INTENT, merchantScope: [NORMAL.merchant_id] }, { idempotencyKey: "idem-intent-bg" });
+      await r.signWhileWaiting(intent.id, () => r.purchase.awaitIntent());
+      const offer = (await r.purchase.search()).contour.find((o) => o.shopId === NORMAL.id)!;
+      const cart = await r.purchase.cart(one(offer, 1), { idempotencyKey: "idem-cart-bg" });
+      await r.signWhileWaiting(cart.id, () => r.purchase.awaitCart());
+      await r.purchase.placeOrder({ idempotencyKey: "idem-order-bg" });
+      const total = cart.cart!.total;
+      const authorizing = r.purchase.authorize({ idempotencyKey: "idem-pay-bg" });
+      const d = await decided(r);
+      await processing(r, { op_ref: d.op_ref, msg_type: "ISSUER_RESPONSE", issuer_approved: true });
+      await authorizing;
+      expect(r.operations.polling).toBe(false); // до итога — ожидание читает ленту само, фонового чтения нет
+      const settling = r.purchase.settle(new AbortController().signal);
+      await processing(r, { op_ref: d.op_ref, msg_type: "PRESENTMENT", amount: total.amount, currency: total.currency });
+      await settling;
+      expect(r.purchase.state).toBe("DONE");
+      expect(r.operations.polling).toBe(true); // операция под наблюдением — фоновое чтение идёт
+
+      // возврат процессинга; тест ленту не читает (r.readFeed не вызывается) — только фоновое чтение модуля операций
+      await processing(r, { op_ref: d.op_ref, msg_type: "REFUND", amount: total.amount, currency: total.currency });
+      for (let i = 0; i < 50 && notices.length === 0; i++) await new Promise((res) => setTimeout(res, 100));
+      expect(notices).toEqual([["OPERATION_REFUNDED", total]]);
+      expect(r.purchase.state).toBe("DONE");
+      expect(r.c.violations()).toEqual([]);
+    } finally {
+      r.operations.stopPolling();
+    }
+  });
+
   it("риск 4а (авторизация): новый CART после нового поиска — операция привязана к новому CART; от прежнего агент отказался (Р63, дополнение 1 п. 6), он не используется", async () => {
     const r = await standPurchase({ contourPayment: true, adpUntilPs11: true });
     c = r.c;

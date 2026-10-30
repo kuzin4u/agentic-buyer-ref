@@ -82,6 +82,9 @@ export const StandParamsSchema = z
   // не таймер: × 1000 остаётся safe integer). Равны параметрам стенда Платформы.
   operation_reread_interval_sec: positive.max(Math.floor(TIMER_MAX_MS / 1000)),
   reservation_ttl_sec: positive.max(Math.floor(Number.MAX_SAFE_INTEGER / 1000)),
+  // Фоновое чтение ленты после итога покупки (Р65 п. 5): пока под наблюдением есть операция — раз в
+  // watch_poll_interval_sec (срок таймера: не больше его предела). Отдельно от operation_reread_interval_sec: смысл разный.
+  watch_poll_interval_sec: positive.max(Math.floor(TIMER_MAX_MS / 1000)),
   // Окно обработанных event_id у модулей операций и подтверждений (Р50 п. 1): вытеснение старейшего, рост ограничен.
   event_seen_max: positive,
 })

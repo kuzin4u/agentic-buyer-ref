@@ -90,7 +90,7 @@ describe("AgentCore.payment (Р45 п. 6)", () => {
     });
     const total = { amount: 250000, currency: "RUB" };
     const cart = { id: "m_cart", cart: { merchantId: "shop_1", lines: [], total } } as unknown as Mandate;
-    const ctx: PaymentContext = { intent: { id: "m_intent" } as Mandate, cart, shopId: "SHOP-1", merchantId: "shop_1", order: { orderId: "ORD-1", total }, signal: new AbortController().signal, sending: () => {} };
+    const ctx: PaymentContext = { intent: { id: "m_intent" } as Mandate, cart, shopId: "SHOP-1", merchantId: "shop_1", channel: "CARD", order: { orderId: "ORD-1", total }, signal: new AbortController().signal, sending: () => {} };
     await expect(steps.authorize(ctx, { idempotencyKey: "idem-pay-compose" })).resolves.toMatchObject({ opRef: "op_1", orderRef: "ORD-1", status: "AUTHORIZED", amount: total });
     expect(journal.entries.filter((e) => e.kind === "operation.status").map((e) => [e.agent, e.ref, e.detail])).toEqual([[AGENT, "op_1", "AUTHORIZED"]]);
     expect(s.stub.calls.filter((c) => c.op === "POST /pao/v1/credentials").map((c) => c.idempotencyKey)).toEqual(["idem-pay-compose"]);
@@ -137,7 +137,7 @@ describe("AgentCore.payment (Р45 п. 6)", () => {
     const steps = core.payment({ pay: async () => ({ status: "PAID" }) });
     const total = { amount: 250000, currency: "RUB" };
     const cart = { id: "m_cart", cart: { merchantId: "shop_1", lines: [], total } } as unknown as Mandate;
-    const ctx: PaymentContext = { intent: { id: "m_intent" } as Mandate, cart, shopId: "SHOP-1", merchantId: "shop_1", order: { orderId: "ORD-2", total }, signal: new AbortController().signal, sending: () => {} };
+    const ctx: PaymentContext = { intent: { id: "m_intent" } as Mandate, cart, shopId: "SHOP-1", merchantId: "shop_1", channel: "CARD", order: { orderId: "ORD-2", total }, signal: new AbortController().signal, sending: () => {} };
     await expect(steps.authorize(ctx, { idempotencyKey: "idem-pay-mismatch" })).rejects.toMatchObject({ code: "OPERATION_REPLY_MISMATCH" });
     expect(journal.entries.filter((e) => e.kind === "operation.mismatch").map((e) => [e.ref, e.detail, e.mandate])).toEqual([["op_2", "MERCHANT", "m_cart"]]);
 
@@ -178,7 +178,7 @@ describe("AgentCore.payment (Р45 п. 6)", () => {
     const total = { amount: 250000, currency: "RUB" };
     const cart = { id: "m_cart", cart: { merchantId: "shop_1", lines: [], total } } as unknown as Mandate;
     const ac = new AbortController();
-    const ctx: PaymentContext = { intent: { id: "m_intent" } as Mandate, cart, shopId: "SHOP-1", merchantId: "shop_1", order: { orderId: "ORD-1", total }, signal: ac.signal, sending: () => {} };
+    const ctx: PaymentContext = { intent: { id: "m_intent" } as Mandate, cart, shopId: "SHOP-1", merchantId: "shop_1", channel: "CARD", order: { orderId: "ORD-1", total }, signal: ac.signal, sending: () => {} };
     await expect(steps.authorize(ctx, { idempotencyKey: "idem-pay-declined" })).rejects.toMatchObject({ code: "CONFIRMATION_REQUIRED" });
     const waiting = steps.confirm(ctx, () => {}, ac.signal);
     ac.abort(new Error("покупка остановлена"));
@@ -209,7 +209,7 @@ describe("AgentCore.payment (Р45 п. 6)", () => {
     const steps = core.payment({ pay: async () => ({ status: "DECLINED" }) });
     const total = { amount: 250000, currency: "RUB" };
     const cart = { id: "m_cart", cart: { merchantId: "shop_1", lines: [], total } } as unknown as Mandate;
-    const ctx: PaymentContext = { intent: { id: "m_intent" } as Mandate, cart, shopId: "SHOP-1", merchantId: "shop_1", order: { orderId: "ORD-1", total }, signal: new AbortController().signal, sending: () => {} };
+    const ctx: PaymentContext = { intent: { id: "m_intent" } as Mandate, cart, shopId: "SHOP-1", merchantId: "shop_1", channel: "CARD", order: { orderId: "ORD-1", total }, signal: new AbortController().signal, sending: () => {} };
     const notified: string[] = [];
     await expect(steps.confirm(ctx, () => void notified.push("n"), new AbortController().signal)).resolves.toBe("REJECTED");
     expect(notified).toEqual([]);
@@ -227,7 +227,7 @@ describe("AgentCore.payment (Р45 п. 6)", () => {
     const steps = core.payment({ pay: async () => (paid++, { status: "PAID" }) });
     const total = { amount: 250000, currency: "RUB" };
     const cart = { id: "m_cart", cart: { merchantId: "shop_1", lines: [], total } } as unknown as Mandate;
-    const ctx = (orderId: string, signal: AbortSignal): PaymentContext => ({ intent: { id: "m_intent" } as Mandate, cart, shopId: "SHOP-1", merchantId: "shop_1", order: { orderId, total }, signal, sending: () => {} });
+    const ctx = (orderId: string, signal: AbortSignal): PaymentContext => ({ intent: { id: "m_intent" } as Mandate, cart, shopId: "SHOP-1", merchantId: "shop_1", channel: "CARD", order: { orderId, total }, signal, sending: () => {} });
     const pan = luhnTail("900000000000000");
     await expect(steps.authorize(ctx(`ORD-${pan}`, new AbortController().signal), { idempotencyKey: "idem-pan" })).rejects.toMatchObject({ code: "SHOP_ORDER_REF_INVALID" });
     expect(journal.entries.filter((e) => e.kind === "agent.refused").map((e) => [e.reason, e.detail, e.mandate])).toEqual([["SHOP_ORDER_REF_INVALID", "PAN_LIKE", "m_cart"]]);
@@ -258,7 +258,7 @@ describe("AgentCore.payment (Р45 п. 6)", () => {
     const steps = core.payment({ pay: async () => (paid++, { status: "PAID" }) });
     const total = { amount: 250000, currency: "RUB" };
     const cart = { id: "m_cart", cart: { merchantId: "shop_1", lines: [], total } } as unknown as Mandate;
-    const ctx: PaymentContext = { intent: { id: "m_intent" } as Mandate, cart, shopId: "SHOP-1", merchantId: "shop_1", order: { orderId: "ORD-1", total }, signal: new AbortController().signal, sending: () => {} };
+    const ctx: PaymentContext = { intent: { id: "m_intent" } as Mandate, cart, shopId: "SHOP-1", merchantId: "shop_1", channel: "CARD", order: { orderId: "ORD-1", total }, signal: new AbortController().signal, sending: () => {} };
     await expect(steps.authorize(ctx, { idempotencyKey: "idem-k3" })).rejects.toMatchObject({ code });
     expect(paid).toBe(0);
     expect(s3.stub.calls.filter((c) => c.op === "POST /pao/v1/credentials")).toHaveLength(1);

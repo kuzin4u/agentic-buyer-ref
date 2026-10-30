@@ -35,6 +35,8 @@ export interface FeedShop {
   profile: CatalogShop;
   merchantId: string;
   inContour?: boolean;
+  /** адрес витрины для человека — как у адаптера, у каждого магазина (дополнение 1 к Р66 п. 3) */
+  link?: string;
 }
 
 /** Выдача из фидов; `calls` — сколько раз спросили (обращений до ворот быть не должно). */
@@ -47,6 +49,7 @@ export function feedOffers(...shops: FeedShop[]): OfferSource & { calls: number 
         merchantId: s.merchantId,
         inContour: s.inContour ?? true,
         facts: readFeed(s.feed, s.profile, { exponent: 2, offset: "+03:00" }),
+        ...(s.link !== undefined && { link: s.link }),
       }));
     },
   };

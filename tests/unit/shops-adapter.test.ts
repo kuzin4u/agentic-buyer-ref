@@ -174,12 +174,13 @@ describe("адаптер витрин (Р42)", () => {
       { "MER-S2": [READY("MER-S2", "SUSPENDED")], "MER-S3": [READY("MER-S3", "NONE")] },
     );
     const out = await a.search();
+    // ссылка — у каждого магазина (дополнение 1 к Р66 п. 3): при ACTIVE без способа оплаты агента товар тоже в зоне рынка
     expect(out.map((s) => ("unavailable" in s ? null : [s.merchantId, s.inContour, s.link]))).toEqual([
-      ["MER-S1", true, undefined],
+      ["MER-S1", true, `${BASE}/v1/shops/S1/catalog`],
       ["MER-S2", false, `${BASE}/v1/shops/S2/catalog`],
       ["MER-S3", false, `${BASE}/v1/shops/S3/catalog`],
-      ["MER-S4", true, undefined],
-      ["MER-S5", true, undefined],
+      ["MER-S4", true, `${BASE}/v1/shops/S4/catalog`],
+      ["MER-S5", true, `${BASE}/v1/shops/S5/catalog`],
     ]);
     expect(journal.entries.filter((e) => e.kind === "shop.readiness_mismatch").map((e) => [e.merchant, e.detail])).toEqual([
       ["MER-S2", "SUSPENDED:CONTOUR"],

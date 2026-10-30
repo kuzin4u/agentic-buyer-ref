@@ -149,6 +149,9 @@ export type JournalKind =
   | "shop.readiness"
   /** зона по ПАО и слова витрины расходятся (Р53 п. 3): merchant, detail — «статус ПАО:CONTOUR|MARKET витрины»; действий нет */
   | "shop.readiness_mismatch"
+  /** знак ACTIVE, но способа оплаты агента у витрины нет — товары в зоне рынка (дополнение 1 к Р66 п. 3): merchant,
+   *  reason NO_AGENT_PAYMENT_METHOD; строк payment_methods витрины нет; пишет конвейер */
+  | "shop.zone_market"
   /** статус запроса подтверждения по GET (Р47 п. 3): ref — confirmation_id, detail — PENDING / APPROVED / REJECTED /
    *  EXPIRED; ни link, ни confirmation_ref в журнал не попадают */
   | "confirmation.status"

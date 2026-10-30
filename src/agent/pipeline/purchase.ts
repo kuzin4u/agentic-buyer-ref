@@ -3,7 +3,7 @@
 // «выполнены ли условия сейчас». Ход покупки задаёт вызывающий: каждое действие человека — типизированный вход метода
 // (инвариант 3). Состояние — только в памяти (Р38 п. 6).
 import type { StandParams } from "../../shared/config.js";
-import { PlatformFailure, type CartLine, type Mandate, type MandateDraft, type Money, type Operation } from "../../shared/domain.js";
+import { PlatformFailure, type CartLine, type Mandate, type MandateDraft, type Money, type Operation, type PaymentChannel } from "../../shared/domain.js";
 import type { DiagCode } from "../../shared/diag-codes.js";
 import { SAFE_ID, SHOP_ID } from "../../shared/ids.js";
 import { liveCheck, type A5SignalCode, type CatalogIssueCode, type CatalogProduct, type LiveCheckParams, type LiveFactCode } from "../catalog/index.js";
@@ -12,6 +12,7 @@ import { MandateRefused, type MandateClient } from "../mandates/index.js";
 import { chargedAmount, scopeNotice } from "../operations/notice.js";
 import { issuedByShell, spend } from "../policy/a5-issued.js";
 import { acceptedA5, cartTotal, classifyOffer, mayDraftCart, mayOrder, type CartPurchase, type HumanA5Decision, type OfferVerdict, type OrderDecision, type OrderNext } from "../policy/catalog.js";
+import { paymentChannel } from "../policy/channels.js";
 import { confirmThreshold, currencySupported, mandateRefusal, mayAuthorize, mayCartMerchant, needsConfirmation, type PaymentDecision, type Thresholds } from "../policy/payment.js";
 import type { OrderPriceMismatches } from "../policy/order-mismatch.js";
 import type { SplitWindow } from "../policy/split.js";
@@ -59,6 +60,9 @@ export interface PipelineJournal extends PurchaseJournal {
       /** магазин отказал в каталоге (Т4, Р42 п. 4): detail — код витрины, BAD_RESPONSE или NO_RESPONSE; reason — код вне
        *  перечня; merchant — код продавца по маске */
       | ({ at: string; kind: "shop.unavailable"; mandate?: string; merchant?: string } & ShopUnavailableCause)
+      /** знак ACTIVE, но способа оплаты агента у витрины нет — товары в зоне рынка (дополнение 1 к Р66 п. 3); строк
+       *  payment_methods витрины в записи нет (инвариант 5) */
+      | { at: string; kind: "shop.zone_market"; reason: "NO_AGENT_PAYMENT_METHOD"; mandate?: string; merchant?: string }
       /** прежний CART больше не используется (Т15, Р46 п. 3): mandate — id CART по маске, detail — причина закрытым
        *  перечнем; сумм, позиций и продавца нет. У Платформы CART остаётся ACTIVE (риск 4а) */
       | { at: string; kind: "cart.abandoned"; detail: CartAbandoned; mandate?: string }
@@ -95,7 +99,9 @@ export interface PipelineJournal extends PurchaseJournal {
 }
 
 /** Товар выдачи. `a5` непустой — показ с пометкой «сведения продавца противоречивы» (Р32 п. 1). `link` — у зоны вне
- *  контура: адрес витрины для человека, платежа нет (инвариант 10, Р42 п. 3). */
+ *  контура: адрес витрины для человека, платежа нет (инвариант 10, Р42 п. 3). `channel` — у зоны контура: способ оплаты
+ *  агента у этой витрины, канал реквизита (дополнение 1 к Р66 п. 3). `marketReason` — у зоны рынка, когда знак ACTIVE,
+ *  но способа оплаты агента у витрины нет; текст — в оболочке (`shell/zones`). */
 export interface Offer {
   shopId: string;
   merchantId: string;
@@ -103,7 +109,12 @@ export interface Offer {
   product: CatalogProduct;
   a5: A5SignalCode[];
   link?: string;
+  channel?: PaymentChannel;
+  marketReason?: MarketReason;
 }
+
+/** Почему товар продавца со знаком ACTIVE — в зоне рынка (дополнение 1 к Р66 п. 3). */
+export type MarketReason = "ZONE_MARKET_NO_METHOD";
 
 /** Код пояснения различия в защите по зоне (Т5, A6 п. 3.1, Р42 п. 3); тексты для человека — в оболочке (`shell/zones`). */
 export type ZoneCode = "ZONE_CONTOUR" | "ZONE_MARKET";
@@ -795,6 +806,10 @@ export class Purchase {
       for (const reason of dropped) this.#record({ kind: "offer.excluded", reason, ...m });
       // магазин исключён, а товаров нет — запись на код магазина, как у неразобранного фида
       if (products.length === 0) for (const reason of shopIssues) this.#record({ kind: "offer.excluded", reason, ...m });
+      // зона контура — знак ACTIVE и способ оплаты агента у витрины (дополнение 1 к Р66 п. 3); нет способа — зона рынка
+      const channel = s.inContour ? paymentChannel(shop.paymentMethods) : null;
+      const noMethod = s.inContour && channel === null;
+      let shownNoMethod = false;
       for (const p of products) {
         const v = classifyOffer(p, shop, shopIssues, this.o.region, s.merchantId);
         const ref = { ...skuRef(p.product.sku), ...m };
@@ -810,9 +825,13 @@ export class Purchase {
           this.#record({ kind: "offer.flagged", reason: "A5_PRICE_MISMATCH", detail: "ORDER_REPLY_MISMATCH", ...ref });
         }
         const offer: Offer = { shopId: shop.id, merchantId: s.merchantId, sku: p.product.sku, product: p.product, a5: v.a5 };
-        if (s.inContour) zones.contour.push(offer);
-        else zones.market.push({ ...offer, ...(s.link !== undefined && { link: s.link }) });
+        if (channel !== null) zones.contour.push({ ...offer, channel });
+        else zones.market.push({ ...offer, ...(s.link !== undefined && { link: s.link }), ...(noMethod && { marketReason: "ZONE_MARKET_NO_METHOD" as const }) });
+        shownNoMethod ||= noMethod;
       }
+      // запись — только когда товар магазина показан в зоне рынка по этой причине: магазин исключён или все товары
+      // отсеяны — записей исключения достаточно, журнал не противоречит выдаче (ревью КТ1 № 4)
+      if (shownNoMethod) this.#record({ kind: "shop.zone_market", reason: "NO_AGENT_PAYMENT_METHOD", ...m });
     }
     return zones;
   }
@@ -820,7 +839,9 @@ export class Purchase {
   #context(): Omit<PaymentContext, "signal" | "sending"> {
     const [offer] = this.#need(this.#lines);
     if (offer === undefined) this.#halt("PIPELINE_TRANSITION_FORBIDDEN");
-    return { intent: this.#need(this.#intent), cart: this.#need(this.#cart), shopId: offer.shopId, merchantId: offer.merchantId, order: this.#need(this.#order) };
+    // товар выбора — из зоны контура (cart()), у него есть способ оплаты агента; нет — дефект, а не тихий канал по умолчанию
+    if (offer.channel === undefined) this.#halt("PIPELINE_TRANSITION_FORBIDDEN");
+    return { intent: this.#need(this.#intent), cart: this.#need(this.#cart), shopId: offer.shopId, merchantId: offer.merchantId, channel: offer.channel, order: this.#need(this.#order) };
   }
 
   /** Контекст шагу оплаты: копия снимков и связь с машиной — сигнал остановки и отметка «пакет уходит» (Р45, Б2в). */

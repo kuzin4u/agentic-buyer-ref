@@ -809,7 +809,7 @@ export class Purchase {
       // зона контура — знак ACTIVE и способ оплаты агента у витрины (дополнение 1 к Р66 п. 3); нет способа — зона рынка
       const channel = s.inContour ? paymentChannel(shop.paymentMethods) : null;
       const noMethod = s.inContour && channel === null;
-      if (noMethod) this.#record({ kind: "shop.zone_market", reason: "NO_AGENT_PAYMENT_METHOD", ...m });
+      let shownNoMethod = false;
       for (const p of products) {
         const v = classifyOffer(p, shop, shopIssues, this.o.region, s.merchantId);
         const ref = { ...skuRef(p.product.sku), ...m };
@@ -827,7 +827,11 @@ export class Purchase {
         const offer: Offer = { shopId: shop.id, merchantId: s.merchantId, sku: p.product.sku, product: p.product, a5: v.a5 };
         if (channel !== null) zones.contour.push({ ...offer, channel });
         else zones.market.push({ ...offer, ...(s.link !== undefined && { link: s.link }), ...(noMethod && { marketReason: "ZONE_MARKET_NO_METHOD" as const }) });
+        shownNoMethod ||= noMethod;
       }
+      // запись — только когда товар магазина показан в зоне рынка по этой причине: магазин исключён или все товары
+      // отсеяны — записей исключения достаточно, журнал не противоречит выдаче (ревью КТ1 № 4)
+      if (shownNoMethod) this.#record({ kind: "shop.zone_market", reason: "NO_AGENT_PAYMENT_METHOD", ...m });
     }
     return zones;
   }

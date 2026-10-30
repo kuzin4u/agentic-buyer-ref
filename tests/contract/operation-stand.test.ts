@@ -133,10 +133,12 @@ describe("стадии 5–6 на стенде v0.20.0: итог из событ
     for (let i = 0; i < 50 && notices.length === 0; i++) await new Promise((res) => setTimeout(res, 100));
     expect(notices).toEqual([["OPERATION_REFUNDED", total]]);
     expect(r.purchase.state).toBe("DONE");
-    // фоновое чтение было; число GET операции здесь не считается: settle() узнаёт расчёт по GET и ленту не читает, так что
-    // фоновое чтение может застать непрочитанный operation.settled — второй GET (вариант (б), решение владельца 30.10);
-    // точный подсчёт — в тесте ниже
+    // фоновое чтение было; GET операции — по одному на событие: settle() узнаёт расчёт по GET и ленту не читает, так что
+    // фоновое чтение может застать и непрочитанный operation.settled — второй GET (вариант (б), решение владельца 30.10);
+    // больше двух — лишний GET фонового чтения (ревью КТ1 № 2); точный подсчёт — в тесте ниже
     expect(afterFrom(r, from, "GET /pao/v1/events").length).toBeGreaterThan(0);
+    expect(afterFrom(r, from, `GET /pao/v1/operations/${d.op_ref}`).length).toBeGreaterThanOrEqual(1);
+    expect(afterFrom(r, from, `GET /pao/v1/operations/${d.op_ref}`).length).toBeLessThanOrEqual(2);
     // возврат — конечный: операция ушла из окна, окно пустое — фоновое чтение снято (дополнение 1 к Р65 п. 1, 3)
     expect(r.operations.polling).toBe(false);
     expect(r.c.violations()).toEqual([]);

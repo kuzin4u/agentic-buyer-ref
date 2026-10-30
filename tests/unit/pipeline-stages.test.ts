@@ -204,6 +204,17 @@ describe("стадия 2 — зона по способу оплаты аген�
     expect(channels).toEqual(["CARD"]);
   });
 
+  // случай «все товары отсеяны по региону» на фиде пекарни не собрать: самовывоз проходит при любом регионе
+  it("способа нет, но витрина исключена целиком (пустая строка в payment_methods) — товаров в зоне рынка нет, записи shop.zone_market нет, только исключения (ревью КТ1 № 4)", async () => {
+    const r = await setup({ shops: [{ ...SHOP, profile: bakery({ paymentMethods: ["", "cash"] }), link: LINK }] });
+    await signedIntent(r);
+    const zones = await r.purchase.search();
+    expect(zones.contour).toEqual([]);
+    expect(zones.market).toEqual([]);
+    expect(r.journal.entries.filter((e) => e.kind === "offer.excluded").length).toBeGreaterThan(0);
+    expect(r.journal.entries.filter((e) => e.kind === "shop.zone_market")).toEqual([]);
+  });
+
   it("знак не ACTIVE и способа нет — зона рынка без ZONE_MARKET_NO_METHOD и без shop.zone_market (причина — знак)", async () => {
     const r = await setup({ shops: [{ ...SHOP, profile: bakery({ paymentMethods: ["cash"] }), inContour: false, link: LINK }] });
     await signedIntent(r);

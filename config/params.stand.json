@@ -30,5 +30,6 @@
   "operation_outcome_max_delay_sec": 30,
   "operation_reread_interval_sec": 3600,
   "reservation_ttl_sec": 604800,
+  "watch_poll_interval_sec": 3600,
   "event_seen_max": 10000
 }

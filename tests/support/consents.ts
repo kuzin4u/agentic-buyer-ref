@@ -6,6 +6,8 @@
 // его ведёт платформа (инвариант 6), тест лишь назначает значение. Порядок отзыва задаёт «Платформа» (ПАО 1.4.0, РП37):
 // поле запроса не берётся, у CART — как у родителя (если родитель здесь есть). Стенд Платформы этого пока не проверяет:
 // стенд (с v0.5.0, у агента — v0.11.0; ПАО 1.4.0; К2а, К1.2 AG-06) мандаты уже отдаёт; переход этих тестов на createStand — STATUS «Открыто».
+// Выписка (`GET …/evidence`) — эмуляция сверх PaoStub (у него обработчика нет): цепочка и integrity задаёт тест; на стенде
+// выписка проверяется настоящей — operation-stand.test.ts, после П15 (Р65, нюанс К1.1; ревью КТ1 сессии 51 № 8).
 import type * as Pao from "@kuzin4u/agentic-core/pao";
 import type { PaoStubOptions } from "@kuzin4u/agentic-core/pao";
 import type { FeedItem } from "../../src/agent/ports/events.js";
@@ -47,6 +49,10 @@ export class Consents {
   revocationOrder = "bank:pr_1:revocation:v1";
   /** подмена ответа на создание (проверка сверки ответа с проектом) */
   tamper?: (m: PaoMandate) => PaoMandate;
+  /** integrity выписки: BROKEN — 200 с пустыми массивами, как у Платформы (ПАО 1.4.0, РП38 п. 7) */
+  integrity: "OK" | "BROKEN" = "OK";
+  /** BROKEN с непустой цепочкой — Платформа так не отвечает; проверка, что агент её не отдаёт (дополнение 1 к Р65 п. 4) */
+  brokenWithChain = false;
   private seq = 0;
 
   constructor(
@@ -80,6 +86,17 @@ export class Consents {
         if (!m) return { error: { code: "MANDATE_NOT_FOUND" } };
         if (m.status === "PENDING_SIGNATURE" || m.status === "ACTIVE") m.status = "REVOKED";
         return { body: this.tamper ? this.tamper(m) : m };
+      },
+      // выписка (ПАО §3): цепочка — у CART родитель и CART; записей журнала и операций здесь нет; подмена — как у создания
+      "GET /pao/v1/mandates/{id}/evidence": ({ path }) => {
+        const m = this.mandates.get(path.id!);
+        if (!m) return { error: { code: "MANDATE_NOT_FOUND" } };
+        const parent = m.parent_id ? this.mandates.get(m.parent_id) : undefined;
+        const chain = [...(parent ? [parent] : []), m].map((x) => (this.tamper ? this.tamper(x) : x));
+        if (this.integrity === "BROKEN") {
+          return { body: { mandate_chain: this.brokenWithChain ? chain : [], records: [], operations: [], integrity: "BROKEN" } };
+        }
+        return { body: { mandate_chain: chain, records: [], operations: [], integrity: "OK" } };
       },
       "GET /pao/v1/mandates/{id}/verify": ({ path }) => {
         const m = this.mandates.get(path.id!);

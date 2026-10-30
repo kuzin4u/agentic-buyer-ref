@@ -7,6 +7,7 @@ import { SAFE_ID } from "../../shared/ids.js";
 import {
   PlatformFailure,
   type Cart,
+  type Evidence,
   type FailureCode,
   type Mandate,
   type MandateCheck,
@@ -28,6 +29,8 @@ export interface MandateJournal {
       | { at: string; kind: "mandate.revoked"; mandate?: string }
       /** агент отказался от мандата (Р63, дополнение 1 п. 5); detail — статус в ответе (REVOKED или уже конечный) */
       | { at: string; kind: "mandate.relinquished"; mandate?: string; detail: MandateStatus }
+      /** выписка из журнала согласий получена (Р65 п. 3); detail — integrity, тела выписки нет */
+      | { at: string; kind: "mandate.evidence"; mandate?: string; detail: Evidence["integrity"] }
       /** держимый мандат больше не ACTIVE — не держится; detail — статус по GET (Р37 п. 4) */
       | { at: string; kind: "mandate.status_changed"; mandate?: string; detail: MandateStatus }
       /** аномалия: держимый ACTIVE-мандат пропал у Платформы (GET 404) — решение владельца по К2.3, вариант (а) */
@@ -205,6 +208,23 @@ export class MandateClient {
     return got;
   }
 
+  /**
+   * Выписка из журнала согласий по mandate_id (Т12, стадия 7; Р65 п. 1–3) — чтение, держимые мандаты не меняет. Мандат
+   * без порядка отзыва — mandate.revocation_order_missing и отказ (#mandate; ревью К2.2 № 2–4 Р33). integrity OK —
+   * запрошенный мандат есть в цепочке, иначе MANDATE_REPLY_MISMATCH (инвариант 4); BROKEN — не отказ, а выписка с
+   * признаком: доказательством не служит, человеку — EVIDENCE_BROKEN_TEXT. Запись mandate.evidence — только признак
+   * цепочки, тела выписки нет (инвариант 1). Прочие отказы — наружу как есть.
+   */
+  async evidence(id: string): Promise<Evidence> {
+    const got = await this.#mandate(() => this.o.port.mandateEvidence(id), id);
+    if (got.integrity === "OK" && !got.mandateChain.some((m) => m.id === id)) {
+      throw this.#refuse("MANDATE_REPLY_MISMATCH", "в выписке нет запрошенного мандата", id);
+    }
+    this.o.journal.record({ at: this.now().toISOString(), kind: "mandate.evidence", ...masked(id), detail: got.integrity });
+    // нарушенная цепочка не служит данными — пустые массивы, даже если Платформа прислала их (дополнение 1 к Р65 п. 4)
+    return got.integrity === "BROKEN" ? { mandateChain: [], operations: [], integrity: "BROKEN" } : got;
+  }
+
   #hold(m: Mandate): Mandate {
     if (m.status === "ACTIVE") this.#held.set(m.id, m);
     return m;
@@ -294,7 +314,7 @@ export class MandateClient {
   /** Ответ с мандатом без порядка отзыва: версия ПАО Платформы подтверждена — событие в журнал и отказ с текстом человеку
    *  (Р33 п. 4); не подтверждена — порт уже записал событие и остановил агента (PLATFORM_PROTOCOL_UNSUPPORTED), отказ
    *  платформы — дальше как есть (Р33 п. 10). */
-  async #mandate(call: () => Promise<Mandate>, id?: string): Promise<Mandate> {
+  async #mandate<T>(call: () => Promise<T>, id?: string): Promise<T> {
     try {
       return await call();
     } catch (e) {

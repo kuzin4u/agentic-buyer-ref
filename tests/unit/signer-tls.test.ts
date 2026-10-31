@@ -1,6 +1,6 @@
 // Ключ канала mTLS и CSR при допуске (Р64 п. 2–3, К2.1; передачи #86, #88). Ключ TLS — P-256, только в signer
 // (инвариант 2): файл 0600 в каталоге 0700, наружу — описатель и CSR. CSR сверяется внешним инструментом (openssl) и
-// строгим разбором Платформы — допуском на стенде v0.32.1 с полем csr. Без openssl тест красный, а не пропущенный
+// строгим разбором Платформы — допуском на стенде с полем csr (с v0.32.1; у агента — v0.34.0, Р68). Без openssl тест красный, а не пропущенный
 // (Р64 п. 8, как Р-726 Платформы).
 import { createHash, createPrivateKey, createPublicKey, generateKeyPairSync, X509Certificate } from "node:crypto";
 import { execFileSync } from "node:child_process";
@@ -135,7 +135,7 @@ describe("CSR при допуске (Р64 п. 3; передача #86 п. 2)", (
     expect(der.includes(Buffer.from(priv, "base64url"))).toBe(false);
   });
 
-  it("стенд v0.32.1: допуск с csr — в решении сертификат на наш ключ, SAN — код агента, выдан УЦ стенда", async () => {
+  it("стенд (с v0.32.1): допуск с csr — в решении сертификат на наш ключ, SAN — код агента, выдан УЦ стенда", async () => {
     stand = createStand();
     const sig = generateKey(dir);
     const d = generateTlsKey(dir);

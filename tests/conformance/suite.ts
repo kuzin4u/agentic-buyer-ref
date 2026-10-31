@@ -51,6 +51,8 @@ export type FaultMethod = "requestMandate" | "issueCredential" | "verifyMandate"
 export interface ConformanceTarget {
   /** имя цели в названии набора */
   readonly name: string;
+  /** срок одного теста, мс; стенд под параллельной нагрузкой прогона медленнее 5 с по умолчанию */
+  readonly timeoutMs?: number;
   open(): Promise<ConformanceSession>;
 }
 
@@ -93,7 +95,7 @@ function expectNoSecrets(value: unknown, secrets: readonly string[], where = "я
 }
 
 export function describeConformance(target: ConformanceTarget): void {
-  describe(`набор соответствия адаптеров (AG-20, Р67) — ${target.name}`, () => {
+  describe(`набор соответствия адаптеров (AG-20, Р67) — ${target.name}`, { ...(target.timeoutMs !== undefined && { timeout: target.timeoutMs }) }, () => {
     let session: ConformanceSession | undefined;
     afterEach(async () => {
       await session?.close();
@@ -204,6 +206,20 @@ export function describeConformance(target: ConformanceTarget): void {
         const e = await s.platform.mandateEvidence(m.id);
         expect(["OK", "BROKEN"]).toContain(e.integrity);
         if (e.integrity === "OK") expect(e.mandateChain.map((x) => x.id)).toContain(m.id);
+      });
+
+      // КТ1 сессии 53 № 7: платформа сверяет агента мандата в каждом методе мандата, а не только в выдаче реквизита
+      it("мандат другого агента: чтение, verify, отказ и выписка — отказ PlatformFailure; мандат у владельца не изменился", async () => {
+        const s = await begin();
+        const m = await s.foreign.requestMandate(s.intent(), { idempotencyKey: "conformance-foreign" });
+        await s.signMandate(m.id);
+        const ref = { id: m.id, currency: m.amountLimit.currency };
+        await expect(s.platform.getMandate(m.id), "getMandate").rejects.toBeInstanceOf(PlatformFailure);
+        await expect(s.platform.verifyMandate(ref), "verifyMandate").rejects.toBeInstanceOf(PlatformFailure);
+        await expect(s.platform.relinquishMandate(m.id, { idempotencyKey: "conformance-relinquish" }), "relinquishMandate").rejects.toBeInstanceOf(PlatformFailure);
+        await expect(s.platform.mandateEvidence(m.id), "mandateEvidence").rejects.toBeInstanceOf(PlatformFailure);
+        expect((await s.foreign.getMandate(m.id)).status).toBe("ACTIVE");
+        expect((await s.foreign.verifyMandate(ref)).outcome).toBe("CONFIRMED");
       });
     });
 

@@ -59,6 +59,12 @@ export interface ContourOptions {
   /** только для "stand": способы оплаты витрин эмулятора по merchant_id (`createMerchants`, v0.34.0, Р68 п. 3) — как
    *  есть, без перечня; знак готовности и справочник продавцов стенда не меняются. Эмулятор способ не сверяет. */
   paymentMethods?: Readonly<Record<string, readonly string[]>>;
+  /** только для "stand": транспорт клиента ПАО своего агента (допуск и адаптер) — подмена ответа тестовой стороной
+   *  (потеря, тело не по схеме; набор соответствия, AG-20 ч. 2, Р67 нюансы К1.3). Обращения к витринам — без неё. */
+  paoFetch?: typeof fetch;
+  /** только для "stand": второй зарегистрированный агент BUYER из фикстур стенда (`foreign`) — свой каталог ключей, допуск
+   *  тем же путём; его мандаты для своего агента — чужие (набор соответствия, AG-20 ч. 2, Р67 нюансы К1.2) */
+  secondAgent?: true;
   /** только для "stub": настройки обёртки PaoStand (ключи, обработчики операций, незарегистрированный агент) */
   stub?: StandOptions;
 }
@@ -128,6 +134,8 @@ export interface Contour {
   /** только "stand": адрес ПАО стенда и порт подписи агента — знак готовности продавца по ПАО (Р53 п. 1) */
   readonly paoAccess?: { baseUrl: string; signing: RequestSigning };
   readonly stand?: Stand;
+  /** только "stand" с `secondAgent`: второй агент — код, адаптер ПАО, допуск; журнал — свой, в `journal` не входит */
+  readonly foreign?: { readonly agentCode: string; readonly platform: PaymentPlatform; start(): Promise<AgentSelf> };
   /** только "stub" */
   readonly paoStand?: PaoStand;
   /** полный журнал обращений по порядку */
@@ -196,14 +204,32 @@ function captureCredentials(app: Stand["app"], out: string[]): void {
 }
 
 /** Повтор compose до AG-09 (см. шапку): связка ключей и адаптер ПАО с портом подписи. */
-function agent(o: { dir: string; baseUrl: string; agentCode: string; params: StandParams; journal: MemoryJournal; now?: () => Date; paoNow?: () => Date }) {
+function agent(o: {
+  dir: string;
+  baseUrl: string;
+  agentCode: string;
+  params: StandParams;
+  journal: MemoryJournal;
+  now?: () => Date;
+  paoNow?: () => Date;
+  fetch?: typeof fetch;
+}) {
   const ring = new KeyRing({ dir: o.dir, params: o.params, journal: o.journal, ...(o.now && { now: o.now }) });
   // Часы клиента ПАО — системные, как в tests/support/core.ts: окно времени подписи проверяет сервер по своим часам.
   // `paoNow` — только для стенда, когда тест двигает часы стенда (setClock) и клиента вместе (истечение подтверждения, Р47)
   const sleep = async () => {};
   // один ограничитель частоты на агента, как в compose (Р59 п. 1)
   const pace = new Pace({ fallbackPerMin: o.params.pao_rate_limit_fallback_per_min, journal: o.journal, sleep });
-  const pao = { baseUrl: o.baseUrl, agentCode: o.agentCode, params: o.params, sleep, journal: o.journal, pace, ...(o.paoNow && { now: o.paoNow }) };
+  const pao = {
+    baseUrl: o.baseUrl,
+    agentCode: o.agentCode,
+    params: o.params,
+    sleep,
+    journal: o.journal,
+    pace,
+    ...(o.paoNow && { now: o.paoNow }),
+    ...(o.fetch && { fetch: o.fetch }),
+  };
   const platform = new PaoPlatform({ ...pao, signing: ring.port() });
   let admitted = false;
   // один запрос реестра для допуска и для сверки — как у места сборки (compose.ts)
@@ -237,7 +263,7 @@ export function shopBy(behaviour: ShopBehaviour): MerchantFixture {
 }
 
 export async function createContour(o: ContourOptions): Promise<Contour> {
-  return o.pao === "stub" ? stubContour(o.stub) : standContour(o.now, o.adpUntilPs11 === true, o.aoiSupport !== false, o.paymentMethods);
+  return o.pao === "stub" ? stubContour(o.stub) : standContour(o);
 }
 
 async function stubContour(opts: StandOptions | undefined): Promise<Contour> {
@@ -287,28 +313,32 @@ async function stubContour(opts: StandOptions | undefined): Promise<Contour> {
   };
 }
 
-async function standContour(
-  paoNow?: () => Date,
-  adpUntilPs11 = false,
-  aoiSupport = true,
-  paymentMethods?: Readonly<Record<string, readonly string[]>>,
-): Promise<Contour> {
-  const fixture = AGENT_FIXTURES.find((f) => f.registered && f.class === "BUYER");
+async function standContour(o: ContourOptions): Promise<Contour> {
+  const { now: paoNow, paymentMethods, paoFetch } = o;
+  const adpUntilPs11 = o.adpUntilPs11 === true;
+  const aoiSupport = o.aoiSupport !== false;
+  const buyers = AGENT_FIXTURES.filter((f) => f.registered && f.class === "BUYER");
+  const fixture = buyers[0];
   if (!fixture) throw new Error("в AGENT_FIXTURES нет зарегистрированного агента BUYER");
+  const fixture2 = o.secondAgent ? buyers[1] : undefined;
+  if (o.secondAgent && !fixture2) throw new Error("в AGENT_FIXTURES нет второго зарегистрированного агента BUYER");
   const params = loadParams();
   const journal = new MemoryJournal();
   const log: ContourCall[] = [];
   const secrets: string[] = [];
   let dir: string | undefined;
+  let dir2: string | undefined;
   let stand: Stand | undefined;
   let emulator: MerchantsStand | undefined;
   let ring: KeyRing | undefined;
+  let ring2: KeyRing | undefined;
   const release = async () => {
     try {
       ring?.close();
+      ring2?.close();
     } finally {
       await Promise.allSettled([emulator?.close(), stand?.close()]);
-      if (dir !== undefined) rmSync(dir, { recursive: true, force: true });
+      for (const d of [dir, dir2]) if (d !== undefined) rmSync(d, { recursive: true, force: true });
     }
   };
   try {
@@ -337,9 +367,20 @@ async function standContour(
     const decision = await stand.admit(agentApplication(fixture, { alg: descriptor.alg, public_key: descriptor.public_key }), fixture.operator);
     if (!decision.admitted) throw new Error(`стенд не допустил агента фикстуры: ${JSON.stringify(decision)}`);
     const [baseUrl, merchantsUrl] = await Promise.all([stand.listen(), emulator.listen()]);
-    const a = agent({ dir, baseUrl, agentCode: fixture.agent_code, params, journal, ...(paoNow && { paoNow }) });
+    const a = agent({ dir, baseUrl, agentCode: fixture.agent_code, params, journal, ...(paoNow && { paoNow }), ...(paoFetch && { fetch: paoFetch }) });
     ring = a.ring;
     const signing = a.ring.port();
+    // Второй агент — тем же путём допуска, свой каталог ключей и журнал; подмена транспорта его не касается.
+    let foreign: Contour["foreign"];
+    if (fixture2) {
+      dir2 = mkdtempSync(join(tmpdir(), "buyref-contour-"));
+      const key2 = generateKey(dir2).descriptor;
+      const decision2 = await stand.admit(agentApplication(fixture2, { alg: key2.alg, public_key: key2.public_key }), fixture2.operator);
+      if (!decision2.admitted) throw new Error(`стенд не допустил второго агента фикстуры: ${JSON.stringify(decision2)}`);
+      const b = agent({ dir: dir2, baseUrl, agentCode: fixture2.agent_code, params, journal: new MemoryJournal(), ...(paoNow && { paoNow }) });
+      ring2 = b.ring;
+      foreign = { agentCode: fixture2.agent_code, platform: b.platform, start: b.start };
+    }
 
     const merchants: Merchants = {
       baseUrl: merchantsUrl,
@@ -391,6 +432,7 @@ async function standContour(
       shopSigning: { sign: (req) => signRequest(req, signing.current()) },
       paoAccess: { baseUrl, signing },
       stand,
+      ...(foreign && { foreign }),
       calls: () => log.map((c) => ({ ...c })),
       agentCalls: () => log.filter((c) => c.source !== "test").map((c) => ({ ...c })),
       // агент не обращается к путям участников (ADP, ПИ-3): копию сообщения эквайрера и ПИ-3 шлёт только тестовая поддержка

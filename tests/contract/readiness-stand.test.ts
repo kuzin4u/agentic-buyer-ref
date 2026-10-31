@@ -1,7 +1,8 @@
 // Знак готовности продавца по ПАО на стенде Платформы (Р53, AG-09 ч. 2б, К2.3; передача #67, PS-30 ч. 2). Знак подаёт
 // эквайрер стенда (ПИ-8) по readiness_mark фикстуры: ACTIVE у витрин контура, у витрины рынка (READ_ONLY) — NONE; приостанавливает и снимает
 // оператор (`stand.suspendReadiness` / `reinstateReadiness`). Ожидание — из ответа знака стенда эквайреру
-// (`acquirerParticipant.getReadiness`), а не из слов витрины и не из журнала агента. Подмен ответов нет.
+// (`acquirerParticipant.getReadiness`), а не из слов витрины и не из журнала агента. Подмен ответов нет. С v0.34.0 —
+// способ оплаты витрины при знаке ACTIVE (`paymentMethods` стенда; эмулятор способ не сверяет — Р68 п. 4).
 import { afterEach, describe, expect, it } from "vitest";
 import { MERCHANT_FIXTURES } from "agentic-ps-platform/fixtures";
 import { startFailureCode } from "../../src/agent/compose.js";
@@ -161,7 +162,7 @@ describe("знак готовности по ПАО на стенде (Р53)", {
   it("витрина NORMAL с [\"cash\"] при знаке ACTIVE — зона рынка со ссылкой и ZONE_MARKET_NO_METHOD, shop.zone_market; выбор — OFFER_NOT_IN_CONTOUR, реквизит не запрашивается (Р68 п. 4)", async () => {
     const r = await standPurchase({ paymentMethods: { [NORMAL.merchant_id]: ["cash"] } });
     c = r.c;
-    const intent = await r.purchase.intent({ ...INTENT, merchantScope: [NORMAL.merchant_id] }, { idempotencyKey: "idem-intent-cash" });
+    const intent = await r.purchase.intent({ ...INTENT, merchantScope: [NORMAL.merchant_id] }, { idempotencyKey: "idem-intent-nomethod" });
     await r.signWhileWaiting(intent.id, () => r.purchase.awaitIntent());
     const zones = await r.purchase.search();
     // знак у стенда прежний — в рынок витрину уводит способ оплаты, а не знак
@@ -170,6 +171,9 @@ describe("знак готовности по ПАО на стенде (Р53)", {
     expect(zones.contour.filter((o) => o.shopId === NORMAL.id)).toEqual([]);
     const market = zones.market.filter((o) => o.shopId === NORMAL.id);
     expect(market.length).toBeGreaterThan(0);
+    // ни один товар витрины не отброшен — ни молча, ни исключением: в рынке ровно товары витрины для агента (ревью КТ № 4)
+    expect(new Set(market.map((o) => o.sku))).toEqual(new Set(NORMAL.agent_items.map((i) => i.sku)));
+    expect(r.c.journal.entries.filter((e) => e.kind === "offer.excluded" && e.merchant === NORMAL.merchant_id)).toEqual([]);
     for (const o of market) {
       expect(o).toMatchObject({ merchantId: NORMAL.merchant_id, marketReason: "ZONE_MARKET_NO_METHOD" });
       expect(o.link).toMatch(/\S/);
@@ -177,11 +181,14 @@ describe("знак готовности по ПАО на стенде (Р53)", {
     }
     const records = r.c.journal.entries.filter((e) => e.kind === "shop.zone_market");
     expect(records.map((e) => [e.merchant, e.reason])).toEqual([[NORMAL.merchant_id, "NO_AGENT_PAYMENT_METHOD"]]);
-    // строки payment_methods витрины в журнал не попадают (инвариант 5)
-    expect(JSON.stringify(r.c.journal.entries).includes('"cash"')).toBe(false);
-    // выбор товара зоны рынка — отказ без оплаты (инвариант 10)
-    await expect(r.purchase.cart(one(market[0]!, 1), { idempotencyKey: "idem-cart-cash" })).rejects.toBeInstanceOf(PurchaseStopped);
+    // строки payment_methods витрины в журнал не попадают ни в каком виде (инвариант 5; ревью КТ № 5)
+    expect(JSON.stringify(r.c.journal.entries)).not.toMatch(/\bcash\b/i);
+    // выбор товара зоны рынка — отказ без оплаты и без обращений (инвариант 10; ревью КТ № 1, № 3)
+    const before = r.c.agentCalls().length;
+    await expect(r.purchase.cart(one(market[0]!, 1), { idempotencyKey: "idem-cart-nomethod" })).rejects.toBeInstanceOf(PurchaseStopped);
     expect(r.purchase.reason).toBe("OFFER_NOT_IN_CONTOUR");
+    expect(r.c.agentCalls()).toHaveLength(before);
+    expect(r.c.journal.entries.filter((e) => e.kind === "agent.refused").map((e) => [e.reason, e.ref])).toEqual([["OFFER_NOT_IN_CONTOUR", market[0]!.sku]]);
     // реквизит не запрашивался — ни в журнале обращений контура, ни у стенда (инварианты 1, 10); стенд обращения агента
     // видел (знак продавца), то есть отсутствие выдачи — не пустой журнал
     const credentials = (m: string, p: string) => m === "POST" && p === "/pao/v1/credentials";
@@ -189,5 +196,8 @@ describe("знак готовности по ПАО на стенде (Р53)", {
     const standCalls = r.stand.calls();
     expect(standCalls.some((x) => x.method === "GET" && x.path === readinessCall(NORMAL.merchant_id).split(" ")[1])).toBe(true);
     expect(standCalls.filter((x) => credentials(x.method, x.path))).toEqual([]);
+    // выданных реквизитов нет ни у стенда, ни в перехвате контура (Р68 п. 3; ревью КТ № 2)
+    expect(r.stand.issuedCredentials()).toEqual([]);
+    expect(r.c.issuedSecrets()).toEqual([]);
   });
 });

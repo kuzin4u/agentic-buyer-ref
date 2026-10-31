@@ -41,11 +41,19 @@ function closure(entry: string, read: (f: string) => string): string[] {
   return [...seen].map(rel).sort();
 }
 
+/** Внешние пакеты, которые `suite.ts` подключает напрямую (не относительные спецификаторы). */
+const external = (file: string) =>
+  [...new Set(ts.preProcessFile(readFileSync(file, "utf8"), true, true).importedFiles.map((i) => i.fileName).filter((n) => !n.startsWith(".")))].sort();
+
 const violations = (files: readonly string[]) => files.flatMap((f) => FORBIDDEN.filter(([re]) => re.test(f)).map(([, what]) => `${f} — ${what}`));
 
 describe("граница набора соответствия (Р67 п. 1)", () => {
   it("прямые импорты suite.ts из проекта — ровно порт, shared/domain, policy/channels и declines/table (нюансы К1.2, К1.3)", () => {
     expect([...new Set(direct(SUITE, (f) => readFileSync(f, "utf8")).map(rel))].sort()).toEqual(ALLOWED);
+  });
+
+  it("внешние пакеты suite.ts — ровно vitest и node:util (КТ1 № 12 (а)): ни agentic-core, ни PaoStub, ни клиента сети", () => {
+    expect(external(SUITE)).toEqual(["node:util", "vitest"]);
   });
 
   it("suite.ts транзитивно не подключает contour, adapters/* и compose", () => {

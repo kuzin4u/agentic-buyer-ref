@@ -29,6 +29,9 @@ export interface ConformanceSession {
   loseNextResponse?(method: FaultMethod): void;
   /** следующий ответ на метод порта — 200 с телом не по схеме */
   garbleNextResponse?(method: FaultMethod): void;
+  /** журнал адаптера `platform` текстом, как его видит оператор (инвариант 1: платёжных данных в нём нет) */
+  journalText(): string;
+  /** закрыть цель; нарушения контракта, которые видит тестовая сторона (запрос не по схеме), — отказ здесь */
   close(): Promise<void>;
 }
 
@@ -83,10 +86,10 @@ const CREDENTIAL_FIELDS = ["channel", "credentialRef", "indicator", "status", "v
 const ISO_TIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$/;
 
 /** Ни один образец платёжных данных не виден в сериализации и в `inspect` значения (инвариант 1, Р45 п. 3). */
-function expectNoSecrets(value: unknown, secrets: readonly string[]): void {
+function expectNoSecrets(value: unknown, secrets: readonly string[], where = "ядру"): void {
   expect(secrets.length, "цель не отдала образцов — проверка была бы пустой").toBeGreaterThan(0);
   const shown = `${JSON.stringify(value)}\n${inspect(value, { depth: 10, showHidden: true })}\n${String(value)}`;
-  for (const s of secrets) expect(shown.includes(s), "платёжные данные видны ядру").toBe(false);
+  for (const s of secrets) expect(shown.includes(s), `платёжные данные видны ${where}`).toBe(false);
 }
 
 export function describeConformance(target: ConformanceTarget): void {
@@ -215,6 +218,7 @@ export function describeConformance(target: ConformanceTarget): void {
         expect(c.channel).toBe(draft.channel);
         expect(c.indicator).toEqual({ agentCode: s.agentCode, mandateId: cart.id });
         expectNoSecrets(c, s.issuedSecrets());
+        expectNoSecrets(s.journalText(), s.issuedSecrets(), "в журнале адаптера");
       });
 
       it("пакет агентской оплаты: реквизит — тот же вид и признак; пакет запечатан — платёжных данных не видно", async () => {
@@ -233,7 +237,10 @@ export function describeConformance(target: ConformanceTarget): void {
         const cart = await signedCart(s);
         await s.platform.relinquishMandate(cart.id, { idempotencyKey: "conformance-relinquish" });
         const before = s.issuedSecrets().length;
-        await expect(s.platform.issueCredential(credentialDraft(cart, "ord_conformance_3"), { idempotencyKey: "conformance-credential" })).rejects.toBeInstanceOf(PlatformFailure);
+        const e = await s.platform.issueCredential(credentialDraft(cart, "ord_conformance_3"), { idempotencyKey: "conformance-credential" }).catch((x: unknown) => x);
+        expect(e).toBeInstanceOf(PlatformFailure);
+        // отозванный мандат не оживает: повтор запрещён (SPEC §7а, MANDATE_REVOKED — never)
+        expect((e as PlatformFailure).retry).toBe("never");
         expect(s.issuedSecrets()).toHaveLength(before);
       });
 
@@ -247,20 +254,23 @@ export function describeConformance(target: ConformanceTarget): void {
     });
 
     describe("ошибки и повторы (инварианты 4, 8, 9; SPEC §7а)", () => {
-      /** Отказ порта — PlatformFailure с кодом из словаря ядра (§7а) и классом повтора; иное — дефект адаптера. */
+      /** Отказ порта — PlatformFailure с кодом из словаря ядра (§7а) и классом повтора по словарю; иное — дефект
+       *  адаптера. Исключение словаря — потеря ответа на выдачу реквизита (Р48 п. 4 (а)) — проверяется своим тестом. */
       const expectPortFailure = (e: unknown) => {
         expect(e).toBeInstanceOf(PlatformFailure);
-        expect(Object.keys(FAILURE_RULES)).toContain((e as PlatformFailure).code);
+        const f = e as PlatformFailure;
+        expect(Object.keys(FAILURE_RULES)).toContain(f.code);
+        expect(f.retry, `класс повтора ${f.code}`).toBe(FAILURE_RULES[f.code as keyof typeof FAILURE_RULES].retry);
       };
 
-      it("каждое изменяющее обращение подписано агентом и несёт Idempotency-Key (инвариант 8)", async () => {
+      it("каждое изменяющее обращение подписано агентом и несёт Idempotency-Key вызывающего (инвариант 8)", async () => {
         const s = await begin();
         const cart = await signedCart(s);
         await s.platform.issueCredential(credentialDraft(cart, "ord_conformance_5"), { idempotencyKey: "conformance-credential" });
         await s.platform.relinquishMandate(cart.id, { idempotencyKey: "conformance-relinquish" });
         const mutating = s.calls().filter((c) => c.mutating);
-        // INTENT, CART, реквизит, отказ — четыре изменяющих обращения адаптера
-        expect(mutating.length).toBeGreaterThanOrEqual(4);
+        // INTENT, CART, реквизит, отказ — ровно четыре изменяющих обращения адаптера, ключи — те, что дал вызывающий
+        expect(mutating.map((c) => c.idempotencyKey)).toEqual(["conformance-intent", "conformance-cart", "conformance-credential", "conformance-relinquish"]);
         for (const c of mutating) {
           expect(c.signed, `обращение ${JSON.stringify(c)} без подписи`).toBe(true);
           expect(c.idempotencyKey, `обращение ${JSON.stringify(c)} без Idempotency-Key`).toMatch(/\S/);
@@ -280,25 +290,30 @@ export function describeConformance(target: ConformanceTarget): void {
         expect((await s.platform.getMandate(m.id)).status).toBe("PENDING_SIGNATURE");
       });
 
-      it("ответ на выдачу реквизита потерян — без повтора: одно обращение, NO_RESPONSE с классом never (Р48 п. 4а)", async (ctx) => {
+      it("ответ на выдачу реквизита потерян — без повтора: одно обращение, NO_RESPONSE с классом never (Р48 п. 4 (а))", async (ctx) => {
         const s = await begin();
         if (s.loseNextResponse === undefined) return ctx.skip("цель не умеет терять ответ");
         const cart = await signedCart(s);
         const from = s.calls().length;
         s.loseNextResponse("issueCredential");
         const e = await s.platform.issueCredential(credentialDraft(cart, "ord_conformance_6"), { idempotencyKey: "conformance-lost" }).catch((x: unknown) => x);
-        expectPortFailure(e);
+        expect(e).toBeInstanceOf(PlatformFailure);
         expect(e).toMatchObject({ code: "NO_RESPONSE", retry: "never" });
         expect(s.calls().slice(from).filter((x) => x.mutating)).toHaveLength(1);
+        // платформа выдала реквизит, ответ не дошёл: платёжных данных нет ни в отказе, ни в журнале (инвариант 1)
+        expectNoSecrets(e, s.issuedSecrets(), "в тексте отказа");
+        expectNoSecrets(s.journalText(), s.issuedSecrets(), "в журнале адаптера");
       });
 
-      it("ответ 200 не по схеме — отказ PlatformFailure, а не частичный результат (инвариант 4)", async (ctx) => {
+      it("ответ 200 не по схеме — BAD_RESPONSE без повтора, а не частичный результат (инвариант 4)", async (ctx) => {
         const s = await begin();
         if (s.garbleNextResponse === undefined) return ctx.skip("цель не умеет подменять ответ");
         const m = await s.platform.requestMandate(s.intent(), { idempotencyKey: "conformance-intent" });
         await s.signMandate(m.id);
         s.garbleNextResponse("verifyMandate");
-        expectPortFailure(await s.platform.verifyMandate({ id: m.id, currency: m.amountLimit.currency }).catch((e: unknown) => e));
+        const e = await s.platform.verifyMandate({ id: m.id, currency: m.amountLimit.currency }).catch((x: unknown) => x);
+        expectPortFailure(e);
+        expect(e).toMatchObject({ code: "BAD_RESPONSE", retry: "never" });
       });
 
       it("отказы порта — только PlatformFailure с кодом словаря ядра (§7а)", async () => {

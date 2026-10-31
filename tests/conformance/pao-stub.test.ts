@@ -1,9 +1,12 @@
 // Цель набора соответствия (AG-20, Р67 п. 1): адаптер ПАО напрямую против PaoStub agentic-core (ПАО 1.4.0). Мандаты —
 // журнал согласий-обёртка tests/support/consents.ts (подпись человека — `sign`), агент мандата — тот, кто его запросил;
-// выдача реквизита — обработчик ниже, условия — как у Платформы (ПАО §4, РП47 п. 4): мандат чужой — 404
-// MANDATE_NOT_FOUND, агент отказался — 409 MANDATE_REVOKED (П22).
+// выдача реквизита — обработчик ниже. Из условий выдачи Платформы (ПАО §4, РП47 п. 4) эмулированы только два: мандат
+// чужой — 404 MANDATE_NOT_FOUND, агент отказался — 409 MANDATE_REVOKED (П22); вид, срок, продавец, сумма и прочие
+// условия §4 обработчик не сверяет — полностью их проверяет цель на стенде (К1.4, AG-20 ч. 2). Запросы и ответы PaoStub
+// сверяет со схемой YAML 1.4.0; нарушение схемы — красный тест при закрытии сессии (КТ1 № 1).
 import { newEd25519Signer } from "@kuzin4u/agentic-core";
 import { PaoStub } from "@kuzin4u/agentic-core/pao";
+import { expect } from "vitest";
 import { Pace, PaoPlatform } from "../../src/agent/adapters/pao/index.js";
 import { MemoryJournal } from "../../src/agent/journal/index.js";
 import type { RequestSigning } from "../../src/agent/ports/index.js";
@@ -100,8 +103,9 @@ describeConformance({
       if (fault === "lose") throw new TypeError("fetch failed");
       return r;
     };
+    const ownJournal = new MemoryJournal();
     const adapter = (agentCode: string, signing: RequestSigning, own: boolean) => {
-      const journal = new MemoryJournal();
+      const journal = own ? ownJournal : new MemoryJournal();
       return new PaoPlatform({
         journal,
         baseUrl,
@@ -145,7 +149,16 @@ describeConformance({
           })),
       loseNextResponse: (m: FaultMethod) => void faults.set(m, "lose"),
       garbleNextResponse: (m: FaultMethod) => void faults.set(m, "garble"),
-      close: () => stub.close(),
+      journalText: () => JSON.stringify(ownJournal.entries),
+      // нарушения схемы YAML 1.4.0 в запросах адаптера и в ответах обработчиков — дефект (КТ1 № 1); заглушка
+      // закрывается и при красной сверке
+      close: async () => {
+        try {
+          expect(stub.violations, "PaoStub: обращения не по схеме ПАО 1.4.0").toEqual([]);
+        } finally {
+          await stub.close();
+        }
+      },
     };
   },
 });

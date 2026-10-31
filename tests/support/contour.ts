@@ -56,6 +56,9 @@ export interface ContourOptions {
   adpUntilPs11?: boolean;
   /** только для "stand": эквайрер эмулятора без поддержки aoi (РП22 п. 6) — признак до ADP не доходит (П14, Р56 п. 1) */
   aoiSupport?: false;
+  /** только для "stand": способы оплаты витрин эмулятора по merchant_id (`createMerchants`, v0.34.0, Р68 п. 3) — как
+   *  есть, без перечня; знак готовности и справочник продавцов стенда не меняются. Эмулятор способ не сверяет. */
+  paymentMethods?: Readonly<Record<string, readonly string[]>>;
   /** только для "stub": настройки обёртки PaoStand (ключи, обработчики операций, незарегистрированный агент) */
   stub?: StandOptions;
 }
@@ -234,7 +237,7 @@ export function shopBy(behaviour: ShopBehaviour): MerchantFixture {
 }
 
 export async function createContour(o: ContourOptions): Promise<Contour> {
-  return o.pao === "stub" ? stubContour(o.stub) : standContour(o.now, o.adpUntilPs11 === true, o.aoiSupport !== false);
+  return o.pao === "stub" ? stubContour(o.stub) : standContour(o.now, o.adpUntilPs11 === true, o.aoiSupport !== false, o.paymentMethods);
 }
 
 async function stubContour(opts: StandOptions | undefined): Promise<Contour> {
@@ -284,7 +287,12 @@ async function stubContour(opts: StandOptions | undefined): Promise<Contour> {
   };
 }
 
-async function standContour(paoNow?: () => Date, adpUntilPs11 = false, aoiSupport = true): Promise<Contour> {
+async function standContour(
+  paoNow?: () => Date,
+  adpUntilPs11 = false,
+  aoiSupport = true,
+  paymentMethods?: Readonly<Record<string, readonly string[]>>,
+): Promise<Contour> {
   const fixture = AGENT_FIXTURES.find((f) => f.registered && f.class === "BUYER");
   if (!fixture) throw new Error("в AGENT_FIXTURES нет зарегистрированного агента BUYER");
   const params = loadParams();
@@ -311,6 +319,7 @@ async function standContour(paoNow?: () => Date, adpUntilPs11 = false, aoiSuppor
     emulator = adpUntilPs11
       ? createMerchants(stand, {
           aoiSupport,
+          ...(paymentMethods && { paymentMethods }),
           // до PS-11: решение заглушки — отказ продавцу; решение ADP — по копии сообщения, без влияния на ответ продавца
           decide: (msg) => {
             // op_ref — из сообщения эквайрера: процессинг (тест) шлёт по нему ответ эмитента и клиринг (ПИ-3, Р49 К5)
@@ -319,7 +328,7 @@ async function standContour(paoNow?: () => Date, adpUntilPs11 = false, aoiSuppor
             return { approved: false, reason: "CONFIRMATION_REQUIRED" };
           },
         })
-      : createMerchants(stand, { aoiSupport });
+      : createMerchants(stand, { aoiSupport, ...(paymentMethods && { paymentMethods }) });
     record(stand.app, "pao", log);
     record(emulator.app, "merchants", log);
     captureCredentials(stand.app, secrets);

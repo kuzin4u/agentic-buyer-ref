@@ -155,4 +155,39 @@ describe("знак готовности по ПАО на стенде (Р53)", {
     await expect(r.c.platform.agentSelf()).rejects.toBeInstanceOf(SignerSuspended);
     expect(r.c.agentCalls()).toHaveLength(before);
   });
+
+  // Р68 п. 4, дополнение 1 к Р66 п. 3 (AG-09 ч. 2д, хвост): эмулятор способ оплаты не сверяет (оплата пакетом CARD у
+  // ["cash"] прошла бы) — проверяется решение агента, а не отказ витрины; отсутствие выдачи реквизита видно и стенду.
+  it("витрина NORMAL с [\"cash\"] при знаке ACTIVE — зона рынка со ссылкой и ZONE_MARKET_NO_METHOD, shop.zone_market; выбор — OFFER_NOT_IN_CONTOUR, реквизит не запрашивается (Р68 п. 4)", async () => {
+    const r = await standPurchase({ paymentMethods: { [NORMAL.merchant_id]: ["cash"] } });
+    c = r.c;
+    const intent = await r.purchase.intent({ ...INTENT, merchantScope: [NORMAL.merchant_id] }, { idempotencyKey: "idem-intent-cash" });
+    await r.signWhileWaiting(intent.id, () => r.purchase.awaitIntent());
+    const zones = await r.purchase.search();
+    // знак у стенда прежний — в рынок витрину уводит способ оплаты, а не знак
+    expect(await standMark(r, NORMAL.merchant_id)).toBe("ACTIVE");
+    expect(agentMarks(r)[NORMAL.merchant_id]).toBe("ACTIVE");
+    expect(zones.contour.filter((o) => o.shopId === NORMAL.id)).toEqual([]);
+    const market = zones.market.filter((o) => o.shopId === NORMAL.id);
+    expect(market.length).toBeGreaterThan(0);
+    for (const o of market) {
+      expect(o).toMatchObject({ merchantId: NORMAL.merchant_id, marketReason: "ZONE_MARKET_NO_METHOD" });
+      expect(o.link).toMatch(/\S/);
+      expect(o.channel).toBeUndefined();
+    }
+    const records = r.c.journal.entries.filter((e) => e.kind === "shop.zone_market");
+    expect(records.map((e) => [e.merchant, e.reason])).toEqual([[NORMAL.merchant_id, "NO_AGENT_PAYMENT_METHOD"]]);
+    // строки payment_methods витрины в журнал не попадают (инвариант 5)
+    expect(JSON.stringify(r.c.journal.entries).includes('"cash"')).toBe(false);
+    // выбор товара зоны рынка — отказ без оплаты (инвариант 10)
+    await expect(r.purchase.cart(one(market[0]!, 1), { idempotencyKey: "idem-cart-cash" })).rejects.toBeInstanceOf(PurchaseStopped);
+    expect(r.purchase.reason).toBe("OFFER_NOT_IN_CONTOUR");
+    // реквизит не запрашивался — ни в журнале обращений контура, ни у стенда (инварианты 1, 10); стенд обращения агента
+    // видел (знак продавца), то есть отсутствие выдачи — не пустой журнал
+    const credentials = (m: string, p: string) => m === "POST" && p === "/pao/v1/credentials";
+    expect(r.c.calls().filter((x) => x.target === "pao" && credentials(x.route.split(" ")[0]!, x.route.split(" ")[1]!.split("?")[0]!))).toEqual([]);
+    const standCalls = r.stand.calls();
+    expect(standCalls.some((x) => x.method === "GET" && x.path === readinessCall(NORMAL.merchant_id).split(" ")[1])).toBe(true);
+    expect(standCalls.filter((x) => credentials(x.method, x.path))).toEqual([]);
+  });
 });

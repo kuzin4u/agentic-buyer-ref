@@ -8,6 +8,8 @@ import { describe, expect, it } from "vitest";
 const ROOT = resolve(".");
 const SUITE = resolve(ROOT, "tests/conformance/suite.ts");
 const rel = (f: string) => f.slice(ROOT.length + 1);
+/** Прямые импорты набора из проекта — ровно эти (нюанс К1.2 к Р67 п. 1): порт, доменные типы и способы оплаты агента. */
+const ALLOWED = ["src/agent/policy/channels.ts", "src/agent/ports/index.ts", "src/shared/domain.ts"];
 const FORBIDDEN: readonly [RegExp, string][] = [
   [/^tests\/support\/contour\.ts$/, "тестовый контур"],
   [/^src\/agent\/adapters\//, "адаптер"],
@@ -16,7 +18,16 @@ const FORBIDDEN: readonly [RegExp, string][] = [
 
 const opts = ts.parseJsonConfigFileContent(ts.readConfigFile(resolve(ROOT, "tsconfig.json"), ts.sys.readFile).config, ts.sys, ROOT).options;
 
-/** Транзитивные файлы проекта, которые подключает `entry` (import / export from / import() строковым литералом). */
+/** Файлы проекта, которые `file` подключает напрямую (import / export from / import() строковым литералом). */
+function direct(file: string, read: (f: string) => string): string[] {
+  return ts
+    .preProcessFile(read(file), true, true)
+    .importedFiles.map((i) => ts.resolveModuleName(i.fileName, file, opts, ts.sys).resolvedModule)
+    .filter((r) => r !== undefined && r.isExternalLibraryImport !== true && r.resolvedFileName.startsWith(ROOT + "/"))
+    .map((r) => r!.resolvedFileName);
+}
+
+/** Транзитивные файлы проекта, которые подключает `entry`. */
 function closure(entry: string, read: (f: string) => string): string[] {
   const seen = new Set<string>();
   const queue = [entry];
@@ -24,11 +35,7 @@ function closure(entry: string, read: (f: string) => string): string[] {
     const file = queue.pop()!;
     if (seen.has(file)) continue;
     seen.add(file);
-    for (const spec of ts.preProcessFile(read(file), true, true).importedFiles.map((i) => i.fileName)) {
-      const r = ts.resolveModuleName(spec, file, opts, ts.sys).resolvedModule;
-      if (r === undefined || r.isExternalLibraryImport === true) continue;
-      if (r.resolvedFileName.startsWith(ROOT + "/")) queue.push(r.resolvedFileName);
-    }
+    queue.push(...direct(file, read));
   }
   return [...seen].map(rel).sort();
 }
@@ -36,6 +43,10 @@ function closure(entry: string, read: (f: string) => string): string[] {
 const violations = (files: readonly string[]) => files.flatMap((f) => FORBIDDEN.filter(([re]) => re.test(f)).map(([, what]) => `${f} — ${what}`));
 
 describe("граница набора соответствия (Р67 п. 1)", () => {
+  it("прямые импорты suite.ts из проекта — ровно порт, shared/domain и policy/channels (нюанс К1.2)", () => {
+    expect([...new Set(direct(SUITE, (f) => readFileSync(f, "utf8")).map(rel))].sort()).toEqual(ALLOWED);
+  });
+
   it("suite.ts транзитивно не подключает contour, adapters/* и compose", () => {
     const files = closure(SUITE, (f) => readFileSync(f, "utf8"));
     expect(files).toContain("src/agent/ports/payment-platform.ts");

@@ -8,8 +8,9 @@ import { describe, expect, it } from "vitest";
 const ROOT = resolve(".");
 const SUITE = resolve(ROOT, "tests/conformance/suite.ts");
 const rel = (f: string) => f.slice(ROOT.length + 1);
-/** Прямые импорты набора из проекта — ровно эти (нюанс К1.2 к Р67 п. 1): порт, доменные типы и способы оплаты агента. */
-const ALLOWED = ["src/agent/policy/channels.ts", "src/agent/ports/index.ts", "src/shared/domain.ts"];
+/** Прямые импорты набора из проекта — ровно эти (нюансы К1.2, К1.3 к Р67 п. 1): порт, доменные типы, способы оплаты
+ *  агента и словарь кодов отказа ядра (SPEC §7а). */
+const ALLOWED = ["src/agent/declines/table.ts", "src/agent/policy/channels.ts", "src/agent/ports/index.ts", "src/shared/domain.ts"];
 const FORBIDDEN: readonly [RegExp, string][] = [
   [/^tests\/support\/contour\.ts$/, "тестовый контур"],
   [/^src\/agent\/adapters\//, "адаптер"],
@@ -43,7 +44,7 @@ function closure(entry: string, read: (f: string) => string): string[] {
 const violations = (files: readonly string[]) => files.flatMap((f) => FORBIDDEN.filter(([re]) => re.test(f)).map(([, what]) => `${f} — ${what}`));
 
 describe("граница набора соответствия (Р67 п. 1)", () => {
-  it("прямые импорты suite.ts из проекта — ровно порт, shared/domain и policy/channels (нюанс К1.2)", () => {
+  it("прямые импорты suite.ts из проекта — ровно порт, shared/domain, policy/channels и declines/table (нюансы К1.2, К1.3)", () => {
     expect([...new Set(direct(SUITE, (f) => readFileSync(f, "utf8")).map(rel))].sort()).toEqual(ALLOWED);
   });
 

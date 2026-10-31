@@ -3,6 +3,7 @@
 // contour, adapters/* и compose не импортирует — Р67 п. 1, tests/unit/conformance-imports.test.ts.
 import { inspect } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
+import { FAILURE_RULES } from "../../src/agent/declines/table.js";
 import { AGENT_CHANNELS } from "../../src/agent/policy/channels.js";
 import type { PaymentPlatform, PlatformCapabilities } from "../../src/agent/ports/index.js";
 import { PlatformFailure, type ConfirmationDraft, type CredentialDraft, type DisputeDraft, type Mandate, type MandateDraft } from "../../src/shared/domain.js";
@@ -22,8 +23,26 @@ export interface ConformanceSession {
   signMandate(id: string): Promise<void>;
   /** образцы платёжных данных из ответов платформы на выдачу реквизита (`token_ref`, криптограмма) — для проверки утечки */
   issuedSecrets(): string[];
+  /** обращения адаптера `platform` к платформе по порядку, как их видит платформа */
+  calls(): PlatformCall[];
+  /** следующий ответ на метод порта теряется после того, как платформа его обработала; нет — цель подменять не умеет */
+  loseNextResponse?(method: FaultMethod): void;
+  /** следующий ответ на метод порта — 200 с телом не по схеме */
+  garbleNextResponse?(method: FaultMethod): void;
   close(): Promise<void>;
 }
+
+/** Обращение глазами платформы: изменяющее ли, подписано ли агентом, ключ идемпотентности и одноразовое значение подписи. */
+export interface PlatformCall {
+  mutating: boolean;
+  status: number;
+  signed: boolean;
+  idempotencyKey?: string;
+  nonce?: string;
+}
+
+/** Методы порта, ответы которых цель умеет подменять. */
+export type FaultMethod = "requestMandate" | "issueCredential" | "verifyMandate";
 
 /** Цель набора: как поднять платформу и адаптер к ней. Каждый тест открывает свою сессию. */
 export interface ConformanceTarget {
@@ -224,6 +243,70 @@ export function describeConformance(target: ConformanceTarget): void {
         const before = s.issuedSecrets().length;
         await expect(s.platform.issueCredential(credentialDraft(cart, "ord_conformance_4"), { idempotencyKey: "conformance-credential" })).rejects.toBeInstanceOf(PlatformFailure);
         expect(s.issuedSecrets()).toHaveLength(before);
+      });
+    });
+
+    describe("ошибки и повторы (инварианты 4, 8, 9; SPEC §7а)", () => {
+      /** Отказ порта — PlatformFailure с кодом из словаря ядра (§7а) и классом повтора; иное — дефект адаптера. */
+      const expectPortFailure = (e: unknown) => {
+        expect(e).toBeInstanceOf(PlatformFailure);
+        expect(Object.keys(FAILURE_RULES)).toContain((e as PlatformFailure).code);
+      };
+
+      it("каждое изменяющее обращение подписано агентом и несёт Idempotency-Key (инвариант 8)", async () => {
+        const s = await begin();
+        const cart = await signedCart(s);
+        await s.platform.issueCredential(credentialDraft(cart, "ord_conformance_5"), { idempotencyKey: "conformance-credential" });
+        await s.platform.relinquishMandate(cart.id, { idempotencyKey: "conformance-relinquish" });
+        const mutating = s.calls().filter((c) => c.mutating);
+        // INTENT, CART, реквизит, отказ — четыре изменяющих обращения адаптера
+        expect(mutating.length).toBeGreaterThanOrEqual(4);
+        for (const c of mutating) {
+          expect(c.signed, `обращение ${JSON.stringify(c)} без подписи`).toBe(true);
+          expect(c.idempotencyKey, `обращение ${JSON.stringify(c)} без Idempotency-Key`).toMatch(/\S/);
+        }
+      });
+
+      it("ответ на запрос мандата потерян — повтор тем же ключом идемпотентности, новая подпись, тот же мандат (инвариант 9, Р48 п. 4)", async (ctx) => {
+        const s = await begin();
+        if (s.loseNextResponse === undefined) return ctx.skip("цель не умеет терять ответ");
+        const from = s.calls().length;
+        s.loseNextResponse("requestMandate");
+        const m = await s.platform.requestMandate(s.intent(), { idempotencyKey: "conformance-lost" });
+        const tries = s.calls().slice(from).filter((x) => x.mutating);
+        expect(tries.length).toBeGreaterThanOrEqual(2);
+        expect(new Set(tries.map((x) => x.idempotencyKey))).toEqual(new Set(["conformance-lost"]));
+        expect(new Set(tries.map((x) => x.nonce)).size).toBe(tries.length);
+        expect((await s.platform.getMandate(m.id)).status).toBe("PENDING_SIGNATURE");
+      });
+
+      it("ответ на выдачу реквизита потерян — без повтора: одно обращение, NO_RESPONSE с классом never (Р48 п. 4а)", async (ctx) => {
+        const s = await begin();
+        if (s.loseNextResponse === undefined) return ctx.skip("цель не умеет терять ответ");
+        const cart = await signedCart(s);
+        const from = s.calls().length;
+        s.loseNextResponse("issueCredential");
+        const e = await s.platform.issueCredential(credentialDraft(cart, "ord_conformance_6"), { idempotencyKey: "conformance-lost" }).catch((x: unknown) => x);
+        expectPortFailure(e);
+        expect(e).toMatchObject({ code: "NO_RESPONSE", retry: "never" });
+        expect(s.calls().slice(from).filter((x) => x.mutating)).toHaveLength(1);
+      });
+
+      it("ответ 200 не по схеме — отказ PlatformFailure, а не частичный результат (инвариант 4)", async (ctx) => {
+        const s = await begin();
+        if (s.garbleNextResponse === undefined) return ctx.skip("цель не умеет подменять ответ");
+        const m = await s.platform.requestMandate(s.intent(), { idempotencyKey: "conformance-intent" });
+        await s.signMandate(m.id);
+        s.garbleNextResponse("verifyMandate");
+        expectPortFailure(await s.platform.verifyMandate({ id: m.id, currency: m.amountLimit.currency }).catch((e: unknown) => e));
+      });
+
+      it("отказы порта — только PlatformFailure с кодом словаря ядра (§7а)", async () => {
+        const s = await begin();
+        const cart = await signedCart(s);
+        await s.platform.relinquishMandate(cart.id, { idempotencyKey: "conformance-relinquish" });
+        expectPortFailure(await s.platform.issueCredential(credentialDraft(cart, "ord_conformance_7"), { idempotencyKey: "conformance-credential" }).catch((e: unknown) => e));
+        expectPortFailure(await s.platform.getMandate("mnd_conformance_absent").catch((e: unknown) => e));
       });
     });
   });

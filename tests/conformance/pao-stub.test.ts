@@ -10,11 +10,22 @@ import type { RequestSigning } from "../../src/agent/ports/index.js";
 import { loadParams } from "../../src/shared/config.js";
 import type { Mandate, MandateDraft } from "../../src/shared/domain.js";
 import { Consents, INTENT } from "../support/consents.js";
-import { describeConformance } from "./suite.js";
+import { describeConformance, type FaultMethod, type PlatformCall } from "./suite.js";
 
 const AGENT = "nspk:agent:buyref-01:v1";
 const OTHER = "nspk:agent:buyref-02:v1";
 const params = loadParams();
+/** Метод порта → обращение ПАО, ответ на которое цель подменяет, и тело «не по схеме»: по форме как настоящее, одно
+ *  значение вне перечня ПАО — разбор полей его пропустил бы, отвергает только проверка схемы. */
+const OPS: Readonly<Record<FaultMethod, readonly [string, RegExp, () => unknown]>> = {
+  requestMandate: ["POST", /^\/pao\/v1\/mandates$/, () => ({})],
+  issueCredential: ["POST", /^\/pao\/v1\/credentials$/, () => ({})],
+  verifyMandate: [
+    "GET",
+    /^\/pao\/v1\/mandates\/[^/]+\/verify$/,
+    () => ({ outcome: "PROBABLY_CONFIRMED", amount_left: 100, valid_to: INTENT.validTo, as_of: new Date().toISOString() }),
+  ],
+};
 
 /** Агент с одним ключом: допуск и ротация — не предмет набора (signer-ring, П01–П03). */
 function agentKey(kid: string) {
@@ -75,7 +86,21 @@ describeConformance({
       },
     });
     const baseUrl = await stub.start();
-    const adapter = (agentCode: string, signing: RequestSigning) => {
+    // Подмена транспорта своего агента (только тестовая сторона): обращение доходит до PaoStub, ответ теряется или
+    // заменяется 200 не по схеме.
+    const faults = new Map<FaultMethod, "lose" | "garble">();
+    const transport: typeof fetch = async (input, init) => {
+      const url = new URL(input instanceof Request ? input.url : String(input));
+      const method = (init?.method ?? "GET").toUpperCase();
+      const hit = [...faults.keys()].find((k) => OPS[k][0] === method && OPS[k][1].test(url.pathname));
+      const fault = hit === undefined ? undefined : faults.get(hit);
+      if (hit !== undefined) faults.delete(hit);
+      if (fault === "garble") return new Response(JSON.stringify(OPS[hit!][2]()), { status: 200, headers: { "content-type": "application/json" } });
+      const r = await fetch(input, init);
+      if (fault === "lose") throw new TypeError("fetch failed");
+      return r;
+    };
+    const adapter = (agentCode: string, signing: RequestSigning, own: boolean) => {
       const journal = new MemoryJournal();
       return new PaoPlatform({
         journal,
@@ -85,11 +110,12 @@ describeConformance({
         params,
         sleep: async () => {},
         pace: new Pace({ fallbackPerMin: Infinity, journal, sleep: async () => {} }),
+        ...(own && { fetch: transport }),
       });
     };
     return {
-      platform: adapter(AGENT, own.signing),
-      foreign: adapter(OTHER, other.signing),
+      platform: adapter(AGENT, own.signing, true),
+      foreign: adapter(OTHER, other.signing, false),
       agentCode: AGENT,
       intent: (): MandateDraft => ({ ...INTENT }),
       cart: (parent: Mandate): MandateDraft => {
@@ -106,6 +132,19 @@ describeConformance({
       },
       signMandate: async (id: string) => void consents.sign(id),
       issuedSecrets: () => [...secrets],
+      // PaoStub проверяет подпись до обработчика: keyid из Signature-Input — подпись агента; чужой агент — свой kid
+      calls: (): PlatformCall[] =>
+        stub.calls
+          .filter((c) => c.kid === undefined || c.kid === own.key.kid)
+          .map((c) => ({
+            mutating: c.method !== "GET",
+            status: c.status,
+            signed: c.kid === own.key.kid,
+            ...(c.idempotencyKey !== undefined && { idempotencyKey: c.idempotencyKey }),
+            ...(c.nonce !== undefined && { nonce: c.nonce }),
+          })),
+      loseNextResponse: (m: FaultMethod) => void faults.set(m, "lose"),
+      garbleNextResponse: (m: FaultMethod) => void faults.set(m, "garble"),
       close: () => stub.close(),
     };
   },

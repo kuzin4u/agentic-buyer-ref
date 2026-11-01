@@ -83,7 +83,7 @@ function outward(r: Awaited<ReturnType<typeof above>>["r"], err: unknown): strin
 
 describe("стадия 4 на стенде v0.17.0: подтверждение человеком по confirmation.* (Р47)", { timeout: STAND_TIMEOUT_MS }, () => {
   it("одобрение в приложении банка — STOPPED CONFIRMATION_NOT_DELIVERED: ссылка продавцу не уходит, повтора нет, link и confirmation_ref нигде", async () => {
-    const { r, codes, pending, order } = await above();
+    const { r, codes, details, pending, order } = await above();
     const paying = r.purchase.authorize({ idempotencyKey: "idem-pay-cnf" }).catch((e: unknown) => e);
     await pending;
     expect(codes).toEqual(["CONFIRMATION_PENDING"]);
@@ -111,7 +111,8 @@ describe("стадия 4 на стенде v0.17.0: подтверждение �
     expect(count(r, "pao POST /pao/v1/confirmations")).toBe(0);
     const text = outward(r, err);
     expect(text).not.toContain(ref);
-    expect(text).not.toContain("upk.stand");
+    // хост страницы — из ссылки уведомления (ревью КТ2 № 8)
+    expect(text).not.toContain(new URL((details[0] as { link: string }).link).host);
     expect(text).not.toContain(`/c/${id}`);
     // повторной оплаты нет
     await expect(r.purchase.authorize({ idempotencyKey: "idem-pay-cnf" })).rejects.toThrow();
@@ -148,7 +149,8 @@ describe("стадия 4 на стенде v0.17.0: подтверждение �
     ]);
     const text = outward(r, err);
     expect(text).not.toContain(link!);
-    expect(text).not.toContain("upk.stand");
+    // хост страницы — из самой ссылки, а не литералом настройки стенда (ревью КТ2 № 8)
+    expect(text).not.toContain(url.host);
     expect(text).not.toContain(code!);
   });
 

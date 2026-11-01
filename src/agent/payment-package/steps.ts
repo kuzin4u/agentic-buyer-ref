@@ -151,8 +151,14 @@ export class ContourPayment implements PaymentSteps {
       if (e instanceof PlatformFailure) return false;
       throw e;
     }
-    if (now.status !== "ISSUED" || signal.aborted) return false;
-    return this.o.shop.payable(req);
+    // срок — меньший из выданного и из ответа GET (в GET срока нет — повтора нет): пакет несёт прежнюю криптограмму;
+    // перед повтором — ещё раз, после чтения заказа у витрины (ревью КТ2 № 1)
+    const live = () => {
+      const t = now.validTo === null ? Number.NaN : Date.parse(now.validTo);
+      return Math.min(t, until) > this.now().getTime();
+    };
+    if (now.status !== "ISSUED" || !live() || signal.aborted) return false;
+    return (await this.o.shop.payable(req)) && live();
   }
 
   /** Итог стадии 5 (Р49 п. 5): первое из — привязанная операция или (только при DECLINED продавца) запрос подтверждения,

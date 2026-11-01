@@ -30,7 +30,14 @@ function steps(o: {
   journal?: MemoryJournal;
   /** статус реквизита у Платформы перед повтором (дополнение 1 к Р69 п. 4); Error — отказ чтения; не задан — ISSUED */
   credential?: string | Error;
+  /** срок реквизита в ответе GET; не задан — `validTo` (ревью КТ2 № 1) */
+  credentialValidTo?: string | null;
+  /** вызывается внутри чтения реквизита (ревью КТ2 № 3) */
+  onCredential?: () => void;
+  /** часы после чтения заказа у витрины (ревью КТ2 № 1) */
+  nowAfterPayable?: Date;
 }) {
+  let clockNow = NOW;
   const log: string[] = [];
   const journal = o.journal ?? new MemoryJournal();
   // запечатанный пакет выдачи и пакеты, ушедшие витрине (ревью КТ сессии 57 № 2)
@@ -48,9 +55,11 @@ function steps(o: {
       issuePaymentPackage: async () => (issued++, { credential: { credentialRef: "cr_1", kind: "CARD", indicator: { agentCode: "a", mandateId: "m_cart" }, status: "ISSUED", validTo: o.validTo ?? null }, sealed }) as never,
       credentialStatus: async (ref, mandateId) => {
         log.push(`credential ${ref} ${mandateId}`);
+        o.onCredential?.();
         const st = o.credential ?? "ISSUED";
         if (st instanceof Error) throw st;
-        return { credentialRef: ref, channel: "CARD", indicator: { agentCode: "a", mandateId }, status: st, validTo: o.validTo ?? null } as Credential;
+        const validTo = o.credentialValidTo !== undefined ? o.credentialValidTo : (o.validTo ?? null);
+        return { credentialRef: ref, channel: "CARD", indicator: { agentCode: "a", mandateId }, status: st, validTo } as Credential;
       },
     },
     shop: {
@@ -62,7 +71,14 @@ function steps(o: {
         if (r === "REFUSED") throw new ShopFailure("SHOP_ORDER_REFUSED");
         return { status: r };
       },
-      ...(payable !== undefined && { payable: async () => (log.push("payable"), typeof payable === "function" ? payable() : payable) }),
+      ...(payable !== undefined && {
+        payable: async () => {
+          log.push("payable");
+          const r = typeof payable === "function" ? await payable() : payable;
+          if (o.nowAfterPayable !== undefined) clockNow = o.nowAfterPayable;
+          return r;
+        },
+      }),
     },
     journal,
     confirmations: {
@@ -81,7 +97,7 @@ function steps(o: {
       watch: (op, after) => void log.push(`watch ${op.opRef} ${after}`),
     },
     params: PARAMS,
-    now: () => NOW,
+    now: () => clockNow,
   });
   return { p, log, journal, sealed, packages, issued: () => issued };
 }
@@ -234,11 +250,14 @@ describe("повтор оплаты после обрыва ответа — п�
       ["заказ не CREATED", { reply: "PAID", pays: ["UNKNOWN"], outcome: thenAuthorized(), lookup: { kind: "ABSENT" }, validTo: LATER, payable: false }],
       ["у витрины нет чтения заказа", { reply: "PAID", pays: ["UNKNOWN"], outcome: thenAuthorized(), lookup: { kind: "ABSENT" }, validTo: LATER }],
     ];
+    // чтение реквизита — только на пути повтора (дополнение 1 к Р69 п. 6; ревью КТ2 № 4): до него доходит лишь «заказ не CREATED»
+    const withGet = new Set(["заказ не CREATED"]);
     for (const [name, o] of cases) {
       const s = steps(o);
       await expect(s.p.authorize(ctx(), { idempotencyKey: "k" }), name).rejects.toMatchObject({ code: "OPERATION_RESULT_UNCONFIRMED" });
       expect(s.log.filter((x) => x.startsWith("pay ")), name).toEqual(["pay 1"]);
       expect(s.journal.entries.some((e) => e.kind === "payment.retry"), name).toBe(false);
+      expect(s.log.filter((x) => x.startsWith("credential")), name).toHaveLength(withGet.has(name) ? 1 : 0);
     }
   });
 
@@ -273,10 +292,42 @@ describe("повтор оплаты после обрыва ответа — п�
     expect(b.log.filter((x) => x.startsWith("pay "))).toEqual(["pay 1"]);
   });
 
+  it("ревью КТ2 № 1: срок — меньший из выданного и из ответа GET; в GET срока нет или он прошёл — повтора нет; срок прошёл, пока читали заказ, — повтора нет", async () => {
+    const base = { reply: "PAID" as const, pays: ["UNKNOWN", "PAID"] as ("UNKNOWN" | "PAID")[], lookup: { kind: "ABSENT" } as const, validTo: LATER, payable: true };
+    const cases: [string, Partial<Parameters<typeof steps>[0]>][] = [
+      ["в GET срока нет", { credentialValidTo: null }],
+      ["в GET срок прошёл", { credentialValidTo: NOW.toISOString() }],
+      ["срок прошёл, пока читали заказ", { nowAfterPayable: new Date(LATER) }],
+    ];
+    for (const [name, over] of cases) {
+      const s = steps({ ...base, outcome: thenAuthorized(), ...over });
+      await expect(s.p.authorize(ctx(), { idempotencyKey: "k" }), name).rejects.toMatchObject({ code: "OPERATION_RESULT_UNCONFIRMED" });
+      expect(s.log.filter((x) => x.startsWith("pay ")), name).toEqual(["pay 1"]);
+      expect(s.journal.entries.some((e) => e.kind === "payment.retry"), name).toBe(false);
+    }
+    // в GET срок позже выданного — действует выданный (пакет несёт прежнюю криптограмму): срок выданного прошёл к чтению заказа — повтора нет
+    const later = new Date(Date.parse(LATER) + 600_000).toISOString();
+    const s = steps({ ...base, outcome: thenAuthorized(), credentialValidTo: later, nowAfterPayable: new Date(LATER) });
+    await expect(s.p.authorize(ctx(), { idempotencyKey: "k" })).rejects.toMatchObject({ code: "OPERATION_RESULT_UNCONFIRMED" });
+    expect(s.log.filter((x) => x.startsWith("pay "))).toEqual(["pay 1"]);
+  });
+
+  it("ревью КТ2 № 3: покупку остановили, пока читали реквизит, — заказ у витрины не читается, повтора нет", async () => {
+    const ac = new AbortController();
+    const s = steps({ reply: "PAID", pays: ["UNKNOWN", "PAID"], outcome: thenAuthorized(), lookup: { kind: "ABSENT" }, validTo: LATER, payable: true, onCredential: () => ac.abort(new Error("остановлена")) });
+    await expect(s.p.authorize(ctx(ac.signal), { idempotencyKey: "k" })).rejects.toBeDefined();
+    expect(s.log).toContain("credential cr_1 m_cart");
+    expect(s.log).not.toContain("payable");
+    expect(s.log.filter((x) => x.startsWith("pay "))).toEqual(["pay 1"]);
+    expect(s.journal.entries.some((e) => e.kind === "payment.retry")).toBe(false);
+  });
+
   it("второй неизвестный исход — без третьего POST; покупку остановили, пока читали заказ, — повтора нет", async () => {
     const a = steps({ reply: "PAID", pays: ["UNKNOWN", "UNKNOWN", "PAID"], outcome: async () => ({ kind: "NONE" }), lookup: { kind: "ABSENT" }, validTo: LATER, payable: true });
     await expect(a.p.authorize(ctx(), { idempotencyKey: "k" })).rejects.toMatchObject({ code: "OPERATION_RESULT_UNCONFIRMED" });
     expect(a.log.filter((x) => x.startsWith("pay "))).toEqual(["pay 1", "pay 2"]);
+    // GET реквизита — один на покупку: на второй попытке пути повтора нет (ревью КТ2 № 2)
+    expect(a.log.filter((x) => x.startsWith("credential"))).toHaveLength(1);
     const ac = new AbortController();
     const b = steps({ reply: "PAID", pays: ["UNKNOWN", "PAID"], outcome: thenAuthorized(), lookup: { kind: "ABSENT" }, validTo: LATER, payable: async () => (ac.abort(new Error("остановлена")), true) });
     await expect(b.p.authorize(ctx(ac.signal), { idempotencyKey: "k" })).rejects.toThrow("остановлена");

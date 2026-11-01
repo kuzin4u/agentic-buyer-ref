@@ -20,5 +20,6 @@ export function pageLink(v: unknown): string | null {
     return null;
   }
   if (u.protocol !== "https:" || u.username !== "" || u.password !== "" || u.hostname === "") return null;
-  return u.href;
+  // предел — и для того, что увидит человек: процентное кодирование удлиняет адрес (ревью КТ2 № 5)
+  return u.href.length > LINK_MAX ? null : u.href;
 }

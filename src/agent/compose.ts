@@ -119,9 +119,10 @@ export interface PurchasePorts {
   shop: ShopPort;
   payment: PaymentSteps;
   region?: string;
-  /** уведомление оболочки (Р47 п. 5, В3; Р49 п. 7): CONFIRMATION_PENDING — нужно подтверждение в приложении банка; SCOPE_*
-   *  — запись об исполнении не WITHIN_LIMITS (значение вне перечня — из `purchase.operation`); OPERATION_REFUNDED — возврат
-   *  (Р51 п. 3); `amount` — сумма списания по операции у SCOPE_* и OPERATION_REFUNDED */
+  /** уведомление оболочки (Р47 п. 5, В3; Р49 п. 7): CONFIRMATION_PENDING — нужно подтверждение на странице УПК или в
+   *  приложении банка, вторым аргументом `{ link }`, если ссылка безопасна (Р69 п. 5); SCOPE_* — запись об исполнении не
+   *  WITHIN_LIMITS (значение вне перечня — из `purchase.operation`); OPERATION_REFUNDED — возврат (Р51 п. 3); сумма —
+   *  вторым аргументом у SCOPE_* и OPERATION_REFUNDED */
   notify?: PurchaseNotify;
 }
 

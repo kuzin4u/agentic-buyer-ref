@@ -31,6 +31,13 @@ export interface ConformanceSession {
   garbleNextResponse?(method: FaultMethod): void;
   /** журнал адаптера `platform` текстом, как его видит оператор (инвариант 1: платёжных данных в нём нет) */
   journalText(): string;
+  /** запрос подтверждения человеком по подписанному CART создаёт платформа (в ПАО 1.4 — ADP при авторизации продавца,
+   *  Р47 п. 2); id запроса. Нет — цель создать запрос вне пути покупки не умеет (дополнение 1 к Р67 п. 4) */
+  createConfirmation?(cart: Mandate): Promise<string>;
+  /** решение человека по запросу подтверждения вне агента (приложение банка, УПК) */
+  decideConfirmation?(id: string, decision: "APPROVED" | "REJECTED"): Promise<void>;
+  /** операция агента с итогом, по которой человек поручил спор; нет — маршрута споров у платформы цели нет (Р66 п. 2) */
+  disputableOperation?(): Promise<string>;
   /** закрыть цель; нарушения контракта, которые видит тестовая сторона (запрос не по схеме), — отказ здесь */
   close(): Promise<void>;
 }
@@ -154,16 +161,16 @@ export function describeConformance(target: ConformanceTarget): void {
         }
       });
 
-      // Заявлено «есть» — поведение проверяет ч. 2 (подтверждение, спор); здесь — только согласованность заявления «нет».
+      // Заявлено «есть» — поведение проверяют разделы «подтверждение» и «спор»; здесь — только согласованность заявления «нет».
       it("humanConfirmation = false — запрос подтверждения отклоняется PlatformFailure", async (ctx) => {
         const platform = await open();
-        if (platform.capabilities().humanConfirmation) return ctx.skip("заявлено подтверждение человеком — проверка в ч. 2");
+        if (platform.capabilities().humanConfirmation) return ctx.skip("заявлено подтверждение человеком — проверка в разделе «подтверждение человеком»");
         await expect(platform.requestConfirmation(CONFIRMATION, { idempotencyKey: "conformance-confirmation" })).rejects.toBeInstanceOf(PlatformFailure);
       });
 
       it("disputeResolution = false — открытие спора отклоняется PlatformFailure", async (ctx) => {
         const platform = await open();
-        if (platform.capabilities().disputeResolution) return ctx.skip("заявлен разбор спора — проверка в ч. 2");
+        if (platform.capabilities().disputeResolution) return ctx.skip("заявлен разбор спора — проверка в разделе «спор по поручению человека»");
         await expect(platform.openDispute(DISPUTE, { idempotencyKey: "conformance-dispute" })).rejects.toBeInstanceOf(PlatformFailure);
       });
     });
@@ -338,6 +345,68 @@ export function describeConformance(target: ConformanceTarget): void {
         await s.platform.relinquishMandate(cart.id, { idempotencyKey: "conformance-relinquish" });
         expectPortFailure(await s.platform.issueCredential(credentialDraft(cart, "ord_conformance_7"), { idempotencyKey: "conformance-credential" }).catch((e: unknown) => e));
         expectPortFailure(await s.platform.getMandate("mnd_conformance_absent").catch((e: unknown) => e));
+      });
+    });
+
+    // Дополнение 1 к Р67 п. 4: запрос создаёт платформа (тестовая сторона цели), решает человек; агент только читает.
+    describe("подтверждение человеком (инвариант 7, Р47)", () => {
+      const NO_CREATE =
+        "цель не создаёт запрос вне пути покупки: на стенде его создаёт ADP при авторизации продавца — проверка в tests/contract/confirmation-stand.test.ts (дополнение 1 к Р67 п. 4)";
+
+      for (const decision of ["APPROVED", "REJECTED"] as const) {
+        it(`запрос платформы: агент читает PENDING, чтение не решает; решение человека — ${decision}; чужой запрос — отказ`, async (ctx) => {
+          const s = await begin();
+          if (!s.platform.capabilities().humanConfirmation) return ctx.skip("подтверждение человеком не заявлено — проверка в «заявлении»");
+          if (s.createConfirmation === undefined || s.decideConfirmation === undefined) return ctx.skip(NO_CREATE);
+          const cart = await signedCart(s);
+          const id = await s.createConfirmation(cart);
+          const from = s.calls().length;
+          expect(await s.platform.getConfirmation(id)).toMatchObject({ id, status: "PENDING" });
+          expect((await s.platform.getConfirmation(id)).status, "повторное чтение агентом не меняет запрос").toBe("PENDING");
+          // агент не решает за человека: ни одного изменяющего обращения за время чтения
+          expect(s.calls().slice(from).filter((c) => c.mutating)).toEqual([]);
+          await expect(s.foreign.getConfirmation(id), "запрос другого агента").rejects.toBeInstanceOf(PlatformFailure);
+          await s.decideConfirmation(id, decision);
+          expect(await s.platform.getConfirmation(id)).toMatchObject({ id, status: decision });
+        });
+      }
+    });
+
+    describe("лента событий (Р34, инвариант 8)", () => {
+      it("подпись своего мандата — mandate.signed в ленте; курсор движется; событий мандата другого агента нет", async () => {
+        const s = await begin();
+        const own = await s.platform.requestMandate(s.intent(), { idempotencyKey: "conformance-intent" });
+        const alien = await s.foreign.requestMandate(s.intent(), { idempotencyKey: "conformance-foreign" });
+        await s.signMandate(own.id);
+        await s.signMandate(alien.id);
+        const feed = await s.platform.listEvents(null);
+        const events = feed.flatMap((i) => (i.kind === "event" ? [i.event] : []));
+        expect(events.filter((e) => e.type === "mandate.signed" && e.mandateId === own.id)).toHaveLength(1);
+        expect(events.filter((e) => e.mandateId === alien.id), "событие мандата другого агента").toEqual([]);
+        const last = feed.at(-1)!;
+        const cursor = last.kind === "event" ? last.event.eventId : last.eventId;
+        const seen = new Set(feed.map((i) => (i.kind === "event" ? i.event.eventId : i.eventId)));
+        const after = await s.platform.listEvents(cursor);
+        expect(after.filter((i) => seen.has(i.kind === "event" ? i.event.eventId : i.eventId)), "после курсора — только новые").toEqual([]);
+      });
+
+      it("signedEvents = true — подпись события проверяется", async (ctx) => {
+        const platform = await open();
+        if (!platform.capabilities().signedEvents) return ctx.skip("события не подписаны (заявление): событие — сигнал, статус — по GET (Р34; ПАО до 1.5.0)");
+        // заявлено «есть», а проверки нет — красный: адаптер, заявивший подпись событий, приносит её проверку в набор
+        expect.fail("заявлены подписанные события — проверка подписи события в наборе не написана");
+      });
+    });
+
+    describe("спор по поручению человека (Р66 п. 2)", () => {
+      it("заявлен разбор спора — открытие по операции агента и чтение того же спора", async (ctx) => {
+        const s = await begin();
+        if (!s.platform.capabilities().disputeResolution) return ctx.skip("разбор спора не заявлен — проверка в «заявлении»");
+        if (s.disputableOperation === undefined) return ctx.skip("маршрута споров у платформы цели нет до PS-22 (Р66 п. 2, дополнение 1 к Р67 п. 4)");
+        const opRef = await s.disputableOperation();
+        const d = await s.platform.openDispute({ ...DISPUTE, opRef }, { idempotencyKey: "conformance-dispute" });
+        expect(d.opRef).toBe(opRef);
+        expect(await s.platform.getDispute(d.id)).toMatchObject({ id: d.id, opRef });
       });
     });
   });

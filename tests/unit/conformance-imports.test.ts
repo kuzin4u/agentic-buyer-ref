@@ -47,6 +47,12 @@ function direct(file: string, read: (f: string) => string, found: string[]): str
   found.push(...opaqueLoads(file, src));
   const out: string[] = [];
   for (const i of ts.preProcessFile(src, true, true).importedFiles) {
+    // запрещённый внешний пакет — нарушение, распознан он или нет
+    const banned = forbiddenExternal(file, i.fileName);
+    if (banned.length > 0) {
+      found.push(...banned);
+      continue;
+    }
     // встроенные модули Node (node:fs, node:util) — не файлы проекта; resolveModuleName их не распознаёт
     if (isBuiltin(i.fileName)) continue;
     const r = ts.resolveModuleName(i.fileName, file, opts, ts.sys).resolvedModule;
@@ -55,6 +61,17 @@ function direct(file: string, read: (f: string) => string, found: string[]): str
   }
   return out;
 }
+
+/** Внешние пакеты, которых нет ни в наборе, ни в том, что он подключает (КТ сессии 56 № 6): ПАО ядра agentic-core
+ *  (PaoStub, клиент ПАО), стенд Платформы, клиент сети. Корень ядра и его catalog — общие типы и модули (Р16), их
+ *  подключают shared/domain, ports и catalog — не нарушение. */
+const FORBIDDEN_EXTERNAL: readonly [RegExp, string][] = [
+  [/^@kuzin4u\/agentic-core\/pao(\/|$)/, "ПАО agentic-core"],
+  [/^agentic-ps-platform(\/|$)/, "стенд Платформы"],
+  [/^(node:)?(http|https|http2|net|tls|dgram)$|^undici(\/|$)/, "клиент сети"],
+];
+const forbiddenExternal = (file: string, spec: string): string[] =>
+  FORBIDDEN_EXTERNAL.filter(([re]) => re.test(spec)).map(([, what]) => `${rel(file)} — ${spec} (${what})`);
 
 /** Транзитивные файлы проекта, которые подключает `entry`. */
 function closure(entry: string, read: (f: string) => string, found: string[]): string[] {
@@ -90,6 +107,23 @@ describe("граница набора соответствия (Р67 п. 1)", ()
     expect(files).toContain("src/agent/ports/payment-platform.ts");
     expect(violations(files)).toEqual([]);
     expect(found).toEqual([]);
+  });
+
+  // КТ сессии 56 № 6: внешний пакет в подключённом модуле, а не в самом suite.ts, — тоже нарушение границы
+  it("ПАО agentic-core, стенд или клиент сети в подключённом модуле — нарушение", () => {
+    const shared = resolve(ROOT, "src/shared/domain.ts");
+    const read = (f: string) => {
+      if (f === SUITE) return `import "../../src/shared/domain.js";`;
+      if (f === shared) return `import { PaoStub } from "@kuzin4u/agentic-core/pao";\nimport "agentic-ps-platform";\nimport "node:https";`;
+      return "";
+    };
+    const found: string[] = [];
+    closure(SUITE, read, found);
+    expect(found.sort()).toEqual([
+      "src/shared/domain.ts — @kuzin4u/agentic-core/pao (ПАО agentic-core)",
+      "src/shared/domain.ts — agentic-ps-platform (стенд Платформы)",
+      "src/shared/domain.ts — node:https (клиент сети)",
+    ]);
   });
 
   // КТ1 № 12 (б): модуль, который граф не распознал, — неизвестное ребро; красный, а не молчаливый пропуск

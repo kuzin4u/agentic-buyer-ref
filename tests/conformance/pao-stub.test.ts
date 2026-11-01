@@ -164,7 +164,8 @@ describeConformance({
         return id;
       },
       decideConfirmation: async (id: string, decision: "APPROVED" | "REJECTED") => void (confirmations.get(id)!.status = decision),
-      issuedSecrets: () => [...secrets],
+      issuedSecrets: () => [...secrets, ...faults.secrets],
+      callsCarryNonce: true,
       // PaoStub проверяет подпись до обработчика: keyid из Signature-Input — подпись агента; чужой агент — свой kid
       calls: (): PlatformCall[] =>
         stub.calls

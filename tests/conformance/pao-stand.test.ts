@@ -52,7 +52,8 @@ describeConformance({
         const r = await stand.issuer.sign(id);
         if (r.statusCode !== 200) throw new Error(`эмулятор эмитента не подписал мандат ${id}: ${r.statusCode}`);
       },
-      issuedSecrets: () => c.issuedSecrets(),
+      issuedSecrets: () => [...c.issuedSecrets(), ...faults.secrets],
+      callsCarryNonce: true,
       // по сети — клиент агента; участники стенда и тестовая поддержка — inject; второй агент — свой kid
       calls: (): PlatformCall[] =>
         stand

@@ -50,9 +50,11 @@ const requestOf = (init: RequestInit | undefined): FaultRequest => ({
   agentCode: new Headers(init?.headers).get("x-agent-code") ?? "",
 });
 
-/** Транспорт с одноразовыми подменами по методу порта; `set` — подменить следующий ответ. */
-export function faultyFetch(): { fetch: typeof fetch; set(method: FaultMethod, fault: "lose" | "garble"): void } {
+/** Транспорт с одноразовыми подменами по методу порта; `set` — подменить следующий ответ; `secrets` — платёжные данные из
+ *  тел подмены (`payload`): цель добавляет их к образцам для проверки утечки (инвариант 1). */
+export function faultyFetch(): { fetch: typeof fetch; set(method: FaultMethod, fault: "lose" | "garble"): void; secrets: string[] } {
   const faults = new Map<FaultMethod, "lose" | "garble">();
+  const secrets: string[] = [];
   const transport: typeof fetch = async (input, init) => {
     const url = new URL(input instanceof Request ? input.url : String(input));
     const method = (init?.method ?? "GET").toUpperCase();
@@ -60,12 +62,13 @@ export function faultyFetch(): { fetch: typeof fetch; set(method: FaultMethod, f
     const fault = hit === undefined ? undefined : faults.get(hit);
     if (hit !== undefined) faults.delete(hit);
     if (fault === "garble") {
-      const body = PAO_FAULT_OPS[hit!][2](requestOf(init));
+      const body = PAO_FAULT_OPS[hit!][2](requestOf(init)) as { payload?: Record<string, unknown> };
+      secrets.push(...Object.values(body.payload ?? {}).filter((v): v is string => typeof v === "string"));
       return new Response(JSON.stringify(body), { status: 200, headers: { "content-type": "application/json" } });
     }
     const r = await fetch(input, init);
     if (fault === "lose") throw new TypeError("fetch failed");
     return r;
   };
-  return { fetch: transport, set: (m, f) => void faults.set(m, f) };
+  return { fetch: transport, set: (m, f) => void faults.set(m, f), secrets };
 }

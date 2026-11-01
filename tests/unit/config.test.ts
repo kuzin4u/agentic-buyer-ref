@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { readFileSync } from "node:fs";
-import { ConfigError, PAO_RETRY_AFTER_MAX_SEC, loadParams, paoRateIntervalMs, parseParams } from "../../src/shared/config.js";
+import { ConfigError, PAO_RETRY_AFTER_MAX_SEC, TIMER_MAX_MS, loadParams, paoRateIntervalMs, parseParams } from "../../src/shared/config.js";
 
 const stand = JSON.parse(readFileSync("config/params.stand.json", "utf8"));
 
@@ -142,7 +142,7 @@ describe("стендовые параметры", () => {
     expect(() => parseParams({ ...stand, confirmation_decision_max_sec: 1.5 })).toThrow(ConfigError);
     expect(() => parseParams({ ...stand, confirmation_decision_max_sec: stand.order_hold_sec })).not.toThrow();
     expect(() => parseParams({ ...stand, confirmation_decision_max_sec: stand.order_hold_sec - 1 })).toThrow(/confirmation_decision_max_sec меньше order_hold_sec/);
-    const max = Math.floor(2_147_483_647 / 1000);
+    const max = Math.floor(TIMER_MAX_MS / 1000);
     expect(() => parseParams({ ...stand, confirmation_decision_max_sec: max })).not.toThrow();
     expect(() => parseParams({ ...stand, confirmation_decision_max_sec: max + 1 })).toThrow(ConfigError);
   });

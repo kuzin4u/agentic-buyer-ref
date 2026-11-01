@@ -1,9 +1,11 @@
 // Сборка адаптера витрин в месте сборки (Р42 п. 1; ревью К1 № 3): AgentCore.shops — подпись действующим ключом агента
 // (kid из реестра), код агента, журнал ядра; до допуска и после закрытия подписи — исключение, обращений нет.
+import { writeFileSync } from "node:fs";
 import { afterEach, describe, expect, it } from "vitest";
 import { SignerStopped } from "../../src/agent/signer/index.js";
 import { openPackage } from "../../src/agent/payment-package/index.js";
-import type { PaymentContext } from "../../src/agent/ports/index.js";
+import { ShopFailure, type PaymentContext } from "../../src/agent/ports/index.js";
+import { loadParams } from "../../src/shared/config.js";
 import type { Mandate } from "../../src/shared/domain.js";
 import { luhnTail } from "../support/luhn.js";
 import { coreOn } from "../support/core.js";
@@ -106,6 +108,60 @@ describe("AgentCore.payment (Р45 п. 6)", () => {
     expect(JSON.stringify(journal.entries)).not.toMatch(/tok_ref_1|cg_1/);
     // полный журнал: выдача и один GET операции по событию — без лишних GET /pao/v1/operations
     expect(opsFrom(s, from)).toEqual(["POST /pao/v1/credentials", "GET /pao/v1/operations/{op_ref}"]);
+  });
+
+  it("Р69 п. 4 (ревью КТ сессии 57 № 2): обрыв ответа витрины, «операций нет» — один повтор тем же пакетом; POST /pao/v1/credentials один, нарушений схемы нет", async () => {
+    let paid = 0;
+    let served = false;
+    const VALID_TO = "2026-10-12T09:15:00Z";
+    const s = new PaoStand({
+      handlers: {
+        "POST /pao/v1/credentials": ({ body }) => ({
+          status: 201,
+          body: { credential_ref: "cr_1", kind: body.kind, payload: { token_ref: "tok_ref_1", cryptogram: "cg_1", valid_to: VALID_TO }, aoi: { indicator: true, agent_code: AGENT, mandate_id: body.mandate_id }, status: "ISSUED" },
+        }),
+        // событие — только после второй попытки: первая до продавца не дошла
+        "GET /pao/v1/events": () => {
+          if (paid < 2 || served) return { status: 200, body: [] };
+          served = true;
+          return { status: 200, body: [{ event_id: "evt_op_1", type: "operation.authorized", at: "2026-10-12T09:01:00Z", data: { op_ref: "op_1" } }] };
+        },
+        "GET /pao/v1/operations": () => ({ status: 200, body: [] }),
+        "GET /pao/v1/operations/{op_ref}": () => ({
+          status: 200,
+          body: { op_ref: "op_1", order_ref: "ORD-1", channel: "CARD", amount: 250000, merchant_id: "shop_1", aoi: { indicator: true, agent_code: AGENT, mandate_id: "m_cart" }, status: "AUTHORIZED", reason: null, fulfilment: null, deal_ref: null },
+        }),
+      },
+    });
+    stand = s;
+    // свой срок итога стадии 5 — тест не ждёт стендовых секунд
+    const paramsPath = `${s.dir}-params.json`;
+    writeFileSync(paramsPath, JSON.stringify({ ...loadParams(), operation_outcome_max_delay_sec: 1 }));
+    const { core, journal } = await coreOn(s, { paramsPath });
+    await core.start();
+    const from = s.stub.calls.length;
+    const packages: string[] = [];
+    const steps = core.payment({
+      pay: async (req) => {
+        paid++;
+        packages.push(openPackage(req.package));
+        if (paid === 1) throw new ShopFailure("SHOP_ORDER_STATE_UNKNOWN");
+        return { status: "PAID" };
+      },
+      payable: async () => true,
+    });
+    const total = { amount: 250000, currency: "RUB" };
+    const cart = { id: "m_cart", cart: { merchantId: "shop_1", lines: [], total } } as unknown as Mandate;
+    const ctx: PaymentContext = { intent: { id: "m_intent" } as Mandate, cart, shopId: "SHOP-1", merchantId: "shop_1", channel: "CARD", order: { orderId: "ORD-1", total }, signal: new AbortController().signal, sending: () => {} };
+    await expect(steps.authorize(ctx, { idempotencyKey: "idem-pay-retry" })).resolves.toMatchObject({ opRef: "op_1", status: "AUTHORIZED" });
+    // тот же пакет на обеих попытках; реквизит выдан один раз
+    expect(packages).toHaveLength(2);
+    expect(packages[1]).toBe(packages[0]);
+    expect(s.stub.calls.filter((c) => c.op === "POST /pao/v1/credentials").map((c) => c.idempotencyKey)).toEqual(["idem-pay-retry"]);
+    expect(opsFrom(s, from)).toEqual(["POST /pao/v1/credentials", "GET /pao/v1/operations", "GET /pao/v1/operations/{op_ref}"]);
+    expect(journal.entries.filter((e) => e.kind === "pao.call" && e.method === "POST /pao/v1/credentials").map((e) => e.result)).toEqual(["ok"]);
+    expect(journal.entries.filter((e) => e.kind === "payment.retry").map((e) => [e.ref, e.mandate])).toEqual([["ORD-1", "m_cart"]]);
+    expect(JSON.stringify(journal.entries)).not.toMatch(/tok_ref_1|cg_1|cr_1/);
   });
 
   it("связка ядра (Р49 п. 4, 6): операция по заказу с чужим продавцом — OPERATION_REPLY_MISMATCH; расчёт — GET по op_ref, SETTLED с записью об исполнении", async () => {

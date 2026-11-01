@@ -25,7 +25,8 @@ export interface ContourPaymentOptions {
   /** модуль операций (Р49 п. 3–6): итог по order_ref на стадии 5, расчёт по op_ref на стадии 6 */
   operations: {
     expect(orderRef: string, cart: Mandate): OperationWait;
-    /** поиск операции по CART, когда итога по событию нет (Р51 п. 5) */
+    /** поиск операции по CART, когда итога по событию нет (Р51 п. 5): один раз на попытку оплаты — при повторе
+     *  после обрыва (Р69 п. 4) их не больше двух на покупку */
     lookup(orderRef: string, cart: Mandate, notice?: LateNotice): Promise<OperationOutcome>;
     /** `notice` — под наблюдение после итога ставит сам модуль, в момент итога (Р51 п. 4) */
     settle(authorized: Operation, signal: AbortSignal, deadline?: number, notice?: LateNotice): Promise<SettleOutcome>;

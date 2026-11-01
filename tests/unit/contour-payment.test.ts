@@ -26,9 +26,15 @@ function steps(o: {
   payable?: boolean | (() => Promise<boolean>);
   /** срок реквизита */
   validTo?: string | null;
+  /** журнал шагов; не задан — MemoryJournal */
+  journal?: MemoryJournal;
 }) {
   const log: string[] = [];
-  const journal = new MemoryJournal();
+  const journal = o.journal ?? new MemoryJournal();
+  // запечатанный пакет выдачи и пакеты, ушедшие витрине (ревью КТ сессии 57 № 2)
+  const sealed = {};
+  const packages: unknown[] = [];
+  let issued = 0;
   const wait: OperationWait = {
     outcome: (ms, signal) => (log.push(`outcome ${ms}`), o.outcome(ms, signal)),
     close: () => void log.push("close"),
@@ -36,10 +42,11 @@ function steps(o: {
   let paid = 0;
   const payable = o.payable;
   const p = new ContourPayment({
-    platform: { issuePaymentPackage: async () => ({ credential: { credentialRef: "cr_1", kind: "CARD", indicator: { agentCode: "a", mandateId: "m_cart" }, status: "ISSUED", validTo: o.validTo ?? null }, sealed: {} }) as never },
+    platform: { issuePaymentPackage: async () => (issued++, { credential: { credentialRef: "cr_1", kind: "CARD", indicator: { agentCode: "a", mandateId: "m_cart" }, status: "ISSUED", validTo: o.validTo ?? null }, sealed }) as never },
     shop: {
-      pay: async (_req, attempt) => {
+      pay: async (req, attempt) => {
         log.push(`pay ${attempt ?? 1}`);
+        packages.push(req.package);
         const r = o.pays?.[paid++] ?? o.reply;
         if (r === "UNKNOWN") throw new ShopFailure("SHOP_ORDER_STATE_UNKNOWN");
         if (r === "REFUSED") throw new ShopFailure("SHOP_ORDER_REFUSED");
@@ -66,7 +73,7 @@ function steps(o: {
     params: PARAMS,
     now: () => NOW,
   });
-  return { p, log, journal };
+  return { p, log, journal, sealed, packages, issued: () => issued };
 }
 
 const NOW = new Date("2026-11-01T12:00:00.000Z");
@@ -182,6 +189,29 @@ describe("повтор оплаты после обрыва ответа — п�
     const retries = s.journal.entries.filter((e) => e.kind === "payment.retry");
     expect(retries).toEqual([expect.objectContaining({ kind: "payment.retry", ref: "ORD-1", mandate: "m_cart" })]);
     expect(JSON.stringify(s.journal.entries)).not.toContain("cr_1");
+  });
+
+  it("ревью КТ сессии 57 № 2: повтор — тем же запечатанным пакетом, реквизит выдан один раз", async () => {
+    const s = steps({ reply: "PAID", pays: ["UNKNOWN", "PAID"], outcome: thenAuthorized(), lookup: { kind: "ABSENT" }, validTo: LATER, payable: true });
+    await expect(s.p.authorize(ctx(), { idempotencyKey: "k" })).resolves.toMatchObject({ status: "AUTHORIZED" });
+    expect(s.packages).toHaveLength(2);
+    expect(s.packages[0]).toBe(s.sealed);
+    expect(s.packages[1]).toBe(s.sealed);
+    expect(s.issued()).toBe(1);
+  });
+
+  it("ревью КТ сессии 57 № 3: сбой журнала на payment.retry — второго POST нет, ошибка журнала наружу (инвариант 4)", async () => {
+    class Failing extends MemoryJournal {
+      override record(e: Parameters<MemoryJournal["record"]>[0]): void {
+        if (e.kind === "payment.retry") throw new Error("журнал недоступен");
+        super.record(e);
+      }
+    }
+    const s = steps({ reply: "PAID", pays: ["UNKNOWN", "PAID"], outcome: thenAuthorized(), lookup: { kind: "ABSENT" }, validTo: LATER, payable: true, journal: new Failing() });
+    await expect(s.p.authorize(ctx(), { idempotencyKey: "k" })).rejects.toThrow("журнал недоступен");
+    expect(s.log.filter((x) => x.startsWith("pay "))).toEqual(["pay 1"]);
+    // ожидание снято и при сбое журнала
+    expect(s.log.at(-1)).toBe("close");
   });
 
   it("условие не выполнено — повтора нет, OPERATION_RESULT_UNCONFIRMED", async () => {

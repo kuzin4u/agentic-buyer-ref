@@ -805,6 +805,19 @@ describe("стадии 4–6 — исходы из порта PaymentSteps (ин
     expect(r.purchase.reason).toBe("PIPELINE_TRANSITION_FORBIDDEN");
   });
 
+  /** Исход обещания — за обороты цикла событий, без срока (ревью КТ сессии 57, ответ на вопрос 2): прерывание не дошло
+   *  до ожидания — явный провал, а не таймаут теста. Обращений по сети на этом пути нет — хватает `setImmediate`. */
+  const settledSoon = async <T,>(p: Promise<T>): Promise<T> => {
+    let done = false;
+    p.then(
+      () => (done = true),
+      () => (done = true),
+    );
+    for (let i = 0; i < 20 && !done; i++) await new Promise<void>((r) => setImmediate(r));
+    if (!done) throw new Error("исход не пришёл: прерывание не дошло до ожидания стадии 4");
+    return p;
+  };
+
   /** Порт подтверждения ждёт человека до прерывания своего signal (стадия 4 началась — `entered`). */
   const waitingConfirm = () => {
     let started: () => void = () => {};
@@ -834,7 +847,7 @@ describe("стадии 4–6 — исходы из порта PaymentSteps (ин
     await p.entered;
     const from = r.stand.stub.calls.length;
     ac.abort(new Error("человек передумал"));
-    await expect(waiting).rejects.toMatchObject({ code: "CONFIRMATION_ABORTED" });
+    await expect(settledSoon(waiting)).rejects.toMatchObject({ code: "CONFIRMATION_ABORTED" });
     expect(stages(r).slice(-3)).toEqual(["AUTHORIZING", "CONFIRMING", "STOPPED:CONFIRMATION_ABORTED"]);
     expect(p.authorized()).toBe(1);
     // прерывание — без обращений к Платформе (запрос в банке агент не отменяет)
@@ -851,7 +864,7 @@ describe("стадии 4–6 — исходы из порта PaymentSteps (ин
     const from = r.stand.stub.calls.length;
     const ac = new AbortController();
     ac.abort(new Error("отмена до оплаты"));
-    await expect(r.purchase.authorize({ idempotencyKey: "idem-pay-1" }, ac.signal)).rejects.toMatchObject({ code: "CONFIRMATION_ABORTED" });
+    await expect(settledSoon(r.purchase.authorize({ idempotencyKey: "idem-pay-1" }, ac.signal))).rejects.toMatchObject({ code: "CONFIRMATION_ABORTED" });
     expect(stages(r).at(-1)).toBe("STOPPED:CONFIRMATION_ABORTED");
     expect(p.authorized()).toBe(0);
     expect(r.stand.stub.calls.slice(from)).toEqual([]);
@@ -865,7 +878,10 @@ describe("стадии 4–6 — исходы из порта PaymentSteps (ин
     p.payment.authorize = () => (ac.abort(new Error("во время оплаты")), authorize());
     const r = await setup({ payment: p.payment });
     await ordered(r, Math.floor(THRESHOLD / TARTINE) + 1);
-    await expect(r.purchase.authorize({ idempotencyKey: "idem-pay-1" }, ac.signal)).rejects.toMatchObject({ code: "CONFIRMATION_ABORTED" });
+    const waiting = r.purchase.authorize({ idempotencyKey: "idem-pay-1" }, ac.signal);
+    // ворота стадии 5 ходят к Платформе — ждём входа в стадию 4, дальше исход без сети
+    await p.entered;
+    await expect(settledSoon(waiting)).rejects.toMatchObject({ code: "CONFIRMATION_ABORTED" });
     expect(p.authorized()).toBe(1);
     expect(stages(r).slice(-3)).toEqual(["AUTHORIZING", "CONFIRMING", "STOPPED:CONFIRMATION_ABORTED"]);
   });
@@ -882,7 +898,7 @@ describe("стадии 4–6 — исходы из порта PaymentSteps (ин
     const waiting = s.purchase.authorize({ idempotencyKey: "idem-pay-1" }, new AbortController().signal);
     await p.entered;
     await expect(s.purchase.authorize({ idempotencyKey: "idem-pay-2" })).rejects.toBeInstanceOf(PurchaseTransitionForbidden);
-    await expect(waiting).rejects.toBeInstanceOf(PurchaseStopped);
+    await expect(settledSoon(waiting)).rejects.toBeInstanceOf(PurchaseStopped);
     expect(s.purchase.reason).toBe("PIPELINE_TRANSITION_FORBIDDEN");
   });
 

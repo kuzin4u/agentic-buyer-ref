@@ -16,8 +16,9 @@ const T0 = Date.parse("2026-10-22T12:00:00.000Z");
 const HOLD_MS = 900_000;
 const SKEW_SEC = 300;
 const WAIT_MS = 30_000;
-/** свой предел ожидания решения (Р69 п. 2): больше HOLD_MS + SKEW_SEC — прежние тесты срока его не задевают */
-const DECISION_MAX_SEC = 1800;
+/** свой предел ожидания решения (Р69 п. 2) — из стендовых параметров (ревью КТ сессии 57 № 10); больше HOLD_MS +
+ *  SKEW_SEC — прежние тесты срока его не задевают (проверка — в первом тесте файла) */
+const DECISION_MAX_SEC = loadParams().confirmation_decision_max_sec;
 const SEEN_MAX = loadParams().event_seen_max;
 
 /** Часы и таймеры теста: время двигает только advance; `early` — первый таймер длиннее `early` срабатывает раньше
@@ -102,6 +103,10 @@ function setup(early = 0, seenMax = SEEN_MAX, decisionMaxSec = DECISION_MAX_SEC)
 }
 
 describe("модуль подтверждений: сигнал → GET → статус (Р47 п. 3)", () => {
+  it("предусловие файла: стендовый предел решения больше срока Платформы в тестах (HOLD_MS + SKEW_SEC)", () => {
+    expect(DECISION_MAX_SEC * 1000).toBeGreaterThan(HOLD_MS + SKEW_SEC * 1000);
+  });
+
   it("required → PENDING и одно уведомление; approved → GET → APPROVED; link и confirmation_ref нигде", async () => {
     const s = setup();
     const w = s.waiter();
@@ -459,6 +464,21 @@ describe("привязка запроса к покупке (Р47 п. 4, В1–�
     await settle();
     expect(arrived).toBe(true);
     expect(s.kinds.filter((k) => k === "confirmation.unclaimed")).toHaveLength(2);
+  });
+
+  it("ревью КТ сессии 57 № 8: два невостребованных, сбой записи confirmation.unbound в wait() — UNBOUND сразу, ошибка журнала поглощена (нюанс К1.1)", async () => {
+    const s = failingJournal(() => "confirmation.unbound");
+    s.answers.set(ID1, confirmation("PENDING"));
+    s.answers.set(ID2, confirmation("PENDING", { id: ID2 }));
+    await s.conf.listener(s.item(ID1, "evt_1"));
+    await s.conf.listener(s.item(ID2, "evt_2"));
+    await settle();
+    expect(s.kinds.filter((k) => k === "confirmation.unclaimed")).toHaveLength(2);
+    // ожидание началось при двух невостребованных: запись падает внутри исполнителя обещания — исход уже отдан
+    const w = s.waiter();
+    await settle();
+    expect(w()).toBe("UNBOUND");
+    expect(s.kinds).toContain("confirmation.unbound");
   });
 
   it("гонка (В1а): событие раньше ожидания — невостребованный, затем покупка его берёт", async () => {

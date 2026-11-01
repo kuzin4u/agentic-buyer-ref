@@ -141,6 +141,15 @@ export type PurchaseNotice = Extract<
  *  валюте её мандата (до ПАО 1.5.0 и у возврата — сумма списания, не возврата); у прочих уведомлений — нет. */
 export type NoticeAmount = Money;
 
+/** Адрес страницы УПК к уведомлению CONFIRMATION_PENDING (Р69 п. 5): только абсолютный `https:` без логина и пароля;
+ *  нет — человек подтверждает в приложении банка. Только оболочке: не в журнал, не в исход и не в тексты ошибок. */
+export interface NoticeLink {
+  link: string;
+}
+
+/** Уведомление оболочки: код из реестра и, по коду, сумма (`NoticeAmount`) или ссылка страницы УПК (`NoticeLink`). */
+export type PurchaseNotify = (code: PurchaseNotice, detail?: NoticeAmount | NoticeLink) => void | Promise<void>;
+
 /** Уведомление покупки после её итога (Р51 п. 4): наблюдение за операцией шлёт его через уведомление той покупки;
  *  исход покупки не меняется. */
 export type LateNotice = (code: PurchaseNotice, amount?: NoticeAmount) => void;
@@ -148,9 +157,9 @@ export type LateNotice = (code: PurchaseNotice, amount?: NoticeAmount) => void;
 /** Стадии 4–6. Исход каждого шага — из подписанного события Платформы, не со слов продавца (инвариант 8, Р14). */
 export interface PaymentSteps {
   /** Стадия 4 (Р47 п. 2): после отказа авторизации с требованием подтверждения — ожидание запроса ADP и решения человека
-   *  (AG-13); конвейер решения не создаёт (инвариант 7). `notify` — уведомление оболочки, один раз на запрос, без link;
-   *  `signal` — покупка остановлена. */
-  confirm(c: PaymentContext, notify: () => void, signal: AbortSignal): Promise<ConfirmationOutcome>;
+   *  (AG-13); конвейер решения не создаёт (инвариант 7). `notify` — уведомление оболочки, один раз на запрос; `link` —
+   *  безопасный адрес страницы УПК, если он есть (Р69 п. 5); `signal` — покупка остановлена. */
+  confirm(c: PaymentContext, notify: (link?: string) => void, signal: AbortSignal): Promise<ConfirmationOutcome>;
   /** Стадия 5: реквизит (`POST /pao/v1/credentials`), пакет агентской оплаты продавцу и итог авторизации (AG-11). Платформа
    *  требует подтверждения — PaymentFailure CONFIRMATION_REQUIRED (профиль contour — ответ продавца DECLINED, Р47 п. 4)
    *  или ответ со статусом CONFIRMATION_REQUIRED: дальше стадия 4. */

@@ -107,6 +107,23 @@ describe("модуль подтверждений: сигнал → GET → ст
     expect(DECISION_MAX_SEC * 1000).toBeGreaterThan(HOLD_MS + SKEW_SEC * 1000);
   });
 
+  it("Р69 п. 5: уведомление PENDING несёт безопасный link страницы УПК; http: и логин в адресе — без ссылки; в журнале ссылки нет", async () => {
+    const cases: [string, string, string | undefined][] = [
+      ["https:", "https://upk.stand/c/cnf_1", "https://upk.stand/c/cnf_1"],
+      ["http:", "http://upk.stand/c/cnf_1", undefined],
+      ["логин и пароль", "https://u:p@upk.stand/c/cnf_1", undefined],
+    ];
+    for (const [name, link, shown] of cases) {
+      const s = setup();
+      const got: (string | undefined)[][] = [];
+      void s.conf.wait({ signal: new AbortController().signal, onPending: (...a: (string | undefined)[]) => void got.push(a) });
+      s.answers.set(ID1, confirmation("PENDING", { link }));
+      await s.event("confirmation.required", ID1);
+      expect(got, name).toEqual([shown === undefined ? [] : [shown]]);
+      expect(JSON.stringify(s.journal), name).not.toContain("upk.stand");
+    }
+  });
+
   it("required → PENDING и одно уведомление; approved → GET → APPROVED; link и confirmation_ref нигде", async () => {
     const s = setup();
     const w = s.waiter();

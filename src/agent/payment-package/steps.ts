@@ -22,7 +22,7 @@ export interface ContourPaymentOptions {
   journal: Journal;
   /** модуль подтверждений (Р47 п. 3–4): ожидание запроса ADP и решения человека; появление запроса — гонка стадии 5 */
   confirmations: {
-    wait(o: { signal: AbortSignal; onPending?: () => void }): Promise<ConfirmationOutcome>;
+    wait(o: { signal: AbortSignal; onPending?: (link?: string) => void }): Promise<ConfirmationOutcome>;
     mark(): number;
     arrival(signal: AbortSignal, after: number): Promise<void>;
   };
@@ -50,7 +50,7 @@ export class ContourPayment implements PaymentSteps {
 
   /** Стадия 4 (Р47 п. 3–4): ожидание — после DECLINED продавца, привязка и статус по GET — модуль подтверждений; сам агент
    *  ничего не подтверждает (инвариант 7). */
-  confirm(_c: PaymentContext, notify: () => void, signal: AbortSignal): Promise<ConfirmationOutcome> {
+  confirm(_c: PaymentContext, notify: (link?: string) => void, signal: AbortSignal): Promise<ConfirmationOutcome> {
     return this.o.confirmations.wait({ signal, onPending: notify });
   }
 

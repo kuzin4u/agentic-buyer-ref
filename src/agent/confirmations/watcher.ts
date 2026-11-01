@@ -2,7 +2,10 @@
 // по GET /pao/v1/confirmations/{id}, событие без GET ничего не меняет (Р34). Запрос создаёт ADP на отказе авторизации
 // продавца; в ответе Платформы нет ни мандата, ни order_ref, поэтому запрос относится к покупке, только если его ждёт
 // ровно одна покупка (4а): ошибка привязки денег не стоит — ADP сверяет ссылку с мандатом, продавцом, суммой и order_ref.
-// link и confirmation_ref дальше разбора ответа не идут: ни в журнал, ни в исход, ни человеку (инвариант 1, Р47 п. 5).
+// confirmation_ref дальше разбора ответа не идёт: ни в журнал, ни в исход, ни человеку (инвариант 1, Р47 п. 5). link —
+// только оболочке в уведомлении PENDING и только безопасный (`pageLink`: https:, без логина и пароля; Р69 п. 5), не в
+// журнал, не в исход и не в тексты ошибок.
+import { pageLink } from "./link.js";
 import { poll } from "../events/poll.js";
 import { SeenWindow } from "../events/seen.js";
 import type { FeedItem } from "../ports/events.js";
@@ -42,18 +45,20 @@ export interface ConfirmationsOptions {
   timer?: (fn: () => void, ms: number) => () => void;
 }
 
-/** Вход ожидания: `onPending` — один вызов на запрос, когда он PENDING; без link (Р47 п. 5, В3). Модуль его не ждёт:
- *  исключение и отказ обещания — запись notify.failed, исход не меняется. */
+/** Вход ожидания: `onPending` — один вызов на запрос, когда он PENDING; `link` — адрес страницы УПК из GET, если он
+ *  безопасен (Р69 п. 5), иначе нет — человек подтверждает в приложении банка. Модуль его не ждёт: исключение и отказ
+ *  обещания — запись notify.failed, исход не меняется. */
 export interface WaitOptions {
   signal: AbortSignal;
-  onPending?: () => void | Promise<void>;
+  onPending?: (link?: string) => void | Promise<void>;
 }
 
 type JournalEntry = Parameters<ConfirmationsJournal["record"]>[0];
 type WithoutAt<T> = T extends unknown ? Omit<T, "at"> : never;
 
-/** Статус по GET без link и confirmation_ref; FAILED — GET не дал подтверждённого статуса. */
-type Read = { status: Confirmation["status"]; expiresAt: string | null } | "FAILED";
+/** Статус по GET без confirmation_ref; `link` — только безопасный адрес страницы УПК или null; FAILED — GET не дал
+ *  подтверждённого статуса. */
+type Read = { status: Confirmation["status"]; expiresAt: string | null; link: string | null } | "FAILED";
 
 interface Waiter {
   readonly onPending: WaitOptions["onPending"];
@@ -298,16 +303,16 @@ export class Confirmations {
     if (read.status !== "PENDING") return w.finish(read.status);
     if (!this.#notified.has(id)) {
       this.#notified.add(id);
-      this.#notify(w);
+      this.#notify(w, read.link);
     }
     if (w.cancel === null) this.#schedule(id, w, read.expiresAt);
   }
 
   /** Уведомление — не часть исхода (В3): ни исключение, ни отказ обещания оболочки покупку не меняют и не ждутся. */
-  #notify(w: Waiter): void {
+  #notify(w: Waiter, link: string | null): void {
     const failed = () => this.#record({ kind: "notify.failed", reason: "CONFIRMATION_PENDING" });
     try {
-      const r = w.onPending?.();
+      const r = link === null ? w.onPending?.() : w.onPending?.(link);
       if (r !== undefined) Promise.resolve(r).catch(failed);
     } catch {
       failed();
@@ -372,7 +377,7 @@ export class Confirmations {
     const withRef = typeof c.confirmationRef === "string" && c.confirmationRef !== "";
     if (c.id !== id || !STATUSES.has(c.status) || withRef !== (c.status === "APPROVED") || (!withRef && c.confirmationRef !== null)) return "FAILED";
     this.#record({ kind: "confirmation.status", ref: id, detail: c.status });
-    return { status: c.status, expiresAt: typeof c.expiresAt === "string" ? c.expiresAt : null };
+    return { status: c.status, expiresAt: typeof c.expiresAt === "string" ? c.expiresAt : null, link: c.status === "PENDING" ? pageLink(c.link) : null };
   }
 
   #record(e: WithoutAt<JournalEntry>): void {

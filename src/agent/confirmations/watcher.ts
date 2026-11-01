@@ -232,7 +232,15 @@ export class Confirmations {
     }, this.#o.params.confirmation_wait_ms);
     const seq = ++this.#held;
     this.#unclaimed.set(id, { read, drop, seq });
-    this.#record({ kind: "confirmation.unclaimed", ref: id });
+    // запись — до действия (Р69 п. 1): без записи запрос не хранится и о нём не оповещают (Т15 — особое событие);
+    // ошибка журнала — наружу, слушатель не отмечает событие обработанным, лента прочитает его снова (fail-closed)
+    try {
+      this.#record({ kind: "confirmation.unclaimed", ref: id });
+    } catch (e) {
+      drop();
+      this.#unclaimed.delete(id);
+      throw e;
+    }
     for (const a of [...this.#arrivals]) if (seq > a.after) a.arrived();
   }
 
@@ -261,9 +269,14 @@ export class Confirmations {
     });
   }
 
+  /** Журнал не отменяет действие (Р69 п. 1, дополнение 1 к Р58): запись — в try, исход ожидающих — в finally; при сбое
+   *  журнала покупки останавливаются сразу, а не досиживают до таймера; ошибка журнала — наружу. */
   #unbound(id: string | undefined, waiting: Waiter[]): void {
-    this.#record({ kind: "confirmation.unbound", ...(id !== undefined && { ref: id }) });
-    for (const w of waiting) w.finish("UNBOUND");
+    try {
+      this.#record({ kind: "confirmation.unbound", ...(id !== undefined && { ref: id }) });
+    } finally {
+      for (const w of waiting) w.finish("UNBOUND");
+    }
   }
 
   #bind(id: string, w: Waiter, read: Read): void {

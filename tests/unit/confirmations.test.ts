@@ -366,6 +366,67 @@ describe("привязка запроса к покупке (Р47 п. 4, В1–�
     expect(s.gets).toEqual([ID1]);
   });
 
+  /** Модуль с журналом, падающим на записи вида `failOn()` (КТ1 сессии 39 № 9, Р69 п. 1). */
+  function failingJournal(failOn: () => string | null) {
+    const c = clock();
+    const kinds: string[] = [];
+    const answers = new Map<string, Confirmation>();
+    const conf = new Confirmations({
+      port: { getConfirmation: async (id) => structuredClone(answers.get(id)!) },
+      journal: {
+        record: (e) => {
+          kinds.push(e.kind);
+          if (e.kind === failOn()) throw new Error("журнал недоступен");
+        },
+      },
+      params: { confirmation_wait_ms: WAIT_MS, signature_skew_sec: SKEW_SEC, event_seen_max: SEEN_MAX },
+      now: c.now,
+      timer: c.timer,
+    });
+    const item = (id: string, eventId: string): FeedItem => ({ kind: "event", event: { eventId, type: "confirmation.required", at: c.now().toISOString(), mandateId: null, opRef: null, confirmationId: id, declineReason: null } });
+    const waiter = () => {
+      let outcome: ConfirmationOutcome | undefined;
+      void conf.wait({ signal: new AbortController().signal }).then((o) => (outcome = o));
+      return () => outcome;
+    };
+    return { c, kinds, answers, conf, item, waiter };
+  }
+
+  it("Р69 п. 1: сбой записи confirmation.unbound — обе ожидающие UNBOUND сразу, без таймера; ошибка журнала — наружу", async () => {
+    const s = failingJournal(() => "confirmation.unbound");
+    const a = s.waiter();
+    const b = s.waiter();
+    s.answers.set(ID1, confirmation("PENDING"));
+    await expect(s.conf.listener(s.item(ID1, "evt_1"))).rejects.toThrow("журнал недоступен");
+    await settle();
+    // часы не двигались: исход — сразу, а не по confirmation_wait_ms
+    expect([a(), b()]).toEqual(["UNBOUND", "UNBOUND"]);
+    expect(s.kinds).toContain("confirmation.unbound");
+  });
+
+  it("Р69 п. 1: сбой записи confirmation.unclaimed — запрос не хранится, оповещения нет; повтор события с журналом — хранится", async () => {
+    let failOn: string | null = "confirmation.unclaimed";
+    const s = failingJournal(() => failOn);
+    s.answers.set(ID1, confirmation("PENDING"));
+    let arrived = false;
+    void s.conf.arrival(new AbortController().signal, s.conf.mark()).then(() => (arrived = true));
+    await expect(s.conf.listener(s.item(ID1, "evt_1"))).rejects.toThrow("журнал недоступен");
+    await settle();
+    expect(arrived).toBe(false);
+    // покупка, начавшая ждать, запрос без записи не берёт — NONE по confirmation_wait_ms
+    const w = s.waiter();
+    await settle();
+    expect(w()).toBeUndefined();
+    await s.c.advance(WAIT_MS);
+    expect(w()).toBe("NONE");
+    // событие не отмечено обработанным: повтор того же event_id при работающем журнале — запрос хранится
+    failOn = null;
+    await s.conf.listener(s.item(ID1, "evt_1"));
+    await settle();
+    expect(arrived).toBe(true);
+    expect(s.kinds.filter((k) => k === "confirmation.unclaimed")).toHaveLength(2);
+  });
+
   it("гонка (В1а): событие раньше ожидания — невостребованный, затем покупка его берёт", async () => {
     const s = setup();
     s.answers.set(ID1, confirmation("PENDING"));

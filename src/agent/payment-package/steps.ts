@@ -8,12 +8,16 @@ import type { IssuedPackage } from "../ports/payment-platform.js";
 import type { Mutation } from "../ports/mutation.js";
 import { PaymentFailure, ShopFailure, type ConfirmationOutcome, type LateNotice, type PaymentContext, type PaymentSteps, type ShopPaymentPort, type ShopPaymentReply } from "../ports/shop.js";
 import type { StandParams } from "../../shared/config.js";
-import type { CredentialDraft, Mandate, Operation } from "../../shared/domain.js";
+import { PlatformFailure, type Credential, type CredentialDraft, type Mandate, type Operation } from "../../shared/domain.js";
 import { SAFE_ID } from "../../shared/ids.js";
 import { orderRefIssue } from "./order-ref.js";
 
 export interface ContourPaymentOptions {
-  platform: { issuePaymentPackage(draft: CredentialDraft, m: Mutation): Promise<IssuedPackage> };
+  platform: {
+    issuePaymentPackage(draft: CredentialDraft, m: Mutation): Promise<IssuedPackage>;
+    /** статус реквизита перед повтором оплаты (дополнение 1 к Р69 п. 4) */
+    credentialStatus(ref: string, mandateId: string): Promise<Credential>;
+  };
   shop: ShopPaymentPort;
   journal: Journal;
   /** модуль подтверждений (Р47 п. 3–4): ожидание запроса ADP и решения человека; появление запроса — гонка стадии 5 */
@@ -111,12 +115,12 @@ export class ContourPayment implements PaymentSteps {
           op = await this.#outcome(wait, reply, mark, c.signal, lookup);
           break;
         } catch (e) {
-          // Р69 п. 4: один повтор тем же пакетом — только после неизвестного исхода первой попытки, когда Платформа
-          // ответила «операций заказа нет», срок реквизита не наступил и заказ у витрины CREATED (пакет не дошёл);
-          // второй неизвестный исход — итог как есть, третьего POST нет
+          // Р69 п. 4 с дополнением 1: один повтор тем же пакетом — только после неизвестного исхода первой попытки, когда
+          // Платформа ответила «операций заказа нет», срок реквизита не наступил, реквизит у Платформы ISSUED и заказ у
+          // витрины CREATED (пакет не дошёл); второй неизвестный исход — итог как есть, третьего POST нет
           const unconfirmed = e instanceof PaymentFailure && e.code === "OPERATION_RESULT_UNCONFIRMED";
           if (!unconfirmed || attempt > 1 || !unknown || looked.kind !== "ABSENT" || c.signal.aborted) throw e;
-          if (!(await this.#retryable(credential.validTo, req))) throw e;
+          if (!(await this.#retryable(credential, c.cart.id, req, c.signal))) throw e;
         }
         // покупку остановили, пока читали заказ, — повтора нет; повтор — запись до действия: решение без записи не
         // исполняется (инвариант 4); реквизита в записи нет, только мандат корзины и номер заказа
@@ -132,11 +136,22 @@ export class ContourPayment implements PaymentSteps {
     }
   }
 
-  /** Условия повтора, кроме ответа Платформы (Р69 п. 4): срок реквизита не наступил (нет срока — повтора нет,
-   *  fail-closed), заказ у витрины CREATED с этим номером и мандатом. */
-  async #retryable(validTo: string | null, req: { shopId: string; orderId: string; cartMandateId: string }): Promise<boolean> {
-    const until = validTo === null ? Number.NaN : Date.parse(validTo);
+  /** Условия повтора после «операций нет» (Р69 п. 4, дополнение 1 — порядок В1 (а)): срок реквизита не наступил (нет
+   *  срока — повтора нет, fail-closed); реквизит у Платформы ISSUED — один GET (USED, EXPIRED, REVOKED, иное значение или
+   *  отказ чтения — повтора нет: реквизит гасится при резерве ADP, первая авторизация могла дойти без итога); затем заказ
+   *  у витрины CREATED с этим номером и мандатом. Сначала Платформа (основание, инвариант 8), затем витрина. */
+  async #retryable(credential: Credential, cartId: string, req: { shopId: string; orderId: string; cartMandateId: string }, signal: AbortSignal): Promise<boolean> {
+    const until = credential.validTo === null ? Number.NaN : Date.parse(credential.validTo);
     if (!(until > this.now().getTime()) || this.o.shop.payable === undefined) return false;
+    let now: Credential;
+    try {
+      now = await this.o.platform.credentialStatus(credential.credentialRef, cartId);
+    } catch (e) {
+      // отказ Платформы — повтора нет; код — в записи pao.call адаптера. Прочее (сбой журнала, дефект) — наружу
+      if (e instanceof PlatformFailure) return false;
+      throw e;
+    }
+    if (now.status !== "ISSUED" || signal.aborted) return false;
     return this.o.shop.payable(req);
   }
 

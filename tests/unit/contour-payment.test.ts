@@ -6,7 +6,7 @@ import { ContourPayment } from "../../src/agent/payment-package/index.js";
 import { ShopFailure, type PaymentContext, type ShopPaymentReply } from "../../src/agent/ports/index.js";
 import { MemoryJournal } from "../../src/agent/journal/index.js";
 import { loadParams } from "../../src/shared/config.js";
-import type { Mandate, Operation } from "../../src/shared/domain.js";
+import { PlatformFailure, type Credential, type Mandate, type Operation } from "../../src/shared/domain.js";
 import { trackedSignal } from "../support/signal.js";
 
 const PARAMS = loadParams();
@@ -28,6 +28,8 @@ function steps(o: {
   validTo?: string | null;
   /** журнал шагов; не задан — MemoryJournal */
   journal?: MemoryJournal;
+  /** статус реквизита у Платформы перед повтором (дополнение 1 к Р69 п. 4); Error — отказ чтения; не задан — ISSUED */
+  credential?: string | Error;
 }) {
   const log: string[] = [];
   const journal = o.journal ?? new MemoryJournal();
@@ -42,7 +44,15 @@ function steps(o: {
   let paid = 0;
   const payable = o.payable;
   const p = new ContourPayment({
-    platform: { issuePaymentPackage: async () => (issued++, { credential: { credentialRef: "cr_1", kind: "CARD", indicator: { agentCode: "a", mandateId: "m_cart" }, status: "ISSUED", validTo: o.validTo ?? null }, sealed }) as never },
+    platform: {
+      issuePaymentPackage: async () => (issued++, { credential: { credentialRef: "cr_1", kind: "CARD", indicator: { agentCode: "a", mandateId: "m_cart" }, status: "ISSUED", validTo: o.validTo ?? null }, sealed }) as never,
+      credentialStatus: async (ref, mandateId) => {
+        log.push(`credential ${ref} ${mandateId}`);
+        const st = o.credential ?? "ISSUED";
+        if (st instanceof Error) throw st;
+        return { credentialRef: ref, channel: "CARD", indicator: { agentCode: "a", mandateId }, status: st, validTo: o.validTo ?? null } as Credential;
+      },
+    },
     shop: {
       pay: async (req, attempt) => {
         log.push(`pay ${attempt ?? 1}`);
@@ -185,7 +195,7 @@ describe("повтор оплаты после обрыва ответа — п�
   it("неизвестный исход + «операций нет» + срок реквизита + заказ CREATED — один повтор тем же пакетом, запись payment.retry без реквизита", async () => {
     const s = steps({ reply: "PAID", pays: ["UNKNOWN", "PAID"], outcome: thenAuthorized(), lookup: { kind: "ABSENT" }, validTo: LATER, payable: true });
     await expect(s.p.authorize(ctx(), { idempotencyKey: "k" })).resolves.toMatchObject({ status: "AUTHORIZED" });
-    expect(s.log).toEqual(["expect", "mark", "pay 1", `outcome ${PARAMS.operation_outcome_max_delay_sec * 1000}`, "lookup ORD-1 m_cart", "payable", "mark", "pay 2", `outcome ${PARAMS.operation_outcome_max_delay_sec * 1000}`, "close"]);
+    expect(s.log).toEqual(["expect", "mark", "pay 1", `outcome ${PARAMS.operation_outcome_max_delay_sec * 1000}`, "lookup ORD-1 m_cart", "credential cr_1 m_cart", "payable", "mark", "pay 2", `outcome ${PARAMS.operation_outcome_max_delay_sec * 1000}`, "close"]);
     const retries = s.journal.entries.filter((e) => e.kind === "payment.retry");
     expect(retries).toEqual([expect.objectContaining({ kind: "payment.retry", ref: "ORD-1", mandate: "m_cart" })]);
     expect(JSON.stringify(s.journal.entries)).not.toContain("cr_1");
@@ -230,6 +240,37 @@ describe("повтор оплаты после обрыва ответа — п�
       expect(s.log.filter((x) => x.startsWith("pay ")), name).toEqual(["pay 1"]);
       expect(s.journal.entries.some((e) => e.kind === "payment.retry"), name).toBe(false);
     }
+  });
+
+  it("дополнение 1 к Р69 п. 4: реквизит у Платформы не ISSUED или чтение отказано — повтора нет, заказ у витрины не читается", async () => {
+    const base = { reply: "PAID" as const, pays: ["UNKNOWN", "PAID"] as ("UNKNOWN" | "PAID")[], lookup: { kind: "ABSENT" } as const, validTo: LATER, payable: true };
+    const cases: [string, string | Error][] = [
+      ["USED — первая авторизация дошла до ADP", "USED"],
+      ["EXPIRED", "EXPIRED"],
+      ["REVOKED (В3)", "REVOKED"],
+      ["значение не из перечня (В3)", "SOMETHING_NEW"],
+      ["409 CREDENTIAL_INVALID", new PlatformFailure("CREDENTIAL_INVALID", "never", "CREDENTIAL_INVALID", 409, null)],
+      ["503 STATE_UNAVAILABLE", new PlatformFailure("STATE_UNAVAILABLE", "after_fix", "STATE_UNAVAILABLE", 503, null)],
+      ["ответ не по схеме", new PlatformFailure("BAD_RESPONSE", "never", null, 200, null)],
+    ];
+    for (const [name, credential] of cases) {
+      const s = steps({ ...base, outcome: thenAuthorized(), credential });
+      await expect(s.p.authorize(ctx(), { idempotencyKey: "k" }), name).rejects.toMatchObject({ code: "OPERATION_RESULT_UNCONFIRMED" });
+      expect(s.log.filter((x) => x.startsWith("pay ")), name).toEqual(["pay 1"]);
+      expect(s.log, name).toContain("credential cr_1 m_cart");
+      // сначала Платформа (В1 (а)): при отказе к витрине не ходим
+      expect(s.log, name).not.toContain("payable");
+      expect(s.journal.entries.some((e) => e.kind === "payment.retry"), name).toBe(false);
+    }
+  });
+
+  it("дополнение 1 к Р69 п. 4: чтение реквизита — после срока реквизита; срок наступил — ни GET, ни повтора; сбой не PlatformFailure — наружу", async () => {
+    const a = steps({ reply: "PAID", pays: ["UNKNOWN", "PAID"], outcome: thenAuthorized(), lookup: { kind: "ABSENT" }, validTo: NOW.toISOString(), payable: true });
+    await expect(a.p.authorize(ctx(), { idempotencyKey: "k" })).rejects.toMatchObject({ code: "OPERATION_RESULT_UNCONFIRMED" });
+    expect(a.log.some((x) => x.startsWith("credential"))).toBe(false);
+    const b = steps({ reply: "PAID", pays: ["UNKNOWN", "PAID"], outcome: thenAuthorized(), lookup: { kind: "ABSENT" }, validTo: LATER, payable: true, credential: new Error("журнал недоступен") });
+    await expect(b.p.authorize(ctx(), { idempotencyKey: "k" })).rejects.toThrow("журнал недоступен");
+    expect(b.log.filter((x) => x.startsWith("pay "))).toEqual(["pay 1"]);
   });
 
   it("второй неизвестный исход — без третьего POST; покупку остановили, пока читали заказ, — повтора нет", async () => {

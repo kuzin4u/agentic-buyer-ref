@@ -161,7 +161,8 @@ export async function standPurchase(o: StandPurchaseOptions = {}) {
   // тестовый порт остаётся для проверок «обращений к оплате не было»; конвейер получает шаги contour, если заданы
   const payment = payments();
   const real: PaymentPlatform["issuePaymentPackage"] = (d, m) => c.platform.issuePaymentPackage(d, m);
-  const platform = { issuePaymentPackage: o.issue ? o.issue(real) : real };
+  // статус реквизита перед повтором оплаты — у настоящего адаптера (дополнение 1 к Р69 п. 4)
+  const platform = { issuePaymentPackage: o.issue ? o.issue(real) : real, credentialStatus: (ref: string, mandateId: string) => c.platform.credentialStatus(ref, mandateId) };
   const params = parseParams({ ...c.params, ...o.params });
   // модули подтверждений и операций на ленте стенда, как у места сборки (compose): wake — одно чтение ленты со своим
   // курсором, событие — обоим слушателям; слушатель упал — курсор на месте, событие прочитается снова (Р34 п. 3)

@@ -59,6 +59,8 @@ describeConformance({
       }) as (typeof handlers)[K];
     const secrets: string[] = [];
     let issued = 0;
+    /** выданные реквизиты по credential_ref — для чтения статуса (дополнение 1 к Р69 п. 4) */
+    const credentials = new Map<string, { agentCode: string; mandateId: string; kind: "CARD" | "SBP" }>();
     // Лента и подтверждения — тестовая сторона (у PaoStub их нет, Р34 п. 10): лента у каждого агента своя; чужой или
     // неизвестный курсор и запрос подтверждения — 400 REQUEST_INVALID, как у Платформы (стенд v0.34.0, ПАО §3)
     const feeds = new Map<string, Pao.Event[]>([
@@ -96,6 +98,14 @@ describeConformance({
           if (c === undefined || c.agentCode !== agentCode) return { error: { code: "REQUEST_INVALID" } };
           return { body: { id: path.id!, status: c.status, expires_at: INTENT.validTo } };
         },
+        // как у Платформы (ПАО §3): свой реквизит — тот же Credential, криптограмма пересчитана; чужой и неизвестный — 409
+        "GET /pao/v1/credentials/{ref}": ({ path, agentCode }) => {
+          const c = credentials.get(path.ref!);
+          if (c === undefined || c.agentCode !== agentCode) return { error: { code: "CREDENTIAL_INVALID" } };
+          const payload = { token_ref: `tok_${path.ref!}`, cryptogram: `CRYPTOGRAM_REREAD_${++issued}` };
+          secrets.push(payload.token_ref, payload.cryptogram);
+          return { body: { credential_ref: path.ref!, kind: c.kind, payload, aoi: { indicator: true, agent_code: agentCode, mandate_id: c.mandateId }, status: "ISSUED" as const } };
+        },
         "POST /pao/v1/credentials": ({ body, agentCode }) => {
           const m = consents.mandates.get(body.mandate_id);
           if (m === undefined || m.agent_code !== agentCode) return { error: { code: "MANDATE_NOT_FOUND" } };
@@ -103,6 +113,7 @@ describeConformance({
           const n = ++issued;
           const payload = { token_ref: `tok_conformance_${n}`, cryptogram: `CRYPTOGRAM_CONFORMANCE_${n}` };
           secrets.push(payload.token_ref, payload.cryptogram);
+          credentials.set(`cr_conformance_${n}`, { agentCode, mandateId: body.mandate_id, kind: body.kind });
           return {
             status: 201,
             body: {

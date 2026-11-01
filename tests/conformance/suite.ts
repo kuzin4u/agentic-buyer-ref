@@ -287,6 +287,26 @@ export function describeConformance(target: ConformanceTarget): void {
         expectNoSecrets(sealed, s.issuedSecrets());
       });
 
+      it("статус своего реквизита (дополнение 1 к Р69 п. 4): неиспользованный — ISSUED, та же ссылка, вид и признак; платёжных данных нет; чужой — отказ PlatformFailure", async () => {
+        const s = await begin();
+        const cart = await signedCart(s);
+        const draft = credentialDraft(cart, "ord_conformance_5");
+        const { credential } = await s.platform.issuePaymentPackage(draft, { idempotencyKey: "conformance-package-status" });
+        const before = s.calls().length;
+        const now = await s.platform.credentialStatus(credential.credentialRef, cart.id);
+        // чтение — одно обращение без обязательства: подписано, без Idempotency-Key
+        expect(s.calls().slice(before).map((c) => [c.mutating, c.signed, c.status, c.idempotencyKey ?? null])).toEqual([[false, true, 200, null]]);
+        expect(Object.keys(now).sort()).toEqual(CREDENTIAL_FIELDS);
+        expect(now.credentialRef).toBe(credential.credentialRef);
+        expect(now.channel).toBe(draft.channel);
+        expect(now.status).toBe("ISSUED");
+        expect(now.indicator).toEqual({ agentCode: s.agentCode, mandateId: cart.id });
+        expectNoSecrets(now, s.issuedSecrets());
+        expectNoSecrets(s.journalText(), s.issuedSecrets(), "в журнале адаптера");
+        // реквизит другого агента той же платформы не читается
+        await expect(s.foreign.credentialStatus(credential.credentialRef, cart.id)).rejects.toBeInstanceOf(PlatformFailure);
+      });
+
       it("по мандату, от которого агент отказался, — отказ PlatformFailure, реквизита нет", async () => {
         const s = await begin();
         const cart = await signedCart(s);

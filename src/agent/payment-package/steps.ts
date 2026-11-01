@@ -84,18 +84,44 @@ export class ContourPayment implements PaymentSteps {
     // ожидание итога — до отправки пакета: событие могут прочитать, пока продавец отвечает (Р49 п. 3); отметка запросов
     // подтверждения — тоже до отправки: в гонке стадии 5 — только пришедшие после (ревью КТ1 № 5)
     const wait = this.o.operations.expect(orderRef, c.cart);
-    const mark = this.o.confirmations.mark();
+    const req = { shopId: c.shopId, orderId: orderRef, cartMandateId: c.cart.id };
     try {
-      c.sending();
-      let reply: ShopPaymentReply | null = null;
-      try {
-        reply = await this.o.shop.pay({ shopId: c.shopId, orderId: orderRef, cartMandateId: c.cart.id, package: sealed });
-      } catch (e) {
-        // пакет ушёл (или мог уйти): отказ витрины, нет ответа, ответ не по схеме — итог по событию, «деньги не
-        // списывались» не говорим (Р45, Б1а; инвариант 8); код витрины — detail записи shop.call
-        if (!(e instanceof ShopFailure)) throw e;
+      let op: Operation;
+      for (let attempt = 1; ; attempt++) {
+        const mark = this.o.confirmations.mark();
+        c.sending();
+        let reply: ShopPaymentReply | null = null;
+        let unknown = false;
+        try {
+          reply = await this.o.shop.pay({ ...req, package: sealed }, attempt);
+        } catch (e) {
+          // пакет ушёл (или мог уйти): отказ витрины, нет ответа, ответ не по схеме — итог по событию, «деньги не
+          // списывались» не говорим (Р45, Б1а; инвариант 8); код витрины — detail записи shop.call
+          if (!(e instanceof ShopFailure)) throw e;
+          unknown = e.code === "SHOP_ORDER_STATE_UNKNOWN";
+        }
+        const looked: { kind: OperationOutcome["kind"] | null } = { kind: null };
+        const lookup = async () => {
+          const r = await this.o.operations.lookup(orderRef, c.cart, c.notice);
+          looked.kind = r.kind;
+          return r;
+        };
+        try {
+          op = await this.#outcome(wait, reply, mark, c.signal, lookup);
+          break;
+        } catch (e) {
+          // Р69 п. 4: один повтор тем же пакетом — только после неизвестного исхода первой попытки, когда Платформа
+          // ответила «операций заказа нет», срок реквизита не наступил и заказ у витрины CREATED (пакет не дошёл);
+          // второй неизвестный исход — итог как есть, третьего POST нет
+          const unconfirmed = e instanceof PaymentFailure && e.code === "OPERATION_RESULT_UNCONFIRMED";
+          if (!unconfirmed || attempt > 1 || !unknown || looked.kind !== "ABSENT" || c.signal.aborted) throw e;
+          if (!(await this.#retryable(credential.validTo, req))) throw e;
+        }
+        // покупку остановили, пока читали заказ, — повтора нет; повтор — запись до действия: решение без записи не
+        // исполняется (инвариант 4); реквизита в записи нет, только мандат корзины и номер заказа
+        c.signal.throwIfAborted();
+        this.o.journal.record({ at: this.now().toISOString(), kind: "payment.retry", ref: orderRef, ...mandateRef(c.cart.id) });
       }
-      const op = await this.#outcome(wait, reply, mark, c.signal, () => this.o.operations.lookup(orderRef, c.cart, c.notice));
       // оплата отменена — поздний клиринг или возврат сообщит наблюдение после итога (Р51 п. 4); итог поиска модуль уже
       // поставил под наблюдение сам, здесь — итог по событию (повторная постановка ничего не теряет)
       if (op.status === "REVERSED" && c.notice !== undefined) this.o.operations.watch(op, "REVERSED", c.notice);
@@ -103,6 +129,14 @@ export class ContourPayment implements PaymentSteps {
     } finally {
       wait.close();
     }
+  }
+
+  /** Условия повтора, кроме ответа Платформы (Р69 п. 4): срок реквизита не наступил (нет срока — повтора нет,
+   *  fail-closed), заказ у витрины CREATED с этим номером и мандатом. */
+  async #retryable(validTo: string | null, req: { shopId: string; orderId: string; cartMandateId: string }): Promise<boolean> {
+    const until = validTo === null ? Number.NaN : Date.parse(validTo);
+    if (!(until > this.now().getTime()) || this.o.shop.payable === undefined) return false;
+    return this.o.shop.payable(req);
   }
 
   /** Итог стадии 5 (Р49 п. 5): первое из — привязанная операция или (только при DECLINED продавца) запрос подтверждения,
@@ -135,7 +169,8 @@ export class ContourPayment implements PaymentSteps {
     if (outcome.kind === "NONE" && !signal.aborted) outcome = await lookup();
     if (outcome.kind === "MISMATCH") throw new PaymentFailure("OPERATION_REPLY_MISMATCH");
     // неоднозначная привязка — итога нет, поиск её не снимает (Р49 п. 4–5; ревью КТ1 Р51 № 3)
-    if (outcome.kind === "NONE" || outcome.kind === "AMBIGUOUS") throw new PaymentFailure("OPERATION_RESULT_UNCONFIRMED");
+    // операций заказа нет (ABSENT) — тоже итога нет; повтор после обрыва решает authorize (Р69 п. 4)
+    if (outcome.kind === "NONE" || outcome.kind === "AMBIGUOUS" || outcome.kind === "ABSENT") throw new PaymentFailure("OPERATION_RESULT_UNCONFIRMED");
     return outcome.operation;
   }
 

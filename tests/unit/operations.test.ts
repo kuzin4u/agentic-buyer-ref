@@ -311,10 +311,10 @@ describe("восстановление op_ref: поиск по CART после �
     expect(kinds(s.journal)).toContain("operation.reversed:REVERSAL");
   });
 
-  it("ни одной операции заказа (операция без итога в ответ не входит) — NONE; две — AMBIGUOUS, тоже NONE (не первая)", async () => {
+  it("ни одной операции заказа (операция без итога в ответ не входит) — ABSENT (Р69 п. 4, запись NONE); две — AMBIGUOUS, NONE (не первая)", async () => {
     const s = setup();
     s.lists.set(CART.id, [record("AUTHORIZED", { orderRef: "ord_other" })]);
-    expect(await s.ops.lookup(ORDER, CART)).toEqual({ kind: "NONE" });
+    expect(await s.ops.lookup(ORDER, CART)).toEqual({ kind: "ABSENT" });
     s.lists.set(CART.id, [record("AUTHORIZED"), record("AUTHORIZED", { opRef: "op_2" })]);
     expect(await s.ops.lookup(ORDER, CART)).toEqual({ kind: "NONE" });
     expect(lookups(s.journal)).toEqual([[CART.id, "NONE"], [CART.id, "AMBIGUOUS"]]);

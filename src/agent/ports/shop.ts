@@ -92,10 +92,14 @@ export interface ShopPaymentReply {
   status: "PAID" | "DECLINED" | "REJECTED";
 }
 
-/** Стадия 5: передача пакета продавцу подписанным обращением; не повторяется. Отказ витрины или неизвестный исход —
- *  ShopFailure; иная ошибка вызова — отказ стадии (инвариант 4). */
+/** Стадия 5: передача пакета продавцу подписанным обращением. Отказ витрины — ShopFailure SHOP_ORDER_REFUSED, неизвестный
+ *  исход — SHOP_ORDER_STATE_UNKNOWN; иная ошибка вызова — отказ стадии (инвариант 4). Повтор — только шагами оплаты по
+ *  проверке через Платформу (Р69 п. 4), `attempt` — номер попытки для журнала. `payable` — заказ у витрины ровно один по
+ *  мандату корзины, с этим номером и CREATED (пакет до продавца не дошёл); не прочитано или иначе — false; метода нет —
+ *  повтора нет (fail-closed). */
 export interface ShopPaymentPort {
-  pay(req: ShopPaymentRequest): Promise<ShopPaymentReply>;
+  pay(req: ShopPaymentRequest, attempt?: number): Promise<ShopPaymentReply>;
+  payable?(req: Omit<ShopPaymentRequest, "package">): Promise<boolean>;
 }
 
 /** Что известно шагам оплаты о покупке: только идентификаторы и сумма заказа, без реквизитов (инвариант 1). */

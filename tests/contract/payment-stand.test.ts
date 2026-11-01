@@ -132,7 +132,13 @@ describe("стадия 5 на стенде: реквизит по ПАО и па
     const err = await r.purchase.authorize({ idempotencyKey: "idem-pay-timeout" }).catch((e: unknown) => e);
     expect(err).toBeInstanceOf(PaymentFailure);
     expect(r.purchase.reason).toBe("OPERATION_RESULT_UNCONFIRMED");
-    expect(r.c.journal.entries.filter((e) => e.kind === "shop.call" && e.method?.endsWith("/payment")).map((e) => [e.result, e.detail])).toEqual([["unknown", "NO_RESPONSE"]]);
+    // пакет до витрины не дошёл (заказ CREATED), Платформа — «операций заказа нет», реквизит в сроке: один повтор тем же
+    // пакетом (Р69 п. 4), второй неизвестный исход — без третьего POST
+    expect(r.c.journal.entries.filter((e) => e.kind === "shop.call" && e.method?.endsWith("/payment")).map((e) => [e.attempt, e.result, e.detail])).toEqual([
+      [1, "unknown", "NO_RESPONSE"],
+      [2, "unknown", "NO_RESPONSE"],
+    ]);
+    expect(r.c.journal.entries.filter((e) => e.kind === "payment.retry")).toHaveLength(1);
     const secrets = r.c.issuedSecrets();
     expect(secrets).toHaveLength(2);
     const out = outward(r, err);

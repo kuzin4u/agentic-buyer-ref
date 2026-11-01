@@ -113,6 +113,8 @@ export const AGENT_DIAG_CODES = [
   "CONFIRMATION_UNBOUND",
   // свой предел ожидания решения человека (Р69 п. 2)
   "CONFIRMATION_WAIT_LIMIT",
+  // прерывание ожидания решения человека вызывающим (Р69 п. 3)
+  "CONFIRMATION_ABORTED",
   // причины operation.declined (SPEC §7б, Р48 п. 1): совпадающие с кодом §7а — с приставкой DECLINED_ (код ПАО уже в PAO_DIAG ядра)
   "AOI_MISSING",
   "AOI_MISMATCH",

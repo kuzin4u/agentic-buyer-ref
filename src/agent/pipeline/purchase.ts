@@ -600,9 +600,13 @@ export class Purchase {
    *  (инвариант 8, Р49 п. 5). Итога нет в срок — порт отвечает PaymentFailure OPERATION_RESULT_UNCONFIRMED — STOPPED, место
    *  в окне дробления занято, повторной оплаты нет: из STOPPED переходов нет. Итог выше порога предварительного
    *  подтверждения не требует — его требует ADP (Р47 п. 2). DECLINED — STOPPED с кодом причины (SPEC §7б). Платформа
-   *  требует подтверждения (PaymentFailure CONFIRMATION_REQUIRED порта или ответ CONFIRMATION_REQUIRED) — стадия 4. */
-  authorize(m: Mutation): Promise<Operation> {
+   *  требует подтверждения (PaymentFailure CONFIRMATION_REQUIRED порта или ответ CONFIRMATION_REQUIRED) — стадия 4.
+   *  `signal` вызывающего (Р69 п. 3) — снимок до первого await (Р-205); действует только в стадии 4: прерывание —
+   *  STOPPED CONFIRMATION_ABORTED; уже прерванный при вызове — тот же код без обращений к Платформе. */
+  authorize(m: Mutation, signal?: AbortSignal): Promise<Operation> {
+    const abort = signal;
     return this.#stage("AUTHORIZING", async () => {
+      if (abort?.aborted) this.#halt("CONFIRMATION_ABORTED");
       const c = this.#context();
       this.#prepay(c.intent, c.cart);
       await this.#gate(c.intent, c.cart);
@@ -641,7 +645,7 @@ export class Purchase {
         if (!approved) this.#halt("UNKNOWN");
         return reply;
       });
-      if (op === null) return this.#confirm(c);
+      if (op === null) return this.#confirm(c, abort);
       this.#operation = op;
       this.#authorizedAt = this.now().getTime();
       this.#held(c.intent, c.cart);
@@ -653,14 +657,18 @@ export class Purchase {
   /** Стадия 4 (Т7, Р47 п. 2–6): запрос создала ADP на отказе авторизации — решение человека в приложении банка, агент
    *  сам не подтверждает (инвариант 7). Ожидание — через порт: привязка, уведомление и статус по GET (модуль
    *  confirmations). Канала ссылки к продавцу до AG-13 ч. 2 нет — каждый исход в ч. 1 — STOPPED; переход
-   *  CONFIRMING → AUTHORIZING в ч. 1 не проходит ни один путь. */
-  async #confirm(c: Omit<PaymentContext, "signal" | "sending">): Promise<never> {
+   *  CONFIRMING → AUTHORIZING в ч. 1 не проходит ни один путь. Прерывание вызывающим (Р69 п. 3) — CONFIRMATION_ABORTED:
+   *  место в окне уже занято (UNKNOWN), запрос в банке не отменяется (метода в ПАО 1.4.0 нет). */
+  async #confirm(c: Omit<PaymentContext, "signal" | "sending">, abort: AbortSignal | undefined): Promise<never> {
     this.#machine.to("CONFIRMING");
+    const stopped = this.#machine.stopped;
+    const until = abort === undefined ? stopped : AbortSignal.any([stopped, abort]);
     const outcome = await this.#guard(async () => {
       try {
-        return await this.o.payment.confirm(this.#forPayment(c), () => this.#notify("CONFIRMATION_PENDING"), this.#machine.stopped);
+        return await this.o.payment.confirm(this.#forPayment(c), () => this.#notify("CONFIRMATION_PENDING"), until);
       } catch (e) {
-        if (e === this.#machine.stopped.reason) throw this.#stopped(this.#machine.reason ?? "UNKNOWN");
+        if (stopped.aborted && e === stopped.reason) throw this.#stopped(this.#machine.reason ?? "UNKNOWN");
+        if (abort?.aborted && e === abort.reason) this.#halt("CONFIRMATION_ABORTED");
         throw e;
       }
     });

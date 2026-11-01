@@ -20,7 +20,7 @@ import type { LiveOfferSource } from "../ports/catalog.js";
 import type { FeedItem } from "../ports/events.js";
 import type { Mutation } from "../ports/mutation.js";
 import { orderRefIssue, type OrderRefIssue } from "../payment-package/order-ref.js";
-import { PaymentFailure, ShopFailure, type ConfirmationOutcome, type OfferSource, type PaymentContext, type NoticeAmount, type PaymentSteps, type PurchaseNotice, type ShopOffers, type ShopOrder, type ShopPort, type ShopUnavailable, type ShopUnavailableCause } from "../ports/shop.js";
+import { PaymentFailure, ShopFailure, type ConfirmationOutcome, type OfferSource, type PaymentContext, type NoticeAmount, type NoticeLink, type PaymentSteps, type PurchaseNotice, type PurchaseNotify, type ShopOffers, type ShopOrder, type ShopPort, type ShopUnavailable, type ShopUnavailableCause } from "../ports/shop.js";
 import { PurchaseMachine, PurchaseTransitionForbidden, allowed, type PurchaseJournal, type PurchaseState, type StopCause } from "./machine.js";
 
 /** Почему оставлен CART (Р46 п. 3): новый поиск из CART_ACTIVE или отказ живой проверки перед заказом. */
@@ -229,10 +229,11 @@ export interface PurchaseOptions {
   signingStopped?: () => boolean;
   /** регион человека из профиля; нет — доступен только самовывоз (Р32 п. 5) */
   region?: string;
-  /** уведомление оболочки (Р47 п. 5, В3; Р49 п. 7): CONFIRMATION_PENDING — один раз на запрос подтверждения, без link;
+  /** уведомление оболочки (Р47 п. 5, В3; Р49 п. 7): CONFIRMATION_PENDING — один раз на запрос подтверждения, вторым
+   *  аргументом `{ link }` — адрес страницы УПК, если он безопасен (Р69 п. 5; нет — подтверждение в приложении банка);
    *  SCOPE_* — запись об исполнении не WITHIN_LIMITS; OPERATION_REFUNDED — возврат (Р51 п. 3); `amount` — сумма списания
    *  по операции у SCOPE_* и OPERATION_REFUNDED; конвейер его не ждёт, сбой — запись notify.failed, исход не меняется */
-  notify?: (code: PurchaseNotice, amount?: NoticeAmount) => void | Promise<void>;
+  notify?: PurchaseNotify;
   now?: () => Date;
 }
 
@@ -246,6 +247,7 @@ const CONFIRMATION_STOP: Readonly<Record<ConfirmationOutcome, DiagCode>> = {
   REJECTED: "CONFIRMATION_REJECTED",
   EXPIRED: "CONFIRMATION_EXPIRED",
   UNBOUND: "CONFIRMATION_UNBOUND",
+  WAIT_LIMIT: "CONFIRMATION_WAIT_LIMIT",
   NONE: "OPERATION_RESULT_UNCONFIRMED",
   UNKNOWN: "UNKNOWN",
 };
@@ -599,9 +601,13 @@ export class Purchase {
    *  (инвариант 8, Р49 п. 5). Итога нет в срок — порт отвечает PaymentFailure OPERATION_RESULT_UNCONFIRMED — STOPPED, место
    *  в окне дробления занято, повторной оплаты нет: из STOPPED переходов нет. Итог выше порога предварительного
    *  подтверждения не требует — его требует ADP (Р47 п. 2). DECLINED — STOPPED с кодом причины (SPEC §7б). Платформа
-   *  требует подтверждения (PaymentFailure CONFIRMATION_REQUIRED порта или ответ CONFIRMATION_REQUIRED) — стадия 4. */
-  authorize(m: Mutation): Promise<Operation> {
+   *  требует подтверждения (PaymentFailure CONFIRMATION_REQUIRED порта или ответ CONFIRMATION_REQUIRED) — стадия 4.
+   *  `signal` вызывающего (Р69 п. 3) — снимок до первого await (Р-205); действует только в стадии 4: прерывание —
+   *  STOPPED CONFIRMATION_ABORTED; уже прерванный при вызове — тот же код без обращений к Платформе. */
+  authorize(m: Mutation, signal?: AbortSignal): Promise<Operation> {
+    const abort = signal;
     return this.#stage("AUTHORIZING", async () => {
+      if (abort?.aborted) this.#halt("CONFIRMATION_ABORTED");
       const c = this.#context();
       this.#prepay(c.intent, c.cart);
       await this.#gate(c.intent, c.cart);
@@ -640,7 +646,7 @@ export class Purchase {
         if (!approved) this.#halt("UNKNOWN");
         return reply;
       });
-      if (op === null) return this.#confirm(c);
+      if (op === null) return this.#confirm(c, abort);
       this.#operation = op;
       this.#authorizedAt = this.now().getTime();
       this.#held(c.intent, c.cart);
@@ -652,14 +658,19 @@ export class Purchase {
   /** Стадия 4 (Т7, Р47 п. 2–6): запрос создала ADP на отказе авторизации — решение человека в приложении банка, агент
    *  сам не подтверждает (инвариант 7). Ожидание — через порт: привязка, уведомление и статус по GET (модуль
    *  confirmations). Канала ссылки к продавцу до AG-13 ч. 2 нет — каждый исход в ч. 1 — STOPPED; переход
-   *  CONFIRMING → AUTHORIZING в ч. 1 не проходит ни один путь. */
-  async #confirm(c: Omit<PaymentContext, "signal" | "sending">): Promise<never> {
+   *  CONFIRMING → AUTHORIZING в ч. 1 не проходит ни один путь. Прерывание вызывающим (Р69 п. 3) — CONFIRMATION_ABORTED:
+   *  место в окне уже занято (UNKNOWN), запрос в банке не отменяется (метода в ПАО 1.4.0 нет). */
+  async #confirm(c: Omit<PaymentContext, "signal" | "sending">, abort: AbortSignal | undefined): Promise<never> {
     this.#machine.to("CONFIRMING");
+    const stopped = this.#machine.stopped;
+    const until = abort === undefined ? stopped : AbortSignal.any([stopped, abort]);
     const outcome = await this.#guard(async () => {
       try {
-        return await this.o.payment.confirm(this.#forPayment(c), () => this.#notify("CONFIRMATION_PENDING"), this.#machine.stopped);
+        // ссылка страницы УПК — только оболочке, не в журнал (Р69 п. 5)
+        return await this.o.payment.confirm(this.#forPayment(c), (link) => this.#notify("CONFIRMATION_PENDING", link === undefined ? undefined : { link }), until);
       } catch (e) {
-        if (e === this.#machine.stopped.reason) throw this.#stopped(this.#machine.reason ?? "UNKNOWN");
+        if (stopped.aborted && e === stopped.reason) throw this.#stopped(this.#machine.reason ?? "UNKNOWN");
+        if (abort?.aborted && e === abort.reason) this.#halt("CONFIRMATION_ABORTED");
         throw e;
       }
     });
@@ -673,7 +684,7 @@ export class Purchase {
   readonly #late = (code: PurchaseNotice, amount?: NoticeAmount): void => this.#notify(code, amount);
 
   /** Уведомление оболочки (В3): не ждётся; исключение и отказ обещания — запись notify.failed, исход не меняется. */
-  #notify(code: PurchaseNotice, amount?: NoticeAmount): void {
+  #notify(code: PurchaseNotice, amount?: NoticeAmount | NoticeLink): void {
     const failed = () => {
       try {
         this.#record({ kind: "notify.failed", reason: code });
@@ -682,7 +693,7 @@ export class Purchase {
       }
     };
     try {
-      // сумма — копией: оболочка не меняет снимок операции покупки
+      // сумма (и ссылка) — копией: оболочка не меняет снимок операции покупки
       const r = amount === undefined ? this.o.notify?.(code) : this.o.notify?.(code, { ...amount });
       if (r !== undefined) Promise.resolve(r).catch(failed);
     } catch {

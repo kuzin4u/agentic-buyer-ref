@@ -720,6 +720,46 @@ describe("адаптер витрин (Р42)", () => {
     expect(seen).toEqual([]);
   });
 
+  describe("оплата: неизвестный исход и чтение заказа перед повтором (Р69 п. 4)", () => {
+    const pkg = sealPackage({ credential_ref: "CRD-1", kind: "CARD", payload: { token_ref: "tok_test", cryptogram: "c", valid_to: "2026-10-22T10:00:00Z" }, aoi: { indicator: true, agent_code: "nspk:agent:test:v1", mandate_id: "mnd_1" }, cart_mandate_id: "mnd_1", order_ref: "ord_1" });
+    const PAY = "POST /v1/shops/S1/orders/ord_1/payment";
+    const req = { shopId: "S1", orderId: "ord_1", cartMandateId: "mnd_1" };
+    const ORD = (over: Record<string, unknown> = {}) => ({ id: "ord_1", total: 39000, currency: "RUB", cart_mandate_id: "mnd_1", status: "CREATED", ...over });
+    const read = (...orders: unknown[]): Answer => ({ status: 200, body: { orders } });
+
+    it.each([
+      ["502 без тела", { status: 502, body: undefined }, "SHOP_ORDER_STATE_UNKNOWN", "unknown"],
+      ["504 с кодом вне перечня", { status: 504, body: { code: "GATEWAY_TIMEOUT" } }, "SHOP_ORDER_STATE_UNKNOWN", "unknown"],
+      ["503 с кодом витрины", { status: 503, body: { code: "UPSTREAM_UNAVAILABLE" } }, "SHOP_ORDER_REFUSED", "refused"],
+      ["409 ORDER_NOT_PAYABLE", { status: 409, body: { code: "ORDER_NOT_PAYABLE" } }, "SHOP_ORDER_REFUSED", "refused"],
+    ] as [string, Answer, string, string][])("%s — %s; попытка — в записи", async (_, answer, code, result) => {
+      const { a, journal } = adapter({ [PAY]: [answer] });
+      const err = await a.pay({ ...req, package: pkg }, 2).catch((e: unknown) => e);
+      expect((err as ShopFailure).code).toBe(code);
+      expect(calls(journal)).toEqual([["POST /v1/shops/{id}/orders/{order_id}/payment", 2, result, expect.anything()]]);
+    });
+
+    it("payable: один заказ CREATED с этим номером и мандатом — true, строка запроса по мандату корзины", async () => {
+      const { a, seen } = adapter({ "GET /v1/shops/S1/orders": [read(ORD())] });
+      expect(await a.payable(req)).toBe(true);
+      expect(seen.map((s) => [s.method, s.path, s.query])).toEqual([["GET", "/v1/shops/S1/orders", "?cart_mandate_id=mnd_1"]]);
+    });
+
+    it.each([
+      ["пусто", read(), "unknown", "NO_ORDER"],
+      ["два заказа", read(ORD(), ORD({ id: "ord_2" })), "unknown", "MULTIPLE"],
+      ["заказ PAYING (пакет дошёл)", read(ORD({ status: "PAYING" })), "unknown", "NOT_CREATED"],
+      ["чужой мандат", read(ORD({ cart_mandate_id: "mnd_other" })), "unknown", "FOREIGN_MANDATE"],
+      ["другой номер заказа", read(ORD({ id: "ord_2" })), "unknown", "OTHER_ORDER"],
+      ["нет ответа", "fail", "unknown", "NO_RESPONSE"],
+      ["не по схеме", { status: 200, body: {} }, "refused", "BAD_RESPONSE"],
+    ] as [string, Answer, string, string][])("payable: %s — false, причина в записи чтения", async (_, answer, result, detail) => {
+      const { a, journal } = adapter({ "GET /v1/shops/S1/orders": [answer] });
+      expect(await a.payable(req)).toBe(false);
+      expect(calls(journal).at(-1)).toEqual(["GET /v1/shops/{id}/orders", 1, result, detail]);
+    });
+  });
+
   it("живая проверка: sku у двух витрин — отказ без обращения; иначе цена и наличие из каталога витрины", async () => {
     const { a, seen } = adapter({ ...LIST(shop("S1"), shop("S2")), ...catalog("S1", ok(ITEM, { ...ITEM, sku: "B2" })), ...catalog("S2", ok(ITEM)) });
     await a.search();

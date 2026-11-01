@@ -119,7 +119,9 @@ function mandateOf(op: PaoOperationKey, args: unknown, r?: unknown): string | un
     (op.includes("/mandates/{id}") ? field(a.path, "id") : undefined) ??
     field(a.query, "mandate_id") ??
     field(a.body, "mandate_id") ??
-    (op === "POST /pao/v1/mandates" ? field(r, "id") : undefined);
+    (op === "POST /pao/v1/mandates" ? field(r, "id") : undefined) ??
+    // чтение реквизита (дополнение 1 к Р69 п. 4): в пути — только credential_ref, его в журнал не пишем; мандат — из aoi ответа
+    (op === "GET /pao/v1/credentials/{ref}" ? field(field(r, "aoi"), "mandate_id") : undefined);
   return map.safeId(v) ?? undefined;
 }
 
@@ -760,6 +762,16 @@ export class PaoPlatform implements PaymentPlatform {
       { body: map.confirmationDraftToPao(draft, this.cur), idempotencyKey: keyOf(m) },
       map.confirmationFromPao,
     );
+  }
+
+  /** Статус своего реквизита перед повтором оплаты (дополнение 1 к Р69 п. 4): `credential_ref` и `aoi` (этот агент, мандат
+   *  CART) — как у выданного, иначе BAD_RESPONSE; `payload` (криптограмма пересчитана, ПАО §3) отбрасывается — ядру только
+   *  `Credential` (инвариант 1). Не для опроса: один раз на покупку, только на пути повтора. */
+  credentialStatus(ref: string, mandateId: string) {
+    return this.call("GET /pao/v1/credentials/{ref}", { path: { ref } }, (r) => {
+      if (r.credential_ref !== ref) throw new PlatformFailure("BAD_RESPONSE", "never", null, 200, null, "ответ ПАО неполон: credential_ref — не запрошенный");
+      return map.credentialFromPao(r, mandateId, this.o.agentCode);
+    });
   }
 
   getConfirmation(id: string) {

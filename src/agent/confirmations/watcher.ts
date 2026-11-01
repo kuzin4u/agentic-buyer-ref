@@ -2,7 +2,10 @@
 // по GET /pao/v1/confirmations/{id}, событие без GET ничего не меняет (Р34). Запрос создаёт ADP на отказе авторизации
 // продавца; в ответе Платформы нет ни мандата, ни order_ref, поэтому запрос относится к покупке, только если его ждёт
 // ровно одна покупка (4а): ошибка привязки денег не стоит — ADP сверяет ссылку с мандатом, продавцом, суммой и order_ref.
-// link и confirmation_ref дальше разбора ответа не идут: ни в журнал, ни в исход, ни человеку (инвариант 1, Р47 п. 5).
+// confirmation_ref дальше разбора ответа не идёт: ни в журнал, ни в исход, ни человеку (инвариант 1, Р47 п. 5). link —
+// только оболочке в уведомлении PENDING и только безопасный (`pageLink`: https:, без логина и пароля; Р69 п. 5), не в
+// журнал, не в исход и не в тексты ошибок.
+import { pageLink } from "./link.js";
 import { poll } from "../events/poll.js";
 import { SeenWindow } from "../events/seen.js";
 import type { FeedItem } from "../ports/events.js";
@@ -34,7 +37,7 @@ export interface ConfirmationsOptions {
   port: ConfirmationsPort;
   journal: ConfirmationsJournal;
   /** event_poll_interval_ms — пауза опроса после отказа ленты (ревью КТ1 AG-11 ч. 2 № 3); нет — опрос прекращается */
-  params: { confirmation_wait_ms: number; signature_skew_sec: number; event_seen_max: number; event_poll_interval_ms?: number };
+  params: { confirmation_wait_ms: number; confirmation_decision_max_sec: number; signature_skew_sec: number; event_seen_max: number; event_poll_interval_ms?: number };
   /** прочитать ленту (`EventFeed.signal`): ожидание будит её, пока не решится; частоту чтений ограничивает лента */
   wake?: () => Promise<void>;
   now?: () => Date;
@@ -42,23 +45,27 @@ export interface ConfirmationsOptions {
   timer?: (fn: () => void, ms: number) => () => void;
 }
 
-/** Вход ожидания: `onPending` — один вызов на запрос, когда он PENDING; без link (Р47 п. 5, В3). Модуль его не ждёт:
- *  исключение и отказ обещания — запись notify.failed, исход не меняется. */
+/** Вход ожидания: `onPending` — один вызов на запрос, когда он PENDING; `link` — адрес страницы УПК из GET, если он
+ *  безопасен (Р69 п. 5), иначе нет — человек подтверждает в приложении банка. Модуль его не ждёт: исключение и отказ
+ *  обещания — запись notify.failed, исход не меняется. */
 export interface WaitOptions {
   signal: AbortSignal;
-  onPending?: () => void | Promise<void>;
+  onPending?: (link?: string) => void | Promise<void>;
 }
 
 type JournalEntry = Parameters<ConfirmationsJournal["record"]>[0];
 type WithoutAt<T> = T extends unknown ? Omit<T, "at"> : never;
 
-/** Статус по GET без link и confirmation_ref; FAILED — GET не дал подтверждённого статуса. */
-type Read = { status: Confirmation["status"]; expiresAt: string | null } | "FAILED";
+/** Статус по GET без confirmation_ref; `link` — только безопасный адрес страницы УПК или null; FAILED — GET не дал
+ *  подтверждённого статуса. */
+type Read = { status: Confirmation["status"]; expiresAt: string | null; link: string | null } | "FAILED";
 
 interface Waiter {
   readonly onPending: WaitOptions["onPending"];
   /** привязанный запрос; null — ждёт запрос */
   id: string | null;
+  /** свой предел ожидания решения (Р69 п. 2): время привязки + confirmation_decision_max_sec, мс; до привязки — null */
+  limit: number | null;
   settled: boolean;
   cancel: (() => void) | null;
   finish(o: ConfirmationOutcome): void;
@@ -148,7 +155,7 @@ export class Confirmations {
         signal.removeEventListener("abort", onAbort);
         done();
       };
-      const w: Waiter = { onPending, id: null, settled: false, cancel: null, finish: (outcome) => end(() => resolve(outcome)) };
+      const w: Waiter = { onPending, id: null, limit: null, settled: false, cancel: null, finish: (outcome) => end(() => resolve(outcome)) };
       signal.addEventListener("abort", onAbort, { once: true });
       if (this.#unclaimed.size === 1 && this.#waiters.size === 0) {
         const [id, held] = [...this.#unclaimed][0]!;
@@ -232,7 +239,15 @@ export class Confirmations {
     }, this.#o.params.confirmation_wait_ms);
     const seq = ++this.#held;
     this.#unclaimed.set(id, { read, drop, seq });
-    this.#record({ kind: "confirmation.unclaimed", ref: id });
+    // запись — до действия (Р69 п. 1): без записи запрос не хранится и о нём не оповещают (Т15 — особое событие);
+    // ошибка журнала — наружу, слушатель не отмечает событие обработанным, лента прочитает его снова (fail-closed)
+    try {
+      this.#record({ kind: "confirmation.unclaimed", ref: id });
+    } catch (e) {
+      drop();
+      this.#unclaimed.delete(id);
+      throw e;
+    }
     for (const a of [...this.#arrivals]) if (seq > a.after) a.arrived();
   }
 
@@ -261,9 +276,14 @@ export class Confirmations {
     });
   }
 
+  /** Журнал не отменяет действие (Р69 п. 1, дополнение 1 к Р58): запись — в try, исход ожидающих — в finally; при сбое
+   *  журнала покупки останавливаются сразу, а не досиживают до таймера; ошибка журнала — наружу. */
   #unbound(id: string | undefined, waiting: Waiter[]): void {
-    this.#record({ kind: "confirmation.unbound", ...(id !== undefined && { ref: id }) });
-    for (const w of waiting) w.finish("UNBOUND");
+    try {
+      this.#record({ kind: "confirmation.unbound", ...(id !== undefined && { ref: id }) });
+    } finally {
+      for (const w of waiting) w.finish("UNBOUND");
+    }
   }
 
   #bind(id: string, w: Waiter, read: Read): void {
@@ -271,6 +291,7 @@ export class Confirmations {
     w.cancel?.();
     w.cancel = null;
     w.id = id;
+    w.limit = this.#now().getTime() + this.#o.params.confirmation_decision_max_sec * 1000;
     this.#bound.set(id, w);
     this.#apply(id, w, read);
   }
@@ -282,28 +303,29 @@ export class Confirmations {
     if (read.status !== "PENDING") return w.finish(read.status);
     if (!this.#notified.has(id)) {
       this.#notified.add(id);
-      this.#notify(w);
+      this.#notify(w, read.link);
     }
     if (w.cancel === null) this.#schedule(id, w, read.expiresAt);
   }
 
   /** Уведомление — не часть исхода (В3): ни исключение, ни отказ обещания оболочки покупку не меняют и не ждутся. */
-  #notify(w: Waiter): void {
+  #notify(w: Waiter, link: string | null): void {
     const failed = () => this.#record({ kind: "notify.failed", reason: "CONFIRMATION_PENDING" });
     try {
-      const r = w.onPending?.();
+      const r = link === null ? w.onPending?.() : w.onPending?.(link);
       if (r !== undefined) Promise.resolve(r).catch(failed);
     } catch {
       failed();
     }
   }
 
-  /** Истечение отмечается только при обращении (РП51 п. 6): после expires_at + signature_skew_sec — один GET. */
+  /** Истечение отмечается только при обращении (РП51 п. 6): после expires_at + signature_skew_sec — один GET. Свой предел
+   *  (Р69 п. 2) раньше срока Платформы — один GET в предел. */
   #schedule(id: string, w: Waiter, expiresAt: string | null): void {
     // только RFC 3339 (`format: date-time` ПАО): Date.parse принимает и «2026» (ревью reviewer К2 № 8)
     const deadline = expiresAt === null || !RFC3339.test(expiresAt) ? Number.NaN : Date.parse(expiresAt) + this.#o.params.signature_skew_sec * 1000;
     if (Number.isNaN(deadline)) return w.finish("UNKNOWN");
-    const ms = Math.min(Math.max(deadline - this.#now().getTime(), 0), TIMER_MAX_MS);
+    const ms = Math.min(Math.max(this.#end(w, deadline) - this.#now().getTime(), 0), TIMER_MAX_MS);
     // прежний таймер — отменить: событие и ранний таймер могли поставить по таймеру (ревью reviewer К2 № 5)
     w.cancel?.();
     w.cancel = this.#timer(() => {
@@ -321,12 +343,17 @@ export class Confirmations {
     if (w.settled) return;
     if (read === "FOREIGN" || read === "FAILED") return w.finish("UNKNOWN");
     // таймер сработал раньше срока (предел таймера, ранний таймер — Р46 К2а) — ждать дальше; после срока PENDING —
-    // состояние не подтверждено
+    // состояние не подтверждено; свой предел наступил раньше срока Платформы — WAIT_LIMIT (Р69 п. 2)
     if (read.status === "PENDING") {
-      if (this.#now().getTime() < deadline) return this.#schedule(id, w, read.expiresAt);
-      return w.finish("UNKNOWN");
+      if (this.#now().getTime() < this.#end(w, deadline)) return this.#schedule(id, w, read.expiresAt);
+      return w.finish(w.limit !== null && w.limit < deadline ? "WAIT_LIMIT" : "UNKNOWN");
     }
     w.finish(read.status);
+  }
+
+  /** Конец ожидания решения: меньшее из срока Платформы и своего предела (Р69 п. 2). */
+  #end(w: Waiter, deadline: number): number {
+    return w.limit === null ? deadline : Math.min(deadline, w.limit);
   }
 
   /** Решение человека или истечение по событию: GET; запрос перестал быть своим — UNKNOWN. */
@@ -350,7 +377,7 @@ export class Confirmations {
     const withRef = typeof c.confirmationRef === "string" && c.confirmationRef !== "";
     if (c.id !== id || !STATUSES.has(c.status) || withRef !== (c.status === "APPROVED") || (!withRef && c.confirmationRef !== null)) return "FAILED";
     this.#record({ kind: "confirmation.status", ref: id, detail: c.status });
-    return { status: c.status, expiresAt: typeof c.expiresAt === "string" ? c.expiresAt : null };
+    return { status: c.status, expiresAt: typeof c.expiresAt === "string" ? c.expiresAt : null, link: c.status === "PENDING" ? pageLink(c.link) : null };
   }
 
   #record(e: WithoutAt<JournalEntry>): void {

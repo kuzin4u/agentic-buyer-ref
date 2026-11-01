@@ -1,6 +1,7 @@
 // Стадия 4 на стенде Платформы v0.17.0 и эмуляторе продавцов (Р47; AG-13 ч. 1, К4): итог выше порога ADP — продавец
 // отвечает DECLINED, ADP создала запрос подтверждения и событие confirmation.required; агент читает GET, уведомляет
-// человека (без link) и ждёт решения в приложении банка (stand.issuer.confirm). Канала confirmation_ref к продавцу на
+// человека (со ссылкой страницы УПК, Р69 п. 5) и ждёт решения в приложении банка (stand.issuer.confirm) или на странице
+// УПК (stand.upk, код — stand.issuer.upkCode). Канала confirmation_ref к продавцу на
 // стенде нет — одобрение: STOPPED CONFIRMATION_NOT_DELIVERED, повтора нет; отказ — CONFIRMATION_REJECTED; срок —
 // CONFIRMATION_EXPIRED по GET после expires_at. П12 — до решения человека (в счёт не идёт до AG-13 ч. 2).
 // ПОДМЕНА ДО PS-11 (решение владельца, вариант (а)): ОПКЦ стенда — заглушка, продавец ADP не достигает; заглушка отвечает
@@ -30,12 +31,15 @@ async function above(o: StandPurchaseOptions = {}) {
   let notified: () => void = () => {};
   const pending = new Promise<void>((res) => (notified = res));
   const codes: string[] = [];
+  /** второй аргумент уведомления: у CONFIRMATION_PENDING — `{ link }` страницы УПК (Р69 п. 5) */
+  const details: unknown[] = [];
   const r = await standPurchase({
     ...o,
     contourPayment: true,
     adpUntilPs11: true,
-    notify: (code) => {
+    notify: (code, detail) => {
       codes.push(code);
+      details.push(detail);
       notified();
     },
   });
@@ -49,7 +53,7 @@ async function above(o: StandPurchaseOptions = {}) {
   const order = await r.purchase.placeOrder({ idempotencyKey: "idem-order-cnf" });
   expect(order.total.amount).toBeGreaterThan(r.c.stand!.params.confirm_above_kop);
   expect(order.total.amount).toBeLessThanOrEqual(INTENT.amountLimit.amount);
-  return { r, codes, pending, intent, cart, order };
+  return { r, codes, details, pending, intent, cart, order };
 }
 
 /** id запроса подтверждения — из записи журнала (GET дал PENDING). */
@@ -79,7 +83,7 @@ function outward(r: Awaited<ReturnType<typeof above>>["r"], err: unknown): strin
 
 describe("стадия 4 на стенде v0.17.0: подтверждение человеком по confirmation.* (Р47)", { timeout: STAND_TIMEOUT_MS }, () => {
   it("одобрение в приложении банка — STOPPED CONFIRMATION_NOT_DELIVERED: ссылка продавцу не уходит, повтора нет, link и confirmation_ref нигде", async () => {
-    const { r, codes, pending, order } = await above();
+    const { r, codes, details, pending, order } = await above();
     const paying = r.purchase.authorize({ idempotencyKey: "idem-pay-cnf" }).catch((e: unknown) => e);
     await pending;
     expect(codes).toEqual(["CONFIRMATION_PENDING"]);
@@ -107,11 +111,47 @@ describe("стадия 4 на стенде v0.17.0: подтверждение �
     expect(count(r, "pao POST /pao/v1/confirmations")).toBe(0);
     const text = outward(r, err);
     expect(text).not.toContain(ref);
-    expect(text).not.toContain("upk.stand");
+    // хост страницы — из ссылки уведомления (ревью КТ2 № 8)
+    expect(text).not.toContain(new URL((details[0] as { link: string }).link).host);
     expect(text).not.toContain(`/c/${id}`);
     // повторной оплаты нет
     await expect(r.purchase.authorize({ idempotencyKey: "idem-pay-cnf" })).rejects.toThrow();
     expect(count(r, "pao POST /pao/v1/credentials")).toBe(1);
+  });
+
+  it("Р69 п. 5: страница УПК — link оболочке (https:), человек решает на странице кодом из банка → APPROVED → CONFIRMATION_NOT_DELIVERED; ссылки нет в журнале и текстах", async () => {
+    const { r, codes, details, pending } = await above();
+    const paying = r.purchase.authorize({ idempotencyKey: "idem-pay-upk" }).catch((e: unknown) => e);
+    await pending;
+    expect(codes).toEqual(["CONFIRMATION_PENDING"]);
+    const id = confirmationId(r);
+    const link = (details[0] as { link?: string } | undefined)?.link;
+    expect(link).toBeDefined();
+    const url = new URL(link!);
+    expect(url.protocol).toBe("https:");
+    expect(url.pathname).toBe(`/c/${id}`);
+    // код страницы человек получает в банке — вне ПАО, агенту недоступен (РП51 п. 15)
+    const code = await r.c.stand!.issuer.upkCode(id);
+    expect(code).toMatch(/\S/);
+    const page = await r.c.stand!.upk.app.inject({
+      method: "POST",
+      url: url.pathname,
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      payload: new URLSearchParams({ decision: "APPROVE", instrument: "CARD", code: code! }).toString(),
+    });
+    expect(page.statusCode).toBe(200);
+    const err = await paying;
+    // до ч. 2б канала confirmation_ref к продавцу нет (Р69 п. 0)
+    expect(err).toMatchObject({ code: "CONFIRMATION_NOT_DELIVERED" });
+    expect(r.c.journal.entries.filter((e) => e.kind === "confirmation.status").map((e) => [e.ref, e.detail])).toEqual([
+      [id, "PENDING"],
+      [id, "APPROVED"],
+    ]);
+    const text = outward(r, err);
+    expect(text).not.toContain(link!);
+    // хост страницы — из самой ссылки, а не литералом настройки стенда (ревью КТ2 № 8)
+    expect(text).not.toContain(url.host);
+    expect(text).not.toContain(code!);
   });
 
   it("отказ в приложении банка — STOPPED CONFIRMATION_REJECTED, ничего не повторяется", async () => {

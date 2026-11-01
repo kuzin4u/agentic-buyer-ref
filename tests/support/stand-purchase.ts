@@ -13,7 +13,7 @@ import { Operations } from "../../src/agent/operations/index.js";
 import { ContourPayment } from "../../src/agent/payment-package/index.js";
 import { Purchase } from "../../src/agent/pipeline/index.js";
 import { OrderPriceMismatches, SplitWindow } from "../../src/agent/policy/index.js";
-import type { FeedItem, HttpRequestSigning, NoticeAmount, PaymentPlatform, PurchaseNotice } from "../../src/agent/ports/index.js";
+import type { FeedItem, HttpRequestSigning, PaymentPlatform, PurchaseNotify } from "../../src/agent/ports/index.js";
 import { loadParams, parseParams, type StandParams } from "../../src/shared/config.js";
 import type { DiagCode } from "../../src/shared/diag-codes.js";
 import type { Mandate } from "../../src/shared/domain.js";
@@ -133,7 +133,7 @@ export interface StandPurchaseOptions {
   /** выдача реквизита поверх настоящей платформы контура — действие теста посреди стадии 5 (параллельный вызов, Р45 Б2в) */
   issue?: (real: PaymentPlatform["issuePaymentPackage"]) => PaymentPlatform["issuePaymentPackage"];
   /** уведомление оболочки (Р47 п. 5, В3) */
-  notify?: (code: PurchaseNotice, amount?: NoticeAmount) => void | Promise<void>;
+  notify?: PurchaseNotify;
   /** часы клиента ПАО и модуля подтверждений — тест двигает их вместе с часами стенда (истечение, РП51 п. 6) */
   now?: () => Date;
   /** часы конвейера (свежесть живой проверки сравнивается с ними, Р54 п. 6): подпись обращений и ПАО — на своих часах */
@@ -161,7 +161,8 @@ export async function standPurchase(o: StandPurchaseOptions = {}) {
   // тестовый порт остаётся для проверок «обращений к оплате не было»; конвейер получает шаги contour, если заданы
   const payment = payments();
   const real: PaymentPlatform["issuePaymentPackage"] = (d, m) => c.platform.issuePaymentPackage(d, m);
-  const platform = { issuePaymentPackage: o.issue ? o.issue(real) : real };
+  // статус реквизита перед повтором оплаты — у настоящего адаптера (дополнение 1 к Р69 п. 4)
+  const platform = { issuePaymentPackage: o.issue ? o.issue(real) : real, credentialStatus: (ref: string, mandateId: string) => c.platform.credentialStatus(ref, mandateId) };
   const params = parseParams({ ...c.params, ...o.params });
   // модули подтверждений и операций на ленте стенда, как у места сборки (compose): wake — одно чтение ленты со своим
   // курсором, событие — обоим слушателям; слушатель упал — курсор на месте, событие прочитается снова (Р34 п. 3)

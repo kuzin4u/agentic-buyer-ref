@@ -685,6 +685,46 @@ describe("Р51 п. 5: GET /pao/v1/operations?mandate_id — операции д�
   });
 });
 
+describe("дополнение 1 к Р69 п. 4: GET /pao/v1/credentials/{ref} — статус реквизита перед повтором оплаты", () => {
+  const body = { credential_ref: "cr_1", kind: "CARD", payload: { token_ref: "tok_ref_2", cryptogram: "CRYPTOGRAM_REREAD", valid_to: "2026-11-01T12:10:00Z" }, aoi: { indicator: true, agent_code: AGENT, mandate_id: "m_cart_1" }, status: "USED" };
+
+  it("ядру — статус, срок, ссылка и признак без payload; в пути — ссылка, без Idempotency-Key; в журнале — мандат, ссылки и платёжных данных нет", async () => {
+    const urls: string[] = [];
+    const inits: RequestInit[] = [];
+    const journal = new MemoryJournal();
+    const platform = new PaoPlatform({
+      journal,
+      baseUrl: "http://pao.test",
+      agentCode: AGENT,
+      signing,
+      params,
+      sleep: async () => {},
+      fetch: async (url, init) => (urls.push(String(url)), inits.push(init ?? {}), json(200, body)),
+    });
+    const c = await platform.credentialStatus("cr_1", "m_cart_1");
+    expect(c).toEqual({ credentialRef: "cr_1", channel: "CARD", status: "USED", validTo: "2026-11-01T12:10:00Z", indicator: { agentCode: AGENT, mandateId: "m_cart_1" } });
+    expect(new URL(urls[0]!).pathname).toBe("/pao/v1/credentials/cr_1");
+    expect(inits[0]!.method ?? "GET").toBe("GET");
+    expect(Object.keys((inits[0]!.headers ?? {}) as Record<string, string>).map((h) => h.toLowerCase())).not.toContain("idempotency-key");
+    expect(JSON.stringify(c)).not.toMatch(/tok_ref_2|CRYPTOGRAM_REREAD/);
+    const calls = journal.entries.filter((e) => e.kind === "pao.call");
+    expect(calls.map((e) => [e.method, e.result, e.mandate])).toEqual([["GET /pao/v1/credentials/{ref}", "ok", "m_cart_1"]]);
+    expect(JSON.stringify(journal.entries)).not.toMatch(/cr_1|tok_ref_2|CRYPTOGRAM_REREAD/);
+  });
+
+  it("ссылка не та, признак чужой или не того мандата — BAD_RESPONSE (повтора нет); 409 CREDENTIAL_INVALID — PlatformFailure", async () => {
+    const cases: [string, unknown][] = [
+      ["другая ссылка", { ...body, credential_ref: "cr_2" }],
+      ["чужой агент", { ...body, aoi: { ...body.aoi, agent_code: "nspk:agent:other:v1" } }],
+      ["другой мандат", { ...body, aoi: { ...body.aoi, mandate_id: "m_other" } }],
+    ];
+    for (const [name, b] of cases) {
+      await expect(fake(() => json(200, b)).platform.credentialStatus("cr_1", "m_cart_1"), name).rejects.toMatchObject({ code: "BAD_RESPONSE" });
+    }
+    await expect(fake(() => json(409, { code: "CREDENTIAL_INVALID", message: "x" })).platform.credentialStatus("cr_1", "m_cart_1")).rejects.toBeInstanceOf(PlatformFailure);
+  });
+});
+
 describe("Р53 ревью К2.1 № 8 (Р58, К1.3): сбой журнала не отменяет остановку и смену ключа", () => {
   /** журнал, отказывающий на записи вида `kind` */
   const broken = (kind: string) => ({ record: (e: { kind: string }) => { if (e.kind === kind) throw new Error("журнал недоступен"); } });

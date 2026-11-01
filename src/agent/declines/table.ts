@@ -178,6 +178,8 @@ export const PAYMENT_OUTCOME_CODES: ReadonlySet<DiagCode> = new Set<DiagCode>([
   "CONFIRMATION_EXPIRED",
   "CONFIRMATION_UNBOUND",
   "CONFIRMATION_NOT_DELIVERED",
+  "CONFIRMATION_WAIT_LIMIT",
+  "CONFIRMATION_ABORTED",
   "OPERATION_RESULT_UNCONFIRMED",
   "OPERATION_REPLY_MISMATCH",
   // реверсал или истечение авторизации (Р51 п. 3): итог известен — оплата отменена

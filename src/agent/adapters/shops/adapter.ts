@@ -134,8 +134,9 @@ const Orders = z.object({
 });
 /** POST заказа — не больше двух: второй только после чтения «заказа нет» (Р55 п. 4, инвариант 9). */
 const ORDER_POSTS = 2;
-/** Чтение по схеме, но заказа для продолжения нет (Р55, ревью КТ1 № 7): заказов больше одного, мандат не тот, не CREATED. */
-type OrderMiss = "MULTIPLE" | "FOREIGN_MANDATE" | "NOT_CREATED";
+/** Чтение по схеме, но заказа для продолжения нет (Р55, ревью КТ1 № 7): заказов больше одного, мандат не тот, не CREATED;
+ *  перед повтором оплаты (Р69 п. 4) — ещё заказа нет или номер другой. */
+type OrderMiss = "MULTIPLE" | "FOREIGN_MANDATE" | "NOT_CREATED" | "NO_ORDER" | "OTHER_ORDER";
 
 type Method =
   | "GET /v1/shops"
@@ -433,28 +434,48 @@ export class ShopsAdapter implements OfferSource, LiveOfferSource, ShopPort, Sho
   }
 
   /** Стадия 5: пакет агентской оплаты продавцу (Р45 п. 4) — подписанным обращением, `content-digest` покрывает тело
-   *  (подпись пакета, ПАО §4); не повторяется (как заказ). Тело — только в запросе: в журнал, исключения и сообщения оно не
-   *  попадает. Отказ витрины — SHOP_ORDER_REFUSED; нет ответа в срок или ответ не по схеме — SHOP_ORDER_STATE_UNKNOWN. Статус
-   *  заказа из ответа — detail записи shop.call: это слова продавца, а не итог операции (инвариант 8). */
-  async pay(req: ShopPaymentRequest): Promise<ShopPaymentReply> {
+   *  (подпись пакета, ПАО §4); сам адаптер обращение не повторяет (как заказ) — один повтор тем же пакетом решают шаги
+   *  оплаты по проверке через Платформу (Р69 п. 4), номер попытки — `attempt` для журнала. Тело — только в запросе: в журнал, исключения и сообщения оно не
+   *  попадает. Отказ витрины — SHOP_ORDER_REFUSED; нет ответа в срок, ответ не по схеме или 5xx без кода из перечня
+   *  витрин (как у заказа, Р55 п. 2; Р69 п. 4) — SHOP_ORDER_STATE_UNKNOWN. Статус заказа из ответа — detail записи
+   *  shop.call: это слова продавца, а не итог операции (инвариант 8). */
+  async pay(req: ShopPaymentRequest, attempt = 1): Promise<ShopPaymentReply> {
     const method: Method = "POST /v1/shops/{id}/orders/{order_id}/payment";
     if (!SHOP_ID.test(req.shopId) || !ORDER_REF.test(req.orderId)) throw new Error("id витрины или заказа не по маске");
     const reply = await this.#send("POST", `/v1/shops/${req.shopId}/orders/${req.orderId}/payment`, openPackage(req.package));
     if (reply === null) {
-      this.#log(method, 1, "unknown", req.shopId, { detail: "NO_RESPONSE" }, req.cartMandateId);
+      this.#log(method, attempt, "unknown", req.shopId, { detail: "NO_RESPONSE" }, req.cartMandateId);
       throw new ShopFailure("SHOP_ORDER_STATE_UNKNOWN");
     }
     if (reply.status >= 400) {
-      this.#log(method, 1, "refused", req.shopId, this.#cause(reply.body), req.cartMandateId);
+      const cause = this.#cause(reply.body);
+      // 502 / 504 прокси, пустое тело — пакет мог дойти: исход неизвестен (Р69 п. 4, как Р55 п. 2)
+      if (reply.status >= 500 && cause.reason === "MERCHANT_CODE_UNKNOWN") {
+        this.#log(method, attempt, "unknown", req.shopId, cause, req.cartMandateId);
+        throw new ShopFailure("SHOP_ORDER_STATE_UNKNOWN");
+      }
+      this.#log(method, attempt, "refused", req.shopId, cause, req.cartMandateId);
       throw new ShopFailure("SHOP_ORDER_REFUSED");
     }
     const b = reply.status === 200 ? Paid.safeParse(reply.body) : null;
     if (!b?.success || b.data.id !== req.orderId) {
-      this.#log(method, 1, "unknown", req.shopId, { detail: "BAD_RESPONSE" }, req.cartMandateId);
+      this.#log(method, attempt, "unknown", req.shopId, { detail: "BAD_RESPONSE" }, req.cartMandateId);
       throw new ShopFailure("SHOP_ORDER_STATE_UNKNOWN");
     }
-    this.#log(method, 1, "ok", req.shopId, { detail: b.data.status }, req.cartMandateId);
+    this.#log(method, attempt, "ok", req.shopId, { detail: b.data.status }, req.cartMandateId);
     return { status: b.data.status };
+  }
+
+  /** Перед повтором оплаты (Р69 п. 4): заказы витрины по мандату корзины — ровно один, с этим номером, мандатом и
+   *  CREATED. Продавец ставит PAYING до первого await приёма пакета: CREATED — пакет до него не дошёл. Иначе или не
+   *  прочитано — false; причина — detail записи чтения (NO_ORDER, MULTIPLE, FOREIGN_MANDATE, OTHER_ORDER, NOT_CREATED). */
+  async payable(req: Omit<ShopPaymentRequest, "package">): Promise<boolean> {
+    if (!SHOP_ID.test(req.shopId) || !ORDER_REF.test(req.orderId)) throw new Error("id витрины или заказа не по маске");
+    const path = `/v1/shops/${req.shopId}/orders?cart_mandate_id=${encodeURIComponent(req.cartMandateId)}`;
+    const verdict = ({ orders: [o, ...rest] }: z.infer<typeof Orders>): OrderMiss | null =>
+      o === undefined ? "NO_ORDER" : rest.length > 0 ? "MULTIPLE" : o.cart_mandate_id !== req.cartMandateId ? "FOREIGN_MANDATE" : o.id !== req.orderId ? "OTHER_ORDER" : o.status !== "CREATED" ? "NOT_CREATED" : null;
+    const read = await this.#get("GET /v1/shops/{id}/orders", path, Orders, req.shopId, undefined, undefined, { mandate: req.cartMandateId, verdict });
+    return read.ok;
   }
 
   /** Факты витрины → модель К8 (Р54 п. 4): магазин — из записи списка `entry`, товары — из карточек каталога. Факты

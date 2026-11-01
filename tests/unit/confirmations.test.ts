@@ -16,6 +16,9 @@ const T0 = Date.parse("2026-10-22T12:00:00.000Z");
 const HOLD_MS = 900_000;
 const SKEW_SEC = 300;
 const WAIT_MS = 30_000;
+/** свой предел ожидания решения (Р69 п. 2) — из стендовых параметров (ревью КТ сессии 57 № 10); больше HOLD_MS +
+ *  SKEW_SEC — прежние тесты срока его не задевают (проверка — в первом тесте файла) */
+const DECISION_MAX_SEC = loadParams().confirmation_decision_max_sec;
 const SEEN_MAX = loadParams().event_seen_max;
 
 /** Часы и таймеры теста: время двигает только advance; `early` — первый таймер длиннее `early` срабатывает раньше
@@ -60,7 +63,7 @@ function confirmation(status: Confirmation["status"], over: Partial<Confirmation
   };
 }
 
-function setup(early = 0, seenMax = SEEN_MAX) {
+function setup(early = 0, seenMax = SEEN_MAX, decisionMaxSec = DECISION_MAX_SEC) {
   const c = clock(early);
   const answers = new Map<string, Confirmation | Error>();
   const gets: string[] = [];
@@ -77,7 +80,7 @@ function setup(early = 0, seenMax = SEEN_MAX) {
   const conf = new Confirmations({
     port,
     journal: { record: (e) => void journal.push(e) },
-    params: { confirmation_wait_ms: WAIT_MS, signature_skew_sec: SKEW_SEC, event_seen_max: seenMax },
+    params: { confirmation_wait_ms: WAIT_MS, confirmation_decision_max_sec: decisionMaxSec, signature_skew_sec: SKEW_SEC, event_seen_max: seenMax },
     now: c.now,
     timer: c.timer,
   });
@@ -100,6 +103,27 @@ function setup(early = 0, seenMax = SEEN_MAX) {
 }
 
 describe("модуль подтверждений: сигнал → GET → статус (Р47 п. 3)", () => {
+  it("предусловие файла: стендовый предел решения больше срока Платформы в тестах (HOLD_MS + SKEW_SEC)", () => {
+    expect(DECISION_MAX_SEC * 1000).toBeGreaterThan(HOLD_MS + SKEW_SEC * 1000);
+  });
+
+  it("Р69 п. 5: уведомление PENDING несёт безопасный link страницы УПК; http: и логин в адресе — без ссылки; в журнале ссылки нет", async () => {
+    const cases: [string, string, string | undefined][] = [
+      ["https:", "https://upk.stand/c/cnf_1", "https://upk.stand/c/cnf_1"],
+      ["http:", "http://upk.stand/c/cnf_1", undefined],
+      ["логин и пароль", "https://u:p@upk.stand/c/cnf_1", undefined],
+    ];
+    for (const [name, link, shown] of cases) {
+      const s = setup();
+      const got: (string | undefined)[][] = [];
+      void s.conf.wait({ signal: new AbortController().signal, onPending: (...a: (string | undefined)[]) => void got.push(a) });
+      s.answers.set(ID1, confirmation("PENDING", { link }));
+      await s.event("confirmation.required", ID1);
+      expect(got, name).toEqual([shown === undefined ? [] : [shown]]);
+      expect(JSON.stringify(s.journal), name).not.toContain("upk.stand");
+    }
+  });
+
   it("required → PENDING и одно уведомление; approved → GET → APPROVED; link и confirmation_ref нигде", async () => {
     const s = setup();
     const w = s.waiter();
@@ -204,6 +228,38 @@ describe("модуль подтверждений: сигнал → GET → ст
     expect(w.outcome()).toBe("UNKNOWN");
   });
 
+  it("Р69 п. 2: expires_at далеко в будущем — свой предел от привязки: один GET, PENDING — WAIT_LIMIT; до предела GET нет", async () => {
+    const s = setup();
+    const w = s.waiter();
+    // привязка — через 20 с после начала ожидания: предел считается от неё
+    await s.c.advance(20_000);
+    s.answers.set(ID1, confirmation("PENDING", { expiresAt: new Date(T0 + 10 * 86_400_000).toISOString() }));
+    await s.event("confirmation.required", ID1);
+    await s.c.advance(DECISION_MAX_SEC * 1000 - 1);
+    expect(s.gets).toEqual([ID1]);
+    expect(w.outcome()).toBeUndefined();
+    await s.c.advance(1);
+    expect(s.gets).toEqual([ID1, ID1]);
+    expect(w.outcome()).toBe("WAIT_LIMIT");
+  });
+
+  it("Р69 п. 2: в предел GET дал решение — решение, а не WAIT_LIMIT; срок Платформы раньше предела — прежний путь (UNKNOWN)", async () => {
+    const s = setup(0, SEEN_MAX, 600);
+    const w = s.waiter();
+    s.answers.set(ID1, confirmation("PENDING"));
+    await s.event("confirmation.required", ID1);
+    s.answers.set(ID1, confirmation("APPROVED"));
+    await s.c.advance(600_000);
+    expect(w.outcome()).toBe("APPROVED");
+    // предел 1800 с позже срока Платформы (900 + 300 с): PENDING после срока — UNKNOWN, как без предела
+    const t = setup();
+    const v = t.waiter();
+    t.answers.set(ID1, confirmation("PENDING"));
+    await t.event("confirmation.required", ID1);
+    await t.c.advance(HOLD_MS + SKEW_SEC * 1000);
+    expect(v.outcome()).toBe("UNKNOWN");
+  });
+
   it("нет expires_at или он не RFC 3339 — UNKNOWN", async () => {
     for (const expiresAt of [null, "2026", "22.10.2026 12:15"]) {
       const s = setup();
@@ -294,7 +350,7 @@ describe("модуль подтверждений: сигнал → GET → ст
           if (fail) throw new Error("журнал недоступен");
         },
       },
-      params: { confirmation_wait_ms: WAIT_MS, signature_skew_sec: SKEW_SEC, event_seen_max: SEEN_MAX },
+      params: { confirmation_wait_ms: WAIT_MS, confirmation_decision_max_sec: DECISION_MAX_SEC, signature_skew_sec: SKEW_SEC, event_seen_max: SEEN_MAX },
       now: c.now,
       timer: c.timer,
     });
@@ -318,7 +374,7 @@ describe("модуль подтверждений: сигнал → GET → ст
           if (e.kind === failOn) throw new Error("журнал недоступен");
         },
       },
-      params: { confirmation_wait_ms: WAIT_MS, signature_skew_sec: SKEW_SEC, event_seen_max: SEEN_MAX },
+      params: { confirmation_wait_ms: WAIT_MS, confirmation_decision_max_sec: DECISION_MAX_SEC, signature_skew_sec: SKEW_SEC, event_seen_max: SEEN_MAX },
       now: c.now,
       timer: c.timer,
     });
@@ -364,6 +420,82 @@ describe("привязка запроса к покупке (Р47 п. 4, В1–�
     s.answers.set(ID1, confirmation("APPROVED"));
     await s.event("confirmation.approved", ID1);
     expect(s.gets).toEqual([ID1]);
+  });
+
+  /** Модуль с журналом, падающим на записи вида `failOn()` (КТ1 сессии 39 № 9, Р69 п. 1). */
+  function failingJournal(failOn: () => string | null) {
+    const c = clock();
+    const kinds: string[] = [];
+    const answers = new Map<string, Confirmation>();
+    const conf = new Confirmations({
+      port: { getConfirmation: async (id) => structuredClone(answers.get(id)!) },
+      journal: {
+        record: (e) => {
+          kinds.push(e.kind);
+          if (e.kind === failOn()) throw new Error("журнал недоступен");
+        },
+      },
+      params: { confirmation_wait_ms: WAIT_MS, confirmation_decision_max_sec: DECISION_MAX_SEC, signature_skew_sec: SKEW_SEC, event_seen_max: SEEN_MAX },
+      now: c.now,
+      timer: c.timer,
+    });
+    const item = (id: string, eventId: string): FeedItem => ({ kind: "event", event: { eventId, type: "confirmation.required", at: c.now().toISOString(), mandateId: null, opRef: null, confirmationId: id, declineReason: null } });
+    const waiter = () => {
+      let outcome: ConfirmationOutcome | undefined;
+      void conf.wait({ signal: new AbortController().signal }).then((o) => (outcome = o));
+      return () => outcome;
+    };
+    return { c, kinds, answers, conf, item, waiter };
+  }
+
+  it("Р69 п. 1: сбой записи confirmation.unbound — обе ожидающие UNBOUND сразу, без таймера; ошибка журнала — наружу", async () => {
+    const s = failingJournal(() => "confirmation.unbound");
+    const a = s.waiter();
+    const b = s.waiter();
+    s.answers.set(ID1, confirmation("PENDING"));
+    await expect(s.conf.listener(s.item(ID1, "evt_1"))).rejects.toThrow("журнал недоступен");
+    await settle();
+    // часы не двигались: исход — сразу, а не по confirmation_wait_ms
+    expect([a(), b()]).toEqual(["UNBOUND", "UNBOUND"]);
+    expect(s.kinds).toContain("confirmation.unbound");
+  });
+
+  it("Р69 п. 1: сбой записи confirmation.unclaimed — запрос не хранится, оповещения нет; повтор события с журналом — хранится", async () => {
+    let failOn: string | null = "confirmation.unclaimed";
+    const s = failingJournal(() => failOn);
+    s.answers.set(ID1, confirmation("PENDING"));
+    let arrived = false;
+    void s.conf.arrival(new AbortController().signal, s.conf.mark()).then(() => (arrived = true));
+    await expect(s.conf.listener(s.item(ID1, "evt_1"))).rejects.toThrow("журнал недоступен");
+    await settle();
+    expect(arrived).toBe(false);
+    // покупка, начавшая ждать, запрос без записи не берёт — NONE по confirmation_wait_ms
+    const w = s.waiter();
+    await settle();
+    expect(w()).toBeUndefined();
+    await s.c.advance(WAIT_MS);
+    expect(w()).toBe("NONE");
+    // событие не отмечено обработанным: повтор того же event_id при работающем журнале — запрос хранится
+    failOn = null;
+    await s.conf.listener(s.item(ID1, "evt_1"));
+    await settle();
+    expect(arrived).toBe(true);
+    expect(s.kinds.filter((k) => k === "confirmation.unclaimed")).toHaveLength(2);
+  });
+
+  it("ревью КТ сессии 57 № 8: два невостребованных, сбой записи confirmation.unbound в wait() — UNBOUND сразу, ошибка журнала поглощена (нюанс К1.1)", async () => {
+    const s = failingJournal(() => "confirmation.unbound");
+    s.answers.set(ID1, confirmation("PENDING"));
+    s.answers.set(ID2, confirmation("PENDING", { id: ID2 }));
+    await s.conf.listener(s.item(ID1, "evt_1"));
+    await s.conf.listener(s.item(ID2, "evt_2"));
+    await settle();
+    expect(s.kinds.filter((k) => k === "confirmation.unclaimed")).toHaveLength(2);
+    // ожидание началось при двух невостребованных: запись падает внутри исполнителя обещания — исход уже отдан
+    const w = s.waiter();
+    await settle();
+    expect(w()).toBe("UNBOUND");
+    expect(s.kinds).toContain("confirmation.unbound");
   });
 
   it("гонка (В1а): событие раньше ожидания — невостребованный, затем покупка его берёт", async () => {
@@ -569,7 +701,7 @@ describe("вход вызывающего и прерывание (Р47 п. 8, �
     const conf = new Confirmations({
       port: { getConfirmation: async () => confirmation("PENDING") },
       journal: { record: () => undefined },
-      params: { confirmation_wait_ms: WAIT_MS, signature_skew_sec: SKEW_SEC, event_seen_max: SEEN_MAX },
+      params: { confirmation_wait_ms: WAIT_MS, confirmation_decision_max_sec: DECISION_MAX_SEC, signature_skew_sec: SKEW_SEC, event_seen_max: SEEN_MAX },
       now: c.now,
       timer: c.timer,
       wake: async () => {
@@ -593,7 +725,7 @@ describe("вход вызывающего и прерывание (Р47 п. 8, �
     const conf = new Confirmations({
       port: { getConfirmation: async () => confirmation("PENDING") },
       journal: { record: () => undefined },
-      params: { confirmation_wait_ms: 20, signature_skew_sec: SKEW_SEC, event_seen_max: SEEN_MAX },
+      params: { confirmation_wait_ms: 20, confirmation_decision_max_sec: DECISION_MAX_SEC, signature_skew_sec: SKEW_SEC, event_seen_max: SEEN_MAX },
       wake: async () => void wakes++,
     });
     await expect(conf.wait({ signal: new AbortController().signal })).resolves.toBe("NONE");
@@ -606,7 +738,7 @@ describe("вход вызывающего и прерывание (Р47 п. 8, �
     const conf = new Confirmations({
       port: { getConfirmation: async () => confirmation("PENDING") },
       journal: { record: () => undefined },
-      params: { confirmation_wait_ms: WAIT_MS, signature_skew_sec: SKEW_SEC, event_seen_max: SEEN_MAX },
+      params: { confirmation_wait_ms: WAIT_MS, confirmation_decision_max_sec: DECISION_MAX_SEC, signature_skew_sec: SKEW_SEC, event_seen_max: SEEN_MAX },
       now: c.now,
       timer: c.timer,
       wake: async () => {

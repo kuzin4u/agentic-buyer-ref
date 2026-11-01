@@ -85,7 +85,9 @@ export interface OperationsOptions {
 /** Итог стадии 5: операция привязана и сверена; MISMATCH — привязана, но не сходится с покупкой (запись
  *  operation.mismatch); NONE — привязанной операции нет за срок; AMBIGUOUS — привязка неоднозначна (два ожидания одной
  *  ссылки заказа): итога нет, и поиск по CART его не ищет (ревью КТ1 Р51 № 3). */
-export type OperationOutcome = { kind: "OPERATION"; operation: Operation } | { kind: "MISMATCH" } | { kind: "NONE" } | { kind: "AMBIGUOUS" };
+/** ABSENT — только у поиска по CART (Р69 п. 4): Платформа ответила, операций заказа нет; NONE — итога нет (срок, отказ
+ *  Платформы, больше одной). */
+export type OperationOutcome = { kind: "OPERATION"; operation: Operation } | { kind: "MISMATCH" } | { kind: "NONE" } | { kind: "AMBIGUOUS" } | { kind: "ABSENT" };
 
 /** Итог стадии 6: SETTLED или иной статус — операция; MISMATCH — другая операция; PENDING — расчёта нет, ожидание прервал
  *  вызывающий; UNREAD — GET не подтверждён и не повторяется; EXPIRED — граница ожидания прошла, итога нет (Р51 п. 2 (б)). */
@@ -286,7 +288,8 @@ export class Operations {
   /**
    * Восстановление op_ref (Р51 п. 5; РП55 п. 6): итога по событию нет за срок стадии 5 — один раз операции по CART покупки
    * (только с итогом). Кандидаты — операции с её order_ref; ровно одна — сверка с CART той же привязкой, что у события
-   * (bind.ts): итог или MISMATCH (запись operation.mismatch). Ни одной или больше одной — NONE. Отказ Платформы — NONE,
+   * (bind.ts): итог или MISMATCH (запись operation.mismatch). Ни одной — ABSENT (Р69 п. 4; запись — NONE), больше одной —
+   * NONE (запись AMBIGUOUS). Отказ Платформы — NONE,
    * код — в записи operation.lookup (403 AGENT_SUSPENDED подпись уже приостановил адаптер, Р60 п. 1); сбой журнала —
    * наружу. Повтора нет.
    */
@@ -304,7 +307,8 @@ export class Operations {
       return done(e.code, { kind: "NONE" });
     }
     const mine = list.filter((r) => r.orderRef === orderRef);
-    if (mine.length === 0) return done("NONE", { kind: "NONE" });
+    // ответ Платформы прочитан, операций заказа нет — основание повтора оплаты после обрыва ответа (Р69 п. 4)
+    if (mine.length === 0) return done("NONE", { kind: "ABSENT" });
     if (mine.length > 1) return done("AMBIGUOUS", { kind: "NONE" });
     const r = mine[0]!;
     const bound = bindOperation(r, cart);

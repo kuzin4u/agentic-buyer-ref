@@ -72,6 +72,9 @@ export const StandParamsSchema = z
   shop_search_deadline_ms: positive.max(TIMER_MAX_MS),
   // Ожидание запроса подтверждения после ответа продавца DECLINED (Р47 п. 4): не пришёл — OPERATION_RESULT_UNCONFIRMED.
   confirmation_wait_ms: positive.max(TIMER_MAX_MS),
+  // Свой верхний предел ожидания решения человека от привязки запроса (Р69 п. 2): срок — меньшее из expires_at Платформы
+  // + signature_skew_sec и этого предела. × 1000 — срок таймера: не больше его предела.
+  confirmation_decision_max_sec: positive.max(Math.floor(TIMER_MAX_MS / 1000)),
   // Предел задержки события итога операции (#57 п. 4, Р49 п. 1): на стадии 5 — ожидание operation.* после ответа продавца,
   // на стадии 6 — пауза повтора GET после отказа с просьбой повторить (плановое перечитывание — operation_reread_interval_sec,
   // Р51 п. 2). Равен параметру стенда (тест стенда).
@@ -110,6 +113,8 @@ export const StandParamsSchema = z
   .refine((p) => p.pao_credentials_timeout_ms <= p.registry_cache_ttl_sec * 1000, { message: "pao_credentials_timeout_ms больше registry_cache_ttl_sec" })
   // Ожидание запроса подтверждения — в пределах registry_cache_ttl_sec (Р47 п. 4, инвариант 4).
   .refine((p) => p.confirmation_wait_ms <= p.registry_cache_ttl_sec * 1000, { message: "confirmation_wait_ms больше registry_cache_ttl_sec" })
+  // Свой предел не короче удержания заказа: иначе агент остановил бы покупку раньше, чем банк даёт человеку решить (Р69 п. 2).
+  .refine((p) => p.confirmation_decision_max_sec >= p.order_hold_sec, { message: "confirmation_decision_max_sec меньше order_hold_sec" })
   // Ожидание итога операции — в пределах registry_cache_ttl_sec (Р49 п. 1, инвариант 4).
   .refine((p) => p.operation_outcome_max_delay_sec <= p.registry_cache_ttl_sec, { message: "operation_outcome_max_delay_sec больше registry_cache_ttl_sec" })
   // Сверка при приостановке — хотя бы раз за registry_cache_ttl_sec (Р60 п. 6, инвариант 4).

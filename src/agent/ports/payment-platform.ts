@@ -76,6 +76,10 @@ export interface PaymentPlatform extends MandatePort, EventsPort {
   /** Реквизит и запечатанный пакет агентской оплаты по нему (Р45 п. 3): `payload` — только в пакете, ядру — `Credential`.
    *  Ответ не целиком (вид не тот, нет `token_ref` или криптограммы, признак не свой) — UNKNOWN, пакета нет. */
   issuePaymentPackage(draft: CredentialDraft, m: Mutation): Promise<IssuedPackage>;
+  /** Статус и срок своего реквизита по `credential_ref` (дополнение 1 к Р69 п. 4): только перед повтором оплаты после
+   *  обрыва, один раз на покупку. Ссылка и признак (агент, мандат `mandateId`) — как у выданного, иначе отказ; `payload`
+   *  ядру не отдаётся. Отказ — PlatformFailure: повтора нет (fail-closed). */
+  credentialStatus(ref: string, mandateId: string): Promise<Credential>;
 
   requestConfirmation(draft: ConfirmationDraft, m: Mutation): Promise<Confirmation>;
   getConfirmation(id: string): Promise<Confirmation>;

@@ -25,12 +25,21 @@ export interface ConformanceSession {
   issuedSecrets(): string[];
   /** обращения адаптера `platform` к платформе по порядку, как их видит платформа */
   calls(): PlatformCall[];
+  /** журнал обращений цели отдаёт одноразовое значение подписи (`nonce`); тогда обращение без него — дефект адаптера */
+  readonly callsCarryNonce: boolean;
   /** следующий ответ на метод порта теряется после того, как платформа его обработала; нет — цель подменять не умеет */
   loseNextResponse?(method: FaultMethod): void;
   /** следующий ответ на метод порта — 200 с телом не по схеме */
   garbleNextResponse?(method: FaultMethod): void;
   /** журнал адаптера `platform` текстом, как его видит оператор (инвариант 1: платёжных данных в нём нет) */
   journalText(): string;
+  /** запрос подтверждения человеком по подписанному CART создаёт платформа (в ПАО 1.4 — ADP при авторизации продавца,
+   *  Р47 п. 2); id запроса. Нет — цель создать запрос вне пути покупки не умеет (дополнение 1 к Р67 п. 4) */
+  createConfirmation?(cart: Mandate): Promise<string>;
+  /** решение человека по запросу подтверждения вне агента (приложение банка, УПК) */
+  decideConfirmation?(id: string, decision: "APPROVED" | "REJECTED"): Promise<void>;
+  /** операция агента с итогом, по которой человек поручил спор; нет — маршрута споров у платформы цели нет (Р66 п. 2) */
+  disputableOperation?(): Promise<string>;
   /** закрыть цель; нарушения контракта, которые видит тестовая сторона (запрос не по схеме), — отказ здесь */
   close(): Promise<void>;
 }
@@ -39,6 +48,9 @@ export interface ConformanceSession {
 export interface PlatformCall {
   mutating: boolean;
   status: number;
+  /** код отказа платформы из тела ответа (4xx / 5xx); у успешного — нет */
+  code?: string;
+  /** подписано своим ключом агента цели (`kid`); код агента в журналах обращений — передачами (дополнение 1 к Р67 п. 6) */
   signed: boolean;
   idempotencyKey?: string;
   nonce?: string;
@@ -51,6 +63,8 @@ export type FaultMethod = "requestMandate" | "issueCredential" | "verifyMandate"
 export interface ConformanceTarget {
   /** имя цели в названии набора */
   readonly name: string;
+  /** срок одного теста, мс; стенд под параллельной нагрузкой прогона медленнее 5 с по умолчанию */
+  readonly timeoutMs?: number;
   open(): Promise<ConformanceSession>;
 }
 
@@ -78,12 +92,31 @@ const triple = (v: string): [number, number, number] => {
 const notBelow = (a: [number, number, number], b: [number, number, number]) => a[0] > b[0] || (a[0] === b[0] && (a[1] > b[1] || (a[1] === b[1] && a[2] >= b[2])));
 
 // Проекты для заявленного отказа: платформа без возможности не должна принимать запрос ни при каком содержимом.
-const CONFIRMATION: ConfirmationDraft = { mandate: { id: "mnd_conformance", currency: "RUB" }, merchantId: "shop_conformance", amount: { amount: 100, currency: "RUB" }, summary: "набор соответствия", channel: "UPK" };
+// Валюта — из заявления цели (КТ1 № 8), не литерал.
+const confirmationDraft = (c: PlatformCapabilities): ConfirmationDraft => ({
+  mandate: { id: "mnd_conformance", currency: c.currencies[0]! },
+  merchantId: "shop_conformance",
+  amount: { amount: 100, currency: c.currencies[0]! },
+  summary: "набор соответствия",
+  channel: "UPK",
+});
 const DISPUTE: DisputeDraft = { opRef: "op_conformance", reason: "NOT_AUTHORIZED", principalAck: "ack_conformance" };
 
 /** Поля реквизита глазами ядра (SPEC §4, инвариант 1): только ссылка, вид, состояние, срок и признак. */
 const CREDENTIAL_FIELDS = ["channel", "credentialRef", "indicator", "status", "validTo"];
 const ISO_TIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$/;
+
+/** Отказы проверки подписи (ПАО §6): обращение с таким кодом подписано не так, как принимает платформа. */
+const SIGNATURE_FAILURES = new Set(["AGENT_UNKNOWN", "AGENT_KEY_REVOKED", "SIGNATURE_INVALID"]);
+
+/** Отказ порта — PlatformFailure с кодом из словаря ядра (§7а) и классом повтора по словарю; иное — дефект адаптера.
+ *  Исключение словаря — потеря ответа на выдачу реквизита (Р48 п. 4 (а)) — проверяется своим тестом. */
+function expectPortFailure(e: unknown): void {
+  expect(e).toBeInstanceOf(PlatformFailure);
+  const f = e as PlatformFailure;
+  expect(Object.keys(FAILURE_RULES)).toContain(f.code);
+  expect(f.retry, `класс повтора ${f.code}`).toBe(FAILURE_RULES[f.code as keyof typeof FAILURE_RULES].retry);
+}
 
 /** Ни один образец платёжных данных не виден в сериализации и в `inspect` значения (инвариант 1, Р45 п. 3). */
 function expectNoSecrets(value: unknown, secrets: readonly string[], where = "ядру"): void {
@@ -93,7 +126,7 @@ function expectNoSecrets(value: unknown, secrets: readonly string[], where = "я
 }
 
 export function describeConformance(target: ConformanceTarget): void {
-  describe(`набор соответствия адаптеров (AG-20, Р67) — ${target.name}`, () => {
+  describe(`набор соответствия адаптеров (AG-20, Р67) — ${target.name}`, { ...(target.timeoutMs !== undefined && { timeout: target.timeoutMs }) }, () => {
     let session: ConformanceSession | undefined;
     afterEach(async () => {
       await session?.close();
@@ -152,17 +185,23 @@ export function describeConformance(target: ConformanceTarget): void {
         }
       });
 
-      // Заявлено «есть» — поведение проверяет ч. 2 (подтверждение, спор); здесь — только согласованность заявления «нет».
-      it("humanConfirmation = false — запрос подтверждения отклоняется PlatformFailure", async (ctx) => {
-        const platform = await open();
-        if (platform.capabilities().humanConfirmation) return ctx.skip("заявлено подтверждение человеком — проверка в ч. 2");
-        await expect(platform.requestConfirmation(CONFIRMATION, { idempotencyKey: "conformance-confirmation" })).rejects.toBeInstanceOf(PlatformFailure);
+      // Заявлено «есть» — поведение проверяют разделы «подтверждение» и «спор»; здесь — только согласованность заявления «нет».
+      // Заявлено «нет» — отказ с кодом словаря ядра без обращения к платформе; своего кода нет (дополнение 1 к Р67 п. 3, КТ1 № 8).
+      it("humanConfirmation = false — запрос подтверждения отклоняется PlatformFailure без обращения к платформе", async (ctx) => {
+        const s = await begin();
+        const c = s.platform.capabilities();
+        if (c.humanConfirmation) return ctx.skip("заявлено подтверждение человеком — проверка в разделе «подтверждение человеком»");
+        const from = s.calls().length;
+        expectPortFailure(await s.platform.requestConfirmation(confirmationDraft(c), { idempotencyKey: "conformance-confirmation" }).catch((e: unknown) => e));
+        expect(s.calls().slice(from), "обращения при незаявленной возможности").toEqual([]);
       });
 
-      it("disputeResolution = false — открытие спора отклоняется PlatformFailure", async (ctx) => {
-        const platform = await open();
-        if (platform.capabilities().disputeResolution) return ctx.skip("заявлен разбор спора — проверка в ч. 2");
-        await expect(platform.openDispute(DISPUTE, { idempotencyKey: "conformance-dispute" })).rejects.toBeInstanceOf(PlatformFailure);
+      it("disputeResolution = false — открытие спора отклоняется PlatformFailure без обращения к платформе", async (ctx) => {
+        const s = await begin();
+        if (s.platform.capabilities().disputeResolution) return ctx.skip("заявлен разбор спора — проверка в разделе «спор по поручению человека»");
+        const from = s.calls().length;
+        expectPortFailure(await s.platform.openDispute(DISPUTE, { idempotencyKey: "conformance-dispute" }).catch((e: unknown) => e));
+        expect(s.calls().slice(from), "обращения при незаявленной возможности").toEqual([]);
       });
     });
 
@@ -202,8 +241,24 @@ export function describeConformance(target: ConformanceTarget): void {
         expect((await s.platform.relinquishMandate(m.id, { idempotencyKey: "conformance-relinquish" })).status).toBe("REVOKED");
         expect((await s.platform.verifyMandate({ id: m.id, currency: m.amountLimit.currency })).outcome).not.toBe("CONFIRMED");
         const e = await s.platform.mandateEvidence(m.id);
-        expect(["OK", "BROKEN"]).toContain(e.integrity);
-        if (e.integrity === "OK") expect(e.mandateChain.map((x) => x.id)).toContain(m.id);
+        // выписка только что созданного мандата — OK с цепочкой; BROKEN у нового мандата — дефект, а не пропуск (КТ1 № 9;
+        // КТ сессии 56, Р-1070)
+        expect(e.integrity, "выписка нового мандата").toBe("OK");
+        expect(e.mandateChain.map((x) => x.id)).toContain(m.id);
+      });
+
+      // КТ1 сессии 53 № 7: платформа сверяет агента мандата в каждом методе мандата, а не только в выдаче реквизита
+      it("мандат другого агента: чтение, verify, отказ и выписка — отказ PlatformFailure; мандат у владельца не изменился", async () => {
+        const s = await begin();
+        const m = await s.foreign.requestMandate(s.intent(), { idempotencyKey: "conformance-foreign" });
+        await s.signMandate(m.id);
+        const ref = { id: m.id, currency: m.amountLimit.currency };
+        await expect(s.platform.getMandate(m.id), "getMandate").rejects.toBeInstanceOf(PlatformFailure);
+        await expect(s.platform.verifyMandate(ref), "verifyMandate").rejects.toBeInstanceOf(PlatformFailure);
+        await expect(s.platform.relinquishMandate(m.id, { idempotencyKey: "conformance-relinquish" }), "relinquishMandate").rejects.toBeInstanceOf(PlatformFailure);
+        await expect(s.platform.mandateEvidence(m.id), "mandateEvidence").rejects.toBeInstanceOf(PlatformFailure);
+        expect((await s.foreign.getMandate(m.id)).status).toBe("ACTIVE");
+        expect((await s.foreign.verifyMandate(ref)).outcome).toBe("CONFIRMED");
       });
     });
 
@@ -254,16 +309,7 @@ export function describeConformance(target: ConformanceTarget): void {
     });
 
     describe("ошибки и повторы (инварианты 4, 8, 9; SPEC §7а)", () => {
-      /** Отказ порта — PlatformFailure с кодом из словаря ядра (§7а) и классом повтора по словарю; иное — дефект
-       *  адаптера. Исключение словаря — потеря ответа на выдачу реквизита (Р48 п. 4 (а)) — проверяется своим тестом. */
-      const expectPortFailure = (e: unknown) => {
-        expect(e).toBeInstanceOf(PlatformFailure);
-        const f = e as PlatformFailure;
-        expect(Object.keys(FAILURE_RULES)).toContain(f.code);
-        expect(f.retry, `класс повтора ${f.code}`).toBe(FAILURE_RULES[f.code as keyof typeof FAILURE_RULES].retry);
-      };
-
-      it("каждое изменяющее обращение подписано агентом и несёт Idempotency-Key вызывающего (инвариант 8)", async () => {
+      it("каждое изменяющее обращение подписано своим ключом агента, принято и несёт Idempotency-Key вызывающего (инвариант 8)", async () => {
         const s = await begin();
         const cart = await signedCart(s);
         await s.platform.issueCredential(credentialDraft(cart, "ord_conformance_5"), { idempotencyKey: "conformance-credential" });
@@ -272,7 +318,10 @@ export function describeConformance(target: ConformanceTarget): void {
         // INTENT, CART, реквизит, отказ — ровно четыре изменяющих обращения адаптера, ключи — те, что дал вызывающий
         expect(mutating.map((c) => c.idempotencyKey)).toEqual(["conformance-intent", "conformance-cart", "conformance-credential", "conformance-relinquish"]);
         for (const c of mutating) {
-          expect(c.signed, `обращение ${JSON.stringify(c)} без подписи`).toBe(true);
+          expect(c.signed, `обращение ${JSON.stringify(c)} не подписано своим ключом`).toBe(true);
+          // подпись принята: ответ успешный и не отказ проверки подписи (КТ1 № 10)
+          expect(c.status, `обращение ${JSON.stringify(c)} не принято`).toBeLessThan(300);
+          expect(SIGNATURE_FAILURES.has(c.code ?? ""), `обращение ${JSON.stringify(c)} — отказ подписи`).toBe(false);
           expect(c.idempotencyKey, `обращение ${JSON.stringify(c)} без Idempotency-Key`).toMatch(/\S/);
         }
       });
@@ -286,8 +335,12 @@ export function describeConformance(target: ConformanceTarget): void {
         const tries = s.calls().slice(from).filter((x) => x.mutating);
         expect(tries.length).toBeGreaterThanOrEqual(2);
         expect(new Set(tries.map((x) => x.idempotencyKey))).toEqual(new Set(["conformance-lost"]));
-        expect(new Set(tries.map((x) => x.nonce)).size).toBe(tries.length);
         expect((await s.platform.getMandate(m.id)).status).toBe("PENDING_SIGNATURE");
+        // подписи повторов разные — по одноразовому значению подписи; журнал цели его не отдаёт — пропуск (КТ1 № 3), отдаёт,
+        // а у обращения нет — адаптер подписал без nonce, красный (КТ сессии 56 № 4)
+        if (!s.callsCarryNonce) return ctx.skip("журнал обращений цели не отдаёт одноразовое значение подписи — новизна подписи повтора не проверена");
+        expect(tries.filter((x) => x.nonce === undefined), "обращение без одноразового значения подписи").toEqual([]);
+        expect(new Set(tries.map((x) => x.nonce)).size).toBe(tries.length);
       });
 
       it("ответ на выдачу реквизита потерян — без повтора: одно обращение, NO_RESPONSE с классом never (Р48 п. 4 (а))", async (ctx) => {
@@ -316,12 +369,104 @@ export function describeConformance(target: ConformanceTarget): void {
         expect(e).toMatchObject({ code: "BAD_RESPONSE", retry: "never" });
       });
 
+      // Тело подмены — как настоящее, одно значение вне перечня ПАО (КТ1 № 11): отвергает проверка схемы, а не пустота тела.
+      it("ответ 200 не по схеме на запрос мандата и на выдачу реквизита — BAD_RESPONSE без повтора (инвариант 4)", async (ctx) => {
+        const s = await begin();
+        if (s.garbleNextResponse === undefined) return ctx.skip("цель не умеет подменять ответ");
+        const cart = await signedCart(s);
+        let from = s.calls().length;
+        s.garbleNextResponse("requestMandate");
+        const m = await s.platform.requestMandate(s.intent(), { idempotencyKey: "conformance-garbled-intent" }).catch((x: unknown) => x);
+        expectPortFailure(m);
+        expect(m).toMatchObject({ code: "BAD_RESPONSE", retry: "never" });
+        // подменённый ответ платформы не достигает; повтор адаптера дошёл бы до неё
+        expect(s.calls().slice(from).filter((x) => x.mutating), "повтор после ответа не по схеме").toEqual([]);
+        from = s.calls().length;
+        s.garbleNextResponse("issueCredential");
+        const c = await s.platform.issueCredential(credentialDraft(cart, "ord_conformance_8"), { idempotencyKey: "conformance-garbled-credential" }).catch((x: unknown) => x);
+        expectPortFailure(c);
+        expect(c).toMatchObject({ code: "BAD_RESPONSE", retry: "never" });
+        expect(s.calls().slice(from).filter((x) => x.mutating), "повтор после ответа не по схеме").toEqual([]);
+        // в теле подмены — платёжные данные (образцы цели): их нет ни в отказе, ни в журнале адаптера (инвариант 1)
+        expectNoSecrets(c, s.issuedSecrets(), "в тексте отказа");
+        expectNoSecrets(s.journalText(), s.issuedSecrets(), "в журнале адаптера");
+      });
+
       it("отказы порта — только PlatformFailure с кодом словаря ядра (§7а)", async () => {
         const s = await begin();
         const cart = await signedCart(s);
         await s.platform.relinquishMandate(cart.id, { idempotencyKey: "conformance-relinquish" });
         expectPortFailure(await s.platform.issueCredential(credentialDraft(cart, "ord_conformance_7"), { idempotencyKey: "conformance-credential" }).catch((e: unknown) => e));
         expectPortFailure(await s.platform.getMandate("mnd_conformance_absent").catch((e: unknown) => e));
+      });
+    });
+
+    // Дополнение 1 к Р67 п. 4: запрос создаёт платформа (тестовая сторона цели), решает человек; агент только читает.
+    describe("подтверждение человеком (инвариант 7, Р47)", () => {
+      const NO_CREATE =
+        "цель не создаёт запрос вне пути покупки: на стенде его создаёт ADP при авторизации продавца — создание, чтение и решение человека проверяет tests/contract/confirmation-stand.test.ts; отказ на чужой запрос и неизменность при чтении на стенде не проверены — остаточный риск, STATUS «Открыто» (дополнение 1 к Р67 п. 4)";
+
+      for (const decision of ["APPROVED", "REJECTED"] as const) {
+        it(`запрос платформы: агент читает PENDING, чтение не решает; решение человека — ${decision}; чужой запрос — отказ`, async (ctx) => {
+          const s = await begin();
+          if (!s.platform.capabilities().humanConfirmation) return ctx.skip("подтверждение человеком не заявлено — проверка в «заявлении»");
+          if (s.createConfirmation === undefined || s.decideConfirmation === undefined) return ctx.skip(NO_CREATE);
+          const cart = await signedCart(s);
+          const id = await s.createConfirmation(cart);
+          const from = s.calls().length;
+          expect(await s.platform.getConfirmation(id)).toMatchObject({ id, status: "PENDING" });
+          expect((await s.platform.getConfirmation(id)).status, "повторное чтение агентом не меняет запрос").toBe("PENDING");
+          // агент не решает за человека: ни одного изменяющего обращения за время чтения
+          expect(s.calls().slice(from).filter((c) => c.mutating)).toEqual([]);
+          // запрос другого агента — отказ сверки «запрос невалиден», а не любой сбой (подписи, транспорта) — КТ сессии 56 № 2
+          const alien = await s.foreign.getConfirmation(id).catch((e: unknown) => e);
+          expectPortFailure(alien);
+          expect(alien, "запрос другого агента").toMatchObject({ code: "REQUEST_INVALID" });
+          await s.decideConfirmation(id, decision);
+          expect(await s.platform.getConfirmation(id)).toMatchObject({ id, status: decision });
+        });
+      }
+    });
+
+    describe("лента событий (Р34, инвариант 8)", () => {
+      it("подпись своего мандата — mandate.signed в ленте; курсор движется; событий мандата другого агента нет", async () => {
+        const s = await begin();
+        const own = await s.platform.requestMandate(s.intent(), { idempotencyKey: "conformance-intent" });
+        const alien = await s.foreign.requestMandate(s.intent(), { idempotencyKey: "conformance-foreign" });
+        await s.signMandate(own.id);
+        await s.signMandate(alien.id);
+        const feed = await s.platform.listEvents(null);
+        const events = feed.flatMap((i) => (i.kind === "event" ? [i.event] : []));
+        expect(events.filter((e) => e.type === "mandate.signed" && e.mandateId === own.id)).toHaveLength(1);
+        expect(events.filter((e) => e.mandateId === alien.id), "событие мандата другого агента").toEqual([]);
+        const last = feed.at(-1)!;
+        const cursor = last.kind === "event" ? last.event.eventId : last.eventId;
+        // курсор движется: после него — ровно событие подписи следующего своего мандата (КТ сессии 56 № 1)
+        const next = await s.platform.requestMandate(s.intent(), { idempotencyKey: "conformance-intent-next" });
+        await s.signMandate(next.id);
+        const after = await s.platform.listEvents(cursor);
+        expect(after.map((i) => (i.kind === "event" ? { type: i.event.type, mandateId: i.event.mandateId } : i)), "после курсора").toEqual([
+          { type: "mandate.signed", mandateId: next.id },
+        ]);
+      });
+
+      it("signedEvents = true — подпись события проверяется", async (ctx) => {
+        const platform = await open();
+        if (!platform.capabilities().signedEvents) return ctx.skip("события не подписаны (заявление): событие — сигнал, статус — по GET (Р34; ПАО до 1.5.0)");
+        // заявлено «есть», а проверки нет — красный: адаптер, заявивший подпись событий, приносит её проверку в набор
+        expect.fail("заявлены подписанные события — проверка подписи события в наборе не написана");
+      });
+    });
+
+    describe("спор по поручению человека (Р66 п. 2)", () => {
+      it("заявлен разбор спора — открытие по операции агента и чтение того же спора", async (ctx) => {
+        const s = await begin();
+        if (!s.platform.capabilities().disputeResolution) return ctx.skip("разбор спора не заявлен — проверка в «заявлении»");
+        if (s.disputableOperation === undefined) return ctx.skip("маршрута споров у платформы цели нет до PS-22 (Р66 п. 2, дополнение 1 к Р67 п. 4)");
+        const opRef = await s.disputableOperation();
+        const d = await s.platform.openDispute({ ...DISPUTE, opRef }, { idempotencyKey: "conformance-dispute" });
+        expect(d.opRef).toBe(opRef);
+        expect(await s.platform.getDispute(d.id)).toMatchObject({ id: d.id, opRef });
       });
     });
   });

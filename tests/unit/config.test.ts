@@ -134,6 +134,19 @@ describe("стендовые параметры", () => {
     expect(() => parseParams({ ...stand, confirmation_wait_ms: stand.registry_cache_ttl_sec * 1000 + 1 })).toThrow(ConfigError);
   });
 
+  it("свой предел ожидания решения (Р69 п. 2): обязателен, целое, не меньше order_hold_sec и не больше предела таймера в секундах", () => {
+    const rest = { ...stand };
+    delete rest.confirmation_decision_max_sec;
+    expect(() => parseParams(rest)).toThrow(ConfigError);
+    expect(stand.confirmation_decision_max_sec).toBe(1800);
+    expect(() => parseParams({ ...stand, confirmation_decision_max_sec: 1.5 })).toThrow(ConfigError);
+    expect(() => parseParams({ ...stand, confirmation_decision_max_sec: stand.order_hold_sec })).not.toThrow();
+    expect(() => parseParams({ ...stand, confirmation_decision_max_sec: stand.order_hold_sec - 1 })).toThrow(/confirmation_decision_max_sec меньше order_hold_sec/);
+    const max = Math.floor(2_147_483_647 / 1000);
+    expect(() => parseParams({ ...stand, confirmation_decision_max_sec: max })).not.toThrow();
+    expect(() => parseParams({ ...stand, confirmation_decision_max_sec: max + 1 })).toThrow(ConfigError);
+  });
+
   it("запасная частота ПАО (Р59 п. 3): обязательна, целое > 0; опрос ленты — не больше её половины", () => {
     const rest = { ...stand };
     delete rest.pao_rate_limit_fallback_per_min;

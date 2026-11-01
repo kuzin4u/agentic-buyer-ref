@@ -116,8 +116,9 @@ export interface PaymentContext {
 }
 
 /** Исход стадии 4 (Р47 п. 3–4): решение по GET; UNBOUND — привязка неоднозначна; NONE — запроса нет за
- *  confirmation_wait_ms; UNKNOWN — статус не подтверждён (fail-closed). */
-export type ConfirmationOutcome = "APPROVED" | "REJECTED" | "EXPIRED" | "UNBOUND" | "NONE" | "UNKNOWN";
+ *  confirmation_wait_ms; UNKNOWN — статус не подтверждён (fail-closed); WAIT_LIMIT — PENDING к своему пределу
+ *  confirmation_decision_max_sec раньше срока Платформы (Р69 п. 2). */
+export type ConfirmationOutcome = "APPROVED" | "REJECTED" | "EXPIRED" | "UNBOUND" | "NONE" | "UNKNOWN" | "WAIT_LIMIT";
 
 /** Уведомление оболочки — не исход покупки (Р47 п. 5, Р49 п. 7): запрос подтверждения ждёт человека; запись об исполнении
  *  с scope_check не WITHIN_LIMITS; возврат по операции (Р51 п. 3). Текст — из реестра по коду; значение вне перечня — из

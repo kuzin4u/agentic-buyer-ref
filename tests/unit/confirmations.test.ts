@@ -16,6 +16,8 @@ const T0 = Date.parse("2026-10-22T12:00:00.000Z");
 const HOLD_MS = 900_000;
 const SKEW_SEC = 300;
 const WAIT_MS = 30_000;
+/** свой предел ожидания решения (Р69 п. 2): больше HOLD_MS + SKEW_SEC — прежние тесты срока его не задевают */
+const DECISION_MAX_SEC = 1800;
 const SEEN_MAX = loadParams().event_seen_max;
 
 /** Часы и таймеры теста: время двигает только advance; `early` — первый таймер длиннее `early` срабатывает раньше
@@ -60,7 +62,7 @@ function confirmation(status: Confirmation["status"], over: Partial<Confirmation
   };
 }
 
-function setup(early = 0, seenMax = SEEN_MAX) {
+function setup(early = 0, seenMax = SEEN_MAX, decisionMaxSec = DECISION_MAX_SEC) {
   const c = clock(early);
   const answers = new Map<string, Confirmation | Error>();
   const gets: string[] = [];
@@ -77,7 +79,7 @@ function setup(early = 0, seenMax = SEEN_MAX) {
   const conf = new Confirmations({
     port,
     journal: { record: (e) => void journal.push(e) },
-    params: { confirmation_wait_ms: WAIT_MS, signature_skew_sec: SKEW_SEC, event_seen_max: seenMax },
+    params: { confirmation_wait_ms: WAIT_MS, confirmation_decision_max_sec: decisionMaxSec, signature_skew_sec: SKEW_SEC, event_seen_max: seenMax },
     now: c.now,
     timer: c.timer,
   });
@@ -204,6 +206,38 @@ describe("модуль подтверждений: сигнал → GET → ст
     expect(w.outcome()).toBe("UNKNOWN");
   });
 
+  it("Р69 п. 2: expires_at далеко в будущем — свой предел от привязки: один GET, PENDING — WAIT_LIMIT; до предела GET нет", async () => {
+    const s = setup();
+    const w = s.waiter();
+    // привязка — через 20 с после начала ожидания: предел считается от неё
+    await s.c.advance(20_000);
+    s.answers.set(ID1, confirmation("PENDING", { expiresAt: new Date(T0 + 10 * 86_400_000).toISOString() }));
+    await s.event("confirmation.required", ID1);
+    await s.c.advance(DECISION_MAX_SEC * 1000 - 1);
+    expect(s.gets).toEqual([ID1]);
+    expect(w.outcome()).toBeUndefined();
+    await s.c.advance(1);
+    expect(s.gets).toEqual([ID1, ID1]);
+    expect(w.outcome()).toBe("WAIT_LIMIT");
+  });
+
+  it("Р69 п. 2: в предел GET дал решение — решение, а не WAIT_LIMIT; срок Платформы раньше предела — прежний путь (UNKNOWN)", async () => {
+    const s = setup(0, SEEN_MAX, 600);
+    const w = s.waiter();
+    s.answers.set(ID1, confirmation("PENDING"));
+    await s.event("confirmation.required", ID1);
+    s.answers.set(ID1, confirmation("APPROVED"));
+    await s.c.advance(600_000);
+    expect(w.outcome()).toBe("APPROVED");
+    // предел 1800 с позже срока Платформы (900 + 300 с): PENDING после срока — UNKNOWN, как без предела
+    const t = setup();
+    const v = t.waiter();
+    t.answers.set(ID1, confirmation("PENDING"));
+    await t.event("confirmation.required", ID1);
+    await t.c.advance(HOLD_MS + SKEW_SEC * 1000);
+    expect(v.outcome()).toBe("UNKNOWN");
+  });
+
   it("нет expires_at или он не RFC 3339 — UNKNOWN", async () => {
     for (const expiresAt of [null, "2026", "22.10.2026 12:15"]) {
       const s = setup();
@@ -294,7 +328,7 @@ describe("модуль подтверждений: сигнал → GET → ст
           if (fail) throw new Error("журнал недоступен");
         },
       },
-      params: { confirmation_wait_ms: WAIT_MS, signature_skew_sec: SKEW_SEC, event_seen_max: SEEN_MAX },
+      params: { confirmation_wait_ms: WAIT_MS, confirmation_decision_max_sec: DECISION_MAX_SEC, signature_skew_sec: SKEW_SEC, event_seen_max: SEEN_MAX },
       now: c.now,
       timer: c.timer,
     });
@@ -318,7 +352,7 @@ describe("модуль подтверждений: сигнал → GET → ст
           if (e.kind === failOn) throw new Error("журнал недоступен");
         },
       },
-      params: { confirmation_wait_ms: WAIT_MS, signature_skew_sec: SKEW_SEC, event_seen_max: SEEN_MAX },
+      params: { confirmation_wait_ms: WAIT_MS, confirmation_decision_max_sec: DECISION_MAX_SEC, signature_skew_sec: SKEW_SEC, event_seen_max: SEEN_MAX },
       now: c.now,
       timer: c.timer,
     });
@@ -379,7 +413,7 @@ describe("привязка запроса к покупке (Р47 п. 4, В1–�
           if (e.kind === failOn()) throw new Error("журнал недоступен");
         },
       },
-      params: { confirmation_wait_ms: WAIT_MS, signature_skew_sec: SKEW_SEC, event_seen_max: SEEN_MAX },
+      params: { confirmation_wait_ms: WAIT_MS, confirmation_decision_max_sec: DECISION_MAX_SEC, signature_skew_sec: SKEW_SEC, event_seen_max: SEEN_MAX },
       now: c.now,
       timer: c.timer,
     });
@@ -630,7 +664,7 @@ describe("вход вызывающего и прерывание (Р47 п. 8, �
     const conf = new Confirmations({
       port: { getConfirmation: async () => confirmation("PENDING") },
       journal: { record: () => undefined },
-      params: { confirmation_wait_ms: WAIT_MS, signature_skew_sec: SKEW_SEC, event_seen_max: SEEN_MAX },
+      params: { confirmation_wait_ms: WAIT_MS, confirmation_decision_max_sec: DECISION_MAX_SEC, signature_skew_sec: SKEW_SEC, event_seen_max: SEEN_MAX },
       now: c.now,
       timer: c.timer,
       wake: async () => {
@@ -654,7 +688,7 @@ describe("вход вызывающего и прерывание (Р47 п. 8, �
     const conf = new Confirmations({
       port: { getConfirmation: async () => confirmation("PENDING") },
       journal: { record: () => undefined },
-      params: { confirmation_wait_ms: 20, signature_skew_sec: SKEW_SEC, event_seen_max: SEEN_MAX },
+      params: { confirmation_wait_ms: 20, confirmation_decision_max_sec: DECISION_MAX_SEC, signature_skew_sec: SKEW_SEC, event_seen_max: SEEN_MAX },
       wake: async () => void wakes++,
     });
     await expect(conf.wait({ signal: new AbortController().signal })).resolves.toBe("NONE");
@@ -667,7 +701,7 @@ describe("вход вызывающего и прерывание (Р47 п. 8, �
     const conf = new Confirmations({
       port: { getConfirmation: async () => confirmation("PENDING") },
       journal: { record: () => undefined },
-      params: { confirmation_wait_ms: WAIT_MS, signature_skew_sec: SKEW_SEC, event_seen_max: SEEN_MAX },
+      params: { confirmation_wait_ms: WAIT_MS, confirmation_decision_max_sec: DECISION_MAX_SEC, signature_skew_sec: SKEW_SEC, event_seen_max: SEEN_MAX },
       now: c.now,
       timer: c.timer,
       wake: async () => {

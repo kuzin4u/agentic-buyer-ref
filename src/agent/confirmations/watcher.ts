@@ -34,7 +34,7 @@ export interface ConfirmationsOptions {
   port: ConfirmationsPort;
   journal: ConfirmationsJournal;
   /** event_poll_interval_ms — пауза опроса после отказа ленты (ревью КТ1 AG-11 ч. 2 № 3); нет — опрос прекращается */
-  params: { confirmation_wait_ms: number; signature_skew_sec: number; event_seen_max: number; event_poll_interval_ms?: number };
+  params: { confirmation_wait_ms: number; confirmation_decision_max_sec: number; signature_skew_sec: number; event_seen_max: number; event_poll_interval_ms?: number };
   /** прочитать ленту (`EventFeed.signal`): ожидание будит её, пока не решится; частоту чтений ограничивает лента */
   wake?: () => Promise<void>;
   now?: () => Date;
@@ -59,6 +59,8 @@ interface Waiter {
   readonly onPending: WaitOptions["onPending"];
   /** привязанный запрос; null — ждёт запрос */
   id: string | null;
+  /** свой предел ожидания решения (Р69 п. 2): время привязки + confirmation_decision_max_sec, мс; до привязки — null */
+  limit: number | null;
   settled: boolean;
   cancel: (() => void) | null;
   finish(o: ConfirmationOutcome): void;
@@ -148,7 +150,7 @@ export class Confirmations {
         signal.removeEventListener("abort", onAbort);
         done();
       };
-      const w: Waiter = { onPending, id: null, settled: false, cancel: null, finish: (outcome) => end(() => resolve(outcome)) };
+      const w: Waiter = { onPending, id: null, limit: null, settled: false, cancel: null, finish: (outcome) => end(() => resolve(outcome)) };
       signal.addEventListener("abort", onAbort, { once: true });
       if (this.#unclaimed.size === 1 && this.#waiters.size === 0) {
         const [id, held] = [...this.#unclaimed][0]!;
@@ -284,6 +286,7 @@ export class Confirmations {
     w.cancel?.();
     w.cancel = null;
     w.id = id;
+    w.limit = this.#now().getTime() + this.#o.params.confirmation_decision_max_sec * 1000;
     this.#bound.set(id, w);
     this.#apply(id, w, read);
   }
@@ -311,12 +314,13 @@ export class Confirmations {
     }
   }
 
-  /** Истечение отмечается только при обращении (РП51 п. 6): после expires_at + signature_skew_sec — один GET. */
+  /** Истечение отмечается только при обращении (РП51 п. 6): после expires_at + signature_skew_sec — один GET. Свой предел
+   *  (Р69 п. 2) раньше срока Платформы — один GET в предел. */
   #schedule(id: string, w: Waiter, expiresAt: string | null): void {
     // только RFC 3339 (`format: date-time` ПАО): Date.parse принимает и «2026» (ревью reviewer К2 № 8)
     const deadline = expiresAt === null || !RFC3339.test(expiresAt) ? Number.NaN : Date.parse(expiresAt) + this.#o.params.signature_skew_sec * 1000;
     if (Number.isNaN(deadline)) return w.finish("UNKNOWN");
-    const ms = Math.min(Math.max(deadline - this.#now().getTime(), 0), TIMER_MAX_MS);
+    const ms = Math.min(Math.max(this.#end(w, deadline) - this.#now().getTime(), 0), TIMER_MAX_MS);
     // прежний таймер — отменить: событие и ранний таймер могли поставить по таймеру (ревью reviewer К2 № 5)
     w.cancel?.();
     w.cancel = this.#timer(() => {
@@ -334,12 +338,17 @@ export class Confirmations {
     if (w.settled) return;
     if (read === "FOREIGN" || read === "FAILED") return w.finish("UNKNOWN");
     // таймер сработал раньше срока (предел таймера, ранний таймер — Р46 К2а) — ждать дальше; после срока PENDING —
-    // состояние не подтверждено
+    // состояние не подтверждено; свой предел наступил раньше срока Платформы — WAIT_LIMIT (Р69 п. 2)
     if (read.status === "PENDING") {
-      if (this.#now().getTime() < deadline) return this.#schedule(id, w, read.expiresAt);
-      return w.finish("UNKNOWN");
+      if (this.#now().getTime() < this.#end(w, deadline)) return this.#schedule(id, w, read.expiresAt);
+      return w.finish(w.limit !== null && w.limit < deadline ? "WAIT_LIMIT" : "UNKNOWN");
     }
     w.finish(read.status);
+  }
+
+  /** Конец ожидания решения: меньшее из срока Платформы и своего предела (Р69 п. 2). */
+  #end(w: Waiter, deadline: number): number {
+    return w.limit === null ? deadline : Math.min(deadline, w.limit);
   }
 
   /** Решение человека или истечение по событию: GET; запрос перестал быть своим — UNKNOWN. */

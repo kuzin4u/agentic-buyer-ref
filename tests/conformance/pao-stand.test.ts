@@ -61,6 +61,7 @@ describeConformance({
           .map((x) => ({
             mutating: x.method !== "GET",
             status: x.status,
+            ...(x.code !== undefined && { code: x.code }),
             signed: x.kid === kid,
             ...(x.idempotency_key !== undefined && { idempotencyKey: x.idempotency_key }),
             ...(x.nonce !== undefined && { nonce: x.nonce }),

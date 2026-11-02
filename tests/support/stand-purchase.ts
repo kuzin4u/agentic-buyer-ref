@@ -142,6 +142,8 @@ export interface StandPurchaseOptions {
   confirmationTimer?: (fn: () => void, ms: number) => () => void;
   /** ПОДМЕНА ДО PS-11: авторизация продавца доходит до ADP стенда копией сообщения (createContour, `adpUntilPs11`) */
   adpUntilPs11?: boolean;
+  /** без подмены (#97 п. 6, К1.4 AG-13 ч. 2б): асинхронное решение ОПКЦ через ADP стенда (createContour, `adpAsync`) */
+  adpAsync?: boolean;
   /** эквайрер эмулятора без поддержки aoi (П14, Р56 п. 1) */
   aoiSupport?: false;
   /** способы оплаты витрин эмулятора по merchant_id (createContour, Р68 п. 3) */
@@ -152,7 +154,7 @@ export interface StandPurchaseOptions {
 
 /** Контур со стендом и витринами после start(), покупка на адаптере витрин. Закрыть — `c.close()` у вызывающего. */
 export async function standPurchase(o: StandPurchaseOptions = {}) {
-  const c: Contour = await createContour({ pao: "stand", ...(o.now && { now: o.now }), ...(o.adpUntilPs11 && { adpUntilPs11: true }), ...(o.aoiSupport === false && { aoiSupport: false as const }), ...(o.paymentMethods && { paymentMethods: o.paymentMethods }) });
+  const c: Contour = await createContour({ pao: "stand", ...(o.now && { now: o.now }), ...(o.adpUntilPs11 && { adpUntilPs11: true }), ...(o.adpAsync && { adpAsync: true }), ...(o.aoiSupport === false && { aoiSupport: false as const }), ...(o.paymentMethods && { paymentMethods: o.paymentMethods }) });
   const self = await c.start();
   const { stand } = c;
   if (!stand) throw new Error("контур без стенда");

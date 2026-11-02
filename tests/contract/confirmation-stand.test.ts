@@ -5,10 +5,10 @@
 // Одобрение — ворота заново, ссылка продавцу (POST …/confirmation, один раз), продавец повторяет авторизацию новой
 // операцией с прежним реквизитом: итог — operation.authorized и GET новой операции → SETTLING (Р70; #56 п. 3, 5); отказ —
 // CONFIRMATION_REJECTED; срок — CONFIRMATION_EXPIRED по GET после expires_at.
-// ПОДМЕНА ДО PS-11 (решение владельца, вариант (а)): ОПКЦ стенда — заглушка, продавец ADP не достигает; заглушка отвечает
-// отказом, копию сообщения эквайрера тестовая поддержка передаёт в настоящий ADP стенда (contour.ts, `adpUntilPs11`):
-// запрос, событие, GET, решение банка и решение ADP по ссылке — настоящие; ответ эмитента (ISSUER_RESPONSE) шлёт тест
-// как процессинг (ПИ-3). Продавцу заглушка и на повторе отвечает отказом — его слова DECLINED, итог — по событию.
+// БЕЗ ПОДМЕНЫ (#97 п. 6, РП72 п. 10; К1.4 AG-13 ч. 2б, П12): асинхронное решение заглушки ОПКЦ (contour.ts, `adpAsync`) —
+// сообщение эквайрера уходит в ADP стенда, его решение и есть ответ продавцу: CONFIRMATION_REQUIRED — заказ
+// AWAITING_CONFIRMATION, APPROVE авторизации со ссылкой — ответ эмитента (ISSUER_RESPONSE, ПИ-3, шлёт контур) и PAID.
+// Запрос, событие, GET, решение банка, решение ADP и ответ продавца — настоящие; ОПКЦ — заглушка до PS-11 (путь покупки).
 import { afterEach, describe, expect, it } from "vitest";
 import { inspect } from "node:util";
 import { DIAG } from "../../src/agent/compose.js";
@@ -38,7 +38,7 @@ async function above(o: StandPurchaseOptions = {}) {
   const r = await standPurchase({
     ...o,
     contourPayment: true,
-    adpUntilPs11: true,
+    adpAsync: true,
     notify: (code, detail) => {
       codes.push(code);
       details.push(detail);
@@ -83,7 +83,7 @@ function outward(r: Awaited<ReturnType<typeof above>>["r"], result: unknown): st
   ].join("\n");
 }
 
-/** Решение ADP стенда по копии n-го сообщения эквайрера (подмена до PS-11): ждать, пока продавец его запросит. */
+/** Решение ADP стенда по n-му сообщению эквайрера (`adpAsync`): ждать, пока продавец его запросит. */
 async function adpDecision(r: Awaited<ReturnType<typeof above>>["r"], n: number): Promise<{ op_ref: string; decision: string }> {
   for (let i = 0; i < 250; i++) {
     const all = (await r.c.adpDecisions!()) as { op_ref?: string; decision?: string }[];
@@ -97,13 +97,11 @@ async function adpDecision(r: Awaited<ReturnType<typeof above>>["r"], n: number)
   throw new Error("продавец не дошёл до ADP стенда");
 }
 
-/** После одобрения человеком (Р70): ADP одобрила авторизацию со ссылкой — новая операция; ответ эмитента — тест как
- *  процессинг (ПИ-3); итог агента — operation.authorized и GET → SETTLING. Возвращает op_ref новой операции. */
+/** После одобрения человеком (Р70): ADP одобрила авторизацию со ссылкой — новая операция; ответ эмитента (ПИ-3) шлёт
+ *  контур до ответа продавцу (`adpAsync`); итог агента — operation.authorized и GET → SETTLING. op_ref новой операции. */
 async function issuerApproves(r: Awaited<ReturnType<typeof above>>["r"]): Promise<string> {
   const d = await adpDecision(r, 2);
   expect(d.decision).toBe("APPROVE");
-  const res = await r.c.stand!.app.inject({ method: "POST", url: "/adp/v1/events", payload: { op_ref: d.op_ref, msg_type: "ISSUER_RESPONSE", issuer_approved: true } });
-  expect(res.statusCode).toBe(202);
   return d.op_ref;
 }
 
@@ -113,7 +111,7 @@ describe("стадия 4 на стенде v0.17.0: подтверждение �
     const paying = r.purchase.authorize({ idempotencyKey: "idem-pay-cnf" }).catch((e: unknown) => e);
     await pending;
     expect(codes).toEqual(["CONFIRMATION_PENDING"]);
-    // подмена до PS-11: настоящий ADP стенда по копии сообщения эквайрера потребовал подтверждения (РП50 п. 1)
+    // настоящий ADP стенда по сообщению эквайрера потребовал подтверждения (РП50 п. 1) — без подмены (#97 п. 6)
     expect(await r.c.adpDecisions!()).toEqual([expect.objectContaining({ decision: "CONFIRMATION_REQUIRED" })]);
     const id = confirmationId(r);
     // продавец ответил AWAITING_CONFIRMATION (ADP: CONFIRMATION_REQUIRED; стенд v0.37.0, РП72; до него — DECLINED) — слова
@@ -138,8 +136,8 @@ describe("стадия 4 на стенде v0.17.0: подтверждение �
       [id, "APPROVED"],
     ]);
     expect(r.c.journal.entries.filter((e) => e.kind === "operation.status").map((e) => [e.ref, e.detail])).toEqual([[opRef, "AUTHORIZED"]]);
-    // слова продавца: на оплату — «ждёт», на ссылку — его ответ (подмена отвечает отказом; итог — по событию)
-    expect(r.c.journal.entries.filter((e) => e.kind === "shop.call" && e.method?.endsWith("/confirmation")).map((e) => [e.attempt, e.result])).toEqual([[1, "ok"]]);
+    // слова продавца: на оплату — «ждёт», на ссылку — PAID по решению ADP и ответу эмитента (без подмены); итог — по событию
+    expect(r.c.journal.entries.filter((e) => e.kind === "shop.call" && e.method?.endsWith("/confirmation")).map((e) => [e.attempt, e.result, e.detail])).toEqual([[1, "ok", "PAID"]]);
     // реквизит один, пакет один, ссылка продавцу — ровно одна (инвариант 9; РП72 п. 3); нового реквизита нет (РП72 п. 2)
     expect(count(r, "pao POST /pao/v1/credentials")).toBe(1);
     expect(count(r, `merchants POST /v1/shops/${NORMAL.id}/orders/${order.orderId}/payment`)).toBe(1);

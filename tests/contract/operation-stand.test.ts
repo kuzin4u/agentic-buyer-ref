@@ -50,7 +50,8 @@ const entries = (r: Run, kind: string) => r.c.journal.entries.filter((e) => e.ki
 describe("стадии 5–6 на стенде v0.20.0: итог из события и GET операции, расчёт (Р49)", { timeout: STAND_TIMEOUT_MS * 2 }, () => {
   it("П15: авторизация в пределах лимита — эмитент одобрил → operation.authorized → GET → SETTLING; остаток CART уменьшен; клиринг → operation.settled → DONE, запись об исполнении WITHIN_LIMITS", async () => {
     const notices: string[] = [];
-    const r = await standPurchase({ contourPayment: true, adpUntilPs11: true, notify: (code) => void notices.push(code) });
+    // без подмены (#97 п. 6; К1.4 AG-13 ч. 2б): решение ADP — ответ продавцу, ответ эмитента (ПИ-3) шлёт контур
+    const r = await standPurchase({ contourPayment: true, adpAsync: true, notify: (code) => void notices.push(code) });
     c = r.c;
     const intent = await r.purchase.intent({ ...INTENT, merchantScope: [NORMAL.merchant_id] }, { idempotencyKey: "idem-intent-p15" });
     await r.signWhileWaiting(intent.id, () => r.purchase.awaitIntent());
@@ -63,16 +64,14 @@ describe("стадии 5–6 на стенде v0.20.0: итог из событ
 
     const authorizing = r.purchase.authorize({ idempotencyKey: "idem-pay-p15" });
     const d = await decided(r);
-    // ADP одобрила по пределам мандата и ждёт эмитента: итога ещё нет, события нет
+    // ADP одобрила по пределам мандата; ответ эмитента (одобрение) — от контура, до ответа продавцу
     expect(d.decision).toBe("APPROVE");
-    await processing(r, { op_ref: d.op_ref, msg_type: "ISSUER_RESPONSE", issuer_approved: true });
     const op = await authorizing;
     expect(op).toMatchObject({ opRef: d.op_ref, orderRef: order.orderId, status: "AUTHORIZED", amount: total, merchantId: cart.cart!.merchantId, indicator: { mandateId: cart.id }, channel: "CARD" });
     expect(r.purchase.state).toBe("SETTLING");
-    // продавец ответил «ждёт подтверждения» — след подмены до PS-11: эмулятору продавцов подмена отвечает фиктивной
-    // причиной CONFIRMATION_REQUIRED, на стенде v0.37.0 заказ — AWAITING_CONFIRMATION (Р68, нюанс К0 AG-13 ч. 2б;
-    // пересмотр при К1.4 — асинхронный decide, #97 п. 6). Слова продавца — только в журнале, итог — по событию Платформы
-    expect(r.c.journal.entries.filter((e) => e.kind === "shop.call" && e.method?.endsWith("/payment")).map((e) => e.detail)).toEqual(["AWAITING_CONFIRMATION"]);
+    // продавец ответил PAID по решению ADP — следа подмены нет (нюанс К0 Р68 снят, К1.4); слова продавца — только в
+    // журнале, итог — по событию Платформы
+    expect(r.c.journal.entries.filter((e) => e.kind === "shop.call" && e.method?.endsWith("/payment")).map((e) => e.detail)).toEqual(["PAID"]);
     expect(entries(r, "operation.status")).toEqual([[d.op_ref, "AUTHORIZED"]]);
     // П15: остаток бюджета CART уменьшен — по verify Платформы, агент его не вычисляет (инвариант 6)
     const left = await r.c.platform.verifyMandate({ id: cart.id, currency: total.currency });

@@ -186,7 +186,14 @@
         "CONFIRMATION_REQUIRED"
       ],
       "norms": "A5 п. 3; A1",
-      "requirements": "Т7"
+      "requirements": "Т7",
+      "contour": {
+        "action": "CART выше порога ADP стенда (confirm_above_kop) в пределах INTENT; реквизит POST /pao/v1/credentials, пакет продавцу, авторизация продавца; решение человека — в приложении банка (stand.issuer.confirm) или на странице УПК по link (дополнение 1 к Р70)",
+        "expected": "ADP CONFIRMATION_REQUIRED → заказ AWAITING_CONFIRMATION, confirmation.required → GET → PENDING, человеку CONFIRMATION_PENDING (ссылка https:); агент сам не подтверждает; APPROVED → ворота стадии 5 заново → одна ссылка продавцу POST …/confirmation → новая операция (новый op_ref) с прежним реквизитом → operation.authorized → GET → SETTLING; реквизит выдан один раз, пакет один, confirmation_ref и link — ни в журнале, ни в исходе, ни в текстах. Пул-форма (повтор тем же ключом, 428) в профиле contour не действует",
+        "codes": [
+          "CONFIRMATION_REQUIRED"
+        ]
+      }
     },
     {
       "id": "П13",

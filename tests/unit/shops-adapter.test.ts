@@ -801,9 +801,9 @@ describe("адаптер витрин (Р42)", () => {
       expect(calls(journal)).toEqual([["POST /v1/shops/{id}/orders/{order_id}/payment", 2, result, expect.anything()]]);
     });
 
-    it("payable: один заказ CREATED с этим номером и мандатом — true, строка запроса по мандату корзины", async () => {
+    it("payable: один заказ CREATED с этим номером и мандатом — CREATED, строка запроса по мандату корзины", async () => {
       const { a, seen } = adapter({ "GET /v1/shops/S1/orders": [read(ORD())] });
-      expect(await a.payable(req)).toBe(true);
+      expect(await a.payable(req)).toBe("CREATED");
       expect(seen.map((s) => [s.method, s.path, s.query])).toEqual([["GET", "/v1/shops/S1/orders", "?cart_mandate_id=mnd_1"]]);
     });
 
@@ -811,15 +811,31 @@ describe("адаптер витрин (Р42)", () => {
       ["пусто", read(), "unknown", "NO_ORDER"],
       ["два заказа", read(ORD(), ORD({ id: "ord_2" })), "unknown", "MULTIPLE"],
       ["заказ PAYING (пакет дошёл)", read(ORD({ status: "PAYING" })), "unknown", "NOT_CREATED"],
-      ["заказ AWAITING_CONFIRMATION (стенд v0.37.0, пакет дошёл)", read(ORD({ status: "AWAITING_CONFIRMATION" })), "unknown", "NOT_CREATED"],
       ["чужой мандат", read(ORD({ cart_mandate_id: "mnd_other" })), "unknown", "FOREIGN_MANDATE"],
       ["другой номер заказа", read(ORD({ id: "ord_2" })), "unknown", "OTHER_ORDER"],
       ["нет ответа", "fail", "unknown", "NO_RESPONSE"],
       ["не по схеме", { status: 200, body: {} }, "refused", "BAD_RESPONSE"],
-    ] as [string, Answer, string, string][])("payable: %s — false, причина в записи чтения", async (_, answer, result, detail) => {
+    ] as [string, Answer, string, string][])("payable: %s — NO, причина в записи чтения", async (_, answer, result, detail) => {
       const { a, journal } = adapter({ "GET /v1/shops/S1/orders": [answer] });
-      expect(await a.payable(req)).toBe(false);
+      expect(await a.payable(req)).toBe("NO");
       expect(calls(journal).at(-1)).toEqual(["GET /v1/shops/{id}/orders", 1, result, detail]);
+    });
+
+    it("К1.3 (Р69 п. 4): заказ AWAITING_CONFIRMATION (стенд v0.37.0, пакет дошёл) — AWAITING_CONFIRMATION, причина в записи чтения; другой номер с этим статусом — OTHER_ORDER", async () => {
+      const { a, journal } = adapter({ "GET /v1/shops/S1/orders": [read(ORD({ status: "AWAITING_CONFIRMATION" }))] });
+      expect(await a.payable(req)).toBe("AWAITING_CONFIRMATION");
+      expect(calls(journal).at(-1)).toEqual(["GET /v1/shops/{id}/orders", 1, "unknown", "AWAITING_CONFIRMATION"]);
+      const b = adapter({ "GET /v1/shops/S1/orders": [read(ORD({ id: "ord_2", status: "AWAITING_CONFIRMATION" }))] });
+      expect(await b.a.payable(req)).toBe("NO");
+    });
+
+    it("КТ сессии 57 № 12: payable — сигнал покупки доходит до чтения: остановка прерывает зависшее обращение (и сон до повтора — тот же сигнал)", async () => {
+      const ac = new AbortController();
+      const reason = new Error("покупка остановлена");
+      const { a } = adapter({ "GET /v1/shops/S1/orders": ["hang"] });
+      const p = a.payable(req, ac.signal);
+      ac.abort(reason);
+      await expect(p).rejects.toBe(reason);
     });
   });
 

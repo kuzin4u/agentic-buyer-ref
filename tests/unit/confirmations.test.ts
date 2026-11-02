@@ -657,6 +657,40 @@ describe("вход вызывающего и прерывание (Р47 п. 8, �
     expect(calls).toEqual(["first"]);
   });
 
+  it("КТ сессии 57 № 11: отказ обещания оболочки и сбой журнала на notify.failed — без необработанного отказа, исход не меняется", async () => {
+    const c = clock();
+    const answers = new Map<string, Confirmation>([[ID1, confirmation("PENDING")]]);
+    const conf = new Confirmations({
+      port: { getConfirmation: async (id: string) => structuredClone(answers.get(id)!) },
+      journal: {
+        record: (e) => {
+          if (e.kind === "notify.failed") throw new Error("журнал недоступен");
+        },
+      },
+      params: { confirmation_wait_ms: WAIT_MS, confirmation_decision_max_sec: DECISION_MAX_SEC, signature_skew_sec: SKEW_SEC, event_seen_max: SEEN_MAX },
+      now: c.now,
+      timer: c.timer,
+    });
+    const unhandled: unknown[] = [];
+    const onUnhandled = (e: unknown) => void unhandled.push(e);
+    process.on("unhandledRejection", onUnhandled);
+    try {
+      let outcome: ConfirmationOutcome | undefined;
+      void conf.wait({ signal: new AbortController().signal, onPending: () => Promise.reject(new Error("оболочка отказала")) }).then((o) => (outcome = o));
+      const item = (type: PlatformEventType, eventId: string): FeedItem => ({ kind: "event", event: { eventId, type, at: c.now().toISOString(), mandateId: null, opRef: null, confirmationId: ID1, declineReason: null } });
+      await conf.listener(item("confirmation.required", "evt_1"));
+      await settle();
+      await settle();
+      answers.set(ID1, confirmation("APPROVED"));
+      await conf.listener(item("confirmation.approved", "evt_2"));
+      await settle();
+      expect(outcome).toBe("APPROVED");
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+    }
+  });
+
   it("сбой уведомления — запись notify.failed, исход не меняется: исключение и отказ обещания", async () => {
     for (const onPending of [
       () => {

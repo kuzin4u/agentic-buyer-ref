@@ -317,7 +317,15 @@ export class Confirmations {
 
   /** Уведомление — не часть исхода (В3): ни исключение, ни отказ обещания оболочки покупку не меняют и не ждутся. */
   #notify(w: Waiter, link: string | null): void {
-    const failed = () => this.#record({ kind: "notify.failed", reason: "CONFIRMATION_PENDING" });
+    // сбой журнала здесь некуда отдать: из .catch — необработанный отказ обещания (КТ сессии 57 № 11; модуль может
+    // подключить оболочка напрямую, без Purchase) — глотается, как в purchase.ts
+    const failed = () => {
+      try {
+        this.#record({ kind: "notify.failed", reason: "CONFIRMATION_PENDING" });
+      } catch {
+        // журнал недоступен — уведомление исход не меняет
+      }
+    };
     try {
       const r = link === null ? w.onPending?.() : w.onPending?.(link);
       if (r !== undefined) Promise.resolve(r).catch(failed);

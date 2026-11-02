@@ -37,7 +37,7 @@ export interface ContourPaymentOptions {
     /** наблюдение после итога покупки (Р51 п. 4) */
     watch(op: Operation, after: WatchAfter, notice: LateNotice): void;
   };
-  params: Pick<StandParams, "operation_outcome_max_delay_sec" | "confirmation_wait_ms" | "reservation_ttl_sec">;
+  params: Pick<StandParams, "operation_outcome_max_delay_sec" | "confirmation_wait_ms" | "reservation_ttl_sec" | "shop_request_timeout_ms">;
   now?: () => Date;
 }
 
@@ -187,7 +187,15 @@ export class ContourPayment implements PaymentSteps {
           // витрины CREATED (пакет не дошёл); второй неизвестный исход — итог как есть, третьего POST нет
           const unconfirmed = e instanceof PaymentFailure && e.code === "OPERATION_RESULT_UNCONFIRMED";
           if (!unconfirmed || attempt > 1 || !unknown || looked.kind !== "ABSENT" || c.signal.aborted) throw e;
-          if (!(await this.#retryable(credential, c.cart.id, req, c.signal))) throw e;
+          const next = await this.#retryable(credential, c.cart.id, req, c.signal);
+          // К1.3 (Р69 п. 4, правка ревью): заказ ждёт подтверждения — пакет дошёл, ADP требует подтверждения; стадия 4 —
+          // только по запросу Платформы, пришедшему после отправки пакета (К1.1): ждём его до confirmation_wait_ms; не
+          // пришёл — итога нет. Повтора оплаты нет
+          if (next === "CONFIRM") {
+            await this.#awaitRequest(mark, c.signal);
+            throw new PaymentFailure("CONFIRMATION_REQUIRED");
+          }
+          if (next !== "RETRY") throw e;
         }
         // покупку остановили, пока читали заказ, — повтора нет; повтор — запись до действия: решение без записи не
         // исполняется (инвариант 4); реквизита в записи нет, только мандат корзины и номер заказа
@@ -211,25 +219,44 @@ export class ContourPayment implements PaymentSteps {
    *  отказ чтения — повтора нет: ISSUED лишь отсекает уже одобренные — безопасность повтора держится на атомарном гашении
    *  ISSUED → USED на APPROVE ADP, дополнение 2 к Р69 п. 1); затем заказ у витрины CREATED с этим номером и мандатом.
    *  Сначала Платформа (основание, инвариант 8), затем витрина. */
-  async #retryable(credential: Credential, cartId: string, req: { shopId: string; orderId: string; cartMandateId: string }, signal: AbortSignal): Promise<boolean> {
+  async #retryable(credential: Credential, cartId: string, req: { shopId: string; orderId: string; cartMandateId: string }, signal: AbortSignal): Promise<"RETRY" | "CONFIRM" | "NO"> {
+    // запас к сроку (КТ сессии 57 № 5): повтор доходит до продавца не дольше ответа витрины — срок реквизита должен
+    // пережить его (shop_request_timeout_ms)
+    const margin = this.o.params.shop_request_timeout_ms;
     const until = credential.validTo === null ? Number.NaN : Date.parse(credential.validTo);
-    if (!(until > this.now().getTime()) || this.o.shop.payable === undefined) return false;
+    const payable = this.o.shop.payable?.bind(this.o.shop);
+    if (!(until > this.now().getTime() + margin) || payable === undefined) return "NO";
     let now: Credential;
     try {
       now = await this.o.platform.credentialStatus(credential.credentialRef, cartId);
     } catch (e) {
       // отказ Платформы — повтора нет; код — в записи pao.call адаптера. Прочее (сбой журнала, дефект) — наружу
-      if (e instanceof PlatformFailure) return false;
+      if (e instanceof PlatformFailure) return "NO";
       throw e;
     }
     // срок — меньший из выданного и из ответа GET (в GET срока нет — повтора нет): пакет несёт прежнюю криптограмму;
     // перед повтором — ещё раз, после чтения заказа у витрины (ревью КТ2 № 1)
     const live = () => {
       const t = now.validTo === null ? Number.NaN : Date.parse(now.validTo);
-      return Math.min(t, until) > this.now().getTime();
+      return Math.min(t, until) > this.now().getTime() + margin;
     };
-    if (now.status !== "ISSUED" || !live() || signal.aborted) return false;
-    return (await this.o.shop.payable(req)) && live();
+    if (now.status !== "ISSUED" || !live() || signal.aborted) return "NO";
+    const order = await payable(req, signal);
+    // ждёт подтверждения — реквизит ADP не гасит (CONFIRMATION_REQUIRED до APPROVE): ISSUED и срок здесь уже проверены
+    if (order === "AWAITING_CONFIRMATION") return "CONFIRM";
+    return order === "CREATED" && live() ? "RETRY" : "NO";
+  }
+
+  /** Запрос подтверждения Платформы после отметки `mark` (до отправки пакета) — не дольше confirmation_wait_ms (К1.3);
+   *  не пришёл — OPERATION_RESULT_UNCONFIRMED; остановка покупки — её причина. */
+  async #awaitRequest(mark: number, signal: AbortSignal): Promise<void> {
+    const limit = AbortSignal.timeout(this.o.params.confirmation_wait_ms);
+    try {
+      await this.o.confirmations.arrival(AbortSignal.any([signal, limit]), mark);
+    } catch (e) {
+      if (signal.aborted) throw e;
+      throw new PaymentFailure("OPERATION_RESULT_UNCONFIRMED");
+    }
   }
 
   /** Итог стадии 5 (Р49 п. 5): первое из — привязанная операция или (только при DECLINED продавца) запрос подтверждения,

@@ -22,8 +22,8 @@ function steps(o: {
   lookup?: OperationOutcome;
   /** Р69 п. 4: исход каждой попытки оплаты (UNKNOWN — нет ответа, REFUSED — отказ витрины); нет — `reply` */
   pays?: (ShopPaymentReply["status"] | "UNKNOWN" | "REFUSED")[];
-  /** заказ CREATED у витрины; не задан — метода payable нет */
-  payable?: boolean | (() => Promise<boolean>);
+  /** заказ CREATED у витрины (true), иначе (false) или ждёт подтверждения (К1.3); не задан — метода payable нет */
+  payable?: boolean | "AWAITING_CONFIRMATION" | (() => Promise<boolean>);
   /** срок реквизита */
   validTo?: string | null;
   /** журнал шагов; не задан — MemoryJournal */
@@ -83,11 +83,11 @@ function steps(o: {
         return o.flag === true ? { status: r, confirmationRequired: true } : { status: r };
       },
       ...(payable !== undefined && {
-        payable: async () => {
-          log.push("payable");
+        payable: async (_req, signal) => {
+          log.push(`payable${signal === undefined ? " без сигнала" : ""}`);
           const r = typeof payable === "function" ? await payable() : payable;
           if (o.nowAfterPayable !== undefined) clockNow = o.nowAfterPayable;
-          return r;
+          return r === true ? "CREATED" : r === false ? "NO" : r;
         },
       }),
       ...(o.confirms !== null && {
@@ -295,6 +295,35 @@ describe("повтор оплаты после обрыва ответа — п�
     const lookups = s.log.filter((x) => x.startsWith("lookup"));
     expect(lookups).toEqual(["lookup ORD-1 m_cart", "lookup ORD-1 m_cart", "lookup-skip CI"]);
     expect(s.log.filter((x) => x.startsWith("pay "))).toEqual(["pay 1", "pay 2"]);
+  });
+
+  it("К1.3 (Р69 п. 4, правка ревью): обрыв ответа, «операций нет», заказ AWAITING_CONFIRMATION, запрос Платформы после отметки — стадия 4 (CONFIRMATION_REQUIRED), повтора оплаты нет", async () => {
+    const s = steps({ reply: "PAID", pays: ["UNKNOWN"], outcome: async () => ({ kind: "NONE" }), lookup: { kind: "ABSENT", skipped: 0 }, validTo: LATER, payable: "AWAITING_CONFIRMATION", arrival: Promise.resolve() });
+    await expect(s.p.authorize(ctx(), { idempotencyKey: "k" })).rejects.toMatchObject({ code: "CONFIRMATION_REQUIRED" });
+    // запрос — после отметки первой попытки; сигнал покупки — у чтения заказа (КТ сессии 57 № 12)
+    expect(s.log).toEqual(["expect", "mark", "pay 1", `outcome ${PARAMS.operation_outcome_max_delay_sec * 1000}`, "lookup ORD-1 m_cart", "credential cr_1 m_cart", "payable", "arrival 7", "close"]);
+    expect(s.journal.entries.some((e) => e.kind === "payment.retry")).toBe(false);
+  });
+
+  it("К1.3: заказ AWAITING_CONFIRMATION, а запроса Платформы нет (признак продавца без запроса — не стадия 4, К1.1) — OPERATION_RESULT_UNCONFIRMED; остановка покупки в ожидании — её причина", async () => {
+    const none = steps({ reply: "PAID", pays: ["UNKNOWN"], outcome: async () => ({ kind: "NONE" }), lookup: { kind: "ABSENT", skipped: 0 }, validTo: LATER, payable: "AWAITING_CONFIRMATION", arrival: () => Promise.reject(new Error("срок ожидания запроса")) });
+    await expect(none.p.authorize(ctx(), { idempotencyKey: "k" })).rejects.toMatchObject({ code: "OPERATION_RESULT_UNCONFIRMED" });
+    expect(none.log.filter((x) => x.startsWith("pay "))).toEqual(["pay 1"]);
+    const ac = new AbortController();
+    const reason = new Error("покупка остановлена");
+    const stopped = steps({ reply: "PAID", pays: ["UNKNOWN"], outcome: async () => ({ kind: "NONE" }), lookup: { kind: "ABSENT", skipped: 0 }, validTo: LATER, payable: "AWAITING_CONFIRMATION", arrival: (signal) => (ac.abort(reason), Promise.reject(signal.reason)) });
+    await expect(stopped.p.authorize(ctx(ac.signal), { idempotencyKey: "k" })).rejects.toBe(reason);
+  });
+
+  it("КТ сессии 57 № 5: срок реквизита ближе запаса shop_request_timeout_ms — повтора нет, GET реквизита нет", async () => {
+    const soon = new Date(NOW.getTime() + PARAMS.shop_request_timeout_ms).toISOString();
+    const s = steps({ reply: "PAID", pays: ["UNKNOWN", "PAID"], outcome: thenAuthorized(), lookup: { kind: "ABSENT", skipped: 0 }, validTo: soon, payable: true });
+    await expect(s.p.authorize(ctx(), { idempotencyKey: "k" })).rejects.toMatchObject({ code: "OPERATION_RESULT_UNCONFIRMED" });
+    expect(s.log.filter((x) => x.startsWith("pay ") || x.startsWith("credential"))).toEqual(["pay 1"]);
+    // срок из GET в пределах запаса — тоже без повтора
+    const g = steps({ reply: "PAID", pays: ["UNKNOWN", "PAID"], outcome: thenAuthorized(), lookup: { kind: "ABSENT", skipped: 0 }, validTo: LATER, credentialValidTo: soon, payable: true });
+    await expect(g.p.authorize(ctx(), { idempotencyKey: "k" })).rejects.toMatchObject({ code: "OPERATION_RESULT_UNCONFIRMED" });
+    expect(g.log.filter((x) => x.startsWith("pay "))).toEqual(["pay 1"]);
   });
 
   it("дополнение 2 к Р69 п. 3: без повтора CREDENTIAL_INVALID первой попытки — итог, ожидание ничего не пропускает", async () => {

@@ -158,7 +158,7 @@ describe("AgentCore.payment (Р45 п. 6)", () => {
         if (paid === 1) throw new ShopFailure("SHOP_ORDER_STATE_UNKNOWN");
         return { status: "PAID" };
       },
-      payable: async () => true,
+      payable: async () => "CREATED" as const,
     });
     const total = { amount: 250000, currency: "RUB" };
     const cart = { id: "m_cart", cart: { merchantId: "shop_1", lines: [], total } } as unknown as Mandate;

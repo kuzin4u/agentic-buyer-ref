@@ -26,6 +26,7 @@ import { AGENT_STOP_CODES, channelFailure, ruleForFailure } from "../../declines
 import {
   ShopFailure,
   type OfferSource,
+  type OrderPayable,
   type ShopConfirmRequest,
   type ShopOffers,
   type ShopOrder,
@@ -143,8 +144,8 @@ const Orders = z.object({
 /** POST заказа — не больше двух: второй только после чтения «заказа нет» (Р55 п. 4, инвариант 9). */
 const ORDER_POSTS = 2;
 /** Чтение по схеме, но заказа для продолжения нет (Р55, ревью КТ1 № 7): заказов больше одного, мандат не тот, не CREATED;
- *  перед повтором оплаты (Р69 п. 4) — ещё заказа нет или номер другой. */
-type OrderMiss = "MULTIPLE" | "FOREIGN_MANDATE" | "NOT_CREATED" | "NO_ORDER" | "OTHER_ORDER";
+ *  перед повтором оплаты (Р69 п. 4) — ещё заказа нет, номер другой или заказ ждёт подтверждения (К1.3 AG-13 ч. 2б). */
+type OrderMiss = "MULTIPLE" | "FOREIGN_MANDATE" | "NOT_CREATED" | "NO_ORDER" | "OTHER_ORDER" | "AWAITING_CONFIRMATION";
 
 type Method =
   | "GET /v1/shops"
@@ -505,16 +506,31 @@ export class ShopsAdapter implements OfferSource, LiveOfferSource, ShopPort, Sho
     return { status: b.data.status };
   }
 
-  /** Перед повтором оплаты (Р69 п. 4): заказы витрины по мандату корзины — ровно один, с этим номером, мандатом и
-   *  CREATED. Продавец ставит PAYING до первого await приёма пакета: CREATED — пакет до него не дошёл. Иначе или не
-   *  прочитано — false; причина — detail записи чтения (NO_ORDER, MULTIPLE, FOREIGN_MANDATE, OTHER_ORDER, NOT_CREATED). */
-  async payable(req: Omit<ShopPaymentRequest, "package">): Promise<boolean> {
+  /** Перед повтором оплаты (Р69 п. 4): заказы витрины по мандату корзины — ровно один, с этим номером и мандатом.
+   *  Продавец ставит PAYING до первого await приёма пакета: CREATED — пакет до него не дошёл; AWAITING_CONFIRMATION —
+   *  пакет дошёл, ADP требует подтверждения (стенд v0.37.0; К1.3 AG-13 ч. 2б) — повод ждать запрос Платформы. Иначе или
+   *  не прочитано — NO; причина — detail записи чтения (NO_ORDER, MULTIPLE, FOREIGN_MANDATE, OTHER_ORDER, NOT_CREATED,
+   *  AWAITING_CONFIRMATION). Остановка покупки (`signal`) прерывает чтение и сон до повтора чтения (КТ сессии 57 № 12). */
+  async payable(req: Omit<ShopPaymentRequest, "package">, signal?: AbortSignal): Promise<OrderPayable> {
     if (!SHOP_ID.test(req.shopId) || !ORDER_REF.test(req.orderId)) throw new Error("id витрины или заказа не по маске");
     const path = `/v1/shops/${req.shopId}/orders?cart_mandate_id=${encodeURIComponent(req.cartMandateId)}`;
     const verdict = ({ orders: [o, ...rest] }: z.infer<typeof Orders>): OrderMiss | null =>
-      o === undefined ? "NO_ORDER" : rest.length > 0 ? "MULTIPLE" : o.cart_mandate_id !== req.cartMandateId ? "FOREIGN_MANDATE" : o.id !== req.orderId ? "OTHER_ORDER" : o.status !== "CREATED" ? "NOT_CREATED" : null;
-    const read = await this.#get("GET /v1/shops/{id}/orders", path, Orders, req.shopId, undefined, undefined, { mandate: req.cartMandateId, verdict });
-    return read.ok;
+      o === undefined
+        ? "NO_ORDER"
+        : rest.length > 0
+          ? "MULTIPLE"
+          : o.cart_mandate_id !== req.cartMandateId
+            ? "FOREIGN_MANDATE"
+            : o.id !== req.orderId
+              ? "OTHER_ORDER"
+              : o.status === "AWAITING_CONFIRMATION"
+                ? "AWAITING_CONFIRMATION"
+                : o.status !== "CREATED"
+                  ? "NOT_CREATED"
+                  : null;
+    const read = await this.#get("GET /v1/shops/{id}/orders", path, Orders, req.shopId, signal, undefined, { mandate: req.cartMandateId, verdict });
+    if (read.ok) return "CREATED";
+    return read.cause.detail === "AWAITING_CONFIRMATION" ? "AWAITING_CONFIRMATION" : "NO";
   }
 
   /** Факты витрины → модель К8 (Р54 п. 4): магазин — из записи списка `entry`, товары — из карточек каталога. Факты

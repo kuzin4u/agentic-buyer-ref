@@ -103,6 +103,9 @@ export interface ShopPaymentRequest {
 /** Ответ продавца на оплату — его слова, а не итог (инвариант 8): статус заказа закрытым перечнем, для журнала и как
  *  повод ждать запрос подтверждения (DECLINED, AWAITING_CONFIRMATION или признак `confirmationRequired` —
  *  `payment.confirmation_required` стенда v0.37.0, РП72). Сам запрос — только из `confirmation.required` Платформы. */
+/** Заказ у витрины перед повтором оплаты (Р69 п. 4): слова продавца — только условие, не итог (инвариант 8). */
+export type OrderPayable = "CREATED" | "AWAITING_CONFIRMATION" | "NO";
+
 export interface ShopPaymentReply {
   status: "PAID" | "DECLINED" | "REJECTED" | "AWAITING_CONFIRMATION";
   confirmationRequired?: boolean;
@@ -111,11 +114,14 @@ export interface ShopPaymentReply {
 /** Стадия 5: передача пакета продавцу подписанным обращением. Отказ витрины — ShopFailure SHOP_ORDER_REFUSED, неизвестный
  *  исход — SHOP_ORDER_STATE_UNKNOWN; иная ошибка вызова — отказ стадии (инвариант 4). Повтор — только шагами оплаты по
  *  проверке через Платформу (Р69 п. 4), `attempt` — номер попытки для журнала. `payable` — заказ у витрины ровно один по
- *  мандату корзины, с этим номером и CREATED (пакет до продавца не дошёл); не прочитано или иначе — false; метода нет —
- *  повтора нет (fail-closed). */
+ *  мандату корзины, с этим номером: CREATED (пакет до продавца не дошёл) или AWAITING_CONFIRMATION (ждёт подтверждения —
+ *  повод ждать запрос Платформы, Р69 п. 4, К1.3 AG-13 ч. 2б); не прочитано или иначе — NO; метода нет — повтора нет
+ *  (fail-closed). `signal` у `payable` — остановка покупки: прерывает чтение и сон по `Retry-After` до повтора чтения
+ *  (мелочь КТ сессии 57 № 12). У `pay` сигнала нет: пакет мог уйти, прерванный POST потерял бы ответ продавца; сна до
+ *  повтора у `pay` нет, повтор оплаты защищён проверкой остановки до POST. */
 export interface ShopPaymentPort {
   pay(req: ShopPaymentRequest, attempt?: number): Promise<ShopPaymentReply>;
-  payable?(req: Omit<ShopPaymentRequest, "package">): Promise<boolean>;
+  payable?(req: Omit<ShopPaymentRequest, "package">, signal?: AbortSignal): Promise<OrderPayable>;
   /** Ссылка подтверждения продавцу (Р69 п. 0, Р70 В1; стенд v0.37.0, РП72): подписанный `POST …/orders/{order_id}/confirmation`
    *  с `{confirmation_ref}`; продавец повторяет авторизацию новой операцией с пакетом первой оплаты. Ответ — слова продавца
    *  (инвариант 8). Отказ витрины (4xx: 409, 404, 422) — SHOP_ORDER_REFUSED; нет ответа, не по схеме, любой 5xx (в том числе

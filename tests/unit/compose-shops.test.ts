@@ -194,6 +194,97 @@ describe("AgentCore.payment (Р45 п. 6)", () => {
     expect(journal.entries.some((e) => e.kind === "payment.retry")).toBe(false);
   });
 
+  /** К1.6 (дополнение 3 к Р69; нюанс К1.3): обрыв ответа витрины на оплату, «операций нет», реквизит ISSUED, заказ
+   *  AWAITING_CONFIRMATION — стадия 4 по запросу Платформы. Сборка ядра и настоящие сроки: итог стадии 5 ждётся
+   *  `operation_outcome_max_delay_sec` = 3 с, запрос хранится `confirmation_wait_ms`. `when` — когда лента отдаёт
+   *  confirmation.required: "outcome" — с первой оплаты (читает ожидание итога, срок хранения истекает до ожидания запроса);
+   *  "await" — не раньше LATE_MS после чтения заказа: чтение ленты, начатое ожиданием итога, к этому времени закончилось
+   *  (интервал event_poll_interval_ms = 1 с), прочитать может лишь ожидание запроса. */
+  async function awaitingOnStub(when: "outcome" | "await") {
+    const id = "cnf_22222222-2222-4222-8222-222222222222";
+    const LATE_MS = 1500;
+    let paid = 0;
+    let readAt: number | null = null;
+    let served = false;
+    const VALID_TO = "2026-10-12T09:15:00Z";
+    const issued = (mandateId: string) => ({
+      credential_ref: "cr_1",
+      kind: "CARD" as const,
+      payload: { token_ref: "tok_ref_1", cryptogram: "cg_1", valid_to: VALID_TO },
+      aoi: { indicator: true, agent_code: AGENT, mandate_id: mandateId },
+      status: "ISSUED" as const,
+    });
+    const s = new PaoStand({
+      handlers: {
+        "POST /pao/v1/credentials": ({ body }) => ({ status: 201, body: issued(body.mandate_id) }),
+        "GET /pao/v1/credentials/{ref}": () => ({ status: 200, body: issued("m_cart") }),
+        "GET /pao/v1/events": () => {
+          if (served || paid === 0 || (when === "await" && (readAt === null || Date.now() - readAt < LATE_MS))) return { status: 200, body: [] };
+          served = true;
+          return { status: 200, body: [{ event_id: "evt_cnf_2", type: "confirmation.required", at: "2026-10-12T09:01:00Z", data: { confirmation_id: id } }] };
+        },
+        "GET /pao/v1/confirmations/{id}": () => ({
+          status: 200,
+          body: { id, status: "PENDING", link: "https://upk.stand/c/k16", confirmation_ref: null, expires_at: "2099-10-12T09:15:00.000Z" },
+        }),
+        "GET /pao/v1/operations": () => ({ status: 200, body: [] }),
+      },
+    });
+    stand = s;
+    // "outcome": срок хранения (1 с) короче ожидания итога (3 с) — без удержания отметки запрос выброшен до ожидания;
+    // "await": ожидание запроса 4 с — больше LATE_MS и трёх интервалов чтения ленты, без опроса ленты запрос не прочитан
+    const params = loadParams();
+    const paramsPath = `${s.dir}-params.json`;
+    const waitMs = when === "outcome" ? 1000 : 4000;
+    writeFileSync(paramsPath, JSON.stringify({ ...params, operation_outcome_max_delay_sec: Math.ceil((3 * params.event_poll_interval_ms) / 1000), confirmation_wait_ms: waitMs }));
+    const { core, journal } = await coreOn(s, { paramsPath });
+    await core.start();
+    const from = s.stub.calls.length;
+    const steps = core.payment({
+      pay: async () => {
+        paid++;
+        throw new ShopFailure("SHOP_ORDER_STATE_UNKNOWN");
+      },
+      payable: async () => {
+        readAt = Date.now();
+        return "AWAITING_CONFIRMATION" as const;
+      },
+    });
+    const total = { amount: 250000, currency: "RUB" };
+    const cart = { id: "m_cart", cart: { merchantId: "shop_1", lines: [], total } } as unknown as Mandate;
+    const ac = new AbortController();
+    const ctx: PaymentContext = { intent: { id: "m_intent" } as Mandate, cart, shopId: "SHOP-1", merchantId: "shop_1", channel: "CARD", order: { orderId: "ORD-1", total }, signal: ac.signal, sending: () => {} };
+    const result = await steps.authorize(ctx, { idempotencyKey: "idem-pay-k16" }).then(
+      (op) => op.status,
+      (e: { code?: string }) => e.code,
+    );
+    return { s, from, journal, result, ctx, ac, steps, paid: () => paid };
+  }
+
+  it.each([
+    ["запрос прочитан в ожидании итога, срок хранения истёк до ожидания запроса — удержание отметки (поломка 2)", "outcome"],
+    ["запрос появился только после чтения заказа — опрос ленты в ожидании запроса (поломка 1)", "await"],
+  ] as const)("К1.6 (дополнение 3 к Р69): обрыв ответа, «операций нет», заказ AWAITING_CONFIRMATION — стадия 4 на PaoStub: %s; повтора оплаты нет, человеку — ссылка", { timeout: 20_000 }, async (_name, when) => {
+    const r = await awaitingOnStub(when);
+    expect(r.result).toBe("CONFIRMATION_REQUIRED");
+    expect(r.paid()).toBe(1);
+    // стадия 4 берёт удержанный запрос: PENDING — человеку ссылка; агент сам не подтверждает (инвариант 7)
+    const links: (string | undefined)[] = [];
+    const waiting = r.steps.confirm(r.ctx, (link?: string) => void links.push(link), r.ac.signal);
+    await new Promise((res) => setTimeout(res, 50));
+    expect(links).toEqual(["https://upk.stand/c/k16"]);
+    r.ac.abort(new Error("покупка остановлена"));
+    await expect(waiting).rejects.toThrow("покупка остановлена");
+    // полный журнал: реквизит один, поиск по CART, статус реквизита, GET запроса — один (в ожидании итога или в ожидании
+    // запроса); второго POST и ссылки продавцу нет
+    const cnf = "GET /pao/v1/confirmations/{id}";
+    const tail = ["GET /pao/v1/operations", "GET /pao/v1/credentials/{ref}"];
+    expect(opsFrom(r.s, r.from)).toEqual(when === "outcome" ? ["POST /pao/v1/credentials", cnf, ...tail] : ["POST /pao/v1/credentials", ...tail, cnf]);
+    expect(r.journal.entries.some((e) => e.kind === "payment.retry" || e.kind === "confirmation.discarded")).toBe(false);
+    expect(r.journal.entries.filter((e) => e.kind === "confirmation.unclaimed").map((e) => e.ref)).toEqual(["cnf_22222222-2222-4222-8222-222222222222"]);
+    expect(JSON.stringify(r.journal.entries)).not.toMatch(/tok_ref_1|cg_1|cr_1|upk\.stand/);
+  });
+
   it("связка ядра (Р49 п. 4, 6): операция по заказу с чужим продавцом — OPERATION_REPLY_MISMATCH; расчёт — GET по op_ref, SETTLED с записью об исполнении", async () => {
     let served = false;
     let merchant = "shop_other";

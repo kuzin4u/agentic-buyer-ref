@@ -110,6 +110,7 @@ function steps(o: {
         return "APPROVED";
       },
       mark: () => (log.push("mark"), 7),
+      keep: () => () => {},
       arrival: (signal, after) => {
         log.push(`arrival ${after}`);
         if (typeof o.arrival === "function") return o.arrival(signal);

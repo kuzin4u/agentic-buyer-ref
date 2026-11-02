@@ -76,7 +76,14 @@ interface Waiter {
   finish(o: ConfirmationOutcome): void;
 }
 
-const RFC3339 = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?(Z|[+-]\d{2}:\d{2})$/;
+interface Held {
+  read: Read;
+  drop: () => void;
+  readonly seq: number;
+  expired: boolean;
+}
+
+const RFC3339 =/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?(Z|[+-]\d{2}:\d{2})$/;
 
 const STATUSES: ReadonlySet<string> = new Set(["PENDING", "APPROVED", "REJECTED", "EXPIRED"]);
 
@@ -90,8 +97,12 @@ export class Confirmations {
   readonly #waiters = new Set<Waiter>();
   /** запрос → покупка, ждущая решения */
   readonly #bound = new Map<string, Waiter>();
-  /** невостребованные запросы (В1а): пришли без ожидающих, хранятся не дольше confirmation_wait_ms */
-  readonly #unclaimed = new Map<string, { read: Read; drop: () => void; seq: number }>();
+  /** невостребованные запросы (В1а): пришли без ожидающих, хранятся не дольше confirmation_wait_ms; пришедший позже
+   *  удерживаемой отметки — до её снятия и ещё confirmation_wait_ms (дополнение 3 к Р69 п. 1; expired — срок истёк при
+   *  удержании) */
+  readonly #unclaimed = new Map<string, Held>();
+  /** отметки покупок, ждущих итог стадии 5 (`keep`): запросы позже них по сроку не выбрасываются */
+  readonly #keeps = new Set<{ after: number }>();
   /** запросы, по которым решено (исход, чужой, неоднозначный, выброшен): события по ним больше ничего не делают. Без
    *  окна (Р50, нюанс; условие владельца 1): растёт по запросам подтверждения, а не по событиям — пересмотр при пилоте */
   readonly #done = new Set<string>();
@@ -233,8 +244,32 @@ export class Confirmations {
   }
 
   #hold(id: string, read: Read): void {
-    const drop = this.#timer(() => {
-      if (!this.#unclaimed.delete(id)) return;
+    const held: Held = { read, drop: () => {}, seq: ++this.#held, expired: false };
+    this.#unclaimed.set(id, held);
+    this.#arm(id, held);
+    // запись — до действия (Р69 п. 1): без записи запрос не хранится и о нём не оповещают (Т15 — особое событие);
+    // ошибка журнала — наружу, слушатель не отмечает событие обработанным, лента прочитает его снова (fail-closed)
+    try {
+      this.#record({ kind: "confirmation.unclaimed", ref: id });
+    } catch (e) {
+      held.drop();
+      this.#unclaimed.delete(id);
+      throw e;
+    }
+    for (const a of [...this.#arrivals]) if (held.seq > a.after) a.arrived();
+  }
+
+  /** Срок хранения невостребованного — confirmation_wait_ms от сейчас. Истёк, пока запрос позже удерживаемой отметки, —
+   *  не выбрасывается, пока её не снимут (дополнение 3 к Р69 п. 1). */
+  #arm(id: string, held: Held): void {
+    held.expired = false;
+    held.drop = this.#timer(() => {
+      if (this.#unclaimed.get(id) !== held) return;
+      if (this.#kept(held.seq)) {
+        held.expired = true;
+        return;
+      }
+      this.#unclaimed.delete(id);
       this.#done.add(id);
       // запрос уже выброшен; исключение в таймере ловить некому — оно уронило бы процесс (КТ1 сессии 39 № 8)
       try {
@@ -243,18 +278,11 @@ export class Confirmations {
         // журнал недоступен: записи нет, действие состоялось
       }
     }, this.#o.params.confirmation_wait_ms);
-    const seq = ++this.#held;
-    this.#unclaimed.set(id, { read, drop, seq });
-    // запись — до действия (Р69 п. 1): без записи запрос не хранится и о нём не оповещают (Т15 — особое событие);
-    // ошибка журнала — наружу, слушатель не отмечает событие обработанным, лента прочитает его снова (fail-closed)
-    try {
-      this.#record({ kind: "confirmation.unclaimed", ref: id });
-    } catch (e) {
-      drop();
-      this.#unclaimed.delete(id);
-      throw e;
-    }
-    for (const a of [...this.#arrivals]) if (seq > a.after) a.arrived();
+  }
+
+  #kept(seq: number): boolean {
+    for (const k of this.#keeps) if (seq > k.after) return true;
+    return false;
   }
 
   /** Отметка до отправки пакета (Р49 п. 5): запросы, невостребованные до неё, в гонке этой покупки не в счёт. */
@@ -263,14 +291,32 @@ export class Confirmations {
   }
 
   /**
+   * Удержание отметки покупкой до конца стадии 5 (дополнение 3 к Р69 п. 1): запрос позже `after` по сроку не
+   * выбрасывается; после снятия последней такой отметки хранится ещё confirmation_wait_ms — его возьмёт стадия 4 этой
+   * покупки. Вернуть — снятие (повторное — ничего не делает).
+   */
+  keep(after: number): () => void {
+    const k = { after };
+    this.#keeps.add(k);
+    return () => {
+      if (!this.#keeps.delete(k)) return;
+      for (const [id, held] of this.#unclaimed) if (held.expired && !this.#kept(held.seq)) this.#arm(id, held);
+    };
+  }
+
+  /**
    * Появился невостребованный запрос подтверждения позже отметки `after` (Р49 п. 5; ревью КТ1 № 5): уже есть — сразу. Не
-   * привязывает и не уведомляет: запрос берёт `wait` стадии 4 (В1а). Прерывание `signal` — отказ с его причиной.
+   * привязывает и не уведомляет: запрос берёт `wait` стадии 4 (В1а). Пока ждёт — читает ленту, как `wait` (дополнение 3
+   * к Р69 п. 2): push может не прийти. Прерывание `signal` — отказ с его причиной.
    */
   arrival(signal: AbortSignal, after: number): Promise<void> {
     if (signal.aborted) return Promise.reject(signal.reason);
     if ([...this.#unclaimed.values()].some((h) => h.seq > after)) return Promise.resolve();
     return new Promise<void>((resolve, reject) => {
+      let settled = false;
       const end = (done: () => void) => {
+        if (settled) return;
+        settled = true;
         this.#arrivals.delete(a);
         signal.removeEventListener("abort", onAbort);
         done();
@@ -279,6 +325,7 @@ export class Confirmations {
       const onAbort = () => end(() => reject(signal.reason));
       this.#arrivals.add(a);
       signal.addEventListener("abort", onAbort, { once: true });
+      void poll(this.#o.wake, () => settled, this.#o.params.event_poll_interval_ms);
     });
   }
 

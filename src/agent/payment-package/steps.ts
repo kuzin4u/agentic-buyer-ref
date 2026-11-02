@@ -24,6 +24,8 @@ export interface ContourPaymentOptions {
   confirmations: {
     wait(o: { signal: AbortSignal; onPending?: (link?: string) => void; onApproved?: (ref: string, expiresAt: string) => void }): Promise<ConfirmationOutcome>;
     mark(): number;
+    /** удержание отметки до конца стадии 5 (дополнение 3 к Р69 п. 1); вернуть — снятие */
+    keep(after: number): () => void;
     arrival(signal: AbortSignal, after: number): Promise<void>;
   };
   /** модуль операций (Р49 п. 3–6): итог по order_ref на стадии 5, расчёт по op_ref на стадии 6 */
@@ -160,10 +162,14 @@ export class ContourPayment implements PaymentSteps {
     // по нему, К1.1); что такой отказ был, говорит поиск по CART первой попытки (ABSENT, skipped > 0)
     wait.skip(confirmationDeclined);
     const req = { shopId: c.shopId, orderId: orderRef, cartMandateId: c.cart.id };
+    // дополнение 3 к Р69 п. 1: отметка каждой попытки держится до конца стадии 5 — запрос Платформы, пришедший после неё,
+    // не выбрасывается по сроку, пока идут ожидание итога, поиск, GET реквизита и чтение заказа; снятие — в finally
+    const kept: (() => void)[] = [];
     try {
       let op: Operation;
       for (let attempt = 1; ; attempt++) {
         const mark = this.o.confirmations.mark();
+        kept.push(this.o.confirmations.keep(mark));
         c.sending();
         let reply: ShopPaymentReply | null = null;
         let unknown = false;
@@ -223,6 +229,7 @@ export class ContourPayment implements PaymentSteps {
       return op;
     } finally {
       wait.close();
+      for (const release of kept) release();
     }
   }
 

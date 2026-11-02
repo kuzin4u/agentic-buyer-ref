@@ -861,3 +861,41 @@ describe("появление запроса для гонки стадии 5 (Р
     expect(u.live()).toBe(0);
   });
 });
+
+describe("удержание отметки до конца стадии 5 (дополнение 3 к Р69 п. 1)", () => {
+  const discarded = (s: ReturnType<typeof setup>) => s.journal.filter((e) => e.kind === "confirmation.discarded").map((e) => e.ref);
+
+  it("запрос позже удерживаемой отметки по сроку не выбрасывается; после снятия — ещё confirmation_wait_ms, затем discarded; снятие повторно — ничего", async () => {
+    const s = setup();
+    const release = s.conf.keep(s.conf.mark());
+    s.answers.set(ID1, confirmation("PENDING"));
+    await s.event("confirmation.required", ID1);
+    await s.c.advance(3 * WAIT_MS);
+    expect(discarded(s)).toEqual([]);
+    release();
+    release();
+    await s.c.advance(WAIT_MS - 1);
+    expect(discarded(s)).toEqual([]);
+    await s.c.advance(1);
+    expect(discarded(s)).toEqual([ID1]);
+  });
+
+  it("после снятия запрос берёт стадия 4 (wait) — исход по нему; запрос до отметки и при чужой отметке — срок прежний", async () => {
+    const s = setup();
+    // запрос до отметки удержанием не защищён
+    s.answers.set(ID1, confirmation("PENDING"));
+    await s.event("confirmation.required", ID1);
+    const release = s.conf.keep(s.conf.mark());
+    await s.c.advance(WAIT_MS);
+    expect(discarded(s)).toEqual([ID1]);
+    // запрос после отметки: истёк при удержании, снятие — стадия 4 берёт его в новом сроке
+    s.answers.set(ID2, confirmation("REJECTED", { id: ID2 }));
+    await s.event("confirmation.required", ID2);
+    await s.c.advance(2 * WAIT_MS);
+    release();
+    const w = s.waiter();
+    await settle();
+    expect(w.outcome()).toBe("REJECTED");
+    expect(discarded(s)).toEqual([ID1]);
+  });
+});

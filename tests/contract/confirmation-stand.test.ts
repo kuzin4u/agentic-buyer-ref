@@ -90,8 +90,9 @@ describe("стадия 4 на стенде v0.17.0: подтверждение �
     // подмена до PS-11: настоящий ADP стенда по копии сообщения эквайрера потребовал подтверждения (РП50 п. 1)
     expect(await r.c.adpDecisions!()).toEqual([expect.objectContaining({ decision: "CONFIRMATION_REQUIRED" })]);
     const id = confirmationId(r);
-    // продавец ответил DECLINED (ADP: CONFIRMATION_REQUIRED) — слова продавца только в журнале
-    expect(r.c.journal.entries.filter((e) => e.kind === "shop.call" && e.method?.endsWith("/payment")).map((e) => e.detail)).toEqual(["DECLINED"]);
+    // продавец ответил AWAITING_CONFIRMATION (ADP: CONFIRMATION_REQUIRED; стенд v0.37.0, РП72; до него — DECLINED) — слова
+    // продавца только в журнале
+    expect(r.c.journal.entries.filter((e) => e.kind === "shop.call" && e.method?.endsWith("/payment")).map((e) => e.detail)).toEqual(["AWAITING_CONFIRMATION"]);
     const decided = await r.c.stand!.issuer.confirm(id);
     expect(decided.statusCode).toBe(200);
     const ref = (decided.body as { confirmation_ref: string }).confirmation_ref;

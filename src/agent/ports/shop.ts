@@ -87,9 +87,10 @@ export interface ShopPaymentRequest {
   package: SealedPackage;
 }
 
-/** Ответ продавца на оплату — его слова, а не итог (инвариант 8): статус заказа закрытым перечнем, только для журнала. */
+/** Ответ продавца на оплату — его слова, а не итог (инвариант 8): статус заказа закрытым перечнем, для журнала и как
+ *  повод ждать запрос подтверждения (DECLINED, AWAITING_CONFIRMATION — стенд v0.37.0, РП72). */
 export interface ShopPaymentReply {
-  status: "PAID" | "DECLINED" | "REJECTED";
+  status: "PAID" | "DECLINED" | "REJECTED" | "AWAITING_CONFIRMATION";
 }
 
 /** Стадия 5: передача пакета продавцу подписанным обращением. Отказ витрины — ShopFailure SHOP_ORDER_REFUSED, неизвестный

@@ -69,8 +69,10 @@ describe("стадии 5–6 на стенде v0.20.0: итог из событ
     const op = await authorizing;
     expect(op).toMatchObject({ opRef: d.op_ref, orderRef: order.orderId, status: "AUTHORIZED", amount: total, merchantId: cart.cart!.merchantId, indicator: { mandateId: cart.id }, channel: "CARD" });
     expect(r.purchase.state).toBe("SETTLING");
-    // продавец ответил отказом (подмена до PS-11) — слова продавца только в журнале, итог — по событию Платформы
-    expect(r.c.journal.entries.filter((e) => e.kind === "shop.call" && e.method?.endsWith("/payment")).map((e) => e.detail)).toEqual(["DECLINED"]);
+    // продавец ответил «ждёт подтверждения» — след подмены до PS-11: эмулятору продавцов подмена отвечает фиктивной
+    // причиной CONFIRMATION_REQUIRED, на стенде v0.37.0 заказ — AWAITING_CONFIRMATION (Р68, нюанс К0 AG-13 ч. 2б;
+    // пересмотр при К1.4 — асинхронный decide, #97 п. 6). Слова продавца — только в журнале, итог — по событию Платформы
+    expect(r.c.journal.entries.filter((e) => e.kind === "shop.call" && e.method?.endsWith("/payment")).map((e) => e.detail)).toEqual(["AWAITING_CONFIRMATION"]);
     expect(entries(r, "operation.status")).toEqual([[d.op_ref, "AUTHORIZED"]]);
     // П15: остаток бюджета CART уменьшен — по verify Платформы, агент его не вычисляет (инвариант 6)
     const left = await r.c.platform.verifyMandate({ id: cart.id, currency: total.currency });

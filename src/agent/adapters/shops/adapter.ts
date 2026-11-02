@@ -126,11 +126,13 @@ const Item = LiveItem.extend({
 type ShopItem = z.infer<typeof Item>;
 const Order = z.object({ id: OrderId, total: z.number().int().nonnegative(), currency: z.enum(Object.keys(EXPONENT) as [keyof typeof EXPONENT]) });
 /** Ответ на оплату — заказ продавца: статус после авторизации у эквайрера (слова продавца, не итог — инвариант 8). */
-const Paid = z.object({ id: OrderId, status: z.enum(["PAID", "DECLINED", "REJECTED"]) });
+// AWAITING_CONFIRMATION — стенд v0.37.0 (РП72, передача #97): отказ эквайрера с CONFIRMATION_REQUIRED, заказ ждёт
+// подтверждения человеком; это слова продавца, а не итог (инвариант 8)
+const Paid = z.object({ id: OrderId, status: z.enum(["PAID", "DECLINED", "REJECTED", "AWAITING_CONFIRMATION"]) });
 /** Чтение заказов по мандату корзины (Р55 п. 3): заказ — со статусом и мандатом корзины; хоть одна запись не по схеме —
  *  ответ не по схеме целиком. */
 const Orders = z.object({
-  orders: z.array(Order.extend({ cart_mandate_id: z.string(), status: z.enum(["CREATED", "PAYING", "PAID", "DECLINED", "REJECTED"]) })),
+  orders: z.array(Order.extend({ cart_mandate_id: z.string(), status: z.enum(["CREATED", "PAYING", "AWAITING_CONFIRMATION", "PAID", "DECLINED", "REJECTED"]) })),
 });
 /** POST заказа — не больше двух: второй только после чтения «заказа нет» (Р55 п. 4, инвариант 9). */
 const ORDER_POSTS = 2;

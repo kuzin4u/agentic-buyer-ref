@@ -166,9 +166,11 @@ export class ContourPayment implements PaymentSteps {
   async #outcome(wait: OperationWait, reply: ShopPaymentReply | null, mark: number, signal: AbortSignal, lookup: () => Promise<OperationOutcome>): Promise<Operation> {
     const delayMs = this.o.params.operation_outcome_max_delay_sec * 1000;
     let outcome: OperationOutcome | "CONFIRMATION";
-    if (reply?.status === "DECLINED" || reply?.status === "AWAITING_CONFIRMATION") {
-      // слова продавца не итог (инвариант 8): DECLINED и AWAITING_CONFIRMATION (стенд v0.37.0, РП72) — повод ждать и
-      // запрос подтверждения; сам запрос — только из confirmation.required Платформы; гонка снимается вместе.
+    if (reply !== null && (reply.status === "DECLINED" || reply.status === "AWAITING_CONFIRMATION" || reply.confirmationRequired === true)) {
+      // слова продавца не итог (инвариант 8): DECLINED, AWAITING_CONFIRMATION и признак confirmation_required (стенд
+      // v0.37.0, РП72) — повод ждать и запрос подтверждения; сам запрос — только из confirmation.required Платформы:
+      // признак без запроса — итога нет (OPERATION_RESULT_UNCONFIRMED), ответ продавца получен — повтора оплаты нет
+      // (Р69 п. 4 — только при неизвестном исходе); гонка снимается вместе.
       // Покупку остановили, пока продавец отвечал, — гонка не начинается (ревью КТ1 № 4)
       const race = new AbortController();
       const stop = () => race.abort(signal.reason);

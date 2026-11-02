@@ -36,6 +36,8 @@ function steps(o: {
   onCredential?: () => void;
   /** часы после чтения заказа у витрины (ревью КТ2 № 1) */
   nowAfterPayable?: Date;
+  /** признак payment.confirmation_required в ответе продавца (стенд v0.37.0, К1.1 AG-13 ч. 2б) */
+  flag?: boolean;
 }) {
   let clockNow = NOW;
   const log: string[] = [];
@@ -69,7 +71,7 @@ function steps(o: {
         const r = o.pays?.[paid++] ?? o.reply;
         if (r === "UNKNOWN") throw new ShopFailure("SHOP_ORDER_STATE_UNKNOWN");
         if (r === "REFUSED") throw new ShopFailure("SHOP_ORDER_REFUSED");
-        return { status: r };
+        return o.flag === true ? { status: r, confirmationRequired: true } : { status: r };
       },
       ...(payable !== undefined && {
         payable: async () => {
@@ -158,6 +160,35 @@ describe("ContourPayment: итог стадии 5 (Р49 п. 5)", () => {
     await expect(a.p.authorize(ctx(), { idempotencyKey: "k" })).rejects.toMatchObject({ code: "CONFIRMATION_REQUIRED" });
     const b = steps({ reply: "PAID", outcome: async () => ({ kind: "MISMATCH" }) });
     await expect(b.p.authorize(ctx(), { idempotencyKey: "k" })).rejects.toMatchObject({ code: "OPERATION_REPLY_MISMATCH" });
+  });
+
+  describe("К1.1 AG-13 ч. 2б: AWAITING_CONFIRMATION и признак confirmation_required продавца (РП72 п. 1; Р69 п. 0; инвариант 8)", () => {
+    const WAIT = Math.max(PARAMS.operation_outcome_max_delay_sec * 1000, PARAMS.confirmation_wait_ms);
+
+    it.each([
+      ["AWAITING_CONFIRMATION с признаком", "AWAITING_CONFIRMATION", true],
+      ["AWAITING_CONFIRMATION без поля payment", "AWAITING_CONFIRMATION", false],
+      ["признак при ином статусе (PAID)", "PAID", true],
+    ] as [string, ShopPaymentReply["status"], boolean][])("%s, запрос Платформы после отметки — CONFIRMATION_REQUIRED (стадия 4), пакет один", async (_, reply, flag) => {
+      const { p, log } = steps({ reply, flag, outcome: () => new Promise(() => {}), arrival: Promise.resolve() });
+      await expect(p.authorize(ctx(), { idempotencyKey: "k" })).rejects.toMatchObject({ code: "CONFIRMATION_REQUIRED" });
+      expect(log).toEqual(["expect", "mark", "pay 1", `outcome ${WAIT}`, "arrival 7", "close"]);
+    });
+
+    it("поломка (1): признак без запроса Платформы — не стадия 4 и не повтор оплаты: ожидание по большему из сроков, поиск по CART «операций нет» — OPERATION_RESULT_UNCONFIRMED, второго POST, GET реквизита и чтения заказа нет", async () => {
+      const { p, log, journal } = steps({ reply: "AWAITING_CONFIRMATION", flag: true, outcome: async () => ({ kind: "NONE" }), lookup: { kind: "ABSENT" }, payable: true, validTo: LATER });
+      await expect(p.authorize(ctx(), { idempotencyKey: "k" })).rejects.toMatchObject({ code: "OPERATION_RESULT_UNCONFIRMED" });
+      expect(log).toEqual(["expect", "mark", "pay 1", `outcome ${WAIT}`, "arrival 7", "lookup ORD-1 m_cart", "close"]);
+      expect(journal.entries.some((e) => e.kind === "payment.retry")).toBe(false);
+    });
+
+    it("поломка (2): AWAITING_CONFIRMATION — не итог операции: итог — операция по событию (одобрение после повтора авторизации эквайрером или отказ)", async () => {
+      const AUTHORIZED: Operation = { ...DECLINED, status: "AUTHORIZED", declineReason: null };
+      const a = steps({ reply: "AWAITING_CONFIRMATION", flag: true, outcome: async () => ({ kind: "OPERATION", operation: AUTHORIZED }) });
+      await expect(a.p.authorize(ctx(), { idempotencyKey: "k" })).resolves.toMatchObject({ opRef: "op_1", status: "AUTHORIZED" });
+      const b = steps({ reply: "AWAITING_CONFIRMATION", flag: true, outcome: async () => ({ kind: "OPERATION", operation: DECLINED }) });
+      await expect(b.p.authorize(ctx(), { idempotencyKey: "k" })).resolves.toMatchObject({ status: "DECLINED", declineReason: "LIMIT_EXCEEDED" });
+    });
   });
 
   it("AG-12 ч. 3б (ревью КТ1 Р49 № 14 (в)): гонка решена операцией или запросом подтверждения — проигравшая сторона снята прерыванием, на сигнале покупки слушателя не остаётся", async () => {

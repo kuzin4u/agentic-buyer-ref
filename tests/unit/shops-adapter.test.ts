@@ -720,6 +720,32 @@ describe("адаптер витрин (Р42)", () => {
     expect(seen).toEqual([]);
   });
 
+  describe("оплата: AWAITING_CONFIRMATION и признак payment.confirmation_required (К1.1 AG-13 ч. 2б; РП72 п. 1; инвариант 8)", () => {
+    const pkg = sealPackage({ credential_ref: "CRD-1", kind: "CARD", payload: { token_ref: "tok_test", cryptogram: "c", valid_to: "2026-10-22T10:00:00Z" }, aoi: { indicator: true, agent_code: "nspk:agent:test:v1", mandate_id: "mnd_1" }, cart_mandate_id: "mnd_1", order_ref: "ord_1" });
+    const PAY = "POST /v1/shops/S1/orders/ord_1/payment";
+    const req = { shopId: "S1", orderId: "ord_1", cartMandateId: "mnd_1", package: pkg };
+
+    it.each([
+      ["ждёт подтверждения с признаком", { id: "ord_1", status: "AWAITING_CONFIRMATION", payment: { approved: false, confirmation_required: true }, confirmation_id: "cnf_seller" }, { status: "AWAITING_CONFIRMATION", confirmationRequired: true }],
+      ["ждёт подтверждения без поля payment", { id: "ord_1", status: "AWAITING_CONFIRMATION" }, { status: "AWAITING_CONFIRMATION" }],
+      ["оплачен, признак false", { id: "ord_1", status: "PAID", payment: { approved: true, confirmation_required: false } }, { status: "PAID" }],
+      ["отказ, признак false", { id: "ord_1", status: "DECLINED", payment: { approved: false, confirmation_required: false } }, { status: "DECLINED" }],
+    ] as [string, unknown, unknown][])("%s — ответ получен (не неизвестный исход), confirmation_id продавца не берётся, в журнале — статус", async (_, body, expected) => {
+      const { a, journal } = adapter({ [PAY]: [{ status: 200, body }] });
+      const r = await a.pay(req);
+      expect(r).toEqual(expected);
+      expect(JSON.stringify(r)).not.toContain("cnf_seller");
+      expect(JSON.stringify(journal.entries)).not.toContain("cnf_seller");
+      expect(calls(journal)).toEqual([["POST /v1/shops/{id}/orders/{order_id}/payment", 1, "ok", (expected as { status: string }).status]]);
+    });
+
+    it("поле payment не по форме — ответ не по схеме: неизвестный исход (Р55 п. 2)", async () => {
+      const { a, journal } = adapter({ [PAY]: [{ status: 200, body: { id: "ord_1", status: "AWAITING_CONFIRMATION", payment: { confirmation_required: "yes" } } }] });
+      await expect(a.pay(req)).rejects.toMatchObject({ code: "SHOP_ORDER_STATE_UNKNOWN" });
+      expect(calls(journal)).toEqual([["POST /v1/shops/{id}/orders/{order_id}/payment", 1, "unknown", "BAD_RESPONSE"]]);
+    });
+  });
+
   describe("оплата: неизвестный исход и чтение заказа перед повтором (Р69 п. 4)", () => {
     const pkg = sealPackage({ credential_ref: "CRD-1", kind: "CARD", payload: { token_ref: "tok_test", cryptogram: "c", valid_to: "2026-10-22T10:00:00Z" }, aoi: { indicator: true, agent_code: "nspk:agent:test:v1", mandate_id: "mnd_1" }, cart_mandate_id: "mnd_1", order_ref: "ord_1" });
     const PAY = "POST /v1/shops/S1/orders/ord_1/payment";
@@ -749,6 +775,7 @@ describe("адаптер витрин (Р42)", () => {
       ["пусто", read(), "unknown", "NO_ORDER"],
       ["два заказа", read(ORD(), ORD({ id: "ord_2" })), "unknown", "MULTIPLE"],
       ["заказ PAYING (пакет дошёл)", read(ORD({ status: "PAYING" })), "unknown", "NOT_CREATED"],
+      ["заказ AWAITING_CONFIRMATION (стенд v0.37.0, пакет дошёл)", read(ORD({ status: "AWAITING_CONFIRMATION" })), "unknown", "NOT_CREATED"],
       ["чужой мандат", read(ORD({ cart_mandate_id: "mnd_other" })), "unknown", "FOREIGN_MANDATE"],
       ["другой номер заказа", read(ORD({ id: "ord_2" })), "unknown", "OTHER_ORDER"],
       ["нет ответа", "fail", "unknown", "NO_RESPONSE"],

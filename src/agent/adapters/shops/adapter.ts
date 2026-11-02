@@ -126,9 +126,14 @@ const Item = LiveItem.extend({
 type ShopItem = z.infer<typeof Item>;
 const Order = z.object({ id: OrderId, total: z.number().int().nonnegative(), currency: z.enum(Object.keys(EXPONENT) as [keyof typeof EXPONENT]) });
 /** Ответ на оплату — заказ продавца: статус после авторизации у эквайрера (слова продавца, не итог — инвариант 8). */
-// AWAITING_CONFIRMATION — стенд v0.37.0 (РП72, передача #97): отказ эквайрера с CONFIRMATION_REQUIRED, заказ ждёт
-// подтверждения человеком; это слова продавца, а не итог (инвариант 8)
-const Paid = z.object({ id: OrderId, status: z.enum(["PAID", "DECLINED", "REJECTED", "AWAITING_CONFIRMATION"]) });
+// AWAITING_CONFIRMATION и признак payment.confirmation_required — стенд v0.37.0 (РП72, передача #97): отказ эквайрера с
+// CONFIRMATION_REQUIRED, заказ ждёт подтверждения человеком; это слова продавца, а не итог (инвариант 8). Поля payment
+// нет (стенд до v0.37.0) — признака нет; поле не по форме — ответ не по схеме
+const Paid = z.object({
+  id: OrderId,
+  status: z.enum(["PAID", "DECLINED", "REJECTED", "AWAITING_CONFIRMATION"]),
+  payment: z.object({ approved: z.boolean(), confirmation_required: z.boolean() }).optional(),
+});
 /** Чтение заказов по мандату корзины (Р55 п. 3): заказ — со статусом и мандатом корзины; хоть одна запись не по схеме —
  *  ответ не по схеме целиком. */
 const Orders = z.object({
@@ -465,7 +470,8 @@ export class ShopsAdapter implements OfferSource, LiveOfferSource, ShopPort, Sho
       throw new ShopFailure("SHOP_ORDER_STATE_UNKNOWN");
     }
     this.#log(method, attempt, "ok", req.shopId, { detail: b.data.status }, req.cartMandateId);
-    return { status: b.data.status };
+    // признак — только повод ждать запрос подтверждения Платформы; confirmation_id из ответа продавца не берётся (РП72 п. 1)
+    return b.data.payment?.confirmation_required === true ? { status: b.data.status, confirmationRequired: true } : { status: b.data.status };
   }
 
   /** Перед повтором оплаты (Р69 п. 4): заказы витрины по мандату корзины — ровно один, с этим номером, мандатом и

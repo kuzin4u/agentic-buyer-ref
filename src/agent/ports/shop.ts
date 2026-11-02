@@ -88,9 +88,11 @@ export interface ShopPaymentRequest {
 }
 
 /** Ответ продавца на оплату — его слова, а не итог (инвариант 8): статус заказа закрытым перечнем, для журнала и как
- *  повод ждать запрос подтверждения (DECLINED, AWAITING_CONFIRMATION — стенд v0.37.0, РП72). */
+ *  повод ждать запрос подтверждения (DECLINED, AWAITING_CONFIRMATION или признак `confirmationRequired` —
+ *  `payment.confirmation_required` стенда v0.37.0, РП72). Сам запрос — только из `confirmation.required` Платформы. */
 export interface ShopPaymentReply {
   status: "PAID" | "DECLINED" | "REJECTED" | "AWAITING_CONFIRMATION";
+  confirmationRequired?: boolean;
 }
 
 /** Стадия 5: передача пакета продавцу подписанным обращением. Отказ витрины — ShopFailure SHOP_ORDER_REFUSED, неизвестный

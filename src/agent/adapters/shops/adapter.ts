@@ -26,6 +26,8 @@ import { AGENT_STOP_CODES, channelFailure, ruleForFailure } from "../../declines
 import {
   ShopFailure,
   type OfferSource,
+  type OrderPayable,
+  type ShopConfirmRequest,
   type ShopOffers,
   type ShopOrder,
   type ShopOrderRequest,
@@ -126,24 +128,32 @@ const Item = LiveItem.extend({
 type ShopItem = z.infer<typeof Item>;
 const Order = z.object({ id: OrderId, total: z.number().int().nonnegative(), currency: z.enum(Object.keys(EXPONENT) as [keyof typeof EXPONENT]) });
 /** Ответ на оплату — заказ продавца: статус после авторизации у эквайрера (слова продавца, не итог — инвариант 8). */
-const Paid = z.object({ id: OrderId, status: z.enum(["PAID", "DECLINED", "REJECTED"]) });
+// AWAITING_CONFIRMATION и признак payment.confirmation_required — стенд v0.37.0 (РП72, передача #97): отказ эквайрера с
+// CONFIRMATION_REQUIRED, заказ ждёт подтверждения человеком; это слова продавца, а не итог (инвариант 8). Поля payment
+// нет (стенд до v0.37.0) — признака нет; поле не по форме — ответ не по схеме
+const Paid = z.object({
+  id: OrderId,
+  status: z.enum(["PAID", "DECLINED", "REJECTED", "AWAITING_CONFIRMATION"]),
+  payment: z.object({ approved: z.boolean(), confirmation_required: z.boolean() }).optional(),
+});
 /** Чтение заказов по мандату корзины (Р55 п. 3): заказ — со статусом и мандатом корзины; хоть одна запись не по схеме —
  *  ответ не по схеме целиком. */
 const Orders = z.object({
-  orders: z.array(Order.extend({ cart_mandate_id: z.string(), status: z.enum(["CREATED", "PAYING", "PAID", "DECLINED", "REJECTED"]) })),
+  orders: z.array(Order.extend({ cart_mandate_id: z.string(), status: z.enum(["CREATED", "PAYING", "AWAITING_CONFIRMATION", "PAID", "DECLINED", "REJECTED"]) })),
 });
 /** POST заказа — не больше двух: второй только после чтения «заказа нет» (Р55 п. 4, инвариант 9). */
 const ORDER_POSTS = 2;
 /** Чтение по схеме, но заказа для продолжения нет (Р55, ревью КТ1 № 7): заказов больше одного, мандат не тот, не CREATED;
- *  перед повтором оплаты (Р69 п. 4) — ещё заказа нет или номер другой. */
-type OrderMiss = "MULTIPLE" | "FOREIGN_MANDATE" | "NOT_CREATED" | "NO_ORDER" | "OTHER_ORDER";
+ *  перед повтором оплаты (Р69 п. 4) — ещё заказа нет, номер другой или заказ ждёт подтверждения (К1.3 AG-13 ч. 2б). */
+type OrderMiss = "MULTIPLE" | "FOREIGN_MANDATE" | "NOT_CREATED" | "NO_ORDER" | "OTHER_ORDER" | "AWAITING_CONFIRMATION";
 
 type Method =
   | "GET /v1/shops"
   | "GET /v1/shops/{id}/catalog"
   | "POST /v1/shops/{id}/orders"
   | "GET /v1/shops/{id}/orders"
-  | "POST /v1/shops/{id}/orders/{order_id}/payment";
+  | "POST /v1/shops/{id}/orders/{order_id}/payment"
+  | "POST /v1/shops/{id}/orders/{order_id}/confirmation";
 
 /** Путь знака готовности (Р53 п. 1): в YAML ПАО 1.4.0 его нет — описан вручную, с ПАО 1.5.0 — из YAML (#37 платформы). */
 const READINESS = "GET /pao/v1/merchants/{merchant_id}/readiness";
@@ -463,19 +473,64 @@ export class ShopsAdapter implements OfferSource, LiveOfferSource, ShopPort, Sho
       throw new ShopFailure("SHOP_ORDER_STATE_UNKNOWN");
     }
     this.#log(method, attempt, "ok", req.shopId, { detail: b.data.status }, req.cartMandateId);
+    // признак — только повод ждать запрос подтверждения Платформы; confirmation_id из ответа продавца не берётся (РП72 п. 1)
+    return b.data.payment?.confirmation_required === true ? { status: b.data.status, confirmationRequired: true } : { status: b.data.status };
+  }
+
+  /** Ссылка подтверждения продавцу (Р69 п. 0, Р70 В1; РП72 п. 2–5): подписанным обращением, `content-digest` покрывает тело
+   *  `{confirmation_ref}`; сам адаптер не повторяет — один повтор решают шаги оплаты, `attempt` — для журнала. Отказ витрины
+   *  (4xx) — SHOP_ORDER_REFUSED; нет ответа в срок, ответ не по схеме, любой 5xx (503 `UPSTREAM_UNAVAILABLE` — авторизация
+   *  не ушла, заказ снова ждёт, РП72 п. 3) — SHOP_ORDER_STATE_UNKNOWN. `confirmation_ref` — только в теле
+   *  запроса: в журнал, исключения и сообщения он не попадает; статус ответа — detail записи shop.call (слова продавца). */
+  async confirm(req: ShopConfirmRequest, attempt = 1): Promise<ShopPaymentReply> {
+    const method: Method = "POST /v1/shops/{id}/orders/{order_id}/confirmation";
+    if (!SHOP_ID.test(req.shopId) || !ORDER_REF.test(req.orderId)) throw new Error("id витрины или заказа не по маске");
+    const reply = await this.#send("POST", `/v1/shops/${req.shopId}/orders/${req.orderId}/confirmation`, JSON.stringify({ confirmation_ref: req.confirmationRef }));
+    if (reply === null) {
+      this.#log(method, attempt, "unknown", req.shopId, { detail: "NO_RESPONSE" }, req.cartMandateId);
+      throw new ShopFailure("SHOP_ORDER_STATE_UNKNOWN");
+    }
+    if (reply.status >= 400) {
+      const cause = this.#cause(reply.body);
+      // любой 5xx — неизвестный исход, один повтор шагами оплаты (Р70 В1 (а): «потеря ответа, 503, иные 5xx»)
+      const again = reply.status >= 500;
+      this.#log(method, attempt, again ? "unknown" : "refused", req.shopId, cause, req.cartMandateId);
+      throw new ShopFailure(again ? "SHOP_ORDER_STATE_UNKNOWN" : "SHOP_ORDER_REFUSED");
+    }
+    const b = reply.status === 200 ? Paid.safeParse(reply.body) : null;
+    if (!b?.success || b.data.id !== req.orderId) {
+      this.#log(method, attempt, "unknown", req.shopId, { detail: "BAD_RESPONSE" }, req.cartMandateId);
+      throw new ShopFailure("SHOP_ORDER_STATE_UNKNOWN");
+    }
+    this.#log(method, attempt, "ok", req.shopId, { detail: b.data.status }, req.cartMandateId);
     return { status: b.data.status };
   }
 
-  /** Перед повтором оплаты (Р69 п. 4): заказы витрины по мандату корзины — ровно один, с этим номером, мандатом и
-   *  CREATED. Продавец ставит PAYING до первого await приёма пакета: CREATED — пакет до него не дошёл. Иначе или не
-   *  прочитано — false; причина — detail записи чтения (NO_ORDER, MULTIPLE, FOREIGN_MANDATE, OTHER_ORDER, NOT_CREATED). */
-  async payable(req: Omit<ShopPaymentRequest, "package">): Promise<boolean> {
+  /** Перед повтором оплаты (Р69 п. 4): заказы витрины по мандату корзины — ровно один, с этим номером и мандатом.
+   *  Продавец ставит PAYING до первого await приёма пакета: CREATED — пакет до него не дошёл; AWAITING_CONFIRMATION —
+   *  пакет дошёл, ADP требует подтверждения (стенд v0.37.0; К1.3 AG-13 ч. 2б) — повод ждать запрос Платформы. Иначе или
+   *  не прочитано — NO; причина — detail записи чтения (NO_ORDER, MULTIPLE, FOREIGN_MANDATE, OTHER_ORDER, NOT_CREATED,
+   *  AWAITING_CONFIRMATION). Остановка покупки (`signal`) прерывает чтение и сон до повтора чтения (КТ сессии 57 № 12). */
+  async payable(req: Omit<ShopPaymentRequest, "package">, signal?: AbortSignal): Promise<OrderPayable> {
     if (!SHOP_ID.test(req.shopId) || !ORDER_REF.test(req.orderId)) throw new Error("id витрины или заказа не по маске");
     const path = `/v1/shops/${req.shopId}/orders?cart_mandate_id=${encodeURIComponent(req.cartMandateId)}`;
     const verdict = ({ orders: [o, ...rest] }: z.infer<typeof Orders>): OrderMiss | null =>
-      o === undefined ? "NO_ORDER" : rest.length > 0 ? "MULTIPLE" : o.cart_mandate_id !== req.cartMandateId ? "FOREIGN_MANDATE" : o.id !== req.orderId ? "OTHER_ORDER" : o.status !== "CREATED" ? "NOT_CREATED" : null;
-    const read = await this.#get("GET /v1/shops/{id}/orders", path, Orders, req.shopId, undefined, undefined, { mandate: req.cartMandateId, verdict });
-    return read.ok;
+      o === undefined
+        ? "NO_ORDER"
+        : rest.length > 0
+          ? "MULTIPLE"
+          : o.cart_mandate_id !== req.cartMandateId
+            ? "FOREIGN_MANDATE"
+            : o.id !== req.orderId
+              ? "OTHER_ORDER"
+              : o.status === "AWAITING_CONFIRMATION"
+                ? "AWAITING_CONFIRMATION"
+                : o.status !== "CREATED"
+                  ? "NOT_CREATED"
+                  : null;
+    const read = await this.#get("GET /v1/shops/{id}/orders", path, Orders, req.shopId, signal, undefined, { mandate: req.cartMandateId, verdict });
+    if (read.ok) return "CREATED";
+    return read.cause.detail === "AWAITING_CONFIRMATION" ? "AWAITING_CONFIRMATION" : "NO";
   }
 
   /** Факты витрины → модель К8 (Р54 п. 4): магазин — из записи списка `entry`, товары — из карточек каталога. Факты

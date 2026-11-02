@@ -51,6 +51,27 @@ export async function reinstated(stand: Pick<Stand, "reinstateAgent" | "now">, a
   return rec;
 }
 
+/**
+ * Окно дробления агента-нарушителя (П13, дополнение 2 к Р70 п. 1, 4): место в настоящем окне занимает и исход отмечает, как
+ * честное, но долю не видит никогда. Только тестовая сторона; `policy/split.ts` и конвейер не меняются. Параметры базы —
+ * настоящие (ревью КТ сессии 61 № 6); новый публичный метод `SplitWindow`, который вызывает конвейер, перекрывать здесь
+ * явно — иначе он уйдёт в пустое окно базы, а не в настоящее.
+ */
+export class BlindSplitWindow extends SplitWindow {
+  constructor(
+    private readonly real: SplitWindow,
+    params: Pick<StandParams, "split_window_sec" | "split_min_ops">,
+  ) {
+    super(params, () => new Date());
+  }
+  override isShare(): boolean {
+    return false;
+  }
+  override open(...a: Parameters<SplitWindow["open"]>): ReturnType<SplitWindow["open"]> {
+    return this.real.open(...a);
+  }
+}
+
 /** Решение ADP стенда по n-й копии сообщения эквайрера (`adpUntilPs11`): ждать, пока продавец его запросит. */
 export async function adpDecision(c: Contour, n = 1): Promise<{ op_ref: string; decision: string; reason?: string }> {
   for (let i = 0; i < 200; i++) {
@@ -142,6 +163,8 @@ export interface StandPurchaseOptions {
   confirmationTimer?: (fn: () => void, ms: number) => () => void;
   /** ПОДМЕНА ДО PS-11: авторизация продавца доходит до ADP стенда копией сообщения (createContour, `adpUntilPs11`) */
   adpUntilPs11?: boolean;
+  /** без подмены (#97 п. 6, К1.4 AG-13 ч. 2б): асинхронное решение ОПКЦ через ADP стенда (createContour, `adpAsync`) */
+  adpAsync?: boolean;
   /** эквайрер эмулятора без поддержки aoi (П14, Р56 п. 1) */
   aoiSupport?: false;
   /** способы оплаты витрин эмулятора по merchant_id (createContour, Р68 п. 3) */
@@ -152,7 +175,7 @@ export interface StandPurchaseOptions {
 
 /** Контур со стендом и витринами после start(), покупка на адаптере витрин. Закрыть — `c.close()` у вызывающего. */
 export async function standPurchase(o: StandPurchaseOptions = {}) {
-  const c: Contour = await createContour({ pao: "stand", ...(o.now && { now: o.now }), ...(o.adpUntilPs11 && { adpUntilPs11: true }), ...(o.aoiSupport === false && { aoiSupport: false as const }), ...(o.paymentMethods && { paymentMethods: o.paymentMethods }) });
+  const c: Contour = await createContour({ pao: "stand", ...(o.now && { now: o.now }), ...(o.adpUntilPs11 && { adpUntilPs11: true }), ...(o.adpAsync && { adpAsync: true }), ...(o.aoiSupport === false && { aoiSupport: false as const }), ...(o.paymentMethods && { paymentMethods: o.paymentMethods }) });
   const self = await c.start();
   const { stand } = c;
   if (!stand) throw new Error("контур без стенда");
@@ -195,7 +218,9 @@ export async function standPurchase(o: StandPurchaseOptions = {}) {
   const split = new SplitWindow(params, () => new Date());
   // пометка Д02 — одна на ядро, как у места сборки (Р48 п. 5): следующая покупка (next) видит расхождение прежней
   const orderMismatches = new OrderPriceMismatches();
-  const next = () =>
+  // `split` — окно дробления этой покупки вместо общего: тестовый режим нарушителя (П13, дополнение 2 к Р70 п. 4) — код ядра
+  // не меняется, подменяется только зависимость, которую сборка теста передаёт в Purchase
+  const next = (n: { split?: SplitWindow } = {}) =>
     new Purchase({
       mandates,
       events: feedOf(c.platform),
@@ -204,7 +229,7 @@ export async function standPurchase(o: StandPurchaseOptions = {}) {
       shop: shops,
       payment: steps,
       params,
-      split,
+      split: n.split ?? split,
       orderMismatches,
       journal: c.journal,
       admission: () => c.admission(),

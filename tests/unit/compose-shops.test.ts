@@ -158,7 +158,7 @@ describe("AgentCore.payment (Р45 п. 6)", () => {
         if (paid === 1) throw new ShopFailure("SHOP_ORDER_STATE_UNKNOWN");
         return { status: "PAID" };
       },
-      payable: async () => true,
+      payable: async () => "CREATED" as const,
     });
     const total = { amount: 250000, currency: "RUB" };
     const cart = { id: "m_cart", cart: { merchantId: "shop_1", lines: [], total } } as unknown as Mandate;
@@ -192,6 +192,171 @@ describe("AgentCore.payment (Р45 п. 6)", () => {
     expect(packages).toHaveLength(1);
     expect(opsFrom(s, from)).toEqual(["POST /pao/v1/credentials", "GET /pao/v1/operations", "GET /pao/v1/credentials/{ref}"]);
     expect(journal.entries.some((e) => e.kind === "payment.retry")).toBe(false);
+  });
+
+  /** К1.6 (дополнение 3 к Р69; нюанс К1.3): обрыв ответа витрины на оплату, «операций нет», реквизит ISSUED, заказ
+   *  AWAITING_CONFIRMATION — стадия 4 по запросу Платформы. Сборка ядра и настоящие сроки: итог стадии 5 ждётся
+   *  `operation_outcome_max_delay_sec` = 3 с, запрос хранится `confirmation_wait_ms`. `when` — когда лента отдаёт
+   *  confirmation.required: "outcome" — с первой оплаты (читает ожидание итога, срок хранения истекает до ожидания запроса);
+   *  "await" — не раньше LATE_MS (1,5 интервала чтения ленты event_poll_interval_ms) после чтения заказа: чтение, начатое
+   *  ожиданием итога, к этому времени закончилось, прочитать может лишь ожидание запроса. Сроки — из конфигурации (ревью
+   *  КТ сессии 61 № 3). */
+  async function awaitingOnStub(when: "outcome" | "await") {
+    const id = "cnf_22222222-2222-4222-8222-222222222222";
+    const params = loadParams();
+    const POLL_MS = params.event_poll_interval_ms;
+    const LATE_MS = 1.5 * POLL_MS;
+    let paid = 0;
+    let readAt: number | null = null;
+    let served = false;
+    const VALID_TO = "2026-10-12T09:15:00Z";
+    const issued = (mandateId: string) => ({
+      credential_ref: "cr_1",
+      kind: "CARD" as const,
+      payload: { token_ref: "tok_ref_1", cryptogram: "cg_1", valid_to: VALID_TO },
+      aoi: { indicator: true, agent_code: AGENT, mandate_id: mandateId },
+      status: "ISSUED" as const,
+    });
+    const s = new PaoStand({
+      handlers: {
+        "POST /pao/v1/credentials": ({ body }) => ({ status: 201, body: issued(body.mandate_id) }),
+        "GET /pao/v1/credentials/{ref}": () => ({ status: 200, body: issued("m_cart") }),
+        "GET /pao/v1/events": () => {
+          if (served || paid === 0 || (when === "await" && (readAt === null || Date.now() - readAt < LATE_MS))) return { status: 200, body: [] };
+          served = true;
+          return { status: 200, body: [{ event_id: "evt_cnf_2", type: "confirmation.required", at: "2026-10-12T09:01:00Z", data: { confirmation_id: id } }] };
+        },
+        "GET /pao/v1/confirmations/{id}": () => ({
+          status: 200,
+          body: { id, status: "PENDING", link: "https://upk.stand/c/k16", confirmation_ref: null, expires_at: "2099-10-12T09:15:00.000Z" },
+        }),
+        "GET /pao/v1/operations": () => ({ status: 200, body: [] }),
+      },
+    });
+    stand = s;
+    // "outcome": срок хранения (один интервал) короче ожидания итога (три интервала) — без удержания отметки запрос
+    // выброшен до ожидания; "await": ожидание запроса — четыре интервала, больше LATE_MS, без опроса ленты запрос не прочитан
+    const paramsPath = `${s.dir}-params.json`;
+    const outcomeSec = Math.ceil((3 * POLL_MS) / 1000);
+    const waitMs = when === "outcome" ? POLL_MS : 4 * POLL_MS;
+    expect(waitMs < outcomeSec * 1000 || when === "await").toBe(true);
+    writeFileSync(paramsPath, JSON.stringify({ ...params, operation_outcome_max_delay_sec: outcomeSec, confirmation_wait_ms: waitMs }));
+    const { core, journal } = await coreOn(s, { paramsPath });
+    await core.start();
+    const from = s.stub.calls.length;
+    const steps = core.payment({
+      pay: async () => {
+        paid++;
+        throw new ShopFailure("SHOP_ORDER_STATE_UNKNOWN");
+      },
+      payable: async () => {
+        readAt = Date.now();
+        return "AWAITING_CONFIRMATION" as const;
+      },
+    });
+    const total = { amount: 250000, currency: "RUB" };
+    const cart = { id: "m_cart", cart: { merchantId: "shop_1", lines: [], total } } as unknown as Mandate;
+    const ac = new AbortController();
+    const ctx: PaymentContext = { intent: { id: "m_intent" } as Mandate, cart, shopId: "SHOP-1", merchantId: "shop_1", channel: "CARD", order: { orderId: "ORD-1", total }, signal: ac.signal, sending: () => {} };
+    const result = await steps.authorize(ctx, { idempotencyKey: "idem-pay-k16" }).then(
+      (op) => op.status,
+      (e: { code?: string }) => e.code,
+    );
+    return { s, from, journal, result, ctx, ac, steps, paid: () => paid };
+  }
+
+  it.each([
+    ["запрос прочитан в ожидании итога, срок хранения истёк до ожидания запроса — удержание отметки (поломка 2)", "outcome"],
+    ["запрос появился только после чтения заказа — опрос ленты в ожидании запроса (поломка 1)", "await"],
+  ] as const)("К1.6 (дополнение 3 к Р69): обрыв ответа, «операций нет», заказ AWAITING_CONFIRMATION — стадия 4 на PaoStub: %s; повтора оплаты нет, человеку — ссылка", { timeout: 20_000 }, async (_name, when) => {
+    const r = await awaitingOnStub(when);
+    expect(r.result).toBe("CONFIRMATION_REQUIRED");
+    expect(r.paid()).toBe(1);
+    // стадия 4 берёт удержанный запрос: PENDING — человеку ссылка; агент сам не подтверждает (инвариант 7)
+    const links: (string | undefined)[] = [];
+    const waiting = r.steps.confirm(r.ctx, (link?: string) => void links.push(link), r.ac.signal);
+    await new Promise((res) => setTimeout(res, 50));
+    expect(links).toEqual(["https://upk.stand/c/k16"]);
+    r.ac.abort(new Error("покупка остановлена"));
+    await expect(waiting).rejects.toThrow("покупка остановлена");
+    // полный журнал: реквизит один, поиск по CART, статус реквизита, GET запроса — один (в ожидании итога или в ожидании
+    // запроса); второго POST и ссылки продавцу нет
+    const cnf = "GET /pao/v1/confirmations/{id}";
+    const tail = ["GET /pao/v1/operations", "GET /pao/v1/credentials/{ref}"];
+    expect(opsFrom(r.s, r.from)).toEqual(when === "outcome" ? ["POST /pao/v1/credentials", cnf, ...tail] : ["POST /pao/v1/credentials", ...tail, cnf]);
+    expect(r.journal.entries.some((e) => e.kind === "payment.retry" || e.kind === "confirmation.discarded")).toBe(false);
+    expect(r.journal.entries.filter((e) => e.kind === "confirmation.unclaimed").map((e) => e.ref)).toEqual(["cnf_22222222-2222-4222-8222-222222222222"]);
+    expect(JSON.stringify(r.journal.entries)).not.toMatch(/tok_ref_1|cg_1|cr_1|upk\.stand/);
+  });
+
+  it("К1.7 (КТ сессии 60 № 3; нюанс К1.5): настоящий модуль операций — отказ ADP CONFIRMATION_REQUIRED на первой авторизации (событие и поиск по CART) не итог: пропуск, ABSENT с пропущенным, стадия 4 по запросу Платформы; не DECLINED и не DECLINED_CONFIRMATION_REQUIRED, повтора нет", { timeout: 20_000 }, async () => {
+    const id = "cnf_33333333-3333-4333-8333-333333333333";
+    let paid = 0;
+    let served = false;
+    const declined = { op_ref: "op_1", order_ref: "ORD-1", channel: "CARD", amount: 250000, merchant_id: "shop_1", aoi: { indicator: true, agent_code: AGENT, mandate_id: "m_cart" }, status: "DECLINED", reason: "CONFIRMATION_REQUIRED", fulfilment: null, deal_ref: null } as const;
+    const s = new PaoStand({
+      handlers: {
+        "POST /pao/v1/credentials": ({ body }) => ({
+          status: 201,
+          body: { credential_ref: "cr_1", kind: body.kind, payload: { token_ref: "tok_ref_1", cryptogram: "cg_1" }, aoi: { indicator: true, agent_code: AGENT, mandate_id: body.mandate_id }, status: "ISSUED" },
+        }),
+        // отказ ADP пишет и событие операции, и запрос подтверждения (РП51 п. 7)
+        "GET /pao/v1/events": () => {
+          if (served || paid === 0) return { status: 200, body: [] };
+          served = true;
+          return {
+            status: 200,
+            body: [
+              { event_id: "evt_op_k17", type: "operation.declined", at: "2026-10-23T12:00:00Z", data: { op_ref: "op_1" } },
+              { event_id: "evt_cnf_k17", type: "confirmation.required", at: "2026-10-23T12:00:00Z", data: { confirmation_id: id } },
+            ],
+          };
+        },
+        "GET /pao/v1/operations/{op_ref}": () => ({ status: 200, body: declined }),
+        "GET /pao/v1/operations": () => ({ status: 200, body: [declined] }),
+        "GET /pao/v1/confirmations/{id}": () => ({
+          status: 200,
+          body: { id, status: "PENDING", link: "https://upk.stand/c/k17", confirmation_ref: null, expires_at: "2099-10-23T12:15:00.000Z" },
+        }),
+      },
+    });
+    stand = s;
+    const params = loadParams();
+    const paramsPath = `${s.dir}-params.json`;
+    writeFileSync(paramsPath, JSON.stringify({ ...params, operation_outcome_max_delay_sec: Math.ceil((3 * params.event_poll_interval_ms) / 1000) }));
+    const { core, journal } = await coreOn(s, { paramsPath });
+    await core.start();
+    const from = s.stub.calls.length;
+    // ответ продавца потерян: гонки «DECLINED продавца / запрос» нет — путь К1.5 (поиск пропустил отказ)
+    const steps = core.payment({
+      pay: async () => {
+        paid++;
+        throw new ShopFailure("SHOP_ORDER_STATE_UNKNOWN");
+      },
+      payable: async () => "CREATED" as const,
+    });
+    const total = { amount: 250000, currency: "RUB" };
+    const cart = { id: "m_cart", cart: { merchantId: "shop_1", lines: [], total } } as unknown as Mandate;
+    const ac = new AbortController();
+    const ctx: PaymentContext = { intent: { id: "m_intent" } as Mandate, cart, shopId: "SHOP-1", merchantId: "shop_1", channel: "CARD", order: { orderId: "ORD-1", total }, signal: ac.signal, sending: () => {} };
+    const result = await steps.authorize(ctx, { idempotencyKey: "idem-pay-k17" }).then(
+      (op) => op.status,
+      (e: { code?: string }) => e.code,
+    );
+    expect(result).toBe("CONFIRMATION_REQUIRED");
+    expect(paid).toBe(1);
+    // отказ прочитан модулем (запись operation.status), но итогом не стал; поиск — один, ABSENT (запись NONE)
+    expect(journal.entries.filter((e) => e.kind === "operation.status").map((e) => [e.ref, e.detail])).toEqual([["op_1", "DECLINED"]]);
+    expect(journal.entries.filter((e) => e.kind === "operation.lookup").map((e) => e.detail)).toEqual(["NONE"]);
+    expect(journal.entries.some((e) => e.kind === "payment.retry")).toBe(false);
+    // полный журнал: ни GET реквизита, ни чтения заказа (повтора нет — отказ ADP был), стадия 4 берёт запрос
+    expect(opsFrom(s, from)).toEqual(["POST /pao/v1/credentials", "GET /pao/v1/operations/{op_ref}", "GET /pao/v1/confirmations/{id}", "GET /pao/v1/operations"]);
+    const links: (string | undefined)[] = [];
+    const waiting = steps.confirm(ctx, (link?: string) => void links.push(link), ac.signal);
+    await new Promise((res) => setTimeout(res, 50));
+    expect(links).toEqual(["https://upk.stand/c/k17"]);
+    ac.abort(new Error("покупка остановлена"));
+    await expect(waiting).rejects.toThrow("покупка остановлена");
   });
 
   it("связка ядра (Р49 п. 4, 6): операция по заказу с чужим продавцом — OPERATION_REPLY_MISMATCH; расчёт — GET по op_ref, SETTLED с записью об исполнении", async () => {
@@ -303,6 +468,67 @@ describe("AgentCore.payment (Р45 п. 6)", () => {
     expect(s.stub.calls.filter((c) => c.op === "GET /pao/v1/confirmations/{id}")).toHaveLength(1);
     expect(JSON.stringify(journal.entries)).not.toContain("upk.stand");
   });
+
+  /** Р70 В1 и дополнение 2 к Р69 п. 4 на PaoStub: APPROVED → ссылка продавцу — отказ витрины (409) → события нет →
+   *  поиск по CART отдаёт `listed`. Модуль операций и подтверждений — ядра. */
+  async function refusedLinkOnStub(listed: object[]) {
+    const id = "cnf_11111111-1111-4111-8111-111111111111";
+    let served = false;
+    const s = new PaoStand({
+      handlers: {
+        "GET /pao/v1/events": () => {
+          if (served) return { status: 200, body: [] };
+          served = true;
+          return { status: 200, body: [{ event_id: "evt_cnf_1", type: "confirmation.required", at: "2026-10-22T12:00:00Z", data: { confirmation_id: id } }] };
+        },
+        "GET /pao/v1/confirmations/{id}": () => ({
+          status: 200,
+          body: { id, status: "APPROVED", link: "https://upk.stand/c/x", confirmation_ref: "cr_aaaaaaaaaaaaaaaaaaaaaaaaaa", expires_at: "2099-10-22T12:15:00.000Z" },
+        }),
+        "GET /pao/v1/operations": () => ({ status: 200, body: listed }),
+      },
+    });
+    stand = s;
+    // свой срок итога — тест не ждёт стендовых 30 с (как retryOnStub)
+    const params = loadParams();
+    const paramsPath = `${s.dir}-params.json`;
+    writeFileSync(paramsPath, JSON.stringify({ ...params, operation_outcome_max_delay_sec: Math.ceil((3 * params.event_poll_interval_ms) / 1000) }));
+    const { core, journal } = await coreOn(s, { paramsPath });
+    await core.start();
+    const confirms: number[] = [];
+    const steps = core.payment({
+      pay: async () => ({ status: "DECLINED" }),
+      confirm: async (_req, attempt) => {
+        confirms.push(attempt ?? 1);
+        throw new ShopFailure("SHOP_ORDER_REFUSED");
+      },
+    });
+    const total = { amount: 250000, currency: "RUB" };
+    const cart = { id: "m_cart", cart: { merchantId: "shop_1", lines: [], total } } as unknown as Mandate;
+    const ctx: PaymentContext = { intent: { id: "m_intent" } as Mandate, cart, shopId: "SHOP-1", merchantId: "shop_1", channel: "CARD", order: { orderId: "ORD-1", total }, signal: new AbortController().signal, sending: () => {} };
+    await expect(steps.confirm(ctx, () => {}, new AbortController().signal)).resolves.toBe("APPROVED");
+    const code = await steps.resume!(ctx).then(() => "RESOLVED", (e: { code?: string }) => e.code);
+    return { s, journal, code, confirms };
+  }
+
+  it("Р70 В1, дополнение 2 к Р69 п. 4: отказ витрины на ссылку и операции первой попытки в поиске нет — CONFIRMATION_NOT_DELIVERED; ссылка одна, повтора нет", async () => {
+    const r = await refusedLinkOnStub([]);
+    expect(r.code).toBe("CONFIRMATION_NOT_DELIVERED");
+    expect(r.confirms).toEqual([1]);
+    expect(r.s.stub.calls.filter((c) => c.op === "GET /pao/v1/operations")).toHaveLength(1);
+    expect(JSON.stringify(r.journal.entries)).not.toContain("cr_aaaaaaaaaaaaaaaaaaaaaaaaaa");
+  });
+
+  it("дополнение 2 к Р69 п. 4 (правило по стенду v0.37.0): поиск видит только операцию первой попытки CONFIRMATION_REQUIRED — OPERATION_RESULT_UNCONFIRMED, не CONFIRMATION_NOT_DELIVERED; и повторное требование — DECLINED_CONFIRMATION_REQUIRED", async () => {
+    const op = (opRef: string) => ({ op_ref: opRef, order_ref: "ORD-1", channel: "CARD", amount: 250000, merchant_id: "shop_1", aoi: { indicator: true, agent_code: AGENT, mandate_id: "m_cart" }, status: "CONFIRMATION_REQUIRED", reason: "CONFIRMATION_REQUIRED", fulfilment: null, deal_ref: null });
+    const one = await refusedLinkOnStub([op("op_1")]);
+    expect(one.code).toBe("OPERATION_RESULT_UNCONFIRMED");
+    await stand?.close();
+    stand = undefined;
+    const two = await refusedLinkOnStub([op("op_1"), op("op_2")]);
+    expect(two.code).toBe("DECLINED_CONFIRMATION_REQUIRED");
+    // два ожидания итога по operation_outcome_max_delay_sec (не меньше трёх интервалов чтения ленты) — больше 5 с по умолчанию
+  }, 4 * Math.ceil((3 * loadParams().event_poll_interval_ms) / 1000) * 1000);
 
   it("второй рубеж на стадии 5 (Р45 п. 2.1) и остановленная покупка (Б2в (а)): обращений за реквизитом и к витрине нет", async () => {
     const s2 = new PaoStand();

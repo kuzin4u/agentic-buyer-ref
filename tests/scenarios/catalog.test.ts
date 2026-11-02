@@ -61,13 +61,14 @@ describe("каталог сценариев приёмки", () => {
   });
 
   // Сломанный разбор дал бы пустой перечень и пустую проверку ниже (ревью Р26 № 1).
-  it("перечни кодов разобраны полностью: ПАО — 20 кодов (Р31), SPEC §7б — перечень #57 и две причины ПАО 1.5.0 (Р48)", () => {
+  it("перечни кодов разобраны полностью: ПАО — 20 кодов (Р31), SPEC §7б — перечень #57, две причины ПАО 1.5.0 (Р48) и CONFIRMATION_REQUIRED (дополнение 2 к Р69 п. 4)", () => {
     expect(paoErrors).toHaveLength(20);
     // Независимый источник: таблица ошибок agentic-core по той же версии ПАО.
     expect([...paoErrors].sort()).toEqual(Object.keys(PAO_ERRORS).sort());
-    // Р48 п. 1: закрытый перечень передачи #57 (v0.19.0) плюс AOI_MISSING и INSUFFICIENT_FUNDS (#37).
+    // Р48 п. 1: закрытый перечень передачи #57 (v0.19.0) плюс AOI_MISSING и INSUFFICIENT_FUNDS (#37); дополнение 2 к Р69
+    // п. 4 — CONFIRMATION_REQUIRED (повторное требование после ссылки)
     expect(reasons).toEqual([
-      "AOI_MISSING", "AOI_MISMATCH", "AGENT_SUSPENDED", "CREDENTIAL_INVALID", "MANDATE_NOT_FOUND", "MANDATE_EXPIRED",
+      "AOI_MISSING", "AOI_MISMATCH", "AGENT_SUSPENDED", "CREDENTIAL_INVALID", "CONFIRMATION_REQUIRED", "MANDATE_NOT_FOUND", "MANDATE_EXPIRED",
       "MANDATE_REVOKED", "MANDATE_SCOPE", "LIMIT_EXCEEDED", "STATE_UNAVAILABLE", "ISSUER_DECLINED", "INSUFFICIENT_FUNDS",
     ]);
   });
@@ -82,8 +83,8 @@ describe("каталог сценариев приёмки", () => {
   it("профиль contour: поле описано полностью, коды — из x-pao-errors ПАО", () => {
     const pao = new Set(paoErrors);
     const withContour = catalog.scenarios.filter((s: { contour?: unknown }) => s.contour !== undefined);
-    // П01–П03 — Р23, П04–П06 — Р30, П14–П17 и П24 — Р56
-    expect(withContour.map((s: { id: string }) => s.id)).toEqual(["П01", "П02", "П03", "П04", "П05", "П06", "П14", "П15", "П16", "П17", "П24"]);
+    // П01–П03 — Р23, П04–П06 — Р30, П12 — дополнение 1 к Р70, П13 — дополнение 2 к Р70, П14–П17 и П24 — Р56
+    expect(withContour.map((s: { id: string }) => s.id)).toEqual(["П01", "П02", "П03", "П04", "П05", "П06", "П12", "П13", "П14", "П15", "П16", "П17", "П24"]);
     for (const s of withContour) {
       expect(s.contour.action, `${s.id}.contour.action`).toBeTruthy();
       expect(s.contour.expected, `${s.id}.contour.expected`).toBeTruthy();

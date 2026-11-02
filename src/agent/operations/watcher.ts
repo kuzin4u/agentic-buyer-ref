@@ -87,7 +87,12 @@ export interface OperationsOptions {
  *  ссылки заказа): итога нет, и поиск по CART его не ищет (ревью КТ1 Р51 № 3). */
 /** ABSENT — только у поиска по CART (Р69 п. 4): Платформа ответила, операций заказа нет; NONE — итога нет (срок, отказ
  *  Платформы, больше одной). */
-export type OperationOutcome = { kind: "OPERATION"; operation: Operation } | { kind: "MISMATCH" } | { kind: "NONE" } | { kind: "AMBIGUOUS" } | { kind: "ABSENT" };
+/** `skipped` у ABSENT — сколько операций заказа поиск не взял в кандидаты по `skip` (дополнение 2 к Р69 п. 3–4). */
+export type OperationOutcome = { kind: "OPERATION"; operation: Operation } | { kind: "MISMATCH" } | { kind: "NONE" } | { kind: "AMBIGUOUS" } | { kind: "ABSENT"; skipped: number };
+
+/** Операция заказа, которая итогом покупки не считается (дополнение 2 к Р69 п. 3–4): ожидание её пропускает, поиск по
+ *  CART не берёт в кандидаты. По записи GET — до сверки с CART. */
+export type OperationSkip = (r: OperationRecord) => boolean;
 
 /** Итог стадии 6: SETTLED или иной статус — операция; MISMATCH — другая операция; PENDING — расчёта нет, ожидание прервал
  *  вызывающий; UNREAD — GET не подтверждён и не повторяется; EXPIRED — граница ожидания прошла, итога нет (Р51 п. 2 (б)). */
@@ -111,6 +116,9 @@ interface Watched {
 export interface OperationWait {
   /** Первый привязанный итог; нет за `ms` — NONE. Итог уже есть — сразу. Прерывание `signal` — отказ с его причиной. */
   outcome(ms: number, signal: AbortSignal): Promise<OperationOutcome>;
+  /** Дальше операции, отвечающие `skip`, итогом не считаются (запись operation.status у них есть — её пишет GET); уже
+   *  полученный итог не меняется (дополнение 2 к Р69 п. 3). */
+  skip(skip: OperationSkip): void;
   /** Снять ожидание: события по заказу дальше — operation.unclaimed. */
   close(): void;
 }
@@ -123,6 +131,7 @@ interface Expectation {
   /** два ожидания по одной ссылке заказа — привязка неоднозначна, итога нет (fail-closed) */
   ambiguous: boolean;
   result: OperationOutcome | null;
+  skip: OperationSkip | null;
   readonly listeners: Set<() => void>;
 }
 
@@ -242,7 +251,7 @@ export class Operations {
   /** Встать в ожидание итога по заказу — до отправки пакета (Р49 п. 3). Вход — снимком: `orderRef` уже по маске ссылки
    *  агента (стадия 5 проверила его до реквизита). */
   expect(orderRef: string, cart: Mandate): OperationWait {
-    const exp: Expectation = { cart: structuredClone(cart), ambiguous: false, result: null, listeners: new Set() };
+    const exp: Expectation = { cart: structuredClone(cart), ambiguous: false, result: null, skip: null, listeners: new Set() };
     const prior = this.#byOrder.get(orderRef);
     if (prior !== undefined) {
       prior.ambiguous = exp.ambiguous = true;
@@ -251,6 +260,9 @@ export class Operations {
     this.#byOrder.set(orderRef, exp);
     return {
       outcome: (ms, signal) => this.#outcome(exp, ms, signal),
+      skip: (skip) => {
+        exp.skip = skip;
+      },
       close: () => {
         if (this.#byOrder.get(orderRef) === exp) this.#byOrder.delete(orderRef);
       },
@@ -291,9 +303,10 @@ export class Operations {
    * (bind.ts): итог или MISMATCH (запись operation.mismatch). Ни одной — ABSENT (Р69 п. 4; запись — NONE), больше одной —
    * NONE (запись AMBIGUOUS). Отказ Платформы — NONE,
    * код — в записи operation.lookup (403 AGENT_SUSPENDED подпись уже приостановил адаптер, Р60 п. 1); сбой журнала —
-   * наружу. Повтора нет.
+   * наружу. Повтора нет. `skip` — операции заказа, которые в кандидаты не входят (дополнение 2 к Р69 п. 3–4); их число —
+   * в `skipped` у ABSENT.
    */
-  async lookup(orderRef: string, cart: Mandate, notice?: LateNotice): Promise<OperationOutcome> {
+  async lookup(orderRef: string, cart: Mandate, notice?: LateNotice, skip?: OperationSkip): Promise<OperationOutcome> {
     const ref = mandateRef(cart.id).mandate;
     const done = (detail: LookupDetail, outcome: OperationOutcome): OperationOutcome => {
       this.#record({ kind: "operation.lookup", ...(ref !== undefined && { ref }), detail });
@@ -306,9 +319,10 @@ export class Operations {
       if (!(e instanceof PlatformFailure)) throw e;
       return done(e.code, { kind: "NONE" });
     }
-    const mine = list.filter((r) => r.orderRef === orderRef);
+    const order = list.filter((r) => r.orderRef === orderRef);
+    const mine = skip === undefined ? order : order.filter((r) => !skip(r));
     // ответ Платформы прочитан, операций заказа нет — основание повтора оплаты после обрыва ответа (Р69 п. 4)
-    if (mine.length === 0) return done("NONE", { kind: "ABSENT" });
+    if (mine.length === 0) return done("NONE", { kind: "ABSENT", skipped: order.length });
     if (mine.length > 1) return done("AMBIGUOUS", { kind: "NONE" });
     const r = mine[0]!;
     const bound = bindOperation(r, cart);
@@ -377,7 +391,7 @@ export class Operations {
 
   /** Первый привязанный итог — итог стадии 5; следующие события по заказу его не меняют. */
   #offer(exp: Expectation, r: OperationRecord): void {
-    if (exp.result !== null) return;
+    if (exp.result !== null || exp.skip?.(r) === true) return;
     const bound = bindOperation(r, exp.cart);
     if (typeof bound === "string") {
       this.#record({ kind: "operation.mismatch", ref: r.opRef, detail: bound, reason: "OPERATION_REPLY_MISMATCH", ...mandateRef(exp.cart.id) });

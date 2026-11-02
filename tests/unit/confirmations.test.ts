@@ -145,6 +145,37 @@ describe("модуль подтверждений: сигнал → GET → ст
     expect(text).not.toContain("upk.stand");
   });
 
+  it("Р70: APPROVED — confirmation_ref и срок запроса шагам оплаты (onApproved) до исхода, один раз; срока нет или не RFC 3339 — UNKNOWN без вызова (В3)", async () => {
+    const run = async (over: Partial<Confirmation>) => {
+      const s = setup();
+      const got: [string, string][] = [];
+      let order: string[] = [];
+      let outcome: ConfirmationOutcome | undefined;
+      void s.conf
+        .wait({ signal: new AbortController().signal, onApproved: (ref, exp) => void (got.push([ref, exp]), order.push("approved")) })
+        .then((o) => void ((outcome = o), order.push("outcome")));
+      s.answers.set(ID1, confirmation("PENDING"));
+      await s.event("confirmation.required", ID1);
+      s.answers.set(ID1, confirmation("APPROVED", over));
+      await s.event("confirmation.approved", ID1);
+      // повтор события — без второго вызова
+      await s.event("confirmation.approved", ID1);
+      const r = { got, order, outcome, journal: JSON.stringify(s.journal) };
+      order = [];
+      return r;
+    };
+    const ok = await run({});
+    expect(ok.outcome).toBe("APPROVED");
+    expect(ok.got).toEqual([[REF, new Date(T0 + HOLD_MS).toISOString()]]);
+    expect(ok.order).toEqual(["approved", "outcome"]);
+    expect(ok.journal).not.toContain(REF);
+    for (const expiresAt of [null, "2026"]) {
+      const bad = await run({ expiresAt } as Partial<Confirmation>);
+      expect(bad.outcome, String(expiresAt)).toBe("UNKNOWN");
+      expect(bad.got, String(expiresAt)).toEqual([]);
+    }
+  });
+
   it("дубль события по event_id — ни второго GET, ни второго уведомления", async () => {
     const s = setup();
     const w = s.waiter();
@@ -626,6 +657,40 @@ describe("вход вызывающего и прерывание (Р47 п. 8, �
     expect(calls).toEqual(["first"]);
   });
 
+  it("КТ сессии 57 № 11: отказ обещания оболочки и сбой журнала на notify.failed — без необработанного отказа, исход не меняется", async () => {
+    const c = clock();
+    const answers = new Map<string, Confirmation>([[ID1, confirmation("PENDING")]]);
+    const conf = new Confirmations({
+      port: { getConfirmation: async (id: string) => structuredClone(answers.get(id)!) },
+      journal: {
+        record: (e) => {
+          if (e.kind === "notify.failed") throw new Error("журнал недоступен");
+        },
+      },
+      params: { confirmation_wait_ms: WAIT_MS, confirmation_decision_max_sec: DECISION_MAX_SEC, signature_skew_sec: SKEW_SEC, event_seen_max: SEEN_MAX },
+      now: c.now,
+      timer: c.timer,
+    });
+    const unhandled: unknown[] = [];
+    const onUnhandled = (e: unknown) => void unhandled.push(e);
+    process.on("unhandledRejection", onUnhandled);
+    try {
+      let outcome: ConfirmationOutcome | undefined;
+      void conf.wait({ signal: new AbortController().signal, onPending: () => Promise.reject(new Error("оболочка отказала")) }).then((o) => (outcome = o));
+      const item = (type: PlatformEventType, eventId: string): FeedItem => ({ kind: "event", event: { eventId, type, at: c.now().toISOString(), mandateId: null, opRef: null, confirmationId: ID1, declineReason: null } });
+      await conf.listener(item("confirmation.required", "evt_1"));
+      await settle();
+      await settle();
+      answers.set(ID1, confirmation("APPROVED"));
+      await conf.listener(item("confirmation.approved", "evt_2"));
+      await settle();
+      expect(outcome).toBe("APPROVED");
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+    }
+  });
+
   it("сбой уведомления — запись notify.failed, исход не меняется: исключение и отказ обещания", async () => {
     for (const onPending of [
       () => {
@@ -794,5 +859,60 @@ describe("появление запроса для гонки стадии 5 (Р
     u.ac.abort(new Error("гонка стадии 5 решена"));
     expect(await lost).toBe("ABORTED");
     expect(u.live()).toBe(0);
+  });
+});
+
+describe("удержание отметки до конца стадии 5 (дополнение 3 к Р69 п. 1)", () => {
+  const discarded = (s: ReturnType<typeof setup>) => s.journal.filter((e) => e.kind === "confirmation.discarded").map((e) => e.ref);
+
+  it("запрос позже удерживаемой отметки по сроку не выбрасывается; после снятия — ещё confirmation_wait_ms, затем discarded; снятие повторно — ничего", async () => {
+    const s = setup();
+    const release = s.conf.keep(s.conf.mark());
+    s.answers.set(ID1, confirmation("PENDING"));
+    await s.event("confirmation.required", ID1);
+    await s.c.advance(3 * WAIT_MS);
+    expect(discarded(s)).toEqual([]);
+    release();
+    release();
+    await s.c.advance(WAIT_MS - 1);
+    expect(discarded(s)).toEqual([]);
+    await s.c.advance(1);
+    expect(discarded(s)).toEqual([ID1]);
+  });
+
+  it("ревью КТ сессии 61 № 5: две отметки, снята одна — запрос не выброшен и нового срока нет; снята вторая — ещё confirmation_wait_ms, затем discarded", async () => {
+    const s = setup();
+    const first = s.conf.keep(s.conf.mark());
+    const second = s.conf.keep(s.conf.mark());
+    s.answers.set(ID1, confirmation("PENDING"));
+    await s.event("confirmation.required", ID1);
+    await s.c.advance(2 * WAIT_MS);
+    first();
+    await s.c.advance(3 * WAIT_MS);
+    expect(discarded(s)).toEqual([]);
+    second();
+    await s.c.advance(WAIT_MS - 1);
+    expect(discarded(s)).toEqual([]);
+    await s.c.advance(1);
+    expect(discarded(s)).toEqual([ID1]);
+  });
+
+  it("после снятия запрос берёт стадия 4 (wait) — исход по нему; запрос до отметки и при чужой отметке — срок прежний", async () => {
+    const s = setup();
+    // запрос до отметки удержанием не защищён
+    s.answers.set(ID1, confirmation("PENDING"));
+    await s.event("confirmation.required", ID1);
+    const release = s.conf.keep(s.conf.mark());
+    await s.c.advance(WAIT_MS);
+    expect(discarded(s)).toEqual([ID1]);
+    // запрос после отметки: истёк при удержании, снятие — стадия 4 берёт его в новом сроке
+    s.answers.set(ID2, confirmation("REJECTED", { id: ID2 }));
+    await s.event("confirmation.required", ID2);
+    await s.c.advance(2 * WAIT_MS);
+    release();
+    const w = s.waiter();
+    await settle();
+    expect(w.outcome()).toBe("REJECTED");
+    expect(discarded(s)).toEqual([ID1]);
   });
 });

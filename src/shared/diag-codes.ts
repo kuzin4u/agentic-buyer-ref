@@ -126,6 +126,8 @@ export const AGENT_DIAG_CODES = [
   "DECLINED_MANDATE_SCOPE",
   "DECLINED_LIMIT_EXCEEDED",
   "DECLINED_STATE_UNAVAILABLE",
+  // повторное требование подтверждения после ссылки продавцу (дополнение 2 к Р69 п. 4): второй стадии 4 нет
+  "DECLINED_CONFIRMATION_REQUIRED",
   "ISSUER_DECLINED",
   "INSUFFICIENT_FUNDS",
   "DECLINE_REASON_UNKNOWN",

@@ -23,20 +23,22 @@ describe("зависимость от agentic-core", () => {
     );
   });
 
-  it("стенд Платформы для С0 — dev-зависимость по git+https с тегом v0.34.0 (Р24, PS-12; К2а, Р33 п. 9; К1.2, Р34 п. 10; Р41 п. 2; Р45 п. 1; Р47 п. 1; Р48 п. 1; Р49 п. 1; PR #65; Р52, PR #69; Р53 п. 8, PR #71; корневая запись lock — Р54 п. 2; Р57 п. 1, PR #79; Р61 п. 1, PR #85; Р64 п. 1, PR #89; Р68 п. 1, PR #94)", () => {
+  it("стенд Платформы для С0 — dev-зависимость по git+https с тегом v0.37.0 (Р24, PS-12; К2а, Р33 п. 9; К1.2, Р34 п. 10; Р41 п. 2; Р45 п. 1; Р47 п. 1; Р48 п. 1; Р49 п. 1; PR #65; Р52, PR #69; Р53 п. 8, PR #71; корневая запись lock — Р54 п. 2; Р57 п. 1, PR #79; Р61 п. 1, PR #85; Р64 п. 1, PR #89; Р68 п. 1, PR #94; К0 AG-13 ч. 2б, PR #98)", () => {
     const pkg = JSON.parse(readFileSync("package.json", "utf8"));
     expect(pkg.devDependencies["agentic-ps-platform"]).toBe(
-      "git+https://github.com/kuzin4u/agentic-ps-platform.git#v0.34.0",
+      "git+https://github.com/kuzin4u/agentic-ps-platform.git#v0.37.0",
     );
     expect(pkg.dependencies["agentic-ps-platform"]).toBeUndefined();
     const lock = JSON.parse(readFileSync("package-lock.json", "utf8"));
     const entry = lock.packages["node_modules/agentic-ps-platform"];
-    expect(entry).toMatchObject({ version: "0.34.0", dev: true });
+    expect(entry).toMatchObject({ version: "0.37.0", dev: true });
     // корневая запись lock — те же адреса и теги, что package.json (Р54 п. 2, #72): npm ci ставит дерево по записям
     // node_modules/… и отставания корневой записи не замечает (с v0.24.0 до К1.2 ч. 2в там был #v0.23.0)
     expect(lock.packages[""].devDependencies).toEqual(pkg.devDependencies);
     expect(lock.packages[""].dependencies).toEqual(pkg.dependencies);
-    // ab7d847… — коммит тега v0.34.0 (передача #86: createMerchants(stand, { paymentMethods }) — способы оплаты витрин
+    // b3444d3… — коммит тега v0.37.0 (передача #97, РП72: подтверждение через продавца — заказ AWAITING_CONFIRMATION,
+    // признак payment.confirmation_required, POST …/orders/{order_id}/confirmation; зависимости стенда прежние; ПАО 1.4.0,
+    // md и YAML прежние; К0 AG-13 ч. 2б, PR #98; v0.35.0, v0.36.0 агент не брал); прежде v0.34.0 — ab7d847… (передача #86: createMerchants(stand, { paymentMethods }) — способы оплаты витрин
     // по merchant_id; с v0.33.0 — stand.calls(), stand.issuedCredentials(); зависимости стенда прежние; ПАО 1.4.0, md и
     // YAML прежние; служебный PR #94, Р68 п. 1; v0.33.0 агент не брал — Р-1012); прежде v0.32.1 — 762ffb6… (SEC-1-код
     // ч. 1–2б, передачи #86, #88: csr в заявлении, certificate в решении о допуске, stand.caCertificate; стенд без mTLS;
@@ -45,7 +47,7 @@ describe("зависимость от agentic-core", () => {
     // передачи #74, #77, #78, служебный PR #79, Р57 п. 1; v0.25.1 — 5708313…, MER-62-45, передача #70,
     // fastify закреплён 5.12.6, DEP-1 / РП59, AG-09 ч. 2б, PR #71, Р53 п. 8; v0.24.0 — 5762349…, PS-30 ч. 2, служебный PR #69, Р52; v0.23.0 — a5d496a…, PS-30 ч. 1, PR #65; v0.20.0 — dfa4328…, Р49 п. 1; v0.19.0 — 9454e9f…, Р48 п. 1; v0.17.0 — 57b357c…, Р47 п. 1; v0.15.0 — 9fda145…, Р45 п. 1; v0.11.0 — 693a388…, Р41 п. 2). npm install переписывает адрес на git+ssh — в lock только git+https.
     expect(entry.resolved).toBe(
-      "git+https://github.com/kuzin4u/agentic-ps-platform.git#ab7d8474e76dc4a3f0a2044a2d04f9f6edfd5f03",
+      "git+https://github.com/kuzin4u/agentic-ps-platform.git#b3444d3a668bae87afc42ec0f390cf8d2c5ab27b",
     );
     expect(readFileSync("package-lock.json", "utf8")).not.toMatch(/git\+ssh:|"github:/);
     // стенд объявляет тот же тег ядра, что и агент: npm сводит их к одной копии (Р41 п. 2)

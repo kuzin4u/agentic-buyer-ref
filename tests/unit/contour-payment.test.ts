@@ -1,12 +1,12 @@
 // Итог стадии 5 в шагах профиля contour (Р49 п. 5; ревью КТ1 AG-11 ч. 2 № 4, 5, 14): ожидание по order_ref — до отправки
 // пакета; после DECLINED продавца — гонка операции с запросом подтверждения, пришедшим после отметки; сроки — из параметров.
-import { describe, expect, it } from "vitest";
-import type { OperationOutcome, OperationWait, SettleOutcome } from "../../src/agent/operations/index.js";
+import { describe, expect, it, vi } from "vitest";
+import type { OperationOutcome, OperationSkip, OperationWait, SettleOutcome } from "../../src/agent/operations/index.js";
 import { ContourPayment } from "../../src/agent/payment-package/index.js";
 import { ShopFailure, type PaymentContext, type ShopPaymentReply } from "../../src/agent/ports/index.js";
 import { MemoryJournal } from "../../src/agent/journal/index.js";
 import { loadParams } from "../../src/shared/config.js";
-import { PlatformFailure, type Credential, type Mandate, type Operation } from "../../src/shared/domain.js";
+import { PlatformFailure, type Credential, type Mandate, type Operation, type OperationRecord } from "../../src/shared/domain.js";
 import { trackedSignal } from "../support/signal.js";
 
 const PARAMS = loadParams();
@@ -22,8 +22,8 @@ function steps(o: {
   lookup?: OperationOutcome;
   /** Р69 п. 4: исход каждой попытки оплаты (UNKNOWN — нет ответа, REFUSED — отказ витрины); нет — `reply` */
   pays?: (ShopPaymentReply["status"] | "UNKNOWN" | "REFUSED")[];
-  /** заказ CREATED у витрины; не задан — метода payable нет */
-  payable?: boolean | (() => Promise<boolean>);
+  /** заказ CREATED у витрины (true), иначе (false) или ждёт подтверждения (К1.3); не задан — метода payable нет */
+  payable?: boolean | "AWAITING_CONFIRMATION" | (() => Promise<boolean>);
   /** срок реквизита */
   validTo?: string | null;
   /** журнал шагов; не задан — MemoryJournal */
@@ -36,6 +36,12 @@ function steps(o: {
   onCredential?: () => void;
   /** часы после чтения заказа у витрины (ревью КТ2 № 1) */
   nowAfterPayable?: Date;
+  /** признак payment.confirmation_required в ответе продавца (стенд v0.37.0, К1.1 AG-13 ч. 2б) */
+  flag?: boolean;
+  /** Р70: исход стадии 4 (APPROVED — со ссылкой и сроком `approve`); не задан — NONE */
+  approve?: { ref: string; expiresAt: string } | "UNKNOWN";
+  /** Р70: исход каждого POST …/confirmation (OK — 200, UNKNOWN — неизвестный исход, REFUSED — отказ витрины); нет метода — null */
+  confirms?: ("OK" | "UNKNOWN" | "REFUSED")[] | null;
 }) {
   let clockNow = NOW;
   const log: string[] = [];
@@ -46,9 +52,14 @@ function steps(o: {
   let issued = 0;
   const wait: OperationWait = {
     outcome: (ms, signal) => (log.push(`outcome ${ms}`), o.outcome(ms, signal)),
+    // какие операции пропускает (дополнение 2 к Р69 п. 3–4): CI — отказ CREDENTIAL_INVALID, CR — CONFIRMATION_REQUIRED
+    skip: (skip) => void log.push(`skip ${skipped(skip)}`),
     close: () => void log.push("close"),
   };
   let paid = 0;
+  let confirmed = 0;
+  /** confirmation_ref, ушедшие продавцу (Р70) */
+  const refs: string[] = [];
   const payable = o.payable;
   const p = new ContourPayment({
     platform: {
@@ -69,21 +80,37 @@ function steps(o: {
         const r = o.pays?.[paid++] ?? o.reply;
         if (r === "UNKNOWN") throw new ShopFailure("SHOP_ORDER_STATE_UNKNOWN");
         if (r === "REFUSED") throw new ShopFailure("SHOP_ORDER_REFUSED");
-        return { status: r };
+        return o.flag === true ? { status: r, confirmationRequired: true } : { status: r };
       },
       ...(payable !== undefined && {
-        payable: async () => {
-          log.push("payable");
+        payable: async (_req, signal) => {
+          log.push(`payable${signal === undefined ? " без сигнала" : ""}`);
           const r = typeof payable === "function" ? await payable() : payable;
           if (o.nowAfterPayable !== undefined) clockNow = o.nowAfterPayable;
-          return r;
+          return r === true ? "CREATED" : r === false ? "NO" : r;
+        },
+      }),
+      ...(o.confirms !== null && {
+        confirm: async (req, attempt) => {
+          log.push(`confirm ${attempt ?? 1} ${req.orderId} ${req.cartMandateId}`);
+          refs.push(req.confirmationRef);
+          const r = (o.confirms ?? ["OK"])[confirmed++] ?? "OK";
+          if (r === "UNKNOWN") throw new ShopFailure("SHOP_ORDER_STATE_UNKNOWN");
+          if (r === "REFUSED") throw new ShopFailure("SHOP_ORDER_REFUSED");
+          return { status: "PAID" as const };
         },
       }),
     },
     journal,
     confirmations: {
-      wait: async () => "NONE",
+      wait: async (w) => {
+        if (o.approve === undefined) return "NONE";
+        if (o.approve === "UNKNOWN") return "UNKNOWN";
+        w.onApproved?.(o.approve.ref, o.approve.expiresAt);
+        return "APPROVED";
+      },
       mark: () => (log.push("mark"), 7),
+      keep: () => () => {},
       arrival: (signal, after) => {
         log.push(`arrival ${after}`);
         if (typeof o.arrival === "function") return o.arrival(signal);
@@ -92,14 +119,32 @@ function steps(o: {
     },
     operations: {
       expect: () => (log.push("expect"), wait),
-      lookup: async (orderRef, cart, notice) => (log.push(`lookup ${orderRef} ${cart.id}${notice ? " notice" : ""}`), o.lookup ?? { kind: "NONE" }),
+      lookup: async (orderRef, cart, notice, skip) => {
+        log.push(`lookup ${orderRef} ${cart.id}${notice ? " notice" : ""}`);
+        if (skip !== undefined) log.push(`lookup-skip ${skipped(skip)}`);
+        return o.lookup ?? { kind: "NONE" };
+      },
       settle: async () => ({ kind: "PENDING" }),
       watch: (op, after) => void log.push(`watch ${op.opRef} ${after}`),
     },
     params: PARAMS,
     now: () => clockNow,
   });
-  return { p, log, journal, sealed, packages, issued: () => issued };
+  return { p, log, journal, sealed, packages, refs, issued: () => issued };
+}
+
+/** Что пропускает `skip`: по образцам записей (CI — отказ CREDENTIAL_INVALID, CD — отказ CONFIRMATION_REQUIRED, DL — иной
+ *  отказ, CR — статус CONFIRMATION_REQUIRED, A — AUTHORIZED) */
+function skipped(skip: OperationSkip): string {
+  const base: OperationRecord = { opRef: "op_s", orderRef: "ORD-1", channel: "CARD", amountMinor: 250000, merchantId: "shop_1", indicator: null, status: "AUTHORIZED", declineReason: null, fulfilment: null };
+  const samples: [string, OperationRecord][] = [
+    ["CI", { ...base, status: "DECLINED", declineReason: "CREDENTIAL_INVALID" }],
+    ["CD", { ...base, status: "DECLINED", declineReason: "CONFIRMATION_REQUIRED" }],
+    ["DL", { ...base, status: "DECLINED", declineReason: "LIMIT_EXCEEDED" }],
+    ["CR", { ...base, status: "CONFIRMATION_REQUIRED", declineReason: "CONFIRMATION_REQUIRED" }],
+    ["A", base],
+  ];
+  return samples.filter(([, r]) => skip(r)).map(([k]) => k).join(",") || "-";
 }
 
 const NOW = new Date("2026-11-01T12:00:00.000Z");
@@ -111,7 +156,8 @@ describe("ContourPayment: итог стадии 5 (Р49 п. 5)", () => {
   it("PAID — ожидание по order_ref до отправки пакета, срок operation_outcome_max_delay_sec; NONE — один поиск по CART (Р51 п. 5), ничего — OPERATION_RESULT_UNCONFIRMED; ожидание снято", async () => {
     const { p, log } = steps({ reply: "PAID", outcome: async () => ({ kind: "NONE" }) });
     await expect(p.authorize(ctx(), { idempotencyKey: "k" })).rejects.toMatchObject({ code: "OPERATION_RESULT_UNCONFIRMED" });
-    expect(log).toEqual(["expect", "mark", "pay 1", `outcome ${PARAMS.operation_outcome_max_delay_sec * 1000}`, "lookup ORD-1 m_cart", "close"]);
+    // КТ сессии 60 № 3: отказ ADP CONFIRMATION_REQUIRED — не итог ни ожидания, ни поиска
+    expect(log).toEqual(["expect", "skip CD", "mark", "pay 1", `outcome ${PARAMS.operation_outcome_max_delay_sec * 1000}`, "lookup ORD-1 m_cart", "lookup-skip CD", "close"]);
   });
 
   it("Р51 п. 5: итог найден поиском по CART — итог стадии 5 (в том числе REVERSED до ответа эмитента); поиск не сходится — OPERATION_REPLY_MISMATCH; итог по событию — без поиска", async () => {
@@ -158,6 +204,35 @@ describe("ContourPayment: итог стадии 5 (Р49 п. 5)", () => {
     await expect(a.p.authorize(ctx(), { idempotencyKey: "k" })).rejects.toMatchObject({ code: "CONFIRMATION_REQUIRED" });
     const b = steps({ reply: "PAID", outcome: async () => ({ kind: "MISMATCH" }) });
     await expect(b.p.authorize(ctx(), { idempotencyKey: "k" })).rejects.toMatchObject({ code: "OPERATION_REPLY_MISMATCH" });
+  });
+
+  describe("К1.1 AG-13 ч. 2б: AWAITING_CONFIRMATION и признак confirmation_required продавца (РП72 п. 1; Р69 п. 0; инвариант 8)", () => {
+    const WAIT = Math.max(PARAMS.operation_outcome_max_delay_sec * 1000, PARAMS.confirmation_wait_ms);
+
+    it.each([
+      ["AWAITING_CONFIRMATION с признаком", "AWAITING_CONFIRMATION", true],
+      ["AWAITING_CONFIRMATION без поля payment", "AWAITING_CONFIRMATION", false],
+      ["признак при ином статусе (PAID)", "PAID", true],
+    ] as [string, ShopPaymentReply["status"], boolean][])("%s, запрос Платформы после отметки — CONFIRMATION_REQUIRED (стадия 4), пакет один", async (_, reply, flag) => {
+      const { p, log } = steps({ reply, flag, outcome: () => new Promise(() => {}), arrival: Promise.resolve() });
+      await expect(p.authorize(ctx(), { idempotencyKey: "k" })).rejects.toMatchObject({ code: "CONFIRMATION_REQUIRED" });
+      expect(log).toEqual(["expect", "skip CD", "mark", "pay 1", `outcome ${WAIT}`, "arrival 7", "close"]);
+    });
+
+    it("поломка (1): признак без запроса Платформы — не стадия 4 и не повтор оплаты: ожидание по большему из сроков, поиск по CART «операций нет» — OPERATION_RESULT_UNCONFIRMED, второго POST, GET реквизита и чтения заказа нет", async () => {
+      const { p, log, journal } = steps({ reply: "AWAITING_CONFIRMATION", flag: true, outcome: async () => ({ kind: "NONE" }), lookup: { kind: "ABSENT", skipped: 0 }, payable: true, validTo: LATER });
+      await expect(p.authorize(ctx(), { idempotencyKey: "k" })).rejects.toMatchObject({ code: "OPERATION_RESULT_UNCONFIRMED" });
+      expect(log).toEqual(["expect", "skip CD", "mark", "pay 1", `outcome ${WAIT}`, "arrival 7", "lookup ORD-1 m_cart", "lookup-skip CD", "close"]);
+      expect(journal.entries.some((e) => e.kind === "payment.retry")).toBe(false);
+    });
+
+    it("поломка (2): AWAITING_CONFIRMATION — не итог операции: итог — операция по событию (одобрение после повтора авторизации эквайрером или отказ)", async () => {
+      const AUTHORIZED: Operation = { ...DECLINED, status: "AUTHORIZED", declineReason: null };
+      const a = steps({ reply: "AWAITING_CONFIRMATION", flag: true, outcome: async () => ({ kind: "OPERATION", operation: AUTHORIZED }) });
+      await expect(a.p.authorize(ctx(), { idempotencyKey: "k" })).resolves.toMatchObject({ opRef: "op_1", status: "AUTHORIZED" });
+      const b = steps({ reply: "AWAITING_CONFIRMATION", flag: true, outcome: async () => ({ kind: "OPERATION", operation: DECLINED }) });
+      await expect(b.p.authorize(ctx(), { idempotencyKey: "k" })).resolves.toMatchObject({ status: "DECLINED", declineReason: "LIMIT_EXCEEDED" });
+    });
   });
 
   it("AG-12 ч. 3б (ревью КТ1 Р49 № 14 (в)): гонка решена операцией или запросом подтверждения — проигравшая сторона снята прерыванием, на сигнале покупки слушателя не остаётся", async () => {
@@ -209,16 +284,93 @@ describe("повтор оплаты после обрыва ответа — п�
   };
 
   it("неизвестный исход + «операций нет» + срок реквизита + заказ CREATED — один повтор тем же пакетом, запись payment.retry без реквизита", async () => {
-    const s = steps({ reply: "PAID", pays: ["UNKNOWN", "PAID"], outcome: thenAuthorized(), lookup: { kind: "ABSENT" }, validTo: LATER, payable: true });
+    const s = steps({ reply: "PAID", pays: ["UNKNOWN", "PAID"], outcome: thenAuthorized(), lookup: { kind: "ABSENT", skipped: 0 }, validTo: LATER, payable: true });
     await expect(s.p.authorize(ctx(), { idempotencyKey: "k" })).resolves.toMatchObject({ status: "AUTHORIZED" });
-    expect(s.log).toEqual(["expect", "mark", "pay 1", `outcome ${PARAMS.operation_outcome_max_delay_sec * 1000}`, "lookup ORD-1 m_cart", "credential cr_1 m_cart", "payable", "mark", "pay 2", `outcome ${PARAMS.operation_outcome_max_delay_sec * 1000}`, "close"]);
+    // дополнение 2 к Р69 п. 3: после payment.retry ожидание пропускает отказ повтора CREDENTIAL_INVALID (и только его)
+    expect(s.log).toEqual(["expect", "skip CD", "mark", "pay 1", `outcome ${PARAMS.operation_outcome_max_delay_sec * 1000}`, "lookup ORD-1 m_cart", "lookup-skip CD", "credential cr_1 m_cart", "payable", "skip CI,CD", "mark", "pay 2", `outcome ${PARAMS.operation_outcome_max_delay_sec * 1000}`, "close"]);
     const retries = s.journal.entries.filter((e) => e.kind === "payment.retry");
     expect(retries).toEqual([expect.objectContaining({ kind: "payment.retry", ref: "ORD-1", mandate: "m_cart" })]);
     expect(JSON.stringify(s.journal.entries)).not.toContain("cr_1");
   });
 
+  it("дополнение 2 к Р69 п. 3: на попытке 2 поиск по CART — без отказа CREDENTIAL_INVALID; ничего другого — OPERATION_RESULT_UNCONFIRMED, третьего POST нет; на попытке 1 — без пропуска", async () => {
+    const s = steps({ reply: "PAID", pays: ["UNKNOWN", "UNKNOWN"], outcome: async () => ({ kind: "NONE" }), lookup: { kind: "ABSENT", skipped: 0 }, validTo: LATER, payable: true });
+    await expect(s.p.authorize(ctx(), { idempotencyKey: "k" })).rejects.toMatchObject({ code: "OPERATION_RESULT_UNCONFIRMED" });
+    const lookups = s.log.filter((x) => x.startsWith("lookup"));
+    expect(lookups).toEqual(["lookup ORD-1 m_cart", "lookup-skip CD", "lookup ORD-1 m_cart", "lookup-skip CI,CD"]);
+    expect(s.log.filter((x) => x.startsWith("pay "))).toEqual(["pay 1", "pay 2"]);
+  });
+
+  it("К1.3 (Р69 п. 4, правка ревью): обрыв ответа, «операций нет», заказ AWAITING_CONFIRMATION, запрос Платформы после отметки — стадия 4 (CONFIRMATION_REQUIRED), повтора оплаты нет", async () => {
+    const s = steps({ reply: "PAID", pays: ["UNKNOWN"], outcome: async () => ({ kind: "NONE" }), lookup: { kind: "ABSENT", skipped: 0 }, validTo: LATER, payable: "AWAITING_CONFIRMATION", arrival: Promise.resolve() });
+    await expect(s.p.authorize(ctx(), { idempotencyKey: "k" })).rejects.toMatchObject({ code: "CONFIRMATION_REQUIRED" });
+    // запрос — после отметки первой попытки; сигнал покупки — у чтения заказа (КТ сессии 57 № 12)
+    expect(s.log).toEqual(["expect", "skip CD", "mark", "pay 1", `outcome ${PARAMS.operation_outcome_max_delay_sec * 1000}`, "lookup ORD-1 m_cart", "lookup-skip CD", "credential cr_1 m_cart", "payable", "arrival 7", "close"]);
+    expect(s.journal.entries.some((e) => e.kind === "payment.retry")).toBe(false);
+  });
+
+  it("К1.3: заказ AWAITING_CONFIRMATION, а запроса Платформы нет (признак продавца без запроса — не стадия 4, К1.1) — OPERATION_RESULT_UNCONFIRMED; остановка покупки в ожидании — её причина", async () => {
+    const none = steps({ reply: "PAID", pays: ["UNKNOWN"], outcome: async () => ({ kind: "NONE" }), lookup: { kind: "ABSENT", skipped: 0 }, validTo: LATER, payable: "AWAITING_CONFIRMATION", arrival: () => Promise.reject(new Error("срок ожидания запроса")) });
+    await expect(none.p.authorize(ctx(), { idempotencyKey: "k" })).rejects.toMatchObject({ code: "OPERATION_RESULT_UNCONFIRMED" });
+    expect(none.log.filter((x) => x.startsWith("pay "))).toEqual(["pay 1"]);
+    const ac = new AbortController();
+    const reason = new Error("покупка остановлена");
+    const stopped = steps({ reply: "PAID", pays: ["UNKNOWN"], outcome: async () => ({ kind: "NONE" }), lookup: { kind: "ABSENT", skipped: 0 }, validTo: LATER, payable: "AWAITING_CONFIRMATION", arrival: (signal) => (ac.abort(reason), Promise.reject(signal.reason)) });
+    await expect(stopped.p.authorize(ctx(ac.signal), { idempotencyKey: "k" })).rejects.toBe(reason);
+  });
+
+  it("КТ сессии 57 № 5: срок реквизита ближе запаса shop_request_timeout_ms — повтора нет, GET реквизита нет", async () => {
+    const soon = new Date(NOW.getTime() + PARAMS.shop_request_timeout_ms).toISOString();
+    const s = steps({ reply: "PAID", pays: ["UNKNOWN", "PAID"], outcome: thenAuthorized(), lookup: { kind: "ABSENT", skipped: 0 }, validTo: soon, payable: true });
+    await expect(s.p.authorize(ctx(), { idempotencyKey: "k" })).rejects.toMatchObject({ code: "OPERATION_RESULT_UNCONFIRMED" });
+    expect(s.log.filter((x) => x.startsWith("pay ") || x.startsWith("credential"))).toEqual(["pay 1"]);
+    // срок из GET в пределах запаса — тоже без повтора
+    const g = steps({ reply: "PAID", pays: ["UNKNOWN", "PAID"], outcome: thenAuthorized(), lookup: { kind: "ABSENT", skipped: 0 }, validTo: LATER, credentialValidTo: soon, payable: true });
+    await expect(g.p.authorize(ctx(), { idempotencyKey: "k" })).rejects.toMatchObject({ code: "OPERATION_RESULT_UNCONFIRMED" });
+    expect(g.log.filter((x) => x.startsWith("pay "))).toEqual(["pay 1"]);
+  });
+
+  it("дополнение 2 к Р69 п. 3: без повтора CREDENTIAL_INVALID первой попытки — итог, ожидание ничего не пропускает", async () => {
+    const declined: Operation = { ...DECLINED, declineReason: "CREDENTIAL_INVALID" };
+    const s = steps({ reply: "PAID", outcome: async () => ({ kind: "OPERATION", operation: declined }) });
+    await expect(s.p.authorize(ctx(), { idempotencyKey: "k" })).resolves.toMatchObject({ status: "DECLINED", declineReason: "CREDENTIAL_INVALID" });
+    // пропуска CREDENTIAL_INVALID нет — только отказ CONFIRMATION_REQUIRED (КТ сессии 60 № 3)
+    expect(s.log.filter((x) => x.startsWith("skip"))).toEqual(["skip CD"]);
+  });
+
+  it("КТ сессии 60 № 2: ожидание запроса — свой таймер (не AbortSignal.timeout с unref); пришёл раньше срока — таймер снят", async () => {
+    vi.useFakeTimers();
+    try {
+      const s = steps({ reply: "PAID", outcome: async () => ({ kind: "NONE" }), lookup: { kind: "ABSENT", skipped: 1 }, arrival: Promise.resolve() });
+      const before = vi.getTimerCount();
+      await expect(s.p.authorize(ctx(), { idempotencyKey: "k" })).rejects.toMatchObject({ code: "CONFIRMATION_REQUIRED" });
+      expect(vi.getTimerCount()).toBe(before);
+      // запроса нет — срок confirmation_wait_ms по таймеру: итог OPERATION_RESULT_UNCONFIRMED
+      const t = steps({ reply: "PAID", outcome: async () => ({ kind: "NONE" }), lookup: { kind: "ABSENT", skipped: 1 } });
+      const out = t.p.authorize(ctx(), { idempotencyKey: "k" }).catch((e: unknown) => e);
+      await vi.advanceTimersByTimeAsync(PARAMS.confirmation_wait_ms);
+      expect(await out).toMatchObject({ code: "OPERATION_RESULT_UNCONFIRMED" });
+      expect(vi.getTimerCount()).toBe(before);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("КТ сессии 60 № 3: отказ ADP CONFIRMATION_REQUIRED на первой авторизации — не итог и не DECLINED_CONFIRMATION_REQUIRED: поиск пропустил его — ждать запрос Платформы; пришёл — CONFIRMATION_REQUIRED (стадия 4), нет — OPERATION_RESULT_UNCONFIRMED; повтора оплаты нет", async () => {
+    const got = steps({ reply: "PAID", outcome: async () => ({ kind: "NONE" }), lookup: { kind: "ABSENT", skipped: 1 }, arrival: Promise.resolve() });
+    await expect(got.p.authorize(ctx(), { idempotencyKey: "k" })).rejects.toMatchObject({ code: "CONFIRMATION_REQUIRED" });
+    expect(got.log.slice(-3)).toEqual(["lookup-skip CD", "arrival 7", "close"]);
+    const none = steps({ reply: "PAID", outcome: async () => ({ kind: "NONE" }), lookup: { kind: "ABSENT", skipped: 1 }, arrival: () => Promise.reject(new Error("срок")) });
+    await expect(none.p.authorize(ctx(), { idempotencyKey: "k" })).rejects.toMatchObject({ code: "OPERATION_RESULT_UNCONFIRMED" });
+    expect(none.log.filter((x) => x.startsWith("pay "))).toEqual(["pay 1"]);
+    // ничего не пропущено — без ожидания запроса
+    const plain = steps({ reply: "PAID", outcome: async () => ({ kind: "NONE" }), lookup: { kind: "ABSENT", skipped: 0 }, arrival: Promise.resolve() });
+    await expect(plain.p.authorize(ctx(), { idempotencyKey: "k" })).rejects.toMatchObject({ code: "OPERATION_RESULT_UNCONFIRMED" });
+    expect(plain.log.some((x) => x.startsWith("arrival"))).toBe(false);
+  });
+
   it("ревью КТ сессии 57 № 2: повтор — тем же запечатанным пакетом, реквизит выдан один раз", async () => {
-    const s = steps({ reply: "PAID", pays: ["UNKNOWN", "PAID"], outcome: thenAuthorized(), lookup: { kind: "ABSENT" }, validTo: LATER, payable: true });
+    const s = steps({ reply: "PAID", pays: ["UNKNOWN", "PAID"], outcome: thenAuthorized(), lookup: { kind: "ABSENT", skipped: 0 }, validTo: LATER, payable: true });
     await expect(s.p.authorize(ctx(), { idempotencyKey: "k" })).resolves.toMatchObject({ status: "AUTHORIZED" });
     expect(s.packages).toHaveLength(2);
     expect(s.packages[0]).toBe(s.sealed);
@@ -233,7 +385,7 @@ describe("повтор оплаты после обрыва ответа — п�
         super.record(e);
       }
     }
-    const s = steps({ reply: "PAID", pays: ["UNKNOWN", "PAID"], outcome: thenAuthorized(), lookup: { kind: "ABSENT" }, validTo: LATER, payable: true, journal: new Failing() });
+    const s = steps({ reply: "PAID", pays: ["UNKNOWN", "PAID"], outcome: thenAuthorized(), lookup: { kind: "ABSENT", skipped: 0 }, validTo: LATER, payable: true, journal: new Failing() });
     await expect(s.p.authorize(ctx(), { idempotencyKey: "k" })).rejects.toThrow("журнал недоступен");
     expect(s.log.filter((x) => x.startsWith("pay "))).toEqual(["pay 1"]);
     // ожидание снято и при сбое журнала
@@ -242,13 +394,13 @@ describe("повтор оплаты после обрыва ответа — п�
 
   it("условие не выполнено — повтора нет, OPERATION_RESULT_UNCONFIRMED", async () => {
     const cases: [string, Parameters<typeof steps>[0]][] = [
-      ["отказ витрины, а не неизвестный исход", { reply: "PAID", pays: ["REFUSED"], outcome: thenAuthorized(), lookup: { kind: "ABSENT" }, validTo: LATER, payable: true }],
-      ["ответ витрины есть (PAID)", { reply: "PAID", outcome: thenAuthorized(), lookup: { kind: "ABSENT" }, validTo: LATER, payable: true }],
+      ["отказ витрины, а не неизвестный исход", { reply: "PAID", pays: ["REFUSED"], outcome: thenAuthorized(), lookup: { kind: "ABSENT", skipped: 0 }, validTo: LATER, payable: true }],
+      ["ответ витрины есть (PAID)", { reply: "PAID", outcome: thenAuthorized(), lookup: { kind: "ABSENT", skipped: 0 }, validTo: LATER, payable: true }],
       ["Платформа не ответила (NONE)", { reply: "PAID", pays: ["UNKNOWN"], outcome: thenAuthorized(), lookup: { kind: "NONE" }, validTo: LATER, payable: true }],
-      ["срок реквизита наступил", { reply: "PAID", pays: ["UNKNOWN"], outcome: thenAuthorized(), lookup: { kind: "ABSENT" }, validTo: NOW.toISOString(), payable: true }],
-      ["срока реквизита нет", { reply: "PAID", pays: ["UNKNOWN"], outcome: thenAuthorized(), lookup: { kind: "ABSENT" }, validTo: null, payable: true }],
-      ["заказ не CREATED", { reply: "PAID", pays: ["UNKNOWN"], outcome: thenAuthorized(), lookup: { kind: "ABSENT" }, validTo: LATER, payable: false }],
-      ["у витрины нет чтения заказа", { reply: "PAID", pays: ["UNKNOWN"], outcome: thenAuthorized(), lookup: { kind: "ABSENT" }, validTo: LATER }],
+      ["срок реквизита наступил", { reply: "PAID", pays: ["UNKNOWN"], outcome: thenAuthorized(), lookup: { kind: "ABSENT", skipped: 0 }, validTo: NOW.toISOString(), payable: true }],
+      ["срока реквизита нет", { reply: "PAID", pays: ["UNKNOWN"], outcome: thenAuthorized(), lookup: { kind: "ABSENT", skipped: 0 }, validTo: null, payable: true }],
+      ["заказ не CREATED", { reply: "PAID", pays: ["UNKNOWN"], outcome: thenAuthorized(), lookup: { kind: "ABSENT", skipped: 0 }, validTo: LATER, payable: false }],
+      ["у витрины нет чтения заказа", { reply: "PAID", pays: ["UNKNOWN"], outcome: thenAuthorized(), lookup: { kind: "ABSENT", skipped: 0 }, validTo: LATER }],
     ];
     // чтение реквизита — только на пути повтора (дополнение 1 к Р69 п. 6; ревью КТ2 № 4): до него доходит лишь «заказ не CREATED»
     const withGet = new Set(["заказ не CREATED"]);
@@ -262,7 +414,7 @@ describe("повтор оплаты после обрыва ответа — п�
   });
 
   it("дополнение 1 к Р69 п. 4: реквизит у Платформы не ISSUED или чтение отказано — повтора нет, заказ у витрины не читается", async () => {
-    const base = { reply: "PAID" as const, pays: ["UNKNOWN", "PAID"] as ("UNKNOWN" | "PAID")[], lookup: { kind: "ABSENT" } as const, validTo: LATER, payable: true };
+    const base = { reply: "PAID" as const, pays: ["UNKNOWN", "PAID"] as ("UNKNOWN" | "PAID")[], lookup: { kind: "ABSENT", skipped: 0 } as const, validTo: LATER, payable: true };
     const cases: [string, string | Error][] = [
       ["USED — первая авторизация дошла до ADP", "USED"],
       ["EXPIRED", "EXPIRED"],
@@ -284,16 +436,16 @@ describe("повтор оплаты после обрыва ответа — п�
   });
 
   it("дополнение 1 к Р69 п. 4: чтение реквизита — после срока реквизита; срок наступил — ни GET, ни повтора; сбой не PlatformFailure — наружу", async () => {
-    const a = steps({ reply: "PAID", pays: ["UNKNOWN", "PAID"], outcome: thenAuthorized(), lookup: { kind: "ABSENT" }, validTo: NOW.toISOString(), payable: true });
+    const a = steps({ reply: "PAID", pays: ["UNKNOWN", "PAID"], outcome: thenAuthorized(), lookup: { kind: "ABSENT", skipped: 0 }, validTo: NOW.toISOString(), payable: true });
     await expect(a.p.authorize(ctx(), { idempotencyKey: "k" })).rejects.toMatchObject({ code: "OPERATION_RESULT_UNCONFIRMED" });
     expect(a.log.some((x) => x.startsWith("credential"))).toBe(false);
-    const b = steps({ reply: "PAID", pays: ["UNKNOWN", "PAID"], outcome: thenAuthorized(), lookup: { kind: "ABSENT" }, validTo: LATER, payable: true, credential: new Error("журнал недоступен") });
+    const b = steps({ reply: "PAID", pays: ["UNKNOWN", "PAID"], outcome: thenAuthorized(), lookup: { kind: "ABSENT", skipped: 0 }, validTo: LATER, payable: true, credential: new Error("журнал недоступен") });
     await expect(b.p.authorize(ctx(), { idempotencyKey: "k" })).rejects.toThrow("журнал недоступен");
     expect(b.log.filter((x) => x.startsWith("pay "))).toEqual(["pay 1"]);
   });
 
   it("ревью КТ2 № 1: срок — меньший из выданного и из ответа GET; в GET срока нет или он прошёл — повтора нет; срок прошёл, пока читали заказ, — повтора нет", async () => {
-    const base = { reply: "PAID" as const, pays: ["UNKNOWN", "PAID"] as ("UNKNOWN" | "PAID")[], lookup: { kind: "ABSENT" } as const, validTo: LATER, payable: true };
+    const base = { reply: "PAID" as const, pays: ["UNKNOWN", "PAID"] as ("UNKNOWN" | "PAID")[], lookup: { kind: "ABSENT", skipped: 0 } as const, validTo: LATER, payable: true };
     const cases: [string, Partial<Parameters<typeof steps>[0]>][] = [
       ["в GET срока нет", { credentialValidTo: null }],
       ["в GET срок прошёл", { credentialValidTo: NOW.toISOString() }],
@@ -314,7 +466,7 @@ describe("повтор оплаты после обрыва ответа — п�
 
   it("ревью КТ2 № 3: покупку остановили, пока читали реквизит, — заказ у витрины не читается, повтора нет", async () => {
     const ac = new AbortController();
-    const s = steps({ reply: "PAID", pays: ["UNKNOWN", "PAID"], outcome: thenAuthorized(), lookup: { kind: "ABSENT" }, validTo: LATER, payable: true, onCredential: () => ac.abort(new Error("остановлена")) });
+    const s = steps({ reply: "PAID", pays: ["UNKNOWN", "PAID"], outcome: thenAuthorized(), lookup: { kind: "ABSENT", skipped: 0 }, validTo: LATER, payable: true, onCredential: () => ac.abort(new Error("остановлена")) });
     await expect(s.p.authorize(ctx(ac.signal), { idempotencyKey: "k" })).rejects.toBeDefined();
     expect(s.log).toContain("credential cr_1 m_cart");
     expect(s.log).not.toContain("payable");
@@ -323,16 +475,134 @@ describe("повтор оплаты после обрыва ответа — п�
   });
 
   it("второй неизвестный исход — без третьего POST; покупку остановили, пока читали заказ, — повтора нет", async () => {
-    const a = steps({ reply: "PAID", pays: ["UNKNOWN", "UNKNOWN", "PAID"], outcome: async () => ({ kind: "NONE" }), lookup: { kind: "ABSENT" }, validTo: LATER, payable: true });
+    const a = steps({ reply: "PAID", pays: ["UNKNOWN", "UNKNOWN", "PAID"], outcome: async () => ({ kind: "NONE" }), lookup: { kind: "ABSENT", skipped: 0 }, validTo: LATER, payable: true });
     await expect(a.p.authorize(ctx(), { idempotencyKey: "k" })).rejects.toMatchObject({ code: "OPERATION_RESULT_UNCONFIRMED" });
     expect(a.log.filter((x) => x.startsWith("pay "))).toEqual(["pay 1", "pay 2"]);
     // GET реквизита — один на покупку: на второй попытке пути повтора нет (ревью КТ2 № 2)
     expect(a.log.filter((x) => x.startsWith("credential"))).toHaveLength(1);
     const ac = new AbortController();
-    const b = steps({ reply: "PAID", pays: ["UNKNOWN", "PAID"], outcome: thenAuthorized(), lookup: { kind: "ABSENT" }, validTo: LATER, payable: async () => (ac.abort(new Error("остановлена")), true) });
+    const b = steps({ reply: "PAID", pays: ["UNKNOWN", "PAID"], outcome: thenAuthorized(), lookup: { kind: "ABSENT", skipped: 0 }, validTo: LATER, payable: async () => (ac.abort(new Error("остановлена")), true) });
     await expect(b.p.authorize(ctx(ac.signal), { idempotencyKey: "k" })).rejects.toThrow("остановлена");
     expect(b.log.filter((x) => x.startsWith("pay "))).toEqual(["pay 1"]);
     expect(b.journal.entries.some((e) => e.kind === "payment.retry")).toBe(false);
+  });
+});
+
+describe("Р70: ссылка подтверждения продавцу после одобрения человеком (Р69 п. 0; РП72 п. 2–5; инварианты 1, 8, 9)", () => {
+  const AUTHORIZED: Operation = { ...DECLINED, opRef: "op_2", status: "AUTHORIZED", declineReason: null };
+  const REF = "cr_secret_ref_1";
+  const approve = { ref: REF, expiresAt: LATER };
+  const stage4 = async (s: ReturnType<typeof steps>) => s.p.confirm(ctx(), () => {}, new AbortController().signal);
+  const DELAY = PARAMS.operation_outcome_max_delay_sec * 1000;
+
+  it("APPROVED — одна ссылка продавцу с confirmation_ref из GET, ожидание по order_ref до отправки, итог — новая операция; реквизита и пакета нет", async () => {
+    const s = steps({ reply: "PAID", outcome: async () => ({ kind: "OPERATION", operation: AUTHORIZED }), approve });
+    expect(await stage4(s)).toBe("APPROVED");
+    await expect(s.p.resume(ctx())).resolves.toMatchObject({ opRef: "op_2", status: "AUTHORIZED" });
+    // дополнение 2 к Р69 п. 4: операции CONFIRMATION_REQUIRED — не кандидаты итога (и только они)
+    expect(s.log).toEqual(["expect", "skip CR", "confirm 1 ORD-1 m_cart", `outcome ${DELAY}`, "close"]);
+    expect(s.refs).toEqual([REF]);
+    expect(s.issued()).toBe(0);
+    expect(s.packages).toEqual([]);
+    // ссылка берётся один раз: второй resume — без POST
+    await expect(s.p.resume(ctx())).rejects.toMatchObject({ code: "CONFIRMATION_NOT_DELIVERED" });
+    expect(s.refs).toEqual([REF]);
+  });
+
+  it("поломка: второй POST …/confirmation после ответа 200 — его нет (инвариант 9)", async () => {
+    const s = steps({ reply: "PAID", outcome: async () => ({ kind: "NONE" }), lookup: { kind: "ABSENT", skipped: 0 }, approve, confirms: ["OK", "OK"] });
+    await stage4(s);
+    await expect(s.p.resume(ctx())).rejects.toMatchObject({ code: "OPERATION_RESULT_UNCONFIRMED" });
+    expect(s.log.filter((x) => x.startsWith("confirm"))).toEqual(["confirm 1 ORD-1 m_cart"]);
+  });
+
+  it("В1 (а): неизвестный исход — один повтор того же запроса (та же ссылка), второй неизвестный — без третьего; итог — по событию", async () => {
+    const a = steps({ reply: "PAID", outcome: async () => ({ kind: "OPERATION", operation: AUTHORIZED }), approve, confirms: ["UNKNOWN", "OK"] });
+    await stage4(a);
+    await expect(a.p.resume(ctx())).resolves.toMatchObject({ opRef: "op_2" });
+    expect(a.log.filter((x) => x.startsWith("confirm"))).toEqual(["confirm 1 ORD-1 m_cart", "confirm 2 ORD-1 m_cart"]);
+    expect(a.refs).toEqual([REF, REF]);
+    const b = steps({ reply: "PAID", outcome: async () => ({ kind: "NONE" }), lookup: { kind: "ABSENT", skipped: 0 }, approve, confirms: ["UNKNOWN", "UNKNOWN", "OK"] });
+    await stage4(b);
+    await expect(b.p.resume(ctx())).rejects.toMatchObject({ code: "OPERATION_RESULT_UNCONFIRMED" });
+    expect(b.log.filter((x) => x.startsWith("confirm"))).toHaveLength(2);
+  });
+
+  it("поломка В1 (а): отказ витрины (409 после потерянного ответа — авторизация со ссылкой идёт) — без повтора, но итог по событию и поиску по CART, а не остановка", async () => {
+    const a = steps({ reply: "PAID", outcome: async () => ({ kind: "OPERATION", operation: AUTHORIZED }), approve, confirms: ["REFUSED"] });
+    await stage4(a);
+    await expect(a.p.resume(ctx())).resolves.toMatchObject({ opRef: "op_2", status: "AUTHORIZED" });
+    expect(a.log).toEqual(["expect", "skip CR", "confirm 1 ORD-1 m_cart", `outcome ${DELAY}`, "close"]);
+    // событие не пришло, поиск по CART нашёл операцию — итог по ней
+    const b = steps({ reply: "PAID", outcome: async () => ({ kind: "NONE" }), lookup: { kind: "OPERATION", operation: AUTHORIZED }, approve, confirms: ["REFUSED"] });
+    await stage4(b);
+    await expect(b.p.resume(ctx())).resolves.toMatchObject({ opRef: "op_2" });
+    expect(b.log).toContain("lookup ORD-1 m_cart");
+  });
+
+  it("отказ витрины и операций нет — CONFIRMATION_NOT_DELIVERED; неизвестный исход и операций нет — OPERATION_RESULT_UNCONFIRMED; неоднозначно — OPERATION_RESULT_UNCONFIRMED", async () => {
+    const a = steps({ reply: "PAID", outcome: async () => ({ kind: "NONE" }), lookup: { kind: "ABSENT", skipped: 0 }, approve, confirms: ["REFUSED"] });
+    await stage4(a);
+    await expect(a.p.resume(ctx())).rejects.toMatchObject({ code: "CONFIRMATION_NOT_DELIVERED" });
+    const b = steps({ reply: "PAID", outcome: async () => ({ kind: "NONE" }), lookup: { kind: "ABSENT", skipped: 0 }, approve, confirms: ["UNKNOWN", "UNKNOWN"] });
+    await stage4(b);
+    await expect(b.p.resume(ctx())).rejects.toMatchObject({ code: "OPERATION_RESULT_UNCONFIRMED" });
+    const c = steps({ reply: "PAID", outcome: async () => ({ kind: "NONE" }), lookup: { kind: "NONE" }, approve, confirms: ["REFUSED"] });
+    await stage4(c);
+    await expect(c.p.resume(ctx())).rejects.toMatchObject({ code: "OPERATION_RESULT_UNCONFIRMED" });
+  });
+
+  it("дополнение 2 к Р69 п. 4 (правило по стенду v0.37.0): поиск по CART без CONFIRMATION_REQUIRED; других нет и их больше одной — DECLINED_CONFIRMATION_REQUIRED; ровно одна — OPERATION_RESULT_UNCONFIRMED (и при отказе витрины)", async () => {
+    for (const confirms of [["OK"], ["REFUSED"]] as const) {
+      const two = steps({ reply: "PAID", outcome: async () => ({ kind: "NONE" }), lookup: { kind: "ABSENT", skipped: 2 }, approve, confirms: [...confirms] });
+      await stage4(two);
+      await expect(two.p.resume(ctx())).rejects.toMatchObject({ code: "DECLINED_CONFIRMATION_REQUIRED" });
+      expect(two.log).toContain("lookup-skip CR");
+      const one = steps({ reply: "PAID", outcome: async () => ({ kind: "NONE" }), lookup: { kind: "ABSENT", skipped: 1 }, approve, confirms: [...confirms] });
+      await stage4(one);
+      await expect(one.p.resume(ctx())).rejects.toMatchObject({ code: "OPERATION_RESULT_UNCONFIRMED" });
+    }
+    // одна другая операция — итог по ней (повторного требования нет)
+    const ok = steps({ reply: "PAID", outcome: async () => ({ kind: "NONE" }), lookup: { kind: "OPERATION", operation: AUTHORIZED }, approve });
+    await stage4(ok);
+    await expect(ok.p.resume(ctx())).resolves.toMatchObject({ opRef: "op_2", status: "AUTHORIZED" });
+  });
+
+  it("поломка В3 (а): срок запроса Платформы прошёл — POST нет, CONFIRMATION_EXPIRED; ровно «сейчас» — тоже прошёл", async () => {
+    for (const expiresAt of [new Date(NOW.getTime() - 1).toISOString(), NOW.toISOString()]) {
+      const s = steps({ reply: "PAID", outcome: async () => ({ kind: "OPERATION", operation: AUTHORIZED }), approve: { ref: REF, expiresAt } });
+      await stage4(s);
+      await expect(s.p.resume(ctx())).rejects.toMatchObject({ code: "CONFIRMATION_EXPIRED" });
+      expect(s.log).toEqual([]);
+      expect(s.refs).toEqual([]);
+    }
+  });
+
+  it("без одобрения (исход не APPROVED) или без метода витрины — POST нет, CONFIRMATION_NOT_DELIVERED; покупку остановили — POST нет", async () => {
+    const a = steps({ reply: "PAID", outcome: async () => ({ kind: "NONE" }), approve: "UNKNOWN" });
+    expect(await stage4(a)).toBe("UNKNOWN");
+    await expect(a.p.resume(ctx())).rejects.toMatchObject({ code: "CONFIRMATION_NOT_DELIVERED" });
+    const b = steps({ reply: "PAID", outcome: async () => ({ kind: "NONE" }), approve, confirms: null });
+    await stage4(b);
+    await expect(b.p.resume(ctx())).rejects.toMatchObject({ code: "CONFIRMATION_NOT_DELIVERED" });
+    const ac = new AbortController();
+    const c = steps({ reply: "PAID", outcome: async () => ({ kind: "NONE" }), approve });
+    await stage4(c);
+    ac.abort(new Error("остановлена"));
+    await expect(c.p.resume(ctx(ac.signal))).rejects.toThrow("остановлена");
+    expect(c.refs).toEqual([]);
+  });
+
+  it("поломка: confirmation_ref не в журнале шагов, не в исходе и не в ошибках", async () => {
+    const journal = new MemoryJournal();
+    const a = steps({ reply: "PAID", outcome: async () => ({ kind: "OPERATION", operation: AUTHORIZED }), approve, journal });
+    await stage4(a);
+    const op = await a.p.resume(ctx());
+    const b = steps({ reply: "PAID", outcome: async () => ({ kind: "NONE" }), lookup: { kind: "ABSENT", skipped: 0 }, approve, confirms: ["REFUSED"], journal });
+    await stage4(b);
+    const err = await b.p.resume(ctx()).catch((e: unknown) => e);
+    const text = [JSON.stringify(journal.entries), JSON.stringify(op), String(err), (err as Error).stack ?? "", JSON.stringify(err)].join("\n");
+    expect(text).not.toContain(REF);
   });
 });
 

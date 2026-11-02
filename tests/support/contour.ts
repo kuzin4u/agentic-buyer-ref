@@ -54,6 +54,12 @@ export interface ContourOptions {
    *  ADP стенда (`POST /adp/v1/decide`): запрос подтверждения, событие и решение банка — настоящие. После PS-11 —
    *  снять. */
   adpUntilPs11?: boolean;
+  /** только для "stand", вместо `adpUntilPs11` (#97 п. 6, РП72 п. 10; К1.4 AG-13 ч. 2б): асинхронное решение заглушки
+   *  ОПКЦ — сообщение эквайрера уходит в ADP стенда (`POST /adp/v1/decide`), его решение и есть ответ продавцу; после
+   *  `APPROVE` контур шлёт ответ эмитента (ПИ-3, `ISSUER_RESPONSE`, одобрение) до ответа продавцу. Путь «витрина → ADP →
+   *  подтверждение → витрина» без подмены: продавец отвечает PAID, AWAITING_CONFIRMATION или DECLINED по решению ADP.
+   *  Решения — в `adpDecisions`, как у подмены. */
+  adpAsync?: boolean;
   /** только для "stand": эквайрер эмулятора без поддержки aoi (РП22 п. 6) — признак до ADP не доходит (П14, Р56 п. 1) */
   aoiSupport?: false;
   /** только для "stand": способы оплаты витрин эмулятора по merchant_id (`createMerchants`, v0.34.0, Р68 п. 3) — как
@@ -109,8 +115,7 @@ export interface Merchants {
 }
 
 export interface Contour {
-  /** только "stand" с `adpUntilPs11`: ответы ADP стенда на копии сообщений эквайрера (подмена до PS-11), с `op_ref`
-   *  сообщения */
+  /** только "stand" с `adpUntilPs11` или `adpAsync`: ответы ADP стенда на сообщения эквайрера, с `op_ref` сообщения */
   adpDecisions?(): Promise<unknown[]>;
   readonly mode: ContourMode;
   readonly agentCode: string;
@@ -316,6 +321,8 @@ async function stubContour(opts: StandOptions | undefined): Promise<Contour> {
 async function standContour(o: ContourOptions): Promise<Contour> {
   const { now: paoNow, paymentMethods, paoFetch } = o;
   const adpUntilPs11 = o.adpUntilPs11 === true;
+  const adpAsync = o.adpAsync === true;
+  if (adpUntilPs11 && adpAsync) throw new Error("adpUntilPs11 и adpAsync — взаимоисключающие");
   const aoiSupport = o.aoiSupport !== false;
   const buyers = AGENT_FIXTURES.filter((f) => f.registered && f.class === "BUYER");
   const fixture = buyers[0];
@@ -358,7 +365,25 @@ async function standContour(o: ContourOptions): Promise<Contour> {
             return { approved: false, reason: "CONFIRMATION_REQUIRED" };
           },
         })
-      : createMerchants(stand, { aoiSupport, ...(paymentMethods && { paymentMethods }) });
+      : adpAsync
+        ? createMerchants(stand, {
+            aoiSupport,
+            ...(paymentMethods && { paymentMethods }),
+            // #97 п. 6: решение ADP стенда — ответ продавцу; APPROVE — сначала ответ эмитента (ПИ-3), затем одобрение
+            decide: async (msg) => {
+              const op_ref = (msg as { op_ref?: unknown }).op_ref;
+              const res = await s.app.inject({ method: "POST", url: "/adp/v1/decide", payload: msg });
+              const d = res.json() as { decision?: string; reason?: string };
+              adp.push(Promise.resolve({ op_ref, ...d }));
+              if (d.decision === "APPROVE") {
+                const issuer = await s.app.inject({ method: "POST", url: "/adp/v1/events", payload: { op_ref, msg_type: "ISSUER_RESPONSE", issuer_approved: true } });
+                if (issuer.statusCode !== 202) throw new Error(`ответ эмитента не принят: ${issuer.statusCode}`);
+                return { approved: true, reason: null };
+              }
+              return { approved: false, reason: d.reason ?? d.decision ?? null };
+            },
+          })
+        : createMerchants(stand, { aoiSupport, ...(paymentMethods && { paymentMethods }) });
     record(stand.app, "pao", log);
     record(emulator.app, "merchants", log);
     captureCredentials(stand.app, secrets);

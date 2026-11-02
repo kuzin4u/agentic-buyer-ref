@@ -720,6 +720,68 @@ describe("адаптер витрин (Р42)", () => {
     expect(seen).toEqual([]);
   });
 
+  describe("оплата: AWAITING_CONFIRMATION и признак payment.confirmation_required (К1.1 AG-13 ч. 2б; РП72 п. 1; инвариант 8)", () => {
+    const pkg = sealPackage({ credential_ref: "CRD-1", kind: "CARD", payload: { token_ref: "tok_test", cryptogram: "c", valid_to: "2026-10-22T10:00:00Z" }, aoi: { indicator: true, agent_code: "nspk:agent:test:v1", mandate_id: "mnd_1" }, cart_mandate_id: "mnd_1", order_ref: "ord_1" });
+    const PAY = "POST /v1/shops/S1/orders/ord_1/payment";
+    const req = { shopId: "S1", orderId: "ord_1", cartMandateId: "mnd_1", package: pkg };
+
+    it.each([
+      ["ждёт подтверждения с признаком", { id: "ord_1", status: "AWAITING_CONFIRMATION", payment: { approved: false, confirmation_required: true }, confirmation_id: "cnf_seller" }, { status: "AWAITING_CONFIRMATION", confirmationRequired: true }],
+      ["ждёт подтверждения без поля payment", { id: "ord_1", status: "AWAITING_CONFIRMATION" }, { status: "AWAITING_CONFIRMATION" }],
+      ["оплачен, признак false", { id: "ord_1", status: "PAID", payment: { approved: true, confirmation_required: false } }, { status: "PAID" }],
+      ["отказ, признак false", { id: "ord_1", status: "DECLINED", payment: { approved: false, confirmation_required: false } }, { status: "DECLINED" }],
+    ] as [string, unknown, unknown][])("%s — ответ получен (не неизвестный исход), confirmation_id продавца не берётся, в журнале — статус", async (_, body, expected) => {
+      const { a, journal } = adapter({ [PAY]: [{ status: 200, body }] });
+      const r = await a.pay(req);
+      expect(r).toEqual(expected);
+      expect(JSON.stringify(r)).not.toContain("cnf_seller");
+      expect(JSON.stringify(journal.entries)).not.toContain("cnf_seller");
+      expect(calls(journal)).toEqual([["POST /v1/shops/{id}/orders/{order_id}/payment", 1, "ok", (expected as { status: string }).status]]);
+    });
+
+    it("поле payment не по форме — ответ не по схеме: неизвестный исход (Р55 п. 2)", async () => {
+      const { a, journal } = adapter({ [PAY]: [{ status: 200, body: { id: "ord_1", status: "AWAITING_CONFIRMATION", payment: { confirmation_required: "yes" } } }] });
+      await expect(a.pay(req)).rejects.toMatchObject({ code: "SHOP_ORDER_STATE_UNKNOWN" });
+      expect(calls(journal)).toEqual([["POST /v1/shops/{id}/orders/{order_id}/payment", 1, "unknown", "BAD_RESPONSE"]]);
+    });
+  });
+
+  describe("ссылка подтверждения продавцу — POST …/confirmation (Р70 В1 (а); РП72 п. 2–5; инварианты 1, 8)", () => {
+    const CNF = "POST /v1/shops/S1/orders/ord_1/confirmation";
+    const REF = "cr_secret_ref_1";
+    const req = { shopId: "S1", orderId: "ord_1", cartMandateId: "mnd_1", confirmationRef: REF };
+    const M = "POST /v1/shops/{id}/orders/{order_id}/confirmation";
+
+    it("200 — слова продавца (статус — detail записи), тело — только {confirmation_ref}, подписано; ссылки нет ни в журнале, ни в ответе порта", async () => {
+      const { a, seen, journal } = adapter({ [CNF]: [{ status: 200, body: { id: "ord_1", status: "DECLINED", payment: { approved: false, confirmation_required: false } } }] });
+      const r = await a.confirm(req, 1);
+      expect(r).toEqual({ status: "DECLINED" });
+      expect(seen.map((s) => [s.method, s.path])).toEqual([["POST", "/v1/shops/S1/orders/ord_1/confirmation"]]);
+      expect(JSON.parse(seen[0]!.body!)).toEqual({ confirmation_ref: REF });
+      expect(seen[0]!.headers["signature"]).toEqual(expect.any(String));
+      expect(calls(journal)).toEqual([[M, 1, "ok", "DECLINED"]]);
+      expect(JSON.stringify(journal.entries)).not.toContain(REF);
+    });
+
+    it.each([
+      ["409 ORDER_NOT_PAYABLE", { status: 409, body: { code: "ORDER_NOT_PAYABLE" } }, "SHOP_ORDER_REFUSED", "refused"],
+      ["404 ORDER_NOT_FOUND", { status: 404, body: { code: "ORDER_NOT_FOUND" } }, "SHOP_ORDER_REFUSED", "refused"],
+      ["422 PACKAGE_INVALID", { status: 422, body: { code: "PACKAGE_INVALID" } }, "SHOP_ORDER_REFUSED", "refused"],
+      ["503 UPSTREAM_UNAVAILABLE (авторизация не ушла)", { status: 503, body: { code: "UPSTREAM_UNAVAILABLE" } }, "SHOP_ORDER_STATE_UNKNOWN", "unknown"],
+      ["502 без тела", { status: 502, body: undefined }, "SHOP_ORDER_STATE_UNKNOWN", "unknown"],
+      ["500 с кодом витрины (иной 5xx)", { status: 500, body: { code: "ORDER_NOT_PAYABLE" } }, "SHOP_ORDER_STATE_UNKNOWN", "unknown"],
+      ["нет ответа", "fail", "SHOP_ORDER_STATE_UNKNOWN", "unknown"],
+      ["200 не по схеме", { status: 200, body: { id: "ord_1" } }, "SHOP_ORDER_STATE_UNKNOWN", "unknown"],
+      ["200 с чужим заказом", { status: 200, body: { id: "ord_2", status: "PAID" } }, "SHOP_ORDER_STATE_UNKNOWN", "unknown"],
+    ] as [string, Answer, string, string][])("%s — %s; ссылки нет ни в записи, ни в ошибке", async (_, answer, code, result) => {
+      const { a, journal } = adapter({ [CNF]: [answer] });
+      const err = await a.confirm(req, 2).catch((e: unknown) => e);
+      expect((err as ShopFailure).code).toBe(code);
+      expect(calls(journal)).toEqual([[M, 2, result, expect.anything()]]);
+      expect([JSON.stringify(journal.entries), String(err), (err as Error).stack ?? ""].join("\n")).not.toContain(REF);
+    });
+  });
+
   describe("оплата: неизвестный исход и чтение заказа перед повтором (Р69 п. 4)", () => {
     const pkg = sealPackage({ credential_ref: "CRD-1", kind: "CARD", payload: { token_ref: "tok_test", cryptogram: "c", valid_to: "2026-10-22T10:00:00Z" }, aoi: { indicator: true, agent_code: "nspk:agent:test:v1", mandate_id: "mnd_1" }, cart_mandate_id: "mnd_1", order_ref: "ord_1" });
     const PAY = "POST /v1/shops/S1/orders/ord_1/payment";
@@ -739,9 +801,9 @@ describe("адаптер витрин (Р42)", () => {
       expect(calls(journal)).toEqual([["POST /v1/shops/{id}/orders/{order_id}/payment", 2, result, expect.anything()]]);
     });
 
-    it("payable: один заказ CREATED с этим номером и мандатом — true, строка запроса по мандату корзины", async () => {
+    it("payable: один заказ CREATED с этим номером и мандатом — CREATED, строка запроса по мандату корзины", async () => {
       const { a, seen } = adapter({ "GET /v1/shops/S1/orders": [read(ORD())] });
-      expect(await a.payable(req)).toBe(true);
+      expect(await a.payable(req)).toBe("CREATED");
       expect(seen.map((s) => [s.method, s.path, s.query])).toEqual([["GET", "/v1/shops/S1/orders", "?cart_mandate_id=mnd_1"]]);
     });
 
@@ -753,10 +815,27 @@ describe("адаптер витрин (Р42)", () => {
       ["другой номер заказа", read(ORD({ id: "ord_2" })), "unknown", "OTHER_ORDER"],
       ["нет ответа", "fail", "unknown", "NO_RESPONSE"],
       ["не по схеме", { status: 200, body: {} }, "refused", "BAD_RESPONSE"],
-    ] as [string, Answer, string, string][])("payable: %s — false, причина в записи чтения", async (_, answer, result, detail) => {
+    ] as [string, Answer, string, string][])("payable: %s — NO, причина в записи чтения", async (_, answer, result, detail) => {
       const { a, journal } = adapter({ "GET /v1/shops/S1/orders": [answer] });
-      expect(await a.payable(req)).toBe(false);
+      expect(await a.payable(req)).toBe("NO");
       expect(calls(journal).at(-1)).toEqual(["GET /v1/shops/{id}/orders", 1, result, detail]);
+    });
+
+    it("К1.3 (Р69 п. 4): заказ AWAITING_CONFIRMATION (стенд v0.37.0, пакет дошёл) — AWAITING_CONFIRMATION, причина в записи чтения; другой номер с этим статусом — OTHER_ORDER", async () => {
+      const { a, journal } = adapter({ "GET /v1/shops/S1/orders": [read(ORD({ status: "AWAITING_CONFIRMATION" }))] });
+      expect(await a.payable(req)).toBe("AWAITING_CONFIRMATION");
+      expect(calls(journal).at(-1)).toEqual(["GET /v1/shops/{id}/orders", 1, "unknown", "AWAITING_CONFIRMATION"]);
+      const b = adapter({ "GET /v1/shops/S1/orders": [read(ORD({ id: "ord_2", status: "AWAITING_CONFIRMATION" }))] });
+      expect(await b.a.payable(req)).toBe("NO");
+    });
+
+    it("КТ сессии 57 № 12: payable — сигнал покупки доходит до чтения: остановка прерывает зависшее обращение (и сон до повтора — тот же сигнал)", async () => {
+      const ac = new AbortController();
+      const reason = new Error("покупка остановлена");
+      const { a } = adapter({ "GET /v1/shops/S1/orders": ["hang"] });
+      const p = a.payable(req, ac.signal);
+      ac.abort(reason);
+      await expect(p).rejects.toBe(reason);
     });
   });
 

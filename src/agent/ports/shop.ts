@@ -44,7 +44,20 @@ export class ShopFailure extends Error {
 /** Отказ шага оплаты профиля contour (Р45): остановка этой сделки с кодом; сообщение — только код (инвариант 1). */
 export class PaymentFailure extends Error {
   override readonly name = "PaymentFailure";
-  constructor(readonly code: Extract<DiagCode, "SHOP_ORDER_REF_INVALID" | "CREDENTIAL_INVALID" | "OPERATION_RESULT_UNCONFIRMED" | "CONFIRMATION_REQUIRED" | "OPERATION_REPLY_MISMATCH" | "SETTLEMENT_PENDING">) {
+  constructor(
+    readonly code: Extract<
+      DiagCode,
+      | "SHOP_ORDER_REF_INVALID"
+      | "CREDENTIAL_INVALID"
+      | "OPERATION_RESULT_UNCONFIRMED"
+      | "CONFIRMATION_REQUIRED"
+      | "OPERATION_REPLY_MISMATCH"
+      | "SETTLEMENT_PENDING"
+      | "CONFIRMATION_NOT_DELIVERED"
+      | "CONFIRMATION_EXPIRED"
+      | "DECLINED_CONFIRMATION_REQUIRED"
+    >,
+  ) {
     super(`оплата: ${code}`);
   }
 }
@@ -87,19 +100,42 @@ export interface ShopPaymentRequest {
   package: SealedPackage;
 }
 
-/** Ответ продавца на оплату — его слова, а не итог (инвариант 8): статус заказа закрытым перечнем, только для журнала. */
+/** Ответ продавца на оплату — его слова, а не итог (инвариант 8): статус заказа закрытым перечнем, для журнала и как
+ *  повод ждать запрос подтверждения (DECLINED, AWAITING_CONFIRMATION или признак `confirmationRequired` —
+ *  `payment.confirmation_required` стенда v0.37.0, РП72). Сам запрос — только из `confirmation.required` Платформы. */
+/** Заказ у витрины перед повтором оплаты (Р69 п. 4): слова продавца — только условие, не итог (инвариант 8). */
+export type OrderPayable = "CREATED" | "AWAITING_CONFIRMATION" | "NO";
+
 export interface ShopPaymentReply {
-  status: "PAID" | "DECLINED" | "REJECTED";
+  status: "PAID" | "DECLINED" | "REJECTED" | "AWAITING_CONFIRMATION";
+  confirmationRequired?: boolean;
 }
 
 /** Стадия 5: передача пакета продавцу подписанным обращением. Отказ витрины — ShopFailure SHOP_ORDER_REFUSED, неизвестный
  *  исход — SHOP_ORDER_STATE_UNKNOWN; иная ошибка вызова — отказ стадии (инвариант 4). Повтор — только шагами оплаты по
  *  проверке через Платформу (Р69 п. 4), `attempt` — номер попытки для журнала. `payable` — заказ у витрины ровно один по
- *  мандату корзины, с этим номером и CREATED (пакет до продавца не дошёл); не прочитано или иначе — false; метода нет —
- *  повтора нет (fail-closed). */
+ *  мандату корзины, с этим номером: CREATED (пакет до продавца не дошёл) или AWAITING_CONFIRMATION (ждёт подтверждения —
+ *  повод ждать запрос Платформы, Р69 п. 4, К1.3 AG-13 ч. 2б); не прочитано или иначе — NO; метода нет — повтора нет
+ *  (fail-closed). `signal` у `payable` — остановка покупки: прерывает чтение и сон по `Retry-After` до повтора чтения
+ *  (мелочь КТ сессии 57 № 12). У `pay` сигнала нет: пакет мог уйти, прерванный POST потерял бы ответ продавца; сна до
+ *  повтора у `pay` нет, повтор оплаты защищён проверкой остановки до POST. */
 export interface ShopPaymentPort {
   pay(req: ShopPaymentRequest, attempt?: number): Promise<ShopPaymentReply>;
-  payable?(req: Omit<ShopPaymentRequest, "package">): Promise<boolean>;
+  payable?(req: Omit<ShopPaymentRequest, "package">, signal?: AbortSignal): Promise<OrderPayable>;
+  /** Ссылка подтверждения продавцу (Р69 п. 0, Р70 В1; стенд v0.37.0, РП72): подписанный `POST …/orders/{order_id}/confirmation`
+   *  с `{confirmation_ref}`; продавец повторяет авторизацию новой операцией с пакетом первой оплаты. Ответ — слова продавца
+   *  (инвариант 8). Отказ витрины (4xx: 409, 404, 422) — SHOP_ORDER_REFUSED; нет ответа, не по схеме, любой 5xx (в том числе
+   *  503 `UPSTREAM_UNAVAILABLE`) — SHOP_ORDER_STATE_UNKNOWN (Р70 В1 (а)).
+   *  `confirmation_ref` — только в теле: не в журнал, не в исключения. Метода нет — ссылка не доставляется (fail-closed). */
+  confirm?(req: ShopConfirmRequest, attempt?: number): Promise<ShopPaymentReply>;
+}
+
+/** Ссылка подтверждения к заказу (Р70): идентификаторы заказа и `confirmation_ref` из GET при APPROVED — только в тело. */
+export interface ShopConfirmRequest {
+  shopId: string;
+  orderId: string;
+  cartMandateId: string;
+  confirmationRef: string;
 }
 
 /** Что известно шагам оплаты о покупке: только идентификаторы и сумма заказа, без реквизитов (инвариант 1). */
@@ -164,6 +200,12 @@ export interface PaymentSteps {
    *  требует подтверждения — PaymentFailure CONFIRMATION_REQUIRED (профиль contour — ответ продавца DECLINED, Р47 п. 4)
    *  или ответ со статусом CONFIRMATION_REQUIRED: дальше стадия 4. */
   authorize(c: PaymentContext, m: Mutation): Promise<Operation>;
+  /** Стадия 5 после одобрения человеком (Р69 п. 0, Р70): ссылка подтверждения продавцу — продавец повторяет авторизацию
+   *  новой операцией с прежним реквизитом; итог — операция по `order_ref` из события Платформы. `confirmation_ref` шаги
+   *  держат сами с исхода APPROVED своего `confirm`: в контекст и конвейер он не попадает. Срок запроса прошёл —
+   *  PaymentFailure CONFIRMATION_EXPIRED; продавец ссылку не принял и операции нет — CONFIRMATION_NOT_DELIVERED; итога нет —
+   *  OPERATION_RESULT_UNCONFIRMED. Нет метода — ссылка не доставляется (CONFIRMATION_NOT_DELIVERED, как до ч. 2б). */
+  resume?(c: PaymentContext): Promise<Operation>;
   /** Стадия 6 (Р49 п. 6, Р51 п. 2): итог расчёта по операции. Расчёта ещё нет, ожидание прервано `signal` — PaymentFailure
    *  SETTLEMENT_PENDING (ожидание, не остановка); операция не та — OPERATION_REPLY_MISMATCH. `authorizedAt` — когда
    *  конвейер получил AUTHORIZED: от него граница ожидания reservation_ttl_sec (нет — с начала ожидания). `notice` —

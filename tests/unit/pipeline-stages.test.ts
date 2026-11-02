@@ -693,6 +693,46 @@ describe("стадии 4–6 — исходы из порта PaymentSteps (ин
     }
   });
 
+  it("Р70: APPROVED и шаг resume — ворота заново (verify обоих мандатов, знак), CONFIRMING → AUTHORIZING, итог новой операции → SETTLING; исходы resume — STOPPED с кодом; второго подтверждения нет", async () => {
+    const run = async (resume: (c: PaymentContext) => Promise<Operation>) => {
+      const steps = confirming("APPROVED");
+      const r = await setup({ payment: { ...steps, resume: async (c: PaymentContext) => (steps.calls.push("resume"), resume(c)) } });
+      await ordered(r, Math.floor(THRESHOLD / TARTINE) + 1);
+      const before = verified(r).length;
+      const out = await r.purchase.authorize({ idempotencyKey: "idem-pay-1" }).catch((e: unknown) => e);
+      return { r, steps, out, gate: verified(r).length - before };
+    };
+    const op = (c: PaymentContext, over: Partial<Operation> = {}): Operation => ({ opRef: "op_2", orderRef: c.order.orderId, channel: "CARD", amount: c.order.total, merchantId: c.merchantId, indicator: null, status: "AUTHORIZED", declineReason: null, fulfilment: null, ...over });
+
+    const ok = await run(async (c) => op(c));
+    expect(ok.out).toMatchObject({ opRef: "op_2", status: "AUTHORIZED" });
+    expect(ok.steps.calls).toEqual(["authorize", "confirm", "resume"]);
+    expect(stages(ok.r).slice(-4)).toEqual(["AUTHORIZING", "CONFIRMING", "AUTHORIZING", "SETTLING"]);
+    // ворота дважды: перед стадией 5 и после стадии 4 (пропуск не живёт после стадии 4, К4) — по два verify
+    expect(ok.gate).toBe(4);
+    expect(ok.r.purchase.operation).toMatchObject({ opRef: "op_2" });
+    await closeStand();
+
+    for (const [name, resume, code] of [
+      ["отказ новой операции", async (c: PaymentContext) => op(c, { status: "DECLINED", declineReason: "ISSUER_DECLINED" }), "ISSUER_DECLINED"],
+      ["ссылка не принята, операции нет", async () => Promise.reject(new PaymentFailure("CONFIRMATION_NOT_DELIVERED")), "CONFIRMATION_NOT_DELIVERED"],
+      ["срок запроса прошёл", async () => Promise.reject(new PaymentFailure("CONFIRMATION_EXPIRED")), "CONFIRMATION_EXPIRED"],
+      // второе требование подтверждения по ссылке — второй стадии 4 нет (РП72 п. 3, Р70 В4); пакет уходил — итоговый код
+      ["второе CONFIRMATION_REQUIRED", async (c: PaymentContext) => op(c, { status: "CONFIRMATION_REQUIRED" }), "OPERATION_RESULT_UNCONFIRMED"],
+      // дополнение 2 к Р69 п. 4 (первая форма): operation.declined с причиной CONFIRMATION_REQUIRED — свой код §7б, а не
+      // DECLINE_REASON_UNKNOWN; вторая форма (поиск по CART, стенд v0.37.0) — код шага оплаты, итоговый
+      ["operation.declined CONFIRMATION_REQUIRED", async (c: PaymentContext) => op(c, { status: "DECLINED", declineReason: "CONFIRMATION_REQUIRED" }), "DECLINED_CONFIRMATION_REQUIRED"],
+      ["повторное требование по поиску по CART", async () => Promise.reject(new PaymentFailure("DECLINED_CONFIRMATION_REQUIRED")), "DECLINED_CONFIRMATION_REQUIRED"],
+    ] as [string, (c: PaymentContext) => Promise<Operation>, string][]) {
+      const bad = await run(resume);
+      expect(bad.out, name).toMatchObject({ code });
+      expect(bad.r.purchase.reason, name).toBe(code);
+      expect(stages(bad.r).filter((x) => x === "CONFIRMING"), name).toHaveLength(1);
+      expect(bad.steps.calls, name).toEqual(["authorize", "confirm", "resume"]);
+      await closeStand();
+    }
+  });
+
   it("стадия 4 и ниже порога: требование подтверждения от Платформы (порог банка ниже, Р-142) — тот же путь", async () => {
     const steps = confirming("REJECTED");
     const r = await setup({ payment: steps });

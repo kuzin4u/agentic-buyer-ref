@@ -186,7 +186,14 @@
         "CONFIRMATION_REQUIRED"
       ],
       "norms": "A5 п. 3; A1",
-      "requirements": "Т7"
+      "requirements": "Т7",
+      "contour": {
+        "action": "CART выше порога ADP стенда (confirm_above_kop) в пределах INTENT; реквизит POST /pao/v1/credentials, пакет продавцу, авторизация продавца; решение человека — в приложении банка (stand.issuer.confirm) или на странице УПК по link (дополнение 1 к Р70)",
+        "expected": "ADP CONFIRMATION_REQUIRED → заказ AWAITING_CONFIRMATION, confirmation.required → GET → PENDING, человеку CONFIRMATION_PENDING (ссылка https:); агент сам не подтверждает; APPROVED → ворота стадии 5 заново → одна ссылка продавцу POST …/confirmation → новая операция (новый op_ref) с прежним реквизитом → operation.authorized → GET → SETTLING; реквизит выдан один раз, пакет один, confirmation_ref и link — ни в журнале, ни в исходе, ни в текстах. Пул-форма (повтор тем же ключом, 428) в профиле contour не действует",
+        "codes": [
+          "CONFIRMATION_REQUIRED"
+        ]
+      }
     },
     {
       "id": "П13",
@@ -200,7 +207,14 @@
         "CONFIRMATION_REQUIRED"
       ],
       "norms": "A3 п. 4",
-      "requirements": "Т7"
+      "requirements": "Т7",
+      "contour": {
+        "action": "Агент-нарушитель — то же ядро в тестовом режиме: окно дробления покупки подменено обёрткой, которая долю не видит (только tests/support). Под одним INTENT — две покупки у витрины NORMAL в окне split_window_sec: доля 1 — 1 890 ₽, доля 2 — 4 × 390 = 1 560 ₽ (каждая не выше порога ADP стенда confirm_above_kop 3 000 ₽, сумма 3 450 ₽ — выше; суммы из фикстур эмулятора); реквизит POST /pao/v1/credentials, пакет продавцу, авторизация продавца. Между долями — честный агент (окно ядра, в нём только доля 1): та же доля 2 под тем же INTENT (дополнение 2 к Р70)",
+        "expected": "Платформа выявляет дробление: доля 1 одобрена (в окно ADP стенда входят одобрения, split_min_ops = 2) → SETTLING; доля 2 — ADP CONFIRMATION_REQUIRED с признаком дробления (split_detected у запроса стенда), заказ AWAITING_CONFIRMATION, confirmation.required → GET → PENDING, человеку CONFIRMATION_PENDING; агент сам не подтверждает; человек отказывает → REJECTED → STOPPED CONFIRMATION_REJECTED, второй операции нет. Честный агент — agent.refused SPLIT_WINDOW до стадии 5: ни реквизита, ни пакета. Расхождение с пулом (обе операции отклонены) — нюанс формы, передача платформе",
+        "codes": [
+          "CONFIRMATION_REQUIRED"
+        ]
+      }
     },
     {
       "id": "П14",

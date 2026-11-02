@@ -2,7 +2,8 @@
 // по GET /pao/v1/confirmations/{id}, событие без GET ничего не меняет (Р34). Запрос создаёт ADP на отказе авторизации
 // продавца; в ответе Платформы нет ни мандата, ни order_ref, поэтому запрос относится к покупке, только если его ждёт
 // ровно одна покупка (4а): ошибка привязки денег не стоит — ADP сверяет ссылку с мандатом, продавцом, суммой и order_ref.
-// confirmation_ref дальше разбора ответа не идёт: ни в журнал, ни в исход, ни человеку (инвариант 1, Р47 п. 5). link —
+// confirmation_ref дальше разбора ответа не идёт, кроме шагов оплаты при APPROVED (`onApproved`, Р70 — ссылка продавцу): ни
+// в журнал, ни в исход, ни человеку (инвариант 1, Р47 п. 5). link —
 // только оболочке в уведомлении PENDING и только безопасный (`pageLink`: https:, без логина и пароля; Р69 п. 5), не в
 // журнал, не в исход и не в тексты ошибок.
 import { pageLink } from "./link.js";
@@ -51,17 +52,21 @@ export interface ConfirmationsOptions {
 export interface WaitOptions {
   signal: AbortSignal;
   onPending?: (link?: string) => void | Promise<void>;
+  /** Р70: при APPROVED — `confirmation_ref` и срок запроса (`expires_at`, RFC 3339) шагам оплаты, синхронно до исхода; в
+   *  журнал, исход и тексты не попадают. Срока нет или он не по формату — исход UNKNOWN без вызова (fail-closed, В3). */
+  onApproved?: (ref: string, expiresAt: string) => void;
 }
 
 type JournalEntry = Parameters<ConfirmationsJournal["record"]>[0];
 type WithoutAt<T> = T extends unknown ? Omit<T, "at"> : never;
 
-/** Статус по GET без confirmation_ref; `link` — только безопасный адрес страницы УПК или null; FAILED — GET не дал
- *  подтверждённого статуса. */
-type Read = { status: Confirmation["status"]; expiresAt: string | null; link: string | null } | "FAILED";
+/** Статус по GET; `link` — только безопасный адрес страницы УПК или null; `ref` — `confirmation_ref` только у APPROVED (Р70:
+ *  дальше — только шагам оплаты через `onApproved`); FAILED — GET не дал подтверждённого статуса. */
+type Read = { status: Confirmation["status"]; expiresAt: string | null; link: string | null; ref: string | null } | "FAILED";
 
 interface Waiter {
   readonly onPending: WaitOptions["onPending"];
+  readonly onApproved: WaitOptions["onApproved"];
   /** привязанный запрос; null — ждёт запрос */
   id: string | null;
   /** свой предел ожидания решения (Р69 п. 2): время привязки + confirmation_decision_max_sec, мс; до привязки — null */
@@ -69,6 +74,13 @@ interface Waiter {
   settled: boolean;
   cancel: (() => void) | null;
   finish(o: ConfirmationOutcome): void;
+}
+
+interface Held {
+  read: Read;
+  drop: () => void;
+  readonly seq: number;
+  expired: boolean;
 }
 
 const RFC3339 = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?(Z|[+-]\d{2}:\d{2})$/;
@@ -85,8 +97,12 @@ export class Confirmations {
   readonly #waiters = new Set<Waiter>();
   /** запрос → покупка, ждущая решения */
   readonly #bound = new Map<string, Waiter>();
-  /** невостребованные запросы (В1а): пришли без ожидающих, хранятся не дольше confirmation_wait_ms */
-  readonly #unclaimed = new Map<string, { read: Read; drop: () => void; seq: number }>();
+  /** невостребованные запросы (В1а): пришли без ожидающих, хранятся не дольше confirmation_wait_ms; пришедший позже
+   *  удерживаемой отметки — до её снятия и ещё confirmation_wait_ms (дополнение 3 к Р69 п. 1; expired — срок истёк при
+   *  удержании) */
+  readonly #unclaimed = new Map<string, Held>();
+  /** отметки покупок, ждущих итог стадии 5 (`keep`): запросы позже них по сроку не выбрасываются */
+  readonly #keeps = new Set<{ after: number }>();
   /** запросы, по которым решено (исход, чужой, неоднозначный, выброшен): события по ним больше ничего не делают. Без
    *  окна (Р50, нюанс; условие владельца 1): растёт по запросам подтверждения, а не по событиям — пересмотр при пилоте */
   readonly #done = new Set<string>();
@@ -139,6 +155,7 @@ export class Confirmations {
   wait(o: WaitOptions): Promise<ConfirmationOutcome> {
     const signal = o.signal;
     const onPending = o.onPending;
+    const onApproved = o.onApproved;
     if (signal.aborted) return Promise.reject(signal.reason);
     return new Promise<ConfirmationOutcome>((resolve, reject) => {
       const onAbort = () => end(() => reject(signal.reason));
@@ -155,7 +172,7 @@ export class Confirmations {
         signal.removeEventListener("abort", onAbort);
         done();
       };
-      const w: Waiter = { onPending, id: null, limit: null, settled: false, cancel: null, finish: (outcome) => end(() => resolve(outcome)) };
+      const w: Waiter = { onPending, onApproved, id: null, limit: null, settled: false, cancel: null, finish: (outcome) => end(() => resolve(outcome)) };
       signal.addEventListener("abort", onAbort, { once: true });
       if (this.#unclaimed.size === 1 && this.#waiters.size === 0) {
         const [id, held] = [...this.#unclaimed][0]!;
@@ -227,8 +244,32 @@ export class Confirmations {
   }
 
   #hold(id: string, read: Read): void {
-    const drop = this.#timer(() => {
-      if (!this.#unclaimed.delete(id)) return;
+    const held: Held = { read, drop: () => {}, seq: ++this.#held, expired: false };
+    this.#unclaimed.set(id, held);
+    this.#arm(id, held);
+    // запись — до действия (Р69 п. 1): без записи запрос не хранится и о нём не оповещают (Т15 — особое событие);
+    // ошибка журнала — наружу, слушатель не отмечает событие обработанным, лента прочитает его снова (fail-closed)
+    try {
+      this.#record({ kind: "confirmation.unclaimed", ref: id });
+    } catch (e) {
+      held.drop();
+      this.#unclaimed.delete(id);
+      throw e;
+    }
+    for (const a of [...this.#arrivals]) if (held.seq > a.after) a.arrived();
+  }
+
+  /** Срок хранения невостребованного — confirmation_wait_ms от сейчас. Истёк, пока запрос позже удерживаемой отметки, —
+   *  не выбрасывается, пока её не снимут (дополнение 3 к Р69 п. 1). */
+  #arm(id: string, held: Held): void {
+    held.expired = false;
+    held.drop = this.#timer(() => {
+      if (this.#unclaimed.get(id) !== held) return;
+      if (this.#kept(held.seq)) {
+        held.expired = true;
+        return;
+      }
+      this.#unclaimed.delete(id);
       this.#done.add(id);
       // запрос уже выброшен; исключение в таймере ловить некому — оно уронило бы процесс (КТ1 сессии 39 № 8)
       try {
@@ -237,18 +278,11 @@ export class Confirmations {
         // журнал недоступен: записи нет, действие состоялось
       }
     }, this.#o.params.confirmation_wait_ms);
-    const seq = ++this.#held;
-    this.#unclaimed.set(id, { read, drop, seq });
-    // запись — до действия (Р69 п. 1): без записи запрос не хранится и о нём не оповещают (Т15 — особое событие);
-    // ошибка журнала — наружу, слушатель не отмечает событие обработанным, лента прочитает его снова (fail-closed)
-    try {
-      this.#record({ kind: "confirmation.unclaimed", ref: id });
-    } catch (e) {
-      drop();
-      this.#unclaimed.delete(id);
-      throw e;
-    }
-    for (const a of [...this.#arrivals]) if (seq > a.after) a.arrived();
+  }
+
+  #kept(seq: number): boolean {
+    for (const k of this.#keeps) if (seq > k.after) return true;
+    return false;
   }
 
   /** Отметка до отправки пакета (Р49 п. 5): запросы, невостребованные до неё, в гонке этой покупки не в счёт. */
@@ -257,14 +291,32 @@ export class Confirmations {
   }
 
   /**
+   * Удержание отметки покупкой до конца стадии 5 (дополнение 3 к Р69 п. 1): запрос позже `after` по сроку не
+   * выбрасывается; после снятия последней такой отметки хранится ещё confirmation_wait_ms — его возьмёт стадия 4 этой
+   * покупки. Вернуть — снятие (повторное — ничего не делает).
+   */
+  keep(after: number): () => void {
+    const k = { after };
+    this.#keeps.add(k);
+    return () => {
+      if (!this.#keeps.delete(k)) return;
+      for (const [id, held] of this.#unclaimed) if (held.expired && !this.#kept(held.seq)) this.#arm(id, held);
+    };
+  }
+
+  /**
    * Появился невостребованный запрос подтверждения позже отметки `after` (Р49 п. 5; ревью КТ1 № 5): уже есть — сразу. Не
-   * привязывает и не уведомляет: запрос берёт `wait` стадии 4 (В1а). Прерывание `signal` — отказ с его причиной.
+   * привязывает и не уведомляет: запрос берёт `wait` стадии 4 (В1а). Пока ждёт — читает ленту, как `wait` (дополнение 3
+   * к Р69 п. 2): push может не прийти. Прерывание `signal` — отказ с его причиной.
    */
   arrival(signal: AbortSignal, after: number): Promise<void> {
     if (signal.aborted) return Promise.reject(signal.reason);
     if ([...this.#unclaimed.values()].some((h) => h.seq > after)) return Promise.resolve();
     return new Promise<void>((resolve, reject) => {
+      let settled = false;
       const end = (done: () => void) => {
+        if (settled) return;
+        settled = true;
         this.#arrivals.delete(a);
         signal.removeEventListener("abort", onAbort);
         done();
@@ -273,6 +325,7 @@ export class Confirmations {
       const onAbort = () => end(() => reject(signal.reason));
       this.#arrivals.add(a);
       signal.addEventListener("abort", onAbort, { once: true });
+      void poll(this.#o.wake, () => settled, this.#o.params.event_poll_interval_ms);
     });
   }
 
@@ -300,6 +353,7 @@ export class Confirmations {
   #apply(id: string, w: Waiter, read: Read): void {
     if (w.settled) return;
     if (read === "FAILED") return w.finish("UNKNOWN");
+    if (read.status === "APPROVED") return this.#approved(w, read);
     if (read.status !== "PENDING") return w.finish(read.status);
     if (!this.#notified.has(id)) {
       this.#notified.add(id);
@@ -310,7 +364,15 @@ export class Confirmations {
 
   /** Уведомление — не часть исхода (В3): ни исключение, ни отказ обещания оболочки покупку не меняют и не ждутся. */
   #notify(w: Waiter, link: string | null): void {
-    const failed = () => this.#record({ kind: "notify.failed", reason: "CONFIRMATION_PENDING" });
+    // сбой журнала здесь некуда отдать: из .catch — необработанный отказ обещания (КТ сессии 57 № 11; модуль может
+    // подключить оболочка напрямую, без Purchase) — глотается, как в purchase.ts
+    const failed = () => {
+      try {
+        this.#record({ kind: "notify.failed", reason: "CONFIRMATION_PENDING" });
+      } catch {
+        // журнал недоступен — уведомление исход не меняет
+      }
+    };
     try {
       const r = link === null ? w.onPending?.() : w.onPending?.(link);
       if (r !== undefined) Promise.resolve(r).catch(failed);
@@ -348,7 +410,15 @@ export class Confirmations {
       if (this.#now().getTime() < this.#end(w, deadline)) return this.#schedule(id, w, read.expiresAt);
       return w.finish(w.limit !== null && w.limit < deadline ? "WAIT_LIMIT" : "UNKNOWN");
     }
+    if (read.status === "APPROVED") return this.#approved(w, read);
     w.finish(read.status);
+  }
+
+  /** APPROVED (Р70): ссылка и срок запроса — шагам оплаты до исхода; срока по формату нет — UNKNOWN (В3, fail-closed). */
+  #approved(w: Waiter, read: Exclude<Read, "FAILED">): void {
+    if (read.ref === null || read.expiresAt === null || !RFC3339.test(read.expiresAt)) return w.finish("UNKNOWN");
+    w.onApproved?.(read.ref, read.expiresAt);
+    w.finish("APPROVED");
   }
 
   /** Конец ожидания решения: меньшее из срока Платформы и своего предела (Р69 п. 2). */
@@ -377,7 +447,12 @@ export class Confirmations {
     const withRef = typeof c.confirmationRef === "string" && c.confirmationRef !== "";
     if (c.id !== id || !STATUSES.has(c.status) || withRef !== (c.status === "APPROVED") || (!withRef && c.confirmationRef !== null)) return "FAILED";
     this.#record({ kind: "confirmation.status", ref: id, detail: c.status });
-    return { status: c.status, expiresAt: typeof c.expiresAt === "string" ? c.expiresAt : null, link: c.status === "PENDING" ? pageLink(c.link) : null };
+    return {
+      status: c.status,
+      expiresAt: typeof c.expiresAt === "string" ? c.expiresAt : null,
+      link: c.status === "PENDING" ? pageLink(c.link) : null,
+      ref: c.status === "APPROVED" ? (c.confirmationRef as string) : null,
+    };
   }
 
   #record(e: WithoutAt<JournalEntry>): void {

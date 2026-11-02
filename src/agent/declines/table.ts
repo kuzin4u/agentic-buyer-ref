@@ -137,6 +137,7 @@ export type DeclineReasonCode = Extract<
   | "DECLINED_MANDATE_SCOPE"
   | "DECLINED_LIMIT_EXCEEDED"
   | "DECLINED_STATE_UNAVAILABLE"
+  | "DECLINED_CONFIRMATION_REQUIRED"
   | "ISSUER_DECLINED"
   | "INSUFFICIENT_FUNDS"
   | "DECLINE_REASON_UNKNOWN"
@@ -158,6 +159,9 @@ export const DECLINE_REASONS: Readonly<Record<string, ReasonRule>> = {
   MANDATE_SCOPE: reason("DECLINED_MANDATE_SCOPE", "NEW_MANDATE"),
   LIMIT_EXCEEDED: reason("DECLINED_LIMIT_EXCEEDED", "NOTIFY_HUMAN"),
   STATE_UNAVAILABLE: reason("DECLINED_STATE_UNAVAILABLE", "STOP"),
+  // банк опять требует подтверждения после ссылки — второй стадии 4 нет, решение за человеком (дополнение 2 к Р69 п. 4,
+  // первая форма; after_human в реестре — NOTIFY_HUMAN, как у LIMIT_EXCEEDED)
+  CONFIRMATION_REQUIRED: reason("DECLINED_CONFIRMATION_REQUIRED", "NOTIFY_HUMAN"),
   ISSUER_DECLINED: reason("ISSUER_DECLINED", "NOTIFY_HUMAN"),
   INSUFFICIENT_FUNDS: reason("INSUFFICIENT_FUNDS", "NOTIFY_HUMAN"),
 };

@@ -146,6 +146,27 @@ describe("стадия 5: итог операции по событию и GET (
     expect(o).toMatchObject({ kind: "OPERATION", operation: { opRef: "op_1", status: "DECLINED", declineReason: "LIMIT_EXCEEDED" } });
   });
 
+  it("дополнение 2 к Р69 п. 3: после skip отказ повтора CREDENTIAL_INVALID раньше authorized первой — не итог; итог — операция первой попытки (запись operation.status у отказа есть)", async () => {
+    const s = setup();
+    const w = s.waiting();
+    w.w.skip((r) => r.status === "DECLINED" && r.declineReason === "CREDENTIAL_INVALID");
+    s.answers.set("op_2", record("DECLINED", { opRef: "op_2", declineReason: "CREDENTIAL_INVALID" }));
+    await s.event("operation.declined", "op_2");
+    expect(w.outcome()).toBeUndefined();
+    s.answers.set("op_1", record("AUTHORIZED"));
+    await s.event("operation.authorized", "op_1");
+    expect(w.outcome()).toMatchObject({ kind: "OPERATION", operation: { opRef: "op_1", status: "AUTHORIZED" } });
+    expect(kinds(s.journal)).toEqual(["operation.status:DECLINED", "operation.status:AUTHORIZED"]);
+    // только отказ повтора — итога по событию нет за срок (дальше поиск по CART)
+    const s2 = setup();
+    const w2 = s2.waiting();
+    w2.w.skip((r) => r.status === "DECLINED" && r.declineReason === "CREDENTIAL_INVALID");
+    s2.answers.set("op_2", record("DECLINED", { opRef: "op_2", declineReason: "CREDENTIAL_INVALID" }));
+    await s2.event("operation.declined", "op_2");
+    await s2.c.advance(DELAY_SEC * 1000);
+    expect(w2.outcome()).toEqual({ kind: "NONE" });
+  });
+
   it("без события за срок — NONE (дальше OPERATION_RESULT_UNCONFIRMED); прерывание — отказ с причиной", async () => {
     const s = setup();
     const w = s.waiting();
@@ -314,10 +335,26 @@ describe("восстановление op_ref: поиск по CART после �
   it("ни одной операции заказа (операция без итога в ответ не входит) — ABSENT (Р69 п. 4, запись NONE); две — AMBIGUOUS, NONE (не первая)", async () => {
     const s = setup();
     s.lists.set(CART.id, [record("AUTHORIZED", { orderRef: "ord_other" })]);
-    expect(await s.ops.lookup(ORDER, CART)).toEqual({ kind: "ABSENT" });
+    expect(await s.ops.lookup(ORDER, CART)).toEqual({ kind: "ABSENT", skipped: 0 });
     s.lists.set(CART.id, [record("AUTHORIZED"), record("AUTHORIZED", { opRef: "op_2" })]);
     expect(await s.ops.lookup(ORDER, CART)).toEqual({ kind: "NONE" });
     expect(lookups(s.journal)).toEqual([[CART.id, "NONE"], [CART.id, "AMBIGUOUS"]]);
+  });
+
+  it("дополнение 2 к Р69 п. 3–4: `skip` — операции заказа не в кандидатах; одна другая — итог по ней; других нет — ABSENT с числом пропущенных", async () => {
+    const s = setup();
+    const credInvalid = (r: OperationRecord) => r.status === "DECLINED" && r.declineReason === "CREDENTIAL_INVALID";
+    s.lists.set(CART.id, [record("DECLINED", { opRef: "op_2", declineReason: "CREDENTIAL_INVALID" }), record("AUTHORIZED")]);
+    expect(await s.ops.lookup(ORDER, CART, undefined, credInvalid)).toMatchObject({ kind: "OPERATION", operation: { opRef: "op_1", status: "AUTHORIZED" } });
+    // без skip — две операции заказа, AMBIGUOUS (как прежде)
+    expect(await s.ops.lookup(ORDER, CART)).toEqual({ kind: "NONE" });
+    s.lists.set(CART.id, [record("DECLINED", { opRef: "op_2", declineReason: "CREDENTIAL_INVALID" })]);
+    expect(await s.ops.lookup(ORDER, CART, undefined, credInvalid)).toEqual({ kind: "ABSENT", skipped: 1 });
+    // правило по стенду v0.37.0: первая попытка и повторное требование — CONFIRMATION_REQUIRED без события
+    const confReq = (r: OperationRecord) => r.status === "CONFIRMATION_REQUIRED";
+    s.lists.set(CART.id, [record("CONFIRMATION_REQUIRED"), record("CONFIRMATION_REQUIRED", { opRef: "op_2" }), record("AUTHORIZED", { opRef: "op_x", orderRef: "ord_other" })]);
+    expect(await s.ops.lookup(ORDER, CART, undefined, confReq)).toEqual({ kind: "ABSENT", skipped: 2 });
+    expect(lookups(s.journal)).toEqual([[CART.id, "BOUND"], [CART.id, "AMBIGUOUS"], [CART.id, "NONE"], [CART.id, "NONE"]]);
   });
 
   it("операция не сходится с CART — MISMATCH, запись operation.mismatch и operation.lookup MISMATCH", async () => {

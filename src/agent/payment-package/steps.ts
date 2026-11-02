@@ -3,7 +3,7 @@
 // operation.settled. Собирается в месте сборки из порта платформы, адаптера витрин и модулей подтверждений и операций.
 // Ответ продавца — только в журнале адаптера витрин и повод ждать запрос подтверждения (инвариант 8).
 import type { Journal } from "../journal/index.js";
-import type { OperationOutcome, OperationWait, SettleOutcome, WatchAfter } from "../operations/index.js";
+import type { OperationOutcome, OperationSkip, OperationWait, SettleOutcome, WatchAfter } from "../operations/index.js";
 import type { IssuedPackage } from "../ports/payment-platform.js";
 import type { Mutation } from "../ports/mutation.js";
 import { PaymentFailure, ShopFailure, type ConfirmationOutcome, type LateNotice, type PaymentContext, type PaymentSteps, type ShopPaymentPort, type ShopPaymentReply } from "../ports/shop.js";
@@ -31,7 +31,7 @@ export interface ContourPaymentOptions {
     expect(orderRef: string, cart: Mandate): OperationWait;
     /** поиск операции по CART, когда итога по событию нет (Р51 п. 5): один раз на попытку оплаты — при повторе
      *  после обрыва (Р69 п. 4) их не больше двух на покупку */
-    lookup(orderRef: string, cart: Mandate, notice?: LateNotice): Promise<OperationOutcome>;
+    lookup(orderRef: string, cart: Mandate, notice?: LateNotice, skip?: OperationSkip): Promise<OperationOutcome>;
     /** `notice` — под наблюдение после итога ставит сам модуль, в момент итога (Р51 п. 4) */
     settle(authorized: Operation, signal: AbortSignal, deadline?: number, notice?: LateNotice): Promise<SettleOutcome>;
     /** наблюдение после итога покупки (Р51 п. 4) */
@@ -75,6 +75,9 @@ export class ContourPayment implements PaymentSteps {
     if (!(Date.parse(approved.expiresAt) > this.now().getTime())) throw new PaymentFailure("CONFIRMATION_EXPIRED");
     c.signal.throwIfAborted();
     const wait = this.o.operations.expect(orderRef, c.cart);
+    // операции CONFIRMATION_REQUIRED (первой попытки и повторного требования) — не кандидаты итога (дополнение 2 к Р69
+    // п. 4, правило по стенду v0.37.0: событий у них нет, видит их только поиск по CART)
+    wait.skip(confirmationRequired);
     const req = { shopId: c.shopId, orderId: orderRef, cartMandateId: c.cart.id, confirmationRef: approved.ref };
     try {
       let refused = false;
@@ -92,16 +95,22 @@ export class ContourPayment implements PaymentSteps {
           }
         }
       }
-      const looked: { kind: OperationOutcome["kind"] | null } = { kind: null };
+      const looked: { r: OperationOutcome | null } = { r: null };
       let op: Operation;
       try {
         op = await this.#outcome(wait, null, 0, c.signal, async () => {
-          const r = await this.o.operations.lookup(orderRef, c.cart, c.notice);
-          looked.kind = r.kind;
+          const r = await this.o.operations.lookup(orderRef, c.cart, c.notice, confirmationRequired);
+          looked.r = r;
           return r;
         });
       } catch (e) {
-        if (refused && looked.kind === "ABSENT" && e instanceof PaymentFailure && e.code === "OPERATION_RESULT_UNCONFIRMED") throw new PaymentFailure("CONFIRMATION_NOT_DELIVERED");
+        const absent = looked.r?.kind === "ABSENT" ? looked.r.skipped : null;
+        if (absent !== null && e instanceof PaymentFailure && e.code === "OPERATION_RESULT_UNCONFIRMED") {
+          // других операций нет, CONFIRMATION_REQUIRED больше одной — первая и повторное требование (правило по стенду
+          // v0.37.0); ровно одна — какая, не различить: op_ref первой агенту неизвестен — итога нет (fail-closed)
+          if (absent > 1) throw new PaymentFailure("DECLINED_CONFIRMATION_REQUIRED");
+          if (refused && absent === 0) throw new PaymentFailure("CONFIRMATION_NOT_DELIVERED");
+        }
         throw e;
       }
       if (op.status === "REVERSED" && c.notice !== undefined) this.o.operations.watch(op, "REVERSED", c.notice);
@@ -163,8 +172,9 @@ export class ContourPayment implements PaymentSteps {
           unknown = e.code === "SHOP_ORDER_STATE_UNKNOWN";
         }
         const looked: { kind: OperationOutcome["kind"] | null } = { kind: null };
+        // попытка 2: её отказ CREDENTIAL_INVALID — не кандидат итога (дополнение 2 к Р69 п. 3)
         const lookup = async () => {
-          const r = await this.o.operations.lookup(orderRef, c.cart, c.notice);
+          const r = await this.o.operations.lookup(orderRef, c.cart, c.notice, attempt > 1 ? credentialInvalid : undefined);
           looked.kind = r.kind;
           return r;
         };
@@ -183,6 +193,9 @@ export class ContourPayment implements PaymentSteps {
         // исполняется (инвариант 4); реквизита в записи нет, только мандат корзины и номер заказа
         c.signal.throwIfAborted();
         this.o.journal.record({ at: this.now().toISOString(), kind: "payment.retry", ref: orderRef, ...mandateRef(c.cart.id) });
+        // дополнение 2 к Р69 п. 3: реквизит одобряет одна авторизация (гашение ISSUED → USED на APPROVE ADP) — отказ
+        // повтора CREDENTIAL_INVALID значит «первая могла выиграть»: не итог, ожидание идёт до операции первой попытки
+        wait.skip(credentialInvalid);
       }
       // оплата отменена — поздний клиринг или возврат сообщит наблюдение после итога (Р51 п. 4); итог поиска модуль уже
       // поставил под наблюдение сам, здесь — итог по событию (повторная постановка ничего не теряет)
@@ -195,8 +208,9 @@ export class ContourPayment implements PaymentSteps {
 
   /** Условия повтора после «операций нет» (Р69 п. 4, дополнение 1 — порядок В1 (а)): срок реквизита не наступил (нет
    *  срока — повтора нет, fail-closed); реквизит у Платформы ISSUED — один GET (USED, EXPIRED, REVOKED, иное значение или
-   *  отказ чтения — повтора нет: реквизит гасится при резерве ADP, первая авторизация могла дойти без итога); затем заказ
-   *  у витрины CREATED с этим номером и мандатом. Сначала Платформа (основание, инвариант 8), затем витрина. */
+   *  отказ чтения — повтора нет: ISSUED лишь отсекает уже одобренные — безопасность повтора держится на атомарном гашении
+   *  ISSUED → USED на APPROVE ADP, дополнение 2 к Р69 п. 1); затем заказ у витрины CREATED с этим номером и мандатом.
+   *  Сначала Платформа (основание, инвариант 8), затем витрина. */
   async #retryable(credential: Credential, cartId: string, req: { shopId: string; orderId: string; cartMandateId: string }, signal: AbortSignal): Promise<boolean> {
     const until = credential.validTo === null ? Number.NaN : Date.parse(credential.validTo);
     if (!(until > this.now().getTime()) || this.o.shop.payable === undefined) return false;
@@ -272,3 +286,9 @@ export class ContourPayment implements PaymentSteps {
 }
 
 const mandateRef = (id: string): { mandate?: string } => (SAFE_ID.test(id) ? { mandate: id } : {});
+
+/** Отказ повтора оплаты по реквизиту, который одобрила (могла одобрить) первая попытка (дополнение 2 к Р69 п. 3). */
+const credentialInvalid: OperationSkip = (r) => r.status === "DECLINED" && r.declineReason === "CREDENTIAL_INVALID";
+
+/** Решение ADP «нужно подтверждение» без события (стенд v0.37.0; дополнение 2 к Р69 п. 4). */
+const confirmationRequired: OperationSkip = (r) => r.status === "CONFIRMATION_REQUIRED";

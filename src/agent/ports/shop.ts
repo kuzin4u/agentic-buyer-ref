@@ -55,6 +55,7 @@ export class PaymentFailure extends Error {
       | "SETTLEMENT_PENDING"
       | "CONFIRMATION_NOT_DELIVERED"
       | "CONFIRMATION_EXPIRED"
+      | "DECLINED_CONFIRMATION_REQUIRED"
     >,
   ) {
     super(`оплата: ${code}`);

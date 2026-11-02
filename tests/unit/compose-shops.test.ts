@@ -304,6 +304,67 @@ describe("AgentCore.payment (Р45 п. 6)", () => {
     expect(JSON.stringify(journal.entries)).not.toContain("upk.stand");
   });
 
+  /** Р70 В1 и дополнение 2 к Р69 п. 4 на PaoStub: APPROVED → ссылка продавцу — отказ витрины (409) → события нет →
+   *  поиск по CART отдаёт `listed`. Модуль операций и подтверждений — ядра. */
+  async function refusedLinkOnStub(listed: object[]) {
+    const id = "cnf_11111111-1111-4111-8111-111111111111";
+    let served = false;
+    const s = new PaoStand({
+      handlers: {
+        "GET /pao/v1/events": () => {
+          if (served) return { status: 200, body: [] };
+          served = true;
+          return { status: 200, body: [{ event_id: "evt_cnf_1", type: "confirmation.required", at: "2026-10-22T12:00:00Z", data: { confirmation_id: id } }] };
+        },
+        "GET /pao/v1/confirmations/{id}": () => ({
+          status: 200,
+          body: { id, status: "APPROVED", link: "https://upk.stand/c/x", confirmation_ref: "cr_aaaaaaaaaaaaaaaaaaaaaaaaaa", expires_at: "2099-10-22T12:15:00.000Z" },
+        }),
+        "GET /pao/v1/operations": () => ({ status: 200, body: listed }),
+      },
+    });
+    stand = s;
+    // свой срок итога — тест не ждёт стендовых 30 с (как retryOnStub)
+    const params = loadParams();
+    const paramsPath = `${s.dir}-params.json`;
+    writeFileSync(paramsPath, JSON.stringify({ ...params, operation_outcome_max_delay_sec: Math.ceil((3 * params.event_poll_interval_ms) / 1000) }));
+    const { core, journal } = await coreOn(s, { paramsPath });
+    await core.start();
+    const confirms: number[] = [];
+    const steps = core.payment({
+      pay: async () => ({ status: "DECLINED" }),
+      confirm: async (_req, attempt) => {
+        confirms.push(attempt ?? 1);
+        throw new ShopFailure("SHOP_ORDER_REFUSED");
+      },
+    });
+    const total = { amount: 250000, currency: "RUB" };
+    const cart = { id: "m_cart", cart: { merchantId: "shop_1", lines: [], total } } as unknown as Mandate;
+    const ctx: PaymentContext = { intent: { id: "m_intent" } as Mandate, cart, shopId: "SHOP-1", merchantId: "shop_1", channel: "CARD", order: { orderId: "ORD-1", total }, signal: new AbortController().signal, sending: () => {} };
+    await expect(steps.confirm(ctx, () => {}, new AbortController().signal)).resolves.toBe("APPROVED");
+    const code = await steps.resume!(ctx).then(() => "RESOLVED", (e: { code?: string }) => e.code);
+    return { s, journal, code, confirms };
+  }
+
+  it("Р70 В1, дополнение 2 к Р69 п. 4: отказ витрины на ссылку и операции первой попытки в поиске нет — CONFIRMATION_NOT_DELIVERED; ссылка одна, повтора нет", async () => {
+    const r = await refusedLinkOnStub([]);
+    expect(r.code).toBe("CONFIRMATION_NOT_DELIVERED");
+    expect(r.confirms).toEqual([1]);
+    expect(r.s.stub.calls.filter((c) => c.op === "GET /pao/v1/operations")).toHaveLength(1);
+    expect(JSON.stringify(r.journal.entries)).not.toContain("cr_aaaaaaaaaaaaaaaaaaaaaaaaaa");
+  });
+
+  it("дополнение 2 к Р69 п. 4 (правило по стенду v0.37.0): поиск видит только операцию первой попытки CONFIRMATION_REQUIRED — OPERATION_RESULT_UNCONFIRMED, не CONFIRMATION_NOT_DELIVERED; и повторное требование — DECLINED_CONFIRMATION_REQUIRED", async () => {
+    const op = (opRef: string) => ({ op_ref: opRef, order_ref: "ORD-1", channel: "CARD", amount: 250000, merchant_id: "shop_1", aoi: { indicator: true, agent_code: AGENT, mandate_id: "m_cart" }, status: "CONFIRMATION_REQUIRED", reason: "CONFIRMATION_REQUIRED", fulfilment: null, deal_ref: null });
+    const one = await refusedLinkOnStub([op("op_1")]);
+    expect(one.code).toBe("OPERATION_RESULT_UNCONFIRMED");
+    await stand?.close();
+    stand = undefined;
+    const two = await refusedLinkOnStub([op("op_1"), op("op_2")]);
+    expect(two.code).toBe("DECLINED_CONFIRMATION_REQUIRED");
+    // два ожидания итога по operation_outcome_max_delay_sec (не меньше трёх интервалов чтения ленты) — больше 5 с по умолчанию
+  }, 4 * Math.ceil((3 * loadParams().event_poll_interval_ms) / 1000) * 1000);
+
   it("второй рубеж на стадии 5 (Р45 п. 2.1) и остановленная покупка (Б2в (а)): обращений за реквизитом и к витрине нет", async () => {
     const s2 = new PaoStand();
     stand = s2;

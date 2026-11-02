@@ -142,14 +142,17 @@ describe("реестр кодов агента (Р36)", () => {
     }
   });
 
-  it("Р48 п. 1: перечень §7б — закрытый перечень Платформы v0.19.0 (передача #57) плюс AOI_MISSING и INSUFFICIENT_FUNDS", () => {
+  it("Р48 п. 1: перечень §7б — закрытый перечень Платформы v0.19.0 (передача #57) плюс AOI_MISSING, INSUFFICIENT_FUNDS и CONFIRMATION_REQUIRED (дополнение 2 к Р69 п. 4)", () => {
     // Перечень стенда не экспортируется (exports пакета — stand и fixtures): читается текст объявления из dist; до ПАО 1.5.0
     // enum в YAML нет (#37). Сломается при переносе файла на стороне платформы — тогда сверка по CHANGELOG и #57.
     const dts = readFileSync("node_modules/agentic-ps-platform/dist/fulfilment/outcomes.d.ts", "utf8");
     const list = /DECLINE_EVENT_REASONS: readonly \[([^\]]*)\]/.exec(dts)?.[1] ?? "";
     const platform = [...list.matchAll(/"([A-Z_]+)"/g)].map((m) => m[1]!);
     expect(platform).toHaveLength(10);
-    expect(Object.keys(DECLINE_REASONS).sort()).toEqual([...platform, "AOI_MISSING", "INSUFFICIENT_FUNDS"].sort());
+    // CONFIRMATION_REQUIRED — не в перечне событий стенда v0.37.0 (решение ADP события не даёт): строка — по контракту, если
+    // Платформа его пришлёт (первая форма; передача платформе — /finish сессии 60)
+    expect(platform).not.toContain("CONFIRMATION_REQUIRED");
+    expect(Object.keys(DECLINE_REASONS).sort()).toEqual([...platform, "AOI_MISSING", "INSUFFICIENT_FUNDS", "CONFIRMATION_REQUIRED"].sort());
   });
 
   it("тексты ядра не повторяются; текст отказа мандата без порядка отзыва — один (Р36 п. 1, п. 3)", () => {

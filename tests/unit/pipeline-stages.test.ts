@@ -719,8 +719,10 @@ describe("стадии 4–6 — исходы из порта PaymentSteps (ин
       ["срок запроса прошёл", async () => Promise.reject(new PaymentFailure("CONFIRMATION_EXPIRED")), "CONFIRMATION_EXPIRED"],
       // второе требование подтверждения по ссылке — второй стадии 4 нет (РП72 п. 3, Р70 В4); пакет уходил — итоговый код
       ["второе CONFIRMATION_REQUIRED", async (c: PaymentContext) => op(c, { status: "CONFIRMATION_REQUIRED" }), "OPERATION_RESULT_UNCONFIRMED"],
-      // В4: operation.declined с причиной CONFIRMATION_REQUIRED — причины нет в таблице §7б: DECLINE_REASON_UNKNOWN (Р20)
-      ["operation.declined CONFIRMATION_REQUIRED", async (c: PaymentContext) => op(c, { status: "DECLINED", declineReason: "CONFIRMATION_REQUIRED" }), "DECLINE_REASON_UNKNOWN"],
+      // дополнение 2 к Р69 п. 4 (первая форма): operation.declined с причиной CONFIRMATION_REQUIRED — свой код §7б, а не
+      // DECLINE_REASON_UNKNOWN; вторая форма (поиск по CART, стенд v0.37.0) — код шага оплаты, итоговый
+      ["operation.declined CONFIRMATION_REQUIRED", async (c: PaymentContext) => op(c, { status: "DECLINED", declineReason: "CONFIRMATION_REQUIRED" }), "DECLINED_CONFIRMATION_REQUIRED"],
+      ["повторное требование по поиску по CART", async () => Promise.reject(new PaymentFailure("DECLINED_CONFIRMATION_REQUIRED")), "DECLINED_CONFIRMATION_REQUIRED"],
     ] as [string, (c: PaymentContext) => Promise<Operation>, string][]) {
       const bad = await run(resume);
       expect(bad.out, name).toMatchObject({ code });

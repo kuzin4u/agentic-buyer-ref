@@ -746,6 +746,42 @@ describe("адаптер витрин (Р42)", () => {
     });
   });
 
+  describe("ссылка подтверждения продавцу — POST …/confirmation (Р70 В1 (а); РП72 п. 2–5; инварианты 1, 8)", () => {
+    const CNF = "POST /v1/shops/S1/orders/ord_1/confirmation";
+    const REF = "cr_secret_ref_1";
+    const req = { shopId: "S1", orderId: "ord_1", cartMandateId: "mnd_1", confirmationRef: REF };
+    const M = "POST /v1/shops/{id}/orders/{order_id}/confirmation";
+
+    it("200 — слова продавца (статус — detail записи), тело — только {confirmation_ref}, подписано; ссылки нет ни в журнале, ни в ответе порта", async () => {
+      const { a, seen, journal } = adapter({ [CNF]: [{ status: 200, body: { id: "ord_1", status: "DECLINED", payment: { approved: false, confirmation_required: false } } }] });
+      const r = await a.confirm(req, 1);
+      expect(r).toEqual({ status: "DECLINED" });
+      expect(seen.map((s) => [s.method, s.path])).toEqual([["POST", "/v1/shops/S1/orders/ord_1/confirmation"]]);
+      expect(JSON.parse(seen[0]!.body!)).toEqual({ confirmation_ref: REF });
+      expect(seen[0]!.headers["signature"]).toEqual(expect.any(String));
+      expect(calls(journal)).toEqual([[M, 1, "ok", "DECLINED"]]);
+      expect(JSON.stringify(journal.entries)).not.toContain(REF);
+    });
+
+    it.each([
+      ["409 ORDER_NOT_PAYABLE", { status: 409, body: { code: "ORDER_NOT_PAYABLE" } }, "SHOP_ORDER_REFUSED", "refused"],
+      ["404 ORDER_NOT_FOUND", { status: 404, body: { code: "ORDER_NOT_FOUND" } }, "SHOP_ORDER_REFUSED", "refused"],
+      ["422 PACKAGE_INVALID", { status: 422, body: { code: "PACKAGE_INVALID" } }, "SHOP_ORDER_REFUSED", "refused"],
+      ["503 UPSTREAM_UNAVAILABLE (авторизация не ушла)", { status: 503, body: { code: "UPSTREAM_UNAVAILABLE" } }, "SHOP_ORDER_STATE_UNKNOWN", "unknown"],
+      ["502 без тела", { status: 502, body: undefined }, "SHOP_ORDER_STATE_UNKNOWN", "unknown"],
+      ["500 с кодом витрины (иной 5xx)", { status: 500, body: { code: "ORDER_NOT_PAYABLE" } }, "SHOP_ORDER_STATE_UNKNOWN", "unknown"],
+      ["нет ответа", "fail", "SHOP_ORDER_STATE_UNKNOWN", "unknown"],
+      ["200 не по схеме", { status: 200, body: { id: "ord_1" } }, "SHOP_ORDER_STATE_UNKNOWN", "unknown"],
+      ["200 с чужим заказом", { status: 200, body: { id: "ord_2", status: "PAID" } }, "SHOP_ORDER_STATE_UNKNOWN", "unknown"],
+    ] as [string, Answer, string, string][])("%s — %s; ссылки нет ни в записи, ни в ошибке", async (_, answer, code, result) => {
+      const { a, journal } = adapter({ [CNF]: [answer] });
+      const err = await a.confirm(req, 2).catch((e: unknown) => e);
+      expect((err as ShopFailure).code).toBe(code);
+      expect(calls(journal)).toEqual([[M, 2, result, expect.anything()]]);
+      expect([JSON.stringify(journal.entries), String(err), (err as Error).stack ?? ""].join("\n")).not.toContain(REF);
+    });
+  });
+
   describe("оплата: неизвестный исход и чтение заказа перед повтором (Р69 п. 4)", () => {
     const pkg = sealPackage({ credential_ref: "CRD-1", kind: "CARD", payload: { token_ref: "tok_test", cryptogram: "c", valid_to: "2026-10-22T10:00:00Z" }, aoi: { indicator: true, agent_code: "nspk:agent:test:v1", mandate_id: "mnd_1" }, cart_mandate_id: "mnd_1", order_ref: "ord_1" });
     const PAY = "POST /v1/shops/S1/orders/ord_1/payment";

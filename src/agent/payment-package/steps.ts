@@ -22,7 +22,7 @@ export interface ContourPaymentOptions {
   journal: Journal;
   /** модуль подтверждений (Р47 п. 3–4): ожидание запроса ADP и решения человека; появление запроса — гонка стадии 5 */
   confirmations: {
-    wait(o: { signal: AbortSignal; onPending?: (link?: string) => void }): Promise<ConfirmationOutcome>;
+    wait(o: { signal: AbortSignal; onPending?: (link?: string) => void; onApproved?: (ref: string, expiresAt: string) => void }): Promise<ConfirmationOutcome>;
     mark(): number;
     arrival(signal: AbortSignal, after: number): Promise<void>;
   };
@@ -43,15 +43,72 @@ export interface ContourPaymentOptions {
 
 export class ContourPayment implements PaymentSteps {
   private readonly now: () => Date;
+  /** Р70: одобренные запросы по номеру заказа — `confirmation_ref` и срок до `resume`; только в памяти шагов, не в
+   *  контексте, журнале и исходе (инвариант 1). Берётся один раз. */
+  readonly #approved = new Map<string, { ref: string; expiresAt: string }>();
 
   constructor(private readonly o: ContourPaymentOptions) {
     this.now = o.now ?? (() => new Date());
   }
 
-  /** Стадия 4 (Р47 п. 3–4): ожидание — после DECLINED продавца, привязка и статус по GET — модуль подтверждений; сам агент
-   *  ничего не подтверждает (инвариант 7). */
-  confirm(_c: PaymentContext, notify: (link?: string) => void, signal: AbortSignal): Promise<ConfirmationOutcome> {
-    return this.o.confirmations.wait({ signal, onPending: notify });
+  /** Стадия 4 (Р47 п. 3–4): ожидание — после ответа продавца на пакет, привязка и статус по GET — модуль подтверждений;
+   *  сам агент ничего не подтверждает (инвариант 7). APPROVED — ссылка и срок запроса запоминаются для `resume` (Р70). */
+  async confirm(c: PaymentContext, notify: (link?: string) => void, signal: AbortSignal): Promise<ConfirmationOutcome> {
+    const order = c.order.orderId;
+    this.#approved.delete(order);
+    return this.o.confirmations.wait({ signal, onPending: notify, onApproved: (ref, expiresAt) => void this.#approved.set(order, { ref, expiresAt }) });
+  }
+
+  /** Стадия 5 после одобрения человеком (Р69 п. 0, Р70): ссылка продавцу — продавец повторяет авторизацию новой операцией
+   *  с прежним реквизитом (нового реквизита нет). Срок запроса Платформы прошёл — POST нет, CONFIRMATION_EXPIRED (В3 (а)).
+   *  Ожидание операции по order_ref — до отправки. Неизвестный исход POST (нет ответа, не по схеме, любой 5xx) — один
+   *  повтор того же запроса; отказ витрины (4xx) — без повтора (В1 (а)). При любом ответе — итог по
+   *  событию, затем один поиск по CART: 409 бывает, пока авторизация со ссылкой идёт. Операций нет после отказа витрины —
+   *  CONFIRMATION_NOT_DELIVERED; иначе итога нет — OPERATION_RESULT_UNCONFIRMED. */
+  async resume(c: PaymentContext): Promise<Operation> {
+    const orderRef = c.order.orderId;
+    const approved = this.#approved.get(orderRef);
+    this.#approved.delete(orderRef);
+    const confirm = this.o.shop.confirm?.bind(this.o.shop);
+    if (approved === undefined || confirm === undefined) throw new PaymentFailure("CONFIRMATION_NOT_DELIVERED");
+    // срок — Платформы: ссылка у неё истекает не позже заказа у продавца (РП72 п. 4); строго «позже сейчас»
+    if (!(Date.parse(approved.expiresAt) > this.now().getTime())) throw new PaymentFailure("CONFIRMATION_EXPIRED");
+    c.signal.throwIfAborted();
+    const wait = this.o.operations.expect(orderRef, c.cart);
+    const req = { shopId: c.shopId, orderId: orderRef, cartMandateId: c.cart.id, confirmationRef: approved.ref };
+    try {
+      let refused = false;
+      for (let attempt = 1; attempt <= 2; attempt++) {
+        c.signal.throwIfAborted();
+        c.sending();
+        try {
+          await confirm(req, attempt);
+          break;
+        } catch (e) {
+          if (!(e instanceof ShopFailure)) throw e;
+          if (e.code !== "SHOP_ORDER_STATE_UNKNOWN") {
+            refused = true;
+            break;
+          }
+        }
+      }
+      const looked: { kind: OperationOutcome["kind"] | null } = { kind: null };
+      let op: Operation;
+      try {
+        op = await this.#outcome(wait, null, 0, c.signal, async () => {
+          const r = await this.o.operations.lookup(orderRef, c.cart, c.notice);
+          looked.kind = r.kind;
+          return r;
+        });
+      } catch (e) {
+        if (refused && looked.kind === "ABSENT" && e instanceof PaymentFailure && e.code === "OPERATION_RESULT_UNCONFIRMED") throw new PaymentFailure("CONFIRMATION_NOT_DELIVERED");
+        throw e;
+      }
+      if (op.status === "REVERSED" && c.notice !== undefined) this.o.operations.watch(op, "REVERSED", c.notice);
+      return op;
+    } finally {
+      wait.close();
+    }
   }
 
   /** Стадия 5 (Т8): номер заказа — до обращения к Платформе (второй рубеж после стадии 3); реквизит по CART под ключом

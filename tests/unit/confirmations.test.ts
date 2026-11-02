@@ -145,6 +145,37 @@ describe("модуль подтверждений: сигнал → GET → ст
     expect(text).not.toContain("upk.stand");
   });
 
+  it("Р70: APPROVED — confirmation_ref и срок запроса шагам оплаты (onApproved) до исхода, один раз; срока нет или не RFC 3339 — UNKNOWN без вызова (В3)", async () => {
+    const run = async (over: Partial<Confirmation>) => {
+      const s = setup();
+      const got: [string, string][] = [];
+      let order: string[] = [];
+      let outcome: ConfirmationOutcome | undefined;
+      void s.conf
+        .wait({ signal: new AbortController().signal, onApproved: (ref, exp) => void (got.push([ref, exp]), order.push("approved")) })
+        .then((o) => void ((outcome = o), order.push("outcome")));
+      s.answers.set(ID1, confirmation("PENDING"));
+      await s.event("confirmation.required", ID1);
+      s.answers.set(ID1, confirmation("APPROVED", over));
+      await s.event("confirmation.approved", ID1);
+      // повтор события — без второго вызова
+      await s.event("confirmation.approved", ID1);
+      const r = { got, order, outcome, journal: JSON.stringify(s.journal) };
+      order = [];
+      return r;
+    };
+    const ok = await run({});
+    expect(ok.outcome).toBe("APPROVED");
+    expect(ok.got).toEqual([[REF, new Date(T0 + HOLD_MS).toISOString()]]);
+    expect(ok.order).toEqual(["approved", "outcome"]);
+    expect(ok.journal).not.toContain(REF);
+    for (const expiresAt of [null, "2026"]) {
+      const bad = await run({ expiresAt } as Partial<Confirmation>);
+      expect(bad.outcome, String(expiresAt)).toBe("UNKNOWN");
+      expect(bad.got, String(expiresAt)).toEqual([]);
+    }
+  });
+
   it("дубль события по event_id — ни второго GET, ни второго уведомления", async () => {
     const s = setup();
     const w = s.waiter();

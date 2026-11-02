@@ -5,5 +5,5 @@ export type { EventsPort, FeedItem } from "./events.js";
 export type { HttpRequestSigning, RequestSigning } from "./request-signing.js";
 export { SIGNER_STOP_DETAILS, haltAgent } from "./request-signing.js";
 export type { LiveAvailability, LiveOffer, LiveOfferRequest, LiveOfferSource } from "./catalog.js";
-export type { ConfirmationOutcome, LateNotice, NoticeAmount, NoticeLink, OfferSource, PaymentContext, PaymentSteps, PurchaseNotice, PurchaseNotify, Readiness, ShopOffers, ShopOrder, ShopOrderRequest, ShopPaymentPort, ShopPaymentReply, ShopPaymentRequest, ShopPort, ShopUnavailable, ShopUnavailableCause } from "./shop.js";
+export type { ConfirmationOutcome, LateNotice, NoticeAmount, NoticeLink, OfferSource, PaymentContext, PaymentSteps, PurchaseNotice, PurchaseNotify, Readiness, ShopConfirmRequest, ShopOffers, ShopOrder, ShopOrderRequest, ShopPaymentPort, ShopPaymentReply, ShopPaymentRequest, ShopPort, ShopUnavailable, ShopUnavailableCause } from "./shop.js";
 export { PaymentFailure, ShopFailure } from "./shop.js";

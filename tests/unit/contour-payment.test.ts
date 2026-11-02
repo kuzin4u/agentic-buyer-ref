@@ -38,6 +38,10 @@ function steps(o: {
   nowAfterPayable?: Date;
   /** признак payment.confirmation_required в ответе продавца (стенд v0.37.0, К1.1 AG-13 ч. 2б) */
   flag?: boolean;
+  /** Р70: исход стадии 4 (APPROVED — со ссылкой и сроком `approve`); не задан — NONE */
+  approve?: { ref: string; expiresAt: string } | "UNKNOWN";
+  /** Р70: исход каждого POST …/confirmation (OK — 200, UNKNOWN — неизвестный исход, REFUSED — отказ витрины); нет метода — null */
+  confirms?: ("OK" | "UNKNOWN" | "REFUSED")[] | null;
 }) {
   let clockNow = NOW;
   const log: string[] = [];
@@ -51,6 +55,9 @@ function steps(o: {
     close: () => void log.push("close"),
   };
   let paid = 0;
+  let confirmed = 0;
+  /** confirmation_ref, ушедшие продавцу (Р70) */
+  const refs: string[] = [];
   const payable = o.payable;
   const p = new ContourPayment({
     platform: {
@@ -81,10 +88,25 @@ function steps(o: {
           return r;
         },
       }),
+      ...(o.confirms !== null && {
+        confirm: async (req, attempt) => {
+          log.push(`confirm ${attempt ?? 1} ${req.orderId} ${req.cartMandateId}`);
+          refs.push(req.confirmationRef);
+          const r = (o.confirms ?? ["OK"])[confirmed++] ?? "OK";
+          if (r === "UNKNOWN") throw new ShopFailure("SHOP_ORDER_STATE_UNKNOWN");
+          if (r === "REFUSED") throw new ShopFailure("SHOP_ORDER_REFUSED");
+          return { status: "PAID" as const };
+        },
+      }),
     },
     journal,
     confirmations: {
-      wait: async () => "NONE",
+      wait: async (w) => {
+        if (o.approve === undefined) return "NONE";
+        if (o.approve === "UNKNOWN") return "UNKNOWN";
+        w.onApproved?.(o.approve.ref, o.approve.expiresAt);
+        return "APPROVED";
+      },
       mark: () => (log.push("mark"), 7),
       arrival: (signal, after) => {
         log.push(`arrival ${after}`);
@@ -101,7 +123,7 @@ function steps(o: {
     params: PARAMS,
     now: () => clockNow,
   });
-  return { p, log, journal, sealed, packages, issued: () => issued };
+  return { p, log, journal, sealed, packages, refs, issued: () => issued };
 }
 
 const NOW = new Date("2026-11-01T12:00:00.000Z");
@@ -364,6 +386,107 @@ describe("повтор оплаты после обрыва ответа — п�
     await expect(b.p.authorize(ctx(ac.signal), { idempotencyKey: "k" })).rejects.toThrow("остановлена");
     expect(b.log.filter((x) => x.startsWith("pay "))).toEqual(["pay 1"]);
     expect(b.journal.entries.some((e) => e.kind === "payment.retry")).toBe(false);
+  });
+});
+
+describe("Р70: ссылка подтверждения продавцу после одобрения человеком (Р69 п. 0; РП72 п. 2–5; инварианты 1, 8, 9)", () => {
+  const AUTHORIZED: Operation = { ...DECLINED, opRef: "op_2", status: "AUTHORIZED", declineReason: null };
+  const REF = "cr_secret_ref_1";
+  const approve = { ref: REF, expiresAt: LATER };
+  const stage4 = async (s: ReturnType<typeof steps>) => s.p.confirm(ctx(), () => {}, new AbortController().signal);
+  const DELAY = PARAMS.operation_outcome_max_delay_sec * 1000;
+
+  it("APPROVED — одна ссылка продавцу с confirmation_ref из GET, ожидание по order_ref до отправки, итог — новая операция; реквизита и пакета нет", async () => {
+    const s = steps({ reply: "PAID", outcome: async () => ({ kind: "OPERATION", operation: AUTHORIZED }), approve });
+    expect(await stage4(s)).toBe("APPROVED");
+    await expect(s.p.resume(ctx())).resolves.toMatchObject({ opRef: "op_2", status: "AUTHORIZED" });
+    expect(s.log).toEqual(["expect", "confirm 1 ORD-1 m_cart", `outcome ${DELAY}`, "close"]);
+    expect(s.refs).toEqual([REF]);
+    expect(s.issued()).toBe(0);
+    expect(s.packages).toEqual([]);
+    // ссылка берётся один раз: второй resume — без POST
+    await expect(s.p.resume(ctx())).rejects.toMatchObject({ code: "CONFIRMATION_NOT_DELIVERED" });
+    expect(s.refs).toEqual([REF]);
+  });
+
+  it("поломка: второй POST …/confirmation после ответа 200 — его нет (инвариант 9)", async () => {
+    const s = steps({ reply: "PAID", outcome: async () => ({ kind: "NONE" }), lookup: { kind: "ABSENT" }, approve, confirms: ["OK", "OK"] });
+    await stage4(s);
+    await expect(s.p.resume(ctx())).rejects.toMatchObject({ code: "OPERATION_RESULT_UNCONFIRMED" });
+    expect(s.log.filter((x) => x.startsWith("confirm"))).toEqual(["confirm 1 ORD-1 m_cart"]);
+  });
+
+  it("В1 (а): неизвестный исход — один повтор того же запроса (та же ссылка), второй неизвестный — без третьего; итог — по событию", async () => {
+    const a = steps({ reply: "PAID", outcome: async () => ({ kind: "OPERATION", operation: AUTHORIZED }), approve, confirms: ["UNKNOWN", "OK"] });
+    await stage4(a);
+    await expect(a.p.resume(ctx())).resolves.toMatchObject({ opRef: "op_2" });
+    expect(a.log.filter((x) => x.startsWith("confirm"))).toEqual(["confirm 1 ORD-1 m_cart", "confirm 2 ORD-1 m_cart"]);
+    expect(a.refs).toEqual([REF, REF]);
+    const b = steps({ reply: "PAID", outcome: async () => ({ kind: "NONE" }), lookup: { kind: "ABSENT" }, approve, confirms: ["UNKNOWN", "UNKNOWN", "OK"] });
+    await stage4(b);
+    await expect(b.p.resume(ctx())).rejects.toMatchObject({ code: "OPERATION_RESULT_UNCONFIRMED" });
+    expect(b.log.filter((x) => x.startsWith("confirm"))).toHaveLength(2);
+  });
+
+  it("поломка В1 (а): отказ витрины (409 после потерянного ответа — авторизация со ссылкой идёт) — без повтора, но итог по событию и поиску по CART, а не остановка", async () => {
+    const a = steps({ reply: "PAID", outcome: async () => ({ kind: "OPERATION", operation: AUTHORIZED }), approve, confirms: ["REFUSED"] });
+    await stage4(a);
+    await expect(a.p.resume(ctx())).resolves.toMatchObject({ opRef: "op_2", status: "AUTHORIZED" });
+    expect(a.log).toEqual(["expect", "confirm 1 ORD-1 m_cart", `outcome ${DELAY}`, "close"]);
+    // событие не пришло, поиск по CART нашёл операцию — итог по ней
+    const b = steps({ reply: "PAID", outcome: async () => ({ kind: "NONE" }), lookup: { kind: "OPERATION", operation: AUTHORIZED }, approve, confirms: ["REFUSED"] });
+    await stage4(b);
+    await expect(b.p.resume(ctx())).resolves.toMatchObject({ opRef: "op_2" });
+    expect(b.log).toContain("lookup ORD-1 m_cart");
+  });
+
+  it("отказ витрины и операций нет — CONFIRMATION_NOT_DELIVERED; неизвестный исход и операций нет — OPERATION_RESULT_UNCONFIRMED; неоднозначно — OPERATION_RESULT_UNCONFIRMED", async () => {
+    const a = steps({ reply: "PAID", outcome: async () => ({ kind: "NONE" }), lookup: { kind: "ABSENT" }, approve, confirms: ["REFUSED"] });
+    await stage4(a);
+    await expect(a.p.resume(ctx())).rejects.toMatchObject({ code: "CONFIRMATION_NOT_DELIVERED" });
+    const b = steps({ reply: "PAID", outcome: async () => ({ kind: "NONE" }), lookup: { kind: "ABSENT" }, approve, confirms: ["UNKNOWN", "UNKNOWN"] });
+    await stage4(b);
+    await expect(b.p.resume(ctx())).rejects.toMatchObject({ code: "OPERATION_RESULT_UNCONFIRMED" });
+    const c = steps({ reply: "PAID", outcome: async () => ({ kind: "NONE" }), lookup: { kind: "NONE" }, approve, confirms: ["REFUSED"] });
+    await stage4(c);
+    await expect(c.p.resume(ctx())).rejects.toMatchObject({ code: "OPERATION_RESULT_UNCONFIRMED" });
+  });
+
+  it("поломка В3 (а): срок запроса Платформы прошёл — POST нет, CONFIRMATION_EXPIRED; ровно «сейчас» — тоже прошёл", async () => {
+    for (const expiresAt of [new Date(NOW.getTime() - 1).toISOString(), NOW.toISOString()]) {
+      const s = steps({ reply: "PAID", outcome: async () => ({ kind: "OPERATION", operation: AUTHORIZED }), approve: { ref: REF, expiresAt } });
+      await stage4(s);
+      await expect(s.p.resume(ctx())).rejects.toMatchObject({ code: "CONFIRMATION_EXPIRED" });
+      expect(s.log).toEqual([]);
+      expect(s.refs).toEqual([]);
+    }
+  });
+
+  it("без одобрения (исход не APPROVED) или без метода витрины — POST нет, CONFIRMATION_NOT_DELIVERED; покупку остановили — POST нет", async () => {
+    const a = steps({ reply: "PAID", outcome: async () => ({ kind: "NONE" }), approve: "UNKNOWN" });
+    expect(await stage4(a)).toBe("UNKNOWN");
+    await expect(a.p.resume(ctx())).rejects.toMatchObject({ code: "CONFIRMATION_NOT_DELIVERED" });
+    const b = steps({ reply: "PAID", outcome: async () => ({ kind: "NONE" }), approve, confirms: null });
+    await stage4(b);
+    await expect(b.p.resume(ctx())).rejects.toMatchObject({ code: "CONFIRMATION_NOT_DELIVERED" });
+    const ac = new AbortController();
+    const c = steps({ reply: "PAID", outcome: async () => ({ kind: "NONE" }), approve });
+    await stage4(c);
+    ac.abort(new Error("остановлена"));
+    await expect(c.p.resume(ctx(ac.signal))).rejects.toThrow("остановлена");
+    expect(c.refs).toEqual([]);
+  });
+
+  it("поломка: confirmation_ref не в журнале шагов, не в исходе и не в ошибках", async () => {
+    const journal = new MemoryJournal();
+    const a = steps({ reply: "PAID", outcome: async () => ({ kind: "OPERATION", operation: AUTHORIZED }), approve, journal });
+    await stage4(a);
+    const op = await a.p.resume(ctx());
+    const b = steps({ reply: "PAID", outcome: async () => ({ kind: "NONE" }), lookup: { kind: "ABSENT" }, approve, confirms: ["REFUSED"], journal });
+    await stage4(b);
+    const err = await b.p.resume(ctx()).catch((e: unknown) => e);
+    const text = [JSON.stringify(journal.entries), JSON.stringify(op), String(err), (err as Error).stack ?? "", JSON.stringify(err)].join("\n");
+    expect(text).not.toContain(REF);
   });
 });
 

@@ -26,6 +26,7 @@ import { AGENT_STOP_CODES, channelFailure, ruleForFailure } from "../../declines
 import {
   ShopFailure,
   type OfferSource,
+  type ShopConfirmRequest,
   type ShopOffers,
   type ShopOrder,
   type ShopOrderRequest,
@@ -150,7 +151,8 @@ type Method =
   | "GET /v1/shops/{id}/catalog"
   | "POST /v1/shops/{id}/orders"
   | "GET /v1/shops/{id}/orders"
-  | "POST /v1/shops/{id}/orders/{order_id}/payment";
+  | "POST /v1/shops/{id}/orders/{order_id}/payment"
+  | "POST /v1/shops/{id}/orders/{order_id}/confirmation";
 
 /** Путь знака готовности (Р53 п. 1): в YAML ПАО 1.4.0 его нет — описан вручную, с ПАО 1.5.0 — из YAML (#37 платформы). */
 const READINESS = "GET /pao/v1/merchants/{merchant_id}/readiness";
@@ -472,6 +474,35 @@ export class ShopsAdapter implements OfferSource, LiveOfferSource, ShopPort, Sho
     this.#log(method, attempt, "ok", req.shopId, { detail: b.data.status }, req.cartMandateId);
     // признак — только повод ждать запрос подтверждения Платформы; confirmation_id из ответа продавца не берётся (РП72 п. 1)
     return b.data.payment?.confirmation_required === true ? { status: b.data.status, confirmationRequired: true } : { status: b.data.status };
+  }
+
+  /** Ссылка подтверждения продавцу (Р69 п. 0, Р70 В1; РП72 п. 2–5): подписанным обращением, `content-digest` покрывает тело
+   *  `{confirmation_ref}`; сам адаптер не повторяет — один повтор решают шаги оплаты, `attempt` — для журнала. Отказ витрины
+   *  (4xx) — SHOP_ORDER_REFUSED; нет ответа в срок, ответ не по схеме, любой 5xx (503 `UPSTREAM_UNAVAILABLE` — авторизация
+   *  не ушла, заказ снова ждёт, РП72 п. 3) — SHOP_ORDER_STATE_UNKNOWN. `confirmation_ref` — только в теле
+   *  запроса: в журнал, исключения и сообщения он не попадает; статус ответа — detail записи shop.call (слова продавца). */
+  async confirm(req: ShopConfirmRequest, attempt = 1): Promise<ShopPaymentReply> {
+    const method: Method = "POST /v1/shops/{id}/orders/{order_id}/confirmation";
+    if (!SHOP_ID.test(req.shopId) || !ORDER_REF.test(req.orderId)) throw new Error("id витрины или заказа не по маске");
+    const reply = await this.#send("POST", `/v1/shops/${req.shopId}/orders/${req.orderId}/confirmation`, JSON.stringify({ confirmation_ref: req.confirmationRef }));
+    if (reply === null) {
+      this.#log(method, attempt, "unknown", req.shopId, { detail: "NO_RESPONSE" }, req.cartMandateId);
+      throw new ShopFailure("SHOP_ORDER_STATE_UNKNOWN");
+    }
+    if (reply.status >= 400) {
+      const cause = this.#cause(reply.body);
+      // любой 5xx — неизвестный исход, один повтор шагами оплаты (Р70 В1 (а): «потеря ответа, 503, иные 5xx»)
+      const again = reply.status >= 500;
+      this.#log(method, attempt, again ? "unknown" : "refused", req.shopId, cause, req.cartMandateId);
+      throw new ShopFailure(again ? "SHOP_ORDER_STATE_UNKNOWN" : "SHOP_ORDER_REFUSED");
+    }
+    const b = reply.status === 200 ? Paid.safeParse(reply.body) : null;
+    if (!b?.success || b.data.id !== req.orderId) {
+      this.#log(method, attempt, "unknown", req.shopId, { detail: "BAD_RESPONSE" }, req.cartMandateId);
+      throw new ShopFailure("SHOP_ORDER_STATE_UNKNOWN");
+    }
+    this.#log(method, attempt, "ok", req.shopId, { detail: b.data.status }, req.cartMandateId);
+    return { status: b.data.status };
   }
 
   /** Перед повтором оплаты (Р69 п. 4): заказы витрины по мандату корзины — ровно один, с этим номером, мандатом и

@@ -2,7 +2,8 @@
 // по GET /pao/v1/confirmations/{id}, событие без GET ничего не меняет (Р34). Запрос создаёт ADP на отказе авторизации
 // продавца; в ответе Платформы нет ни мандата, ни order_ref, поэтому запрос относится к покупке, только если его ждёт
 // ровно одна покупка (4а): ошибка привязки денег не стоит — ADP сверяет ссылку с мандатом, продавцом, суммой и order_ref.
-// confirmation_ref дальше разбора ответа не идёт: ни в журнал, ни в исход, ни человеку (инвариант 1, Р47 п. 5). link —
+// confirmation_ref дальше разбора ответа не идёт, кроме шагов оплаты при APPROVED (`onApproved`, Р70 — ссылка продавцу): ни
+// в журнал, ни в исход, ни человеку (инвариант 1, Р47 п. 5). link —
 // только оболочке в уведомлении PENDING и только безопасный (`pageLink`: https:, без логина и пароля; Р69 п. 5), не в
 // журнал, не в исход и не в тексты ошибок.
 import { pageLink } from "./link.js";
@@ -51,17 +52,21 @@ export interface ConfirmationsOptions {
 export interface WaitOptions {
   signal: AbortSignal;
   onPending?: (link?: string) => void | Promise<void>;
+  /** Р70: при APPROVED — `confirmation_ref` и срок запроса (`expires_at`, RFC 3339) шагам оплаты, синхронно до исхода; в
+   *  журнал, исход и тексты не попадают. Срока нет или он не по формату — исход UNKNOWN без вызова (fail-closed, В3). */
+  onApproved?: (ref: string, expiresAt: string) => void;
 }
 
 type JournalEntry = Parameters<ConfirmationsJournal["record"]>[0];
 type WithoutAt<T> = T extends unknown ? Omit<T, "at"> : never;
 
-/** Статус по GET без confirmation_ref; `link` — только безопасный адрес страницы УПК или null; FAILED — GET не дал
- *  подтверждённого статуса. */
-type Read = { status: Confirmation["status"]; expiresAt: string | null; link: string | null } | "FAILED";
+/** Статус по GET; `link` — только безопасный адрес страницы УПК или null; `ref` — `confirmation_ref` только у APPROVED (Р70:
+ *  дальше — только шагам оплаты через `onApproved`); FAILED — GET не дал подтверждённого статуса. */
+type Read = { status: Confirmation["status"]; expiresAt: string | null; link: string | null; ref: string | null } | "FAILED";
 
 interface Waiter {
   readonly onPending: WaitOptions["onPending"];
+  readonly onApproved: WaitOptions["onApproved"];
   /** привязанный запрос; null — ждёт запрос */
   id: string | null;
   /** свой предел ожидания решения (Р69 п. 2): время привязки + confirmation_decision_max_sec, мс; до привязки — null */
@@ -139,6 +144,7 @@ export class Confirmations {
   wait(o: WaitOptions): Promise<ConfirmationOutcome> {
     const signal = o.signal;
     const onPending = o.onPending;
+    const onApproved = o.onApproved;
     if (signal.aborted) return Promise.reject(signal.reason);
     return new Promise<ConfirmationOutcome>((resolve, reject) => {
       const onAbort = () => end(() => reject(signal.reason));
@@ -155,7 +161,7 @@ export class Confirmations {
         signal.removeEventListener("abort", onAbort);
         done();
       };
-      const w: Waiter = { onPending, id: null, limit: null, settled: false, cancel: null, finish: (outcome) => end(() => resolve(outcome)) };
+      const w: Waiter = { onPending, onApproved, id: null, limit: null, settled: false, cancel: null, finish: (outcome) => end(() => resolve(outcome)) };
       signal.addEventListener("abort", onAbort, { once: true });
       if (this.#unclaimed.size === 1 && this.#waiters.size === 0) {
         const [id, held] = [...this.#unclaimed][0]!;
@@ -300,6 +306,7 @@ export class Confirmations {
   #apply(id: string, w: Waiter, read: Read): void {
     if (w.settled) return;
     if (read === "FAILED") return w.finish("UNKNOWN");
+    if (read.status === "APPROVED") return this.#approved(w, read);
     if (read.status !== "PENDING") return w.finish(read.status);
     if (!this.#notified.has(id)) {
       this.#notified.add(id);
@@ -348,7 +355,15 @@ export class Confirmations {
       if (this.#now().getTime() < this.#end(w, deadline)) return this.#schedule(id, w, read.expiresAt);
       return w.finish(w.limit !== null && w.limit < deadline ? "WAIT_LIMIT" : "UNKNOWN");
     }
+    if (read.status === "APPROVED") return this.#approved(w, read);
     w.finish(read.status);
+  }
+
+  /** APPROVED (Р70): ссылка и срок запроса — шагам оплаты до исхода; срока по формату нет — UNKNOWN (В3, fail-closed). */
+  #approved(w: Waiter, read: Exclude<Read, "FAILED">): void {
+    if (read.ref === null || read.expiresAt === null || !RFC3339.test(read.expiresAt)) return w.finish("UNKNOWN");
+    w.onApproved?.(read.ref, read.expiresAt);
+    w.finish("APPROVED");
   }
 
   /** Конец ожидания решения: меньшее из срока Платформы и своего предела (Р69 п. 2). */
@@ -377,7 +392,12 @@ export class Confirmations {
     const withRef = typeof c.confirmationRef === "string" && c.confirmationRef !== "";
     if (c.id !== id || !STATUSES.has(c.status) || withRef !== (c.status === "APPROVED") || (!withRef && c.confirmationRef !== null)) return "FAILED";
     this.#record({ kind: "confirmation.status", ref: id, detail: c.status });
-    return { status: c.status, expiresAt: typeof c.expiresAt === "string" ? c.expiresAt : null, link: c.status === "PENDING" ? pageLink(c.link) : null };
+    return {
+      status: c.status,
+      expiresAt: typeof c.expiresAt === "string" ? c.expiresAt : null,
+      link: c.status === "PENDING" ? pageLink(c.link) : null,
+      ref: c.status === "APPROVED" ? (c.confirmationRef as string) : null,
+    };
   }
 
   #record(e: WithoutAt<JournalEntry>): void {

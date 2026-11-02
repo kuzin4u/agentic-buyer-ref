@@ -15,7 +15,7 @@ import { acceptedA5, cartTotal, classifyOffer, mayDraftCart, mayOrder, type Cart
 import { paymentChannel } from "../policy/channels.js";
 import { confirmThreshold, currencySupported, mandateRefusal, mayAuthorize, mayCartMerchant, needsConfirmation, type PaymentDecision, type Thresholds } from "../policy/payment.js";
 import type { OrderPriceMismatches } from "../policy/order-mismatch.js";
-import type { SplitWindow } from "../policy/split.js";
+import type { SplitSlot, SplitWindow } from "../policy/split.js";
 import type { LiveOfferSource } from "../ports/catalog.js";
 import type { FeedItem } from "../ports/events.js";
 import type { Mutation } from "../ports/mutation.js";
@@ -630,37 +630,48 @@ export class Purchase {
           if (e instanceof PaymentFailure && e.code === "CONFIRMATION_REQUIRED") return null;
           throw e;
         }
-        // отказ окно не занимает; сбой, неизвестный исход и CONFIRMATION_REQUIRED (дальше стадия 4, исход не известен —
-        // Р47 п. 6, решение владельца по ревью К3 № 4) — занимают (fail-closed)
-        // SETTLED на стадии 5 — событие одобрения прочитано поздно или потеряно, итог уже после клиринга: одобрение
-        // подтверждено, расчёт заберёт settle (ревью КТ1 № 6, дополнение 1 к Р49)
-        // REFUNDED — так же: одобрение, клиринг и возврат уже были, итог заберёт settle (Р51 п. 3). REVERSED — итог известен
-        // (оплата отменена), но место в окне занято: клиринг после реверсала возможен (РП55, fail-closed)
-        const approved = reply.status === "AUTHORIZED" || reply.status === "SETTLED" || reply.status === "REFUNDED";
-        if (reply.status === "DECLINED") slot.settle("REFUSED");
-        else if (approved) slot.settle("APPROVED");
-        else slot.settle("UNKNOWN");
-        if (reply.status === "DECLINED") this.#halt(ruleForDeclineReason(reply.declineReason).code);
-        if (reply.status === "REVERSED") this.#reversed(reply);
-        if (reply.status === "CONFIRMATION_REQUIRED") return null;
-        if (!approved) this.#halt("UNKNOWN");
-        return reply;
+        return this.#judge(reply, slot);
       });
-      if (op === null) return this.#confirm(c, abort);
-      this.#operation = op;
-      this.#authorizedAt = this.now().getTime();
-      this.#held(c.intent, c.cart);
-      this.#machine.to("SETTLING");
-      return copy(op);
+      if (op === null) return this.#confirm(c, abort, slot);
+      return this.#authorized(op, c);
     });
   }
 
-  /** Стадия 4 (Т7, Р47 п. 2–6): запрос создала ADP на отказе авторизации — решение человека в приложении банка, агент
-   *  сам не подтверждает (инвариант 7). Ожидание — через порт: привязка, уведомление и статус по GET (модуль
-   *  confirmations). Канала ссылки к продавцу до AG-13 ч. 2 нет — каждый исход в ч. 1 — STOPPED; переход
-   *  CONFIRMING → AUTHORIZING в ч. 1 не проходит ни один путь. Прерывание вызывающим (Р69 п. 3) — CONFIRMATION_ABORTED:
-   *  место в окне уже занято (UNKNOWN), запрос в банке не отменяется (метода в ПАО 1.4.0 нет). */
-  async #confirm(c: Omit<PaymentContext, "signal" | "sending">, abort: AbortSignal | undefined): Promise<never> {
+  /** Итог операции стадии 5 → место в окне и остановка (Р49 п. 5). Отказ окно не занимает; сбой, неизвестный исход и
+   *  CONFIRMATION_REQUIRED (дальше стадия 4, исход не известен — Р47 п. 6, решение владельца по ревью К3 № 4) — занимают
+   *  (fail-closed). SETTLED на стадии 5 — событие одобрения прочитано поздно или потеряно, итог уже после клиринга:
+   *  одобрение подтверждено, расчёт заберёт settle (ревью КТ1 № 6, дополнение 1 к Р49). REFUNDED — так же: одобрение,
+   *  клиринг и возврат уже были, итог заберёт settle (Р51 п. 3). REVERSED — итог известен (оплата отменена), но место в
+   *  окне занято: клиринг после реверсала возможен (РП55, fail-closed). CONFIRMATION_REQUIRED — null (стадия 4). */
+  #judge(reply: Operation, slot: SplitSlot): Operation | null {
+    const approved = reply.status === "AUTHORIZED" || reply.status === "SETTLED" || reply.status === "REFUNDED";
+    if (reply.status === "DECLINED") slot.settle("REFUSED");
+    else if (approved) slot.settle("APPROVED");
+    else slot.settle("UNKNOWN");
+    if (reply.status === "DECLINED") this.#halt(ruleForDeclineReason(reply.declineReason).code);
+    if (reply.status === "REVERSED") this.#reversed(reply);
+    if (reply.status === "CONFIRMATION_REQUIRED") return null;
+    if (!approved) this.#halt("UNKNOWN");
+    return reply;
+  }
+
+  /** Одобрение стадии 5 (в том числе после стадии 4, Р70) → SETTLING: граница расчёта — от этого момента. */
+  #authorized(op: Operation, c: Omit<PaymentContext, "signal" | "sending">): Operation {
+    this.#operation = op;
+    this.#authorizedAt = this.now().getTime();
+    this.#held(c.intent, c.cart);
+    this.#machine.to("SETTLING");
+    return copy(op);
+  }
+
+  /** Стадия 4 (Т7, Р47 п. 2–6): запрос создала ADP на отказе авторизации — решение человека на странице УПК или в
+   *  приложении банка, агент сам не подтверждает (инвариант 7). Ожидание — через порт: привязка, уведомление и статус по
+   *  GET (модуль confirmations). APPROVED и шаг `resume` у порта (Р69 п. 0, Р70) — ворота стадии 5 заново (пропуск от
+   *  прежних ворот не живёт после стадии 4, К4), переход CONFIRMING → AUTHORIZING, ссылка продавцу, итог — новая операция;
+   *  место в окне остаётся занятым (UNKNOWN, В2 (а), Р-136 без изменений). Прочие исходы — STOPPED. Прерывание вызывающим
+   *  (Р69 п. 3) — только во время ожидания решения: CONFIRMATION_ABORTED, запрос в банке не отменяется (метода в ПАО 1.4.0
+   *  нет). */
+  async #confirm(c: Omit<PaymentContext, "signal" | "sending">, abort: AbortSignal | undefined, slot: SplitSlot): Promise<Operation> {
     this.#machine.to("CONFIRMING");
     const stopped = this.#machine.stopped;
     const until = abort === undefined ? stopped : AbortSignal.any([stopped, abort]);
@@ -676,8 +687,26 @@ export class Purchase {
     });
     // мандаты вышли, пока человек решал (отзыв по ленте), — отказ действовать, как в воротах (Р38 п. 3)
     this.#held(c.intent, c.cart);
-    // исход вне перечня (реализация порта вне ядра) — UNKNOWN, fail-closed
-    this.#halt(Object.hasOwn(CONFIRMATION_STOP, outcome) ? CONFIRMATION_STOP[outcome] : "UNKNOWN");
+    const resume = this.o.payment.resume?.bind(this.o.payment);
+    // исход вне перечня (реализация порта вне ядра) — UNKNOWN, fail-closed; APPROVED без шага ссылки — как до ч. 2б
+    if (outcome !== "APPROVED" || resume === undefined) this.#halt(Object.hasOwn(CONFIRMATION_STOP, outcome) ? CONFIRMATION_STOP[outcome] : "UNKNOWN");
+    // ворота заново: человек решал до confirmation_decision_max_sec — мандаты и знак продавца перечитываются (Р38 п. 3)
+    await this.#gate(c.intent, c.cart);
+    this.#machine.to("AUTHORIZING");
+    const op = await this.#guard(async (): Promise<Operation> => {
+      let reply: Operation;
+      try {
+        reply = snapshot(await resume(this.#forPayment(c)));
+      } catch (e) {
+        if (e === this.#machine.stopped.reason) throw this.#stopped(this.#machine.reason ?? "UNKNOWN");
+        throw e;
+      }
+      // второе требование подтверждения по ссылке — второй стадии 4 нет: новая попытка — новым заказом (РП72 п. 3, Р70 В4)
+      const judged = this.#judge(reply, slot);
+      if (judged === null) this.#halt("UNKNOWN");
+      return judged;
+    });
+    return this.#authorized(op, c);
   }
 
   /** Уведомление покупки после её итога (Р51 п. 4) — для наблюдения модуля операций: то же уведомление оболочки. */

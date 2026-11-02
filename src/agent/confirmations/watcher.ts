@@ -83,7 +83,7 @@ interface Held {
   expired: boolean;
 }
 
-const RFC3339 =/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?(Z|[+-]\d{2}:\d{2})$/;
+const RFC3339 = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?(Z|[+-]\d{2}:\d{2})$/;
 
 const STATUSES: ReadonlySet<string> = new Set(["PENDING", "APPROVED", "REJECTED", "EXPIRED"]);
 

@@ -53,11 +53,16 @@ export async function reinstated(stand: Pick<Stand, "reinstateAgent" | "now">, a
 
 /**
  * Окно дробления агента-нарушителя (П13, дополнение 2 к Р70 п. 1, 4): место в настоящем окне занимает и исход отмечает, как
- * честное, но долю не видит никогда. Только тестовая сторона; `policy/split.ts` и конвейер не меняются.
+ * честное, но долю не видит никогда. Только тестовая сторона; `policy/split.ts` и конвейер не меняются. Параметры базы —
+ * настоящие (ревью КТ сессии 61 № 6); новый публичный метод `SplitWindow`, который вызывает конвейер, перекрывать здесь
+ * явно — иначе он уйдёт в пустое окно базы, а не в настоящее.
  */
 export class BlindSplitWindow extends SplitWindow {
-  constructor(private readonly real: SplitWindow) {
-    super({ split_window_sec: 0, split_min_ops: Number.MAX_SAFE_INTEGER }, () => new Date());
+  constructor(
+    private readonly real: SplitWindow,
+    params: Pick<StandParams, "split_window_sec" | "split_min_ops">,
+  ) {
+    super(params, () => new Date());
   }
   override isShare(): boolean {
     return false;

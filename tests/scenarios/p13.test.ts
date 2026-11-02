@@ -45,7 +45,8 @@ describe("П13 — обход подтверждения дроблением", 
     });
     c = r.c;
     const T = r.c.stand!.params.confirm_above_kop;
-    expect(r.c.stand!.params.split_min_ops).toBe(2);
+    // две доли образуют дробление (ревью КТ сессии 61 № 7)
+    expect(r.c.stand!.params.split_min_ops).toBeLessThanOrEqual(2);
     // каждая доля не выше порога, сумма — выше (дробление под порог, A3 п. 4)
     const shareA = A.price!;
     const shareB = B.price! * QTY_B;
@@ -54,7 +55,7 @@ describe("П13 — обход подтверждения дроблением", 
     expect(shareA + shareB).toBeGreaterThan(T);
     expect(shareA + shareB).toBeLessThanOrEqual(INTENT.amountLimit.amount);
 
-    const blind = new BlindSplitWindow(r.split);
+    const blind = new BlindSplitWindow(r.split, r.params);
     const draft = { ...INTENT, merchantScope: [NORMAL.merchant_id] };
     /** Покупка того же ядра под тем же INTENT: черновик и ключ прежние — Платформа отдаёт тот же мандат */
     async function share(p: ReturnType<typeof r.next>, sku: string, qty: number, n: number) {
@@ -78,6 +79,27 @@ describe("П13 — обход подтверждения дроблением", 
     expect(op1).toMatchObject({ status: "AUTHORIZED", indicator: { mandateId: s1.cart.id } });
     expect(p1.state).toBe("SETTLING");
     const routes1 = routesFrom(r.c, from1, "agent", { intent: s1.intent.id, cart: s1.cart.id, shop: NORMAL.id, merchant: NORMAL.merchant_id, order: s1.order.orderId, op: op1.opRef });
+
+    // честный агент — до доли 2 нарушителя (ревью КТ сессии 61 № 1): в настоящем окне только доля 1, отказ — именно по
+    // ней (1 890 + 1 560 > 3 000 ₽, две операции); та же доля под тем же INTENT, пакет не уходит
+    const p3 = r.next();
+    const s3 = await share(p3, B.sku, QTY_B, 3);
+    expect(s3.intent.id).toBe(s1.intent.id);
+    const from3 = r.c.calls().length;
+    // первое из: конец authorize или вход в стадию 5 (ушла бы на ADP и ждала человека) — красный по коду и журналу, не по сроку
+    let ended = false;
+    const refused = p3.authorize({ idempotencyKey: "idem-pay-p13-3" }).then(
+      () => null,
+      (e: unknown) => e,
+    );
+    void refused.then(() => (ended = true));
+    for (let i = 0; i < 1000 && !ended && p3.state !== "AUTHORIZING"; i++) await pause(10);
+    expect(p3.reason, "честный агент — отказ до стадии 5").toBe("SPLIT_WINDOW");
+    expect(await refused).toBeInstanceOf(PurchaseStopped);
+    expect(r.c.journal.entries.filter((e) => e.kind === "agent.refused" && e.reason === "SPLIT_WINDOW")).toHaveLength(1);
+    // честный агент: отказ до стадии 5 — ни реквизита, ни пакета; CART после остановки отпущен (Р63, дополнение 1)
+    await p3.cartReleased();
+    const routes3 = routesFrom(r.c, from3, "agent", { intent: s3.intent.id, cart: s3.cart.id, shop: NORMAL.id, merchant: NORMAL.merchant_id, order: s3.order.orderId });
 
     // доля 2 нарушителя: тот же INTENT, окно агента подменено — пакет уходит; ADP выявляет дробление
     const p2 = r.next({ split: blind });
@@ -108,25 +130,7 @@ describe("П13 — обход подтверждения дроблением", 
     await p2.cartReleased();
     const routes2 = routesFrom(r.c, from2, "agent", { intent: s2.intent.id, cart: s2.cart.id, shop: NORMAL.id, merchant: NORMAL.merchant_id, order: s2.order.orderId, cnf: id! });
 
-    // честный агент: та же доля под тем же INTENT — настоящее окно видит долю 1, пакет не уходит
-    const p3 = r.next();
-    const s3 = await share(p3, B.sku, QTY_B, 3);
-    expect(s3.intent.id).toBe(s1.intent.id);
-    const from3 = r.c.calls().length;
-    // первое из: конец authorize или вход в стадию 5 (ушла бы на ADP и ждала человека) — красный по коду и журналу, не по сроку
-    let ended = false;
-    const refused = p3.authorize({ idempotencyKey: "idem-pay-p13-3" }).then(
-      () => null,
-      (e: unknown) => e,
-    );
-    void refused.then(() => (ended = true));
-    for (let i = 0; i < 1000 && !ended && p3.state !== "AUTHORIZING"; i++) await pause(10);
-    expect(p3.reason, "честный агент — отказ до стадии 5").toBe("SPLIT_WINDOW");
-    expect(await refused).toBeInstanceOf(PurchaseStopped);
-    expect(r.c.journal.entries.filter((e) => e.kind === "agent.refused" && e.reason === "SPLIT_WINDOW").map((e) => e.mandate ?? null)).toHaveLength(1);
-
     // полный журнал обращений агента на каждой доле (без ленты)
-    const ids = (s: typeof s1, extra: Record<string, string> = {}) => ({ intent: s.intent.id, cart: s.cart.id, shop: NORMAL.id, merchant: NORMAL.merchant_id, order: s.order.orderId, ...extra });
     expect(routes1).toEqual([
       "pao GET /pao/v1/mandates/{intent}/verify 200",
       "pao GET /pao/v1/mandates/{cart}/verify 200",
@@ -144,9 +148,7 @@ describe("П13 — обход подтверждения дроблением", 
       "pao GET /pao/v1/confirmations/{cnf} 200",
       "pao GET /pao/v1/confirmations/{cnf} 200",
     ]);
-    // честный агент: отказ до стадии 5 — ни реквизита, ни пакета; CART после остановки отпущен (Р63, дополнение 1)
-    await p3.cartReleased();
-    expect(routesFrom(r.c, from3, "agent", ids(s3))).toEqual(["pao POST /pao/v1/mandates/{cart}/relinquish 200"]);
+    expect(routes3).toEqual(["pao POST /pao/v1/mandates/{cart}/relinquish 200"]);
 
     // операции: одна одобренная (доля 1), по доле 2 одобрения нет; реквизиты — по одному на долю нарушителя
     const count = (route: string) => r.c.calls().filter((x) => `${x.target} ${x.route.split("?")[0]}` === route).length;

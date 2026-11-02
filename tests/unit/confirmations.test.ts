@@ -880,6 +880,23 @@ describe("удержание отметки до конца стадии 5 (до
     expect(discarded(s)).toEqual([ID1]);
   });
 
+  it("ревью КТ сессии 61 № 5: две отметки, снята одна — запрос не выброшен и нового срока нет; снята вторая — ещё confirmation_wait_ms, затем discarded", async () => {
+    const s = setup();
+    const first = s.conf.keep(s.conf.mark());
+    const second = s.conf.keep(s.conf.mark());
+    s.answers.set(ID1, confirmation("PENDING"));
+    await s.event("confirmation.required", ID1);
+    await s.c.advance(2 * WAIT_MS);
+    first();
+    await s.c.advance(3 * WAIT_MS);
+    expect(discarded(s)).toEqual([]);
+    second();
+    await s.c.advance(WAIT_MS - 1);
+    expect(discarded(s)).toEqual([]);
+    await s.c.advance(1);
+    expect(discarded(s)).toEqual([ID1]);
+  });
+
   it("после снятия запрос берёт стадия 4 (wait) — исход по нему; запрос до отметки и при чужой отметке — срок прежний", async () => {
     const s = setup();
     // запрос до отметки удержанием не защищён

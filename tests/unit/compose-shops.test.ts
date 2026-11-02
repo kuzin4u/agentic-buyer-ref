@@ -198,11 +198,14 @@ describe("AgentCore.payment (Р45 п. 6)", () => {
    *  AWAITING_CONFIRMATION — стадия 4 по запросу Платформы. Сборка ядра и настоящие сроки: итог стадии 5 ждётся
    *  `operation_outcome_max_delay_sec` = 3 с, запрос хранится `confirmation_wait_ms`. `when` — когда лента отдаёт
    *  confirmation.required: "outcome" — с первой оплаты (читает ожидание итога, срок хранения истекает до ожидания запроса);
-   *  "await" — не раньше LATE_MS после чтения заказа: чтение ленты, начатое ожиданием итога, к этому времени закончилось
-   *  (интервал event_poll_interval_ms = 1 с), прочитать может лишь ожидание запроса. */
+   *  "await" — не раньше LATE_MS (1,5 интервала чтения ленты event_poll_interval_ms) после чтения заказа: чтение, начатое
+   *  ожиданием итога, к этому времени закончилось, прочитать может лишь ожидание запроса. Сроки — из конфигурации (ревью
+   *  КТ сессии 61 № 3). */
   async function awaitingOnStub(when: "outcome" | "await") {
     const id = "cnf_22222222-2222-4222-8222-222222222222";
-    const LATE_MS = 1500;
+    const params = loadParams();
+    const POLL_MS = params.event_poll_interval_ms;
+    const LATE_MS = 1.5 * POLL_MS;
     let paid = 0;
     let readAt: number | null = null;
     let served = false;
@@ -231,12 +234,13 @@ describe("AgentCore.payment (Р45 п. 6)", () => {
       },
     });
     stand = s;
-    // "outcome": срок хранения (1 с) короче ожидания итога (3 с) — без удержания отметки запрос выброшен до ожидания;
-    // "await": ожидание запроса 4 с — больше LATE_MS и трёх интервалов чтения ленты, без опроса ленты запрос не прочитан
-    const params = loadParams();
+    // "outcome": срок хранения (один интервал) короче ожидания итога (три интервала) — без удержания отметки запрос
+    // выброшен до ожидания; "await": ожидание запроса — четыре интервала, больше LATE_MS, без опроса ленты запрос не прочитан
     const paramsPath = `${s.dir}-params.json`;
-    const waitMs = when === "outcome" ? 1000 : 4000;
-    writeFileSync(paramsPath, JSON.stringify({ ...params, operation_outcome_max_delay_sec: Math.ceil((3 * params.event_poll_interval_ms) / 1000), confirmation_wait_ms: waitMs }));
+    const outcomeSec = Math.ceil((3 * POLL_MS) / 1000);
+    const waitMs = when === "outcome" ? POLL_MS : 4 * POLL_MS;
+    expect(waitMs < outcomeSec * 1000 || when === "await").toBe(true);
+    writeFileSync(paramsPath, JSON.stringify({ ...params, operation_outcome_max_delay_sec: outcomeSec, confirmation_wait_ms: waitMs }));
     const { core, journal } = await coreOn(s, { paramsPath });
     await core.start();
     const from = s.stub.calls.length;

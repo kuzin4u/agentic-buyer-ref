@@ -1,6 +1,6 @@
 // Итог стадии 5 в шагах профиля contour (Р49 п. 5; ревью КТ1 AG-11 ч. 2 № 4, 5, 14): ожидание по order_ref — до отправки
 // пакета; после DECLINED продавца — гонка операции с запросом подтверждения, пришедшим после отметки; сроки — из параметров.
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { OperationOutcome, OperationSkip, OperationWait, SettleOutcome } from "../../src/agent/operations/index.js";
 import { ContourPayment } from "../../src/agent/payment-package/index.js";
 import { ShopFailure, type PaymentContext, type ShopPaymentReply } from "../../src/agent/ports/index.js";
@@ -132,11 +132,13 @@ function steps(o: {
   return { p, log, journal, sealed, packages, refs, issued: () => issued };
 }
 
-/** Что пропускает `skip`: по образцам записей (CI — отказ CREDENTIAL_INVALID, CR — CONFIRMATION_REQUIRED, A — AUTHORIZED) */
+/** Что пропускает `skip`: по образцам записей (CI — отказ CREDENTIAL_INVALID, CD — отказ CONFIRMATION_REQUIRED, DL — иной
+ *  отказ, CR — статус CONFIRMATION_REQUIRED, A — AUTHORIZED) */
 function skipped(skip: OperationSkip): string {
   const base: OperationRecord = { opRef: "op_s", orderRef: "ORD-1", channel: "CARD", amountMinor: 250000, merchantId: "shop_1", indicator: null, status: "AUTHORIZED", declineReason: null, fulfilment: null };
   const samples: [string, OperationRecord][] = [
     ["CI", { ...base, status: "DECLINED", declineReason: "CREDENTIAL_INVALID" }],
+    ["CD", { ...base, status: "DECLINED", declineReason: "CONFIRMATION_REQUIRED" }],
     ["DL", { ...base, status: "DECLINED", declineReason: "LIMIT_EXCEEDED" }],
     ["CR", { ...base, status: "CONFIRMATION_REQUIRED", declineReason: "CONFIRMATION_REQUIRED" }],
     ["A", base],
@@ -153,7 +155,8 @@ describe("ContourPayment: итог стадии 5 (Р49 п. 5)", () => {
   it("PAID — ожидание по order_ref до отправки пакета, срок operation_outcome_max_delay_sec; NONE — один поиск по CART (Р51 п. 5), ничего — OPERATION_RESULT_UNCONFIRMED; ожидание снято", async () => {
     const { p, log } = steps({ reply: "PAID", outcome: async () => ({ kind: "NONE" }) });
     await expect(p.authorize(ctx(), { idempotencyKey: "k" })).rejects.toMatchObject({ code: "OPERATION_RESULT_UNCONFIRMED" });
-    expect(log).toEqual(["expect", "mark", "pay 1", `outcome ${PARAMS.operation_outcome_max_delay_sec * 1000}`, "lookup ORD-1 m_cart", "close"]);
+    // КТ сессии 60 № 3: отказ ADP CONFIRMATION_REQUIRED — не итог ни ожидания, ни поиска
+    expect(log).toEqual(["expect", "skip CD", "mark", "pay 1", `outcome ${PARAMS.operation_outcome_max_delay_sec * 1000}`, "lookup ORD-1 m_cart", "lookup-skip CD", "close"]);
   });
 
   it("Р51 п. 5: итог найден поиском по CART — итог стадии 5 (в том числе REVERSED до ответа эмитента); поиск не сходится — OPERATION_REPLY_MISMATCH; итог по событию — без поиска", async () => {
@@ -212,13 +215,13 @@ describe("ContourPayment: итог стадии 5 (Р49 п. 5)", () => {
     ] as [string, ShopPaymentReply["status"], boolean][])("%s, запрос Платформы после отметки — CONFIRMATION_REQUIRED (стадия 4), пакет один", async (_, reply, flag) => {
       const { p, log } = steps({ reply, flag, outcome: () => new Promise(() => {}), arrival: Promise.resolve() });
       await expect(p.authorize(ctx(), { idempotencyKey: "k" })).rejects.toMatchObject({ code: "CONFIRMATION_REQUIRED" });
-      expect(log).toEqual(["expect", "mark", "pay 1", `outcome ${WAIT}`, "arrival 7", "close"]);
+      expect(log).toEqual(["expect", "skip CD", "mark", "pay 1", `outcome ${WAIT}`, "arrival 7", "close"]);
     });
 
     it("поломка (1): признак без запроса Платформы — не стадия 4 и не повтор оплаты: ожидание по большему из сроков, поиск по CART «операций нет» — OPERATION_RESULT_UNCONFIRMED, второго POST, GET реквизита и чтения заказа нет", async () => {
       const { p, log, journal } = steps({ reply: "AWAITING_CONFIRMATION", flag: true, outcome: async () => ({ kind: "NONE" }), lookup: { kind: "ABSENT", skipped: 0 }, payable: true, validTo: LATER });
       await expect(p.authorize(ctx(), { idempotencyKey: "k" })).rejects.toMatchObject({ code: "OPERATION_RESULT_UNCONFIRMED" });
-      expect(log).toEqual(["expect", "mark", "pay 1", `outcome ${WAIT}`, "arrival 7", "lookup ORD-1 m_cart", "close"]);
+      expect(log).toEqual(["expect", "skip CD", "mark", "pay 1", `outcome ${WAIT}`, "arrival 7", "lookup ORD-1 m_cart", "lookup-skip CD", "close"]);
       expect(journal.entries.some((e) => e.kind === "payment.retry")).toBe(false);
     });
 
@@ -283,7 +286,7 @@ describe("повтор оплаты после обрыва ответа — п�
     const s = steps({ reply: "PAID", pays: ["UNKNOWN", "PAID"], outcome: thenAuthorized(), lookup: { kind: "ABSENT", skipped: 0 }, validTo: LATER, payable: true });
     await expect(s.p.authorize(ctx(), { idempotencyKey: "k" })).resolves.toMatchObject({ status: "AUTHORIZED" });
     // дополнение 2 к Р69 п. 3: после payment.retry ожидание пропускает отказ повтора CREDENTIAL_INVALID (и только его)
-    expect(s.log).toEqual(["expect", "mark", "pay 1", `outcome ${PARAMS.operation_outcome_max_delay_sec * 1000}`, "lookup ORD-1 m_cart", "credential cr_1 m_cart", "payable", "skip CI", "mark", "pay 2", `outcome ${PARAMS.operation_outcome_max_delay_sec * 1000}`, "close"]);
+    expect(s.log).toEqual(["expect", "skip CD", "mark", "pay 1", `outcome ${PARAMS.operation_outcome_max_delay_sec * 1000}`, "lookup ORD-1 m_cart", "lookup-skip CD", "credential cr_1 m_cart", "payable", "skip CI,CD", "mark", "pay 2", `outcome ${PARAMS.operation_outcome_max_delay_sec * 1000}`, "close"]);
     const retries = s.journal.entries.filter((e) => e.kind === "payment.retry");
     expect(retries).toEqual([expect.objectContaining({ kind: "payment.retry", ref: "ORD-1", mandate: "m_cart" })]);
     expect(JSON.stringify(s.journal.entries)).not.toContain("cr_1");
@@ -293,7 +296,7 @@ describe("повтор оплаты после обрыва ответа — п�
     const s = steps({ reply: "PAID", pays: ["UNKNOWN", "UNKNOWN"], outcome: async () => ({ kind: "NONE" }), lookup: { kind: "ABSENT", skipped: 0 }, validTo: LATER, payable: true });
     await expect(s.p.authorize(ctx(), { idempotencyKey: "k" })).rejects.toMatchObject({ code: "OPERATION_RESULT_UNCONFIRMED" });
     const lookups = s.log.filter((x) => x.startsWith("lookup"));
-    expect(lookups).toEqual(["lookup ORD-1 m_cart", "lookup ORD-1 m_cart", "lookup-skip CI"]);
+    expect(lookups).toEqual(["lookup ORD-1 m_cart", "lookup-skip CD", "lookup ORD-1 m_cart", "lookup-skip CI,CD"]);
     expect(s.log.filter((x) => x.startsWith("pay "))).toEqual(["pay 1", "pay 2"]);
   });
 
@@ -301,7 +304,7 @@ describe("повтор оплаты после обрыва ответа — п�
     const s = steps({ reply: "PAID", pays: ["UNKNOWN"], outcome: async () => ({ kind: "NONE" }), lookup: { kind: "ABSENT", skipped: 0 }, validTo: LATER, payable: "AWAITING_CONFIRMATION", arrival: Promise.resolve() });
     await expect(s.p.authorize(ctx(), { idempotencyKey: "k" })).rejects.toMatchObject({ code: "CONFIRMATION_REQUIRED" });
     // запрос — после отметки первой попытки; сигнал покупки — у чтения заказа (КТ сессии 57 № 12)
-    expect(s.log).toEqual(["expect", "mark", "pay 1", `outcome ${PARAMS.operation_outcome_max_delay_sec * 1000}`, "lookup ORD-1 m_cart", "credential cr_1 m_cart", "payable", "arrival 7", "close"]);
+    expect(s.log).toEqual(["expect", "skip CD", "mark", "pay 1", `outcome ${PARAMS.operation_outcome_max_delay_sec * 1000}`, "lookup ORD-1 m_cart", "lookup-skip CD", "credential cr_1 m_cart", "payable", "arrival 7", "close"]);
     expect(s.journal.entries.some((e) => e.kind === "payment.retry")).toBe(false);
   });
 
@@ -330,7 +333,39 @@ describe("повтор оплаты после обрыва ответа — п�
     const declined: Operation = { ...DECLINED, declineReason: "CREDENTIAL_INVALID" };
     const s = steps({ reply: "PAID", outcome: async () => ({ kind: "OPERATION", operation: declined }) });
     await expect(s.p.authorize(ctx(), { idempotencyKey: "k" })).resolves.toMatchObject({ status: "DECLINED", declineReason: "CREDENTIAL_INVALID" });
-    expect(s.log.some((x) => x.startsWith("skip"))).toBe(false);
+    // пропуска CREDENTIAL_INVALID нет — только отказ CONFIRMATION_REQUIRED (КТ сессии 60 № 3)
+    expect(s.log.filter((x) => x.startsWith("skip"))).toEqual(["skip CD"]);
+  });
+
+  it("КТ сессии 60 № 2: ожидание запроса — свой таймер (не AbortSignal.timeout с unref); пришёл раньше срока — таймер снят", async () => {
+    vi.useFakeTimers();
+    try {
+      const s = steps({ reply: "PAID", outcome: async () => ({ kind: "NONE" }), lookup: { kind: "ABSENT", skipped: 1 }, arrival: Promise.resolve() });
+      const before = vi.getTimerCount();
+      await expect(s.p.authorize(ctx(), { idempotencyKey: "k" })).rejects.toMatchObject({ code: "CONFIRMATION_REQUIRED" });
+      expect(vi.getTimerCount()).toBe(before);
+      // запроса нет — срок confirmation_wait_ms по таймеру: итог OPERATION_RESULT_UNCONFIRMED
+      const t = steps({ reply: "PAID", outcome: async () => ({ kind: "NONE" }), lookup: { kind: "ABSENT", skipped: 1 } });
+      const out = t.p.authorize(ctx(), { idempotencyKey: "k" }).catch((e: unknown) => e);
+      await vi.advanceTimersByTimeAsync(PARAMS.confirmation_wait_ms);
+      expect(await out).toMatchObject({ code: "OPERATION_RESULT_UNCONFIRMED" });
+      expect(vi.getTimerCount()).toBe(before);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("КТ сессии 60 № 3: отказ ADP CONFIRMATION_REQUIRED на первой авторизации — не итог и не DECLINED_CONFIRMATION_REQUIRED: поиск пропустил его — ждать запрос Платформы; пришёл — CONFIRMATION_REQUIRED (стадия 4), нет — OPERATION_RESULT_UNCONFIRMED; повтора оплаты нет", async () => {
+    const got = steps({ reply: "PAID", outcome: async () => ({ kind: "NONE" }), lookup: { kind: "ABSENT", skipped: 1 }, arrival: Promise.resolve() });
+    await expect(got.p.authorize(ctx(), { idempotencyKey: "k" })).rejects.toMatchObject({ code: "CONFIRMATION_REQUIRED" });
+    expect(got.log.slice(-3)).toEqual(["lookup-skip CD", "arrival 7", "close"]);
+    const none = steps({ reply: "PAID", outcome: async () => ({ kind: "NONE" }), lookup: { kind: "ABSENT", skipped: 1 }, arrival: () => Promise.reject(new Error("срок")) });
+    await expect(none.p.authorize(ctx(), { idempotencyKey: "k" })).rejects.toMatchObject({ code: "OPERATION_RESULT_UNCONFIRMED" });
+    expect(none.log.filter((x) => x.startsWith("pay "))).toEqual(["pay 1"]);
+    // ничего не пропущено — без ожидания запроса
+    const plain = steps({ reply: "PAID", outcome: async () => ({ kind: "NONE" }), lookup: { kind: "ABSENT", skipped: 0 }, arrival: Promise.resolve() });
+    await expect(plain.p.authorize(ctx(), { idempotencyKey: "k" })).rejects.toMatchObject({ code: "OPERATION_RESULT_UNCONFIRMED" });
+    expect(plain.log.some((x) => x.startsWith("arrival"))).toBe(false);
   });
 
   it("ревью КТ сессии 57 № 2: повтор — тем же запечатанным пакетом, реквизит выдан один раз", async () => {

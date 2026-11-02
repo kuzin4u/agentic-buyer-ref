@@ -7,7 +7,7 @@ import type { OperationOutcome, OperationSkip, OperationWait, SettleOutcome, Wat
 import type { IssuedPackage } from "../ports/payment-platform.js";
 import type { Mutation } from "../ports/mutation.js";
 import { PaymentFailure, ShopFailure, type ConfirmationOutcome, type LateNotice, type PaymentContext, type PaymentSteps, type ShopPaymentPort, type ShopPaymentReply } from "../ports/shop.js";
-import type { StandParams } from "../../shared/config.js";
+import { TIMER_MAX_MS, type StandParams } from "../../shared/config.js";
 import { PlatformFailure, type Credential, type CredentialDraft, type Mandate, type Operation } from "../../shared/domain.js";
 import { SAFE_ID } from "../../shared/ids.js";
 import { orderRefIssue } from "./order-ref.js";
@@ -155,6 +155,10 @@ export class ContourPayment implements PaymentSteps {
     // ожидание итога — до отправки пакета: событие могут прочитать, пока продавец отвечает (Р49 п. 3); отметка запросов
     // подтверждения — тоже до отправки: в гонке стадии 5 — только пришедшие после (ревью КТ1 № 5)
     const wait = this.o.operations.expect(orderRef, c.cart);
+    // КТ сессии 60 № 3: отказ ADP с причиной CONFIRMATION_REQUIRED на первой авторизации — не итог (код
+    // DECLINED_CONFIRMATION_REQUIRED — только после ссылки, путь resume): повод ждать запрос Платформы (стадия 4 — только
+    // по нему, К1.1); что такой отказ был, говорит поиск по CART первой попытки (ABSENT, skipped > 0)
+    wait.skip(confirmationDeclined);
     const req = { shopId: c.shopId, orderId: orderRef, cartMandateId: c.cart.id };
     try {
       let op: Operation;
@@ -171,11 +175,13 @@ export class ContourPayment implements PaymentSteps {
           if (!(e instanceof ShopFailure)) throw e;
           unknown = e.code === "SHOP_ORDER_STATE_UNKNOWN";
         }
-        const looked: { kind: OperationOutcome["kind"] | null } = { kind: null };
-        // попытка 2: её отказ CREDENTIAL_INVALID — не кандидат итога (дополнение 2 к Р69 п. 3)
+        const looked: { kind: OperationOutcome["kind"] | null; skipped: number } = { kind: null, skipped: 0 };
+        // попытка 2: её отказ CREDENTIAL_INVALID — не кандидат итога (дополнение 2 к Р69 п. 3); отказ CONFIRMATION_REQUIRED —
+        // не кандидат на любой попытке (КТ сессии 60 № 3)
         const lookup = async () => {
-          const r = await this.o.operations.lookup(orderRef, c.cart, c.notice, attempt > 1 ? credentialInvalid : undefined);
+          const r = await this.o.operations.lookup(orderRef, c.cart, c.notice, attempt > 1 ? retrySkip : confirmationDeclined);
           looked.kind = r.kind;
+          if (r.kind === "ABSENT") looked.skipped = r.skipped;
           return r;
         };
         try {
@@ -186,6 +192,12 @@ export class ContourPayment implements PaymentSteps {
           // Платформа ответила «операций заказа нет», срок реквизита не наступил, реквизит у Платформы ISSUED и заказ у
           // витрины CREATED (пакет не дошёл); второй неизвестный исход — итог как есть, третьего POST нет
           const unconfirmed = e instanceof PaymentFailure && e.code === "OPERATION_RESULT_UNCONFIRMED";
+          // первая попытка: отказ ADP CONFIRMATION_REQUIRED был (поиск пропустил его), другой операции нет — ждать запрос
+          // Платформы (как К1.3), повтора оплаты нет. На попытке 2 пропущенные не различаются (CI или CD) — итога нет
+          if (unconfirmed && attempt === 1 && looked.kind === "ABSENT" && looked.skipped > 0 && !c.signal.aborted) {
+            await this.#awaitRequest(mark, c.signal);
+            throw new PaymentFailure("CONFIRMATION_REQUIRED");
+          }
           if (!unconfirmed || attempt > 1 || !unknown || looked.kind !== "ABSENT" || c.signal.aborted) throw e;
           const next = await this.#retryable(credential, c.cart.id, req, c.signal);
           // К1.3 (Р69 п. 4, правка ревью): заказ ждёт подтверждения — пакет дошёл, ADP требует подтверждения; стадия 4 —
@@ -203,7 +215,7 @@ export class ContourPayment implements PaymentSteps {
         this.o.journal.record({ at: this.now().toISOString(), kind: "payment.retry", ref: orderRef, ...mandateRef(c.cart.id) });
         // дополнение 2 к Р69 п. 3: реквизит одобряет одна авторизация (гашение ISSUED → USED на APPROVE ADP) — отказ
         // повтора CREDENTIAL_INVALID значит «первая могла выиграть»: не итог, ожидание идёт до операции первой попытки
-        wait.skip(credentialInvalid);
+        wait.skip(retrySkip);
       }
       // оплата отменена — поздний клиринг или возврат сообщит наблюдение после итога (Р51 п. 4); итог поиска модуль уже
       // поставил под наблюдение сам, здесь — итог по событию (повторная постановка ничего не теряет)
@@ -250,12 +262,17 @@ export class ContourPayment implements PaymentSteps {
   /** Запрос подтверждения Платформы после отметки `mark` (до отправки пакета) — не дольше confirmation_wait_ms (К1.3);
    *  не пришёл — OPERATION_RESULT_UNCONFIRMED; остановка покупки — её причина. */
   async #awaitRequest(mark: number, signal: AbortSignal): Promise<void> {
-    const limit = AbortSignal.timeout(this.o.params.confirmation_wait_ms);
+    // таймер без unref (КТ сессии 60 № 2): пока покупка ждёт, процесс не завершается молча, без исхода (инвариант 4); снят
+    // в finally — и при раннем запросе, и при остановке
+    const limit = new AbortController();
+    const t = setTimeout(() => limit.abort(new Error("срок ожидания запроса подтверждения")), Math.min(this.o.params.confirmation_wait_ms, TIMER_MAX_MS));
     try {
-      await this.o.confirmations.arrival(AbortSignal.any([signal, limit]), mark);
+      await this.o.confirmations.arrival(AbortSignal.any([signal, limit.signal]), mark);
     } catch (e) {
       if (signal.aborted) throw e;
       throw new PaymentFailure("OPERATION_RESULT_UNCONFIRMED");
+    } finally {
+      clearTimeout(t);
     }
   }
 
@@ -316,6 +333,12 @@ const mandateRef = (id: string): { mandate?: string } => (SAFE_ID.test(id) ? { m
 
 /** Отказ повтора оплаты по реквизиту, который одобрила (могла одобрить) первая попытка (дополнение 2 к Р69 п. 3). */
 const credentialInvalid: OperationSkip = (r) => r.status === "DECLINED" && r.declineReason === "CREDENTIAL_INVALID";
+
+/** Отказ ADP с причиной CONFIRMATION_REQUIRED (первая форма дополнения 2 к Р69 п. 4) — на первой авторизации не итог. */
+const confirmationDeclined: OperationSkip = (r) => r.status === "DECLINED" && r.declineReason === "CONFIRMATION_REQUIRED";
+
+/** После повтора оплаты: и отказ CONFIRMATION_REQUIRED, и отказ повтора CREDENTIAL_INVALID — не итог. */
+const retrySkip: OperationSkip = (r) => confirmationDeclined(r) || credentialInvalid(r);
 
 /** Решение ADP «нужно подтверждение» без события (стенд v0.37.0; дополнение 2 к Р69 п. 4). */
 const confirmationRequired: OperationSkip = (r) => r.status === "CONFIRMATION_REQUIRED";

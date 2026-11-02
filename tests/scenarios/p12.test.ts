@@ -13,7 +13,7 @@ import { DIAG } from "../../src/agent/compose.js";
 import { INTENT } from "../support/consents.js";
 import { shopBy, type Contour } from "../support/contour.js";
 import { one } from "../support/purchase.js";
-import { STAND_TIMEOUT_MS, adpDecision, standPurchase } from "../support/stand-purchase.js";
+import { STAND_TIMEOUT_MS, adpDecision, routesFrom, standPurchase } from "../support/stand-purchase.js";
 
 let c: Contour | undefined;
 afterEach(async () => {
@@ -53,6 +53,7 @@ async function p12(path: Decide) {
   expect(order.total.amount).toBeGreaterThan(r.c.stand!.params.confirm_above_kop);
   expect(order.total.amount).toBeLessThanOrEqual(INTENT.amountLimit.amount);
 
+  const from = r.c.calls().length;
   const paying = r.purchase.authorize({ idempotencyKey: "idem-pay-p12" }).catch((e: unknown) => e);
   await pending;
   // ADP потребовала подтверждения; заказ продавца — AWAITING_CONFIRMATION (слова продавца — только в журнале)
@@ -89,12 +90,32 @@ async function p12(path: Decide) {
   const second = await adpDecision(r.c, 2);
   expect(second.decision).toBe("APPROVE");
   const op = await paying;
-  return { r, op, order, cart, id: id!, link: link!, url, secret, first: (await adpDecision(r.c, 1)).op_ref, second: second.op_ref, count, confirmRoute };
+  return { r, op, order, cart, intent, from, id: id!, link: link!, url, secret, first: (await adpDecision(r.c, 1)).op_ref, second: second.op_ref, count, confirmRoute };
 }
 
 describe("П12 — операция выше порога подтверждения", { timeout: STAND_TIMEOUT_MS * 2 }, () => {
   it.each(["APP", "UPK"] as Decide[])("решение человека (%s): ADP CONFIRMATION_REQUIRED → PENDING → APPROVED → одна ссылка продавцу → новая операция → SETTLING; исполнено один раз", async (path) => {
-    const { r, op, order, cart, id, link, url, secret, first, second, count, confirmRoute } = await p12(path);
+    const { r, op, order, cart, intent, from, id, link, url, secret, first, second, count, confirmRoute } = await p12(path);
+    // полный журнал обращений агента от оплаты до SETTLING, без ленты (КТ сессии 60 № 4; как p15): ворота стадии 5, реквизит,
+    // пакет, GET подтверждения, ворота заново, одна ссылка, GET новой операции — ничего лишнего (ни GET реквизита, ни
+    // чтения заказов, ни второго POST)
+    const ids = { intent: intent.id, cart: cart.id, shop: NORMAL.id, merchant: NORMAL.merchant_id, order: order.orderId, cnf: id, op: second };
+    expect(routesFrom(r.c, from, "agent", ids)).toEqual([
+      "pao GET /pao/v1/mandates/{intent}/verify 200",
+      "pao GET /pao/v1/mandates/{cart}/verify 200",
+      "pao GET /pao/v1/merchants/{merchant}/readiness 200",
+      "pao POST /pao/v1/credentials 201",
+      "merchants POST /v1/shops/{shop}/orders/{order}/payment 200",
+      // PENDING по confirmation.required, APPROVED по confirmation.approved
+      "pao GET /pao/v1/confirmations/{cnf} 200",
+      "pao GET /pao/v1/confirmations/{cnf} 200",
+      // ворота стадии 5 заново после решения человека (Р70)
+      "pao GET /pao/v1/mandates/{intent}/verify 200",
+      "pao GET /pao/v1/mandates/{cart}/verify 200",
+      "pao GET /pao/v1/merchants/{merchant}/readiness 200",
+      "merchants POST /v1/shops/{shop}/orders/{order}/confirmation 200",
+      "pao GET /pao/v1/operations/{op} 200",
+    ]);
     expect(op).toMatchObject({ opRef: second, orderRef: order.orderId, status: "AUTHORIZED", amount: cart.cart!.total, indicator: { mandateId: cart.id } });
     expect(second).not.toBe(first);
     expect(r.purchase.state).toBe("SETTLING");

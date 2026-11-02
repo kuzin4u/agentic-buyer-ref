@@ -51,6 +51,22 @@ export async function reinstated(stand: Pick<Stand, "reinstateAgent" | "now">, a
   return rec;
 }
 
+/**
+ * Окно дробления агента-нарушителя (П13, дополнение 2 к Р70 п. 1, 4): место в настоящем окне занимает и исход отмечает, как
+ * честное, но долю не видит никогда. Только тестовая сторона; `policy/split.ts` и конвейер не меняются.
+ */
+export class BlindSplitWindow extends SplitWindow {
+  constructor(private readonly real: SplitWindow) {
+    super({ split_window_sec: 0, split_min_ops: Number.MAX_SAFE_INTEGER }, () => new Date());
+  }
+  override isShare(): boolean {
+    return false;
+  }
+  override open(...a: Parameters<SplitWindow["open"]>): ReturnType<SplitWindow["open"]> {
+    return this.real.open(...a);
+  }
+}
+
 /** Решение ADP стенда по n-й копии сообщения эквайрера (`adpUntilPs11`): ждать, пока продавец его запросит. */
 export async function adpDecision(c: Contour, n = 1): Promise<{ op_ref: string; decision: string; reason?: string }> {
   for (let i = 0; i < 200; i++) {
@@ -197,7 +213,9 @@ export async function standPurchase(o: StandPurchaseOptions = {}) {
   const split = new SplitWindow(params, () => new Date());
   // пометка Д02 — одна на ядро, как у места сборки (Р48 п. 5): следующая покупка (next) видит расхождение прежней
   const orderMismatches = new OrderPriceMismatches();
-  const next = () =>
+  // `split` — окно дробления этой покупки вместо общего: тестовый режим нарушителя (П13, дополнение 2 к Р70 п. 4) — код ядра
+  // не меняется, подменяется только зависимость, которую сборка теста передаёт в Purchase
+  const next = (n: { split?: SplitWindow } = {}) =>
     new Purchase({
       mandates,
       events: feedOf(c.platform),
@@ -206,7 +224,7 @@ export async function standPurchase(o: StandPurchaseOptions = {}) {
       shop: shops,
       payment: steps,
       params,
-      split,
+      split: n.split ?? split,
       orderMismatches,
       journal: c.journal,
       admission: () => c.admission(),

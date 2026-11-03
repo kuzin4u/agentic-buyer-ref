@@ -19,6 +19,7 @@ import { loadParams } from "../../src/shared/config.js";
 import type { Mandate, MandateDraft } from "../../src/shared/domain.js";
 import { Consents, INTENT } from "../support/consents.js";
 import { faultyFetch } from "./pao-faults.js";
+import { ownCalls } from "./pao-stub-calls.js";
 import { describeConformance, type FaultMethod, type PlatformCall } from "./suite.js";
 
 const AGENT = "nspk:agent:buyref-01:v1";
@@ -177,18 +178,9 @@ describeConformance({
       decideConfirmation: async (id: string, decision: "APPROVED" | "REJECTED") => void (confirmations.get(id)!.status = decision),
       issuedSecrets: () => [...secrets, ...faults.secrets],
       callsCarryNonce: true,
-      // PaoStub проверяет подпись до обработчика: keyid из Signature-Input — подпись агента; чужой агент — свой kid
-      calls: (): PlatformCall[] =>
-        stub.calls
-          .filter((c) => c.kid === undefined || c.kid === own.key.kid)
-          .map((c) => ({
-            mutating: c.method !== "GET",
-            status: c.status,
-            ...(c.code !== undefined && { code: c.code }),
-            signed: c.kid === own.key.kid,
-            ...(c.idempotencyKey !== undefined && { idempotencyKey: c.idempotencyKey }),
-            ...(c.nonce !== undefined && { nonce: c.nonce }),
-          })),
+      // PaoStub проверяет подпись до обработчика: свои обращения и подпись агента цели — по agentCode после проверки
+      // подписи и kid (ядро v0.12.0, К24, agentic-core#44; pao-stub-calls.ts)
+      calls: (): PlatformCall[] => ownCalls(stub.calls, { agentCode: AGENT, kid: own.key.kid }),
       loseNextResponse: (m: FaultMethod) => faults.set(m, "lose"),
       garbleNextResponse: (m: FaultMethod) => faults.set(m, "garble"),
       journalText: () => JSON.stringify(ownJournal.entries),

@@ -4,22 +4,24 @@ import { createRequire } from "node:module";
 import { dirname } from "node:path";
 import { PAO_ERRORS, PAO_VERSION } from "@kuzin4u/agentic-core/pao";
 
-// Каркас ядра (AG-01): зависимость от agentic-core v0.11.0 (AG-09 ч. 1 К2, передачи #38 и #41, Р41 п. 1; прежде v0.9.0 — AG-07 К0, передача #34, Р37 п. 1; v0.8.0 — AG-ДГ К1, передача #29; v0.7.0 — Р33, v0.6.0 — Р31, v0.3.0 — AG-05 К1.1) и структура src по CLAUDE.md.
+// Каркас ядра (AG-01): зависимость от agentic-core v0.13.0 (сессия 62, PR #99: передачи ядра #41, #44; дополнение к Р41 п. 2;
+// прежде v0.11.0 — AG-09 ч. 1 К2, передачи #38 и #41, Р41 п. 1; прежде v0.9.0 — AG-07 К0, передача #34, Р37 п. 1; v0.8.0 — AG-ДГ К1, передача #29; v0.7.0 — Р33, v0.6.0 — Р31, v0.3.0 — AG-05 К1.1) и структура src по CLAUDE.md.
 describe("зависимость от agentic-core", () => {
-  it("подключена по git+https с тегом v0.11.0", () => {
+  it("подключена по git+https с тегом v0.13.0", () => {
     const pkg = JSON.parse(readFileSync("package.json", "utf8"));
     expect(pkg.dependencies["@kuzin4u/agentic-core"]).toBe(
-      "git+https://github.com/kuzin4u/agentic-core.git#v0.11.0",
+      "git+https://github.com/kuzin4u/agentic-core.git#v0.13.0",
     );
     const lock = JSON.parse(readFileSync("package-lock.json", "utf8"));
     const entry = lock.packages["node_modules/@kuzin4u/agentic-core"];
-    expect(entry.version).toBe("0.11.0");
+    expect(entry.version).toBe("0.13.0");
     expect(lock.packages[""].dependencies["@kuzin4u/agentic-core"]).toBe(pkg.dependencies["@kuzin4u/agentic-core"]);
-    // e6406b3… — коммит тега v0.11.0 (слияние PR #37 ядра, К20). Копия ядра одна: стенд v0.11.0 сам зависит от #v0.11.0
-    // (Р41 п. 2). Смена тега — без npm install (передача #41, РП46 доп. п. 1): ссылка в package.json → version и resolved
-    // в lock на git+https и полный хэш коммита тега → npm ci; npm install оставляет прежний коммит и переводит адрес на git+ssh.
+    // 8be77a3… — коммит тега v0.13.0 (К25, CO-4; v0.12.0 — К22–К24, ec36de6…; прежде v0.11.0 — e6406b3…, слияние PR #37
+    // ядра, К20). Смена тега — без npm install (передача #41, РП46 доп. п. 1; Р45 п. 1): ссылка в package.json → version
+    // и resolved в lock на git+https и полный хэш коммита тега → npm ci; npm install оставляет прежний коммит и переводит
+    // адрес на git+ssh, а спецификатор — на github: (проверено в К0 сессии 62).
     expect(entry.resolved).toBe(
-      "git+https://github.com/kuzin4u/agentic-core.git#e6406b3a75020de7a5786218aaf0ff7a260654c9",
+      "git+https://github.com/kuzin4u/agentic-core.git#8be77a36a7bbbf5db7cd76c5a728247b6bbcfca9",
     );
   });
 
@@ -50,8 +52,11 @@ describe("зависимость от agentic-core", () => {
       "git+https://github.com/kuzin4u/agentic-ps-platform.git#b3444d3a668bae87afc42ec0f390cf8d2c5ab27b",
     );
     expect(readFileSync("package-lock.json", "utf8")).not.toMatch(/git\+ssh:|"github:/);
-    // стенд объявляет тот же тег ядра, что и агент: npm сводит их к одной копии (Р41 п. 2)
-    expect(entry.dependencies["@kuzin4u/agentic-core"]).toBe(pkg.dependencies["@kuzin4u/agentic-core"]);
+    // Одна копия ядра (Р41 п. 2, дополнение — сессия 62, PR #99): стенд v0.37.0 объявляет #v0.11.0, агент — #v0.13.0;
+    // стенд работает на 0.13.0 из корня — держится на lock (вложенной записи нет), поэтому только npm ci, не npm install
+    // (Р-1044): при npm install может появиться вторая копия. Снимается стендом, объявляющим тот же тег, что агент
+    // (передача платформе — перейти на ядро 0.13); тогда — снова равенство тегов.
+    expect(entry.dependencies["@kuzin4u/agentic-core"]).toBe("git+https://github.com/kuzin4u/agentic-core.git#v0.11.0");
     expect(Object.keys(lock.packages).filter((k) => k.endsWith("node_modules/@kuzin4u/agentic-core"))).toEqual([
       "node_modules/@kuzin4u/agentic-core",
     ]);
@@ -68,7 +73,7 @@ describe("зависимость от agentic-core", () => {
       expect(dirname(dir), "package.json ядра не найден").not.toBe(dir);
       dir = dirname(dir);
     }
-    expect(JSON.parse(readFileSync(`${dir}/package.json`, "utf8")).version).toBe("0.11.0");
+    expect(JSON.parse(readFileSync(`${dir}/package.json`, "utf8")).version).toBe("0.13.0");
   });
 
   it("даёт ПАО 1.4.0 и таблицу ошибок с полем retry", () => {

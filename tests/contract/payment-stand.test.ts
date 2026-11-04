@@ -152,6 +152,8 @@ describe("стадия 5 на стенде: реквизит по ПАО и па
   // обращения (эмулятор честный пакет не отклоняет); пакет ушёл — итог не подтверждён, код витрины — в detail shop.call
   it.each([
     ["PACKAGE_MISMATCH", 409, { code: "PACKAGE_MISMATCH" }, "refused", { detail: "PACKAGE_MISMATCH" }],
+    // стенд v0.39.0 (передача #100): несовпадение aoi.agent_code — свой код; честный пакет агента его не получает
+    ["PACKAGE_AGENT_MISMATCH", 409, { code: "PACKAGE_AGENT_MISMATCH" }, "refused", { detail: "PACKAGE_AGENT_MISMATCH" }],
     ["ORDER_NOT_PAYABLE", 409, { code: "ORDER_NOT_PAYABLE" }, "refused", { detail: "ORDER_NOT_PAYABLE" }],
     ["код вне перечня", 409, { code: "SOMETHING_ELSE" }, "refused", { reason: "MERCHANT_CODE_UNKNOWN" }],
     ["ответ не по схеме", 200, { status: "MAYBE" }, "unknown", { detail: "BAD_RESPONSE" }],

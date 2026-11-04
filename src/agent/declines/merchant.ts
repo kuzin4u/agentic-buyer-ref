@@ -21,6 +21,7 @@ export const MERCHANT_CODES = [
   "ITEM_INCOMPLETE",
   "PACKAGE_INVALID",
   "PACKAGE_MISMATCH",
+  "PACKAGE_AGENT_MISMATCH",
   "ORDER_NOT_PAYABLE",
   "QUERY_INVALID",
   "UPSTREAM_UNAVAILABLE",
@@ -76,8 +77,14 @@ export const MERCHANT_DIAG: Readonly<Record<MerchantCode, DiagEntry>> = {
     "Витрина отклонила пакет агентской оплаты как не по схеме. Без повтора (AG-11).",
     "Р42 п. 4; Т8"),
   PACKAGE_MISMATCH: e("PACKAGE_MISMATCH", ["agent", "merchant"], "after_fix", ORDER,
-    "Пакет агентской оплаты не совпал с заказом (заказ, агент или мандат корзины). Без повтора (AG-11).",
+    "Пакет агентской оплаты не совпал с заказом (номер заказа или мандат корзины). Без повтора (AG-11).",
     "Р42 п. 4; Т8"),
+  // Со стенда v0.39.0 (передача #100) несовпадение aoi.agent_code — свой код, проверка у витрины первой после разбора пакета,
+  // до сверки заказа и корзины; PACKAGE_MISMATCH — только заказ и мандат корзины. Действие — after_fix, источник — агент и продавец, как у соседних кодов пакета; у MERCHANT_DIAG ядра — stop: отличие
+  // намеренное, для агента итог тот же — сделка остановлена без повтора (решение владельца, PR #101, #issuecomment-6629068279 п. 2).
+  PACKAGE_AGENT_MISMATCH: e("PACKAGE_AGENT_MISMATCH", ["agent", "merchant"], "after_fix", ORDER,
+    "Витрина отклонила пакет агентской оплаты: aoi.agent_code пакета не равен агенту, подписавшему обращение (реквизит другого агента или ошибка сверки у продавца). Без повтора (AG-11); сверить код агента в пакете и подпись.",
+    "Р42 п. 4; Т8; инвариант 8"),
   ORDER_NOT_PAYABLE: e("ORDER_NOT_PAYABLE", ["merchant"], "after_human", ORDER,
     "Заказ у витрины нельзя оплатить (уже оплачивается, оплачен или отклонён). Без повтора (AG-11).",
     "Р42 п. 4; инвариант 9"),
